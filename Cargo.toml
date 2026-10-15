@@ -1,0 +1,30 @@
+[package]
+name = "git-rustle"
+version = "0.1.0"
+edition = "2024"
+description = "Windows Terminal-native, fast and colorful Git graph viewer"
+license = "MIT"
+
+[dependencies]
+gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "sha1"] }
+unicode-width = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
