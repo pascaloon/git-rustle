@@ -51,6 +51,7 @@ pub struct Label {
 }
 
 pub struct App {
+    pub branches: crate::branches::Browser,
     pub repo_name: String,
     pub history: History,
     /// A fresh history being built while `history` (stale cache) stays on screen.
@@ -85,6 +86,7 @@ pub struct App {
 
     pub quit: bool,
     pub want_rewalk: bool,
+    pub want_refresh: bool,
     pub needs_redraw: bool,
     /// Rows visible in the list, updated by the renderer.
     pub list_rows: usize,
@@ -93,6 +95,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         App {
+            branches: crate::branches::Browser::default(),
             repo_name: String::new(),
             history: History::default(),
             incoming: None,
@@ -117,6 +120,7 @@ impl App {
             next_key: 1,
             quit: false,
             want_rewalk: false,
+            want_refresh: false,
             needs_redraw: true,
             list_rows: 1,
         }
@@ -222,7 +226,11 @@ impl App {
     pub fn open_diff(&mut self) {
         if self.marks.len() == MAX_MARKS {
             let (a, b) = (self.marks[0], self.marks[1]);
-            let time = |id: &ObjectId| self.history.index_of(id).map(|i| self.history.commits[i].commit_time);
+            let time = |id: &ObjectId| {
+                self.history
+                    .index_of(id)
+                    .map(|i| self.history.commits[i].commit_time)
+            };
             let (old, new) = match (time(&a), time(&b)) {
                 (Some(ta), Some(tb)) if tb < ta => (b, a),
                 _ => (a, b),
@@ -251,7 +259,12 @@ impl App {
     fn show_view(&mut self, changes: ChangeSet, cursor: Option<TreeCursor>) {
         let id = self.next_view_id;
         self.next_view_id += 1;
-        self.mode = Mode::Diff(Box::new(DiffView::new(id, changes, cursor, self.sidebar_width)));
+        self.mode = Mode::Diff(Box::new(DiffView::new(
+            id,
+            changes,
+            cursor,
+            self.sidebar_width,
+        )));
         self.needs_redraw = true;
     }
 
@@ -260,7 +273,9 @@ impl App {
             self.sidebar_width = view.sidebar_width;
             // Hand a parent diff of the selected commit back to the details panel.
             let selected = self.selected_id();
-            if Some(view.changes.new) == selected && view.changes.old == selected.and_then(|s| self.parent_of(&s)) {
+            if Some(view.changes.new) == selected
+                && view.changes.old == selected.and_then(|s| self.parent_of(&s))
+            {
                 self.details_changes = Some(view.changes);
                 self.details_cursor = view.cursor;
             }
@@ -310,6 +325,29 @@ impl App {
         }
         self.labels = labels;
         self.refs = Some(refs);
+        if self.branches.open || !self.branches.entries.is_empty() {
+            self.branches.rebuild(self.refs.as_ref());
+        }
+        self.remote_labels();
+        self.needs_redraw = true;
+    }
+
+    pub fn remote_labels(&mut self) {
+        // API metadata adds labels only. It never changes the local walk tips or cache.
+        for (name, update) in &self.branches.remotes {
+            let prefix = format!("{name}/");
+            for labels in self.labels.values_mut() {
+                labels.retain(|l| !(l.kind == RefKind::Remote && l.name.starts_with(&prefix)));
+            }
+            for branch in &update.branches {
+                if let Ok(id) = ObjectId::from_hex(branch.sha.as_bytes()) {
+                    self.labels.entry(id).or_default().push(Label {
+                        name: format!("{name}/{}", branch.name),
+                        kind: RefKind::Remote,
+                    });
+                }
+            }
+        }
         self.needs_redraw = true;
     }
 
@@ -331,7 +369,9 @@ impl App {
         match self.load {
             LoadState::Refreshing | LoadState::Cached => {
                 // Keep the stale view stable; swap when the fresh walk is complete.
-                self.incoming.get_or_insert_with(History::default).append(batch);
+                self.incoming
+                    .get_or_insert_with(History::default)
+                    .append(batch);
                 if complete {
                     let fresh = self.incoming.take().unwrap_or_default();
                     let keep = self.selected_id();
@@ -441,6 +481,29 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.ctrl && key.code == KeyCode::Char('c') {
+            if self.branches.busy {
+                self.branches.status =
+                    "Checkout is running; wait for completion before quitting".into();
+                self.needs_redraw = true;
+            } else {
+                self.quit = true;
+            }
+            return;
+        }
+        if self.branches.open {
+            self.branches.handle_key(key);
+            if let Some(id) = self.branches.jump.take() {
+                if let Some(index) = self.history.index_of(&id) {
+                    self.select(index);
+                    self.branches.open = false;
+                } else {
+                    self.branches.status = "This commit is not in the local graph. Enter checks out the branch and downloads missing history.".into();
+                }
+            }
+            self.needs_redraw = true;
+            return;
+        }
         if let Mode::Diff(view) = &mut self.mode {
             view.handle_key(key);
             let (close, redraw) = (view.close, view.needs_redraw);
@@ -452,9 +515,24 @@ impl App {
         }
         let page = self.list_rows.saturating_sub(1).max(1) as isize;
         match (key.code, key.ctrl) {
-            (KeyCode::Char('q'), _) | (KeyCode::Char('c'), true) => self.quit = true,
+            (KeyCode::Char('b'), false) => {
+                self.branches.show(self.refs.as_ref());
+                self.want_refresh = true;
+                self.needs_redraw = true;
+            }
+            (KeyCode::Char('q'), _) => {
+                if self.branches.busy {
+                    self.branches.open = true;
+                    self.needs_redraw = true;
+                } else {
+                    self.quit = true;
+                }
+            }
             (KeyCode::Esc, _) => {
-                if self.marks.is_empty() {
+                if self.branches.busy {
+                    self.branches.open = true;
+                    self.needs_redraw = true;
+                } else if self.marks.is_empty() {
                     self.quit = true;
                 } else {
                     self.clear_marks();
@@ -468,7 +546,7 @@ impl App {
             (KeyCode::Delete, _) => self.clear_marks(),
             (KeyCode::Char('d'), false) => self.open_diff(),
             (KeyCode::Tab, _) => self.cycle_focus(),
-            (KeyCode::Char('r'), _) if !key.ctrl => self.want_rewalk = true,
+            (KeyCode::Char('r'), _) if !key.ctrl => self.want_refresh = true,
             (KeyCode::Char('['), _) => self.resize_panel(-2),
             (KeyCode::Char(']'), _) => self.resize_panel(2),
             _ => match self.focus {
@@ -571,6 +649,20 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16, screen_h: u16) {
+        if self.branches.open {
+            match m.kind {
+                MouseKind::Wheel(delta) => self.branches.move_by(-(delta as isize) * 3),
+                MouseKind::Down(Button::Left)
+                    if m.y >= 2 && (m.y as usize) < self.branches.rows + 2 =>
+                {
+                    self.branches.selected = self.branches.scroll + m.y as usize - 2;
+                    self.branches.ensure_visible();
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
         if let Mode::Diff(view) = &mut self.mode {
             let da = crate::ui::diff::compute_areas(screen_w, screen_h, view.sidebar_width);
             view.handle_mouse(m, &da);
@@ -872,9 +964,11 @@ mod tests {
             old: None,
             new: None,
         };
-        app.changes_by_key_mut(cs_key).unwrap().set_tree(Ok(TreeDiff {
-            files: vec![change("src/a.rs"), change("b.rs")],
-        }));
+        app.changes_by_key_mut(cs_key)
+            .unwrap()
+            .set_tree(Ok(TreeDiff {
+                files: vec![change("src/a.rs"), change("b.rs")],
+            }));
         app.details_cursor.rows = 5;
         // Tab: list → details → files.
         app.handle_key(key(KeyCode::Tab));
@@ -883,12 +977,18 @@ mod tests {
         app.handle_key(key(KeyCode::Down)); // a.rs
         app.handle_key(key(KeyCode::Down)); // b.rs
         app.handle_key(key(KeyCode::Enter));
-        let Mode::Diff(v) = &app.mode else { panic!("expected diff view") };
+        let Mode::Diff(v) = &app.mode else {
+            panic!("expected diff view")
+        };
         assert_eq!(v.changes.key, cs_key, "change set reused, no recomputation");
         assert_eq!(v.current, Some(1), "opened at b.rs");
         assert!(app.details_changes.is_none());
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.details_changes.as_ref().map(|c| c.key), Some(cs_key), "handed back");
+        assert_eq!(
+            app.details_changes.as_ref().map(|c| c.key),
+            Some(cs_key),
+            "handed back"
+        );
         assert_eq!(app.details_cursor.sel, 2);
         // Selecting another commit starts a fresh set.
         app.handle_key(key(KeyCode::Tab)); // back to the list
@@ -922,6 +1022,10 @@ mod tests {
         app.push_batch(tail);
         assert_eq!(app.history.len(), 11);
         assert_eq!(app.load, LoadState::Complete);
-        assert_eq!(app.selected_id(), Some(keep), "selection follows the commit id");
+        assert_eq!(
+            app.selected_id(),
+            Some(keep),
+            "selection follows the commit id"
+        );
     }
 }

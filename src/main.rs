@@ -6,12 +6,14 @@
 //! the graph when the refs changed.
 
 mod app;
+mod branches;
 mod cache;
 mod diff;
 mod diffview;
 mod git;
 mod graph;
 mod model;
+mod remote;
 mod term;
 mod ui;
 
@@ -28,6 +30,9 @@ use model::History;
 use term::{Console, Event, Screen};
 
 enum Msg {
+    Remote(remote::Event),
+    Refreshed(Box<git::Result<(gix::Repository, git::RefSnapshot)>>),
+    Checkout(Result<String, String>, bool),
     Input(Event),
     Cache(Option<cache::Cached>),
     Repo(Box<git::Result<(gix::Repository, git::RefSnapshot)>>),
@@ -62,7 +67,8 @@ fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>) -> Sender<DiffReq> 
                     next = req_rx.try_recv().ok();
                 }
                 if let Some(DiffReq::Tree { key, old, new }) = tree {
-                    let result = diff::tree_diff(&repo, old.as_ref(), &new).map_err(|e| e.to_string());
+                    let result =
+                        diff::tree_diff(&repo, old.as_ref(), &new).map_err(|e| e.to_string());
                     if tx.send(Msg::TreeDiff(key, result)).is_err() {
                         return;
                     }
@@ -96,7 +102,11 @@ struct StatsReq {
 /// Stats run on their own thread so a 5,000-file commit never delays the file
 /// diff the user is looking at. Results stream in chunks; the job stops as
 /// soon as `latest` names a different change set.
-fn spawn_stats_worker(repo: gix::Repository, tx: Sender<Msg>, latest: Arc<AtomicU32>) -> Sender<StatsReq> {
+fn spawn_stats_worker(
+    repo: gix::Repository,
+    tx: Sender<Msg>,
+    latest: Arc<AtomicU32>,
+) -> Sender<StatsReq> {
     let (req_tx, req_rx) = mpsc::channel::<StatsReq>();
     thread::Builder::new()
         .name("diff-stats".into())
@@ -114,7 +124,10 @@ fn spawn_stats_worker(repo: gix::Repository, tx: Sender<Msg>, latest: Arc<Atomic
                     let stat = diff::file_stats(&repo, &req.files[i]).unwrap_or(diff::Stat::Opaque);
                     chunk.push((i, stat));
                     if chunk.len() >= 64 || last_send.elapsed() > Duration::from_millis(30) {
-                        if tx.send(Msg::Stats(req.key, std::mem::take(&mut chunk))).is_err() {
+                        if tx
+                            .send(Msg::Stats(req.key, std::mem::take(&mut chunk)))
+                            .is_err()
+                        {
                             return;
                         }
                         last_send = Instant::now();
@@ -223,7 +236,7 @@ fn parse_args() -> Result<Options, String> {
         match arg.to_str() {
             Some("-h") | Some("--help") => {
                 println!(
-                    "git-rustle {}\n\nUsage: git-rustle [OPTIONS] [PATH]\n\n  PATH          repository or any directory inside one (default: .)\n  --no-cache    ignore and do not write the layout cache\n  -h, --help    show this help\n  -V, --version show the version\n\nEnvironment:\n  GIT_RUSTLE_TIMING=1        print startup timings to stderr on exit\n  GIT_RUSTLE_AUTOQUIT=<ms>   quit automatically after the first frame (benchmarking)\n  GIT_RUSTLE_DUMP=<file>     write the last frame as plain text on exit (debugging)\n  GIT_RUSTLE_KEYS=<script>   replay key presses after the first frame, e.g. \"<down>d\" (debugging)",
+                    "git-rustle {}\n\nUsage: git-rustle [OPTIONS] [PATH]\n\n  PATH          repository or any directory inside one (default: .)\n  --no-cache    ignore and do not write disk caches\n  -h, --help    show this help\n  -V, --version show the version\n\nEnvironment:\n  GIT_RUSTLE_TIMING=1        print startup timings to stderr on exit\n  GIT_RUSTLE_AUTOQUIT=<ms>   quit automatically after the first frame (benchmarking)\n  GIT_RUSTLE_DUMP=<file>     write the last frame as plain text on exit (debugging)\n  GIT_RUSTLE_KEYS=<script>   replay key presses after the first frame, e.g. \"<down>d\" (debugging)",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -317,6 +330,16 @@ fn spawn_walk(
         cancel,
         handle: Some(handle),
     }
+}
+
+fn refresh_repo(path: PathBuf, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let result = git::open(&path).and_then(|repo| {
+            let snap = git::snapshot_refs(&repo)?;
+            Ok((repo, snap))
+        });
+        let _ = tx.send(Msg::Refreshed(Box::new(result)));
+    });
 }
 
 fn main() {
@@ -438,11 +461,13 @@ fn run(
     let mut cache_fp: Option<u64> = None;
     let mut cache_seen = false;
     let mut repo_seen = false;
+    let mut refreshing = false;
     let mut walker: Option<Walker> = None;
     // Walkers that finished walking but may still be writing the cache.
     let mut finishing: Vec<Walker> = Vec::new();
     let mut next_walk_id: u32 = 1;
     let mut first_frame = false;
+    let mut branch_frame = false;
     let mut areas = ui::compute_areas(screen.width(), screen.height(), app.right_width);
     let mut last_tick = Instant::now();
     // Benchmark aid: GIT_RUSTLE_AUTOQUIT=<ms> quits after the first frame plus that delay.
@@ -451,13 +476,15 @@ fn run(
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis);
     let mut first_frame_at: Option<Instant> = None;
-    let mut key_script: Option<Vec<term::KeyEvent>> =
-        std::env::var("GIT_RUSTLE_KEYS").ok().map(|s| parse_key_script(&s));
+    let mut key_script: Option<Vec<term::KeyEvent>> = std::env::var("GIT_RUSTLE_KEYS")
+        .ok()
+        .map(|s| parse_key_script(&s));
 
     loop {
         if let (Some(delay), Some(at)) = (autoquit, first_frame_at)
             && at.elapsed() >= delay
             && walker.is_none()
+            && !app.branches.busy
         {
             app.quit = true;
         }
@@ -483,6 +510,51 @@ fn run(
                 wk.join();
             }
             return Ok(());
+        }
+        if (app.want_refresh
+            || app.branches.want_refresh.is_some()
+            || app.branches.checkout.is_some())
+            && let Some(r) = repo.as_ref()
+        {
+            let path = r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf();
+            if app.want_refresh && !refreshing && !app.branches.busy {
+                app.want_refresh = false;
+                refreshing = true;
+                refresh_repo(path.clone(), tx.clone());
+            }
+            if !app.branches.loading
+                && !app.branches.busy
+                && let Some(force) = app.branches.want_refresh.take()
+            {
+                app.branches.loading = true;
+                app.branches.errors.clear();
+                app.needs_redraw = true;
+                let git_dir = git::git_dir(r);
+                let tx = tx.clone();
+                let path = path.clone();
+                timing.mark("remote discovery requested");
+                thread::spawn(move || {
+                    remote::discover(&path, &git_dir, force, no_cache, |event| {
+                        let _ = tx.send(Msg::Remote(event));
+                    })
+                });
+                if force {
+                    app.want_refresh = true;
+                }
+            }
+            if !app.branches.busy
+                && let Some(target) = app.branches.checkout.take()
+            {
+                app.branches.busy = true;
+                app.branches.status = format!("Checking out {}…", target.label());
+                app.needs_redraw = true;
+                let tx = tx.clone();
+                timing.mark("checkout requested");
+                thread::spawn(move || {
+                    let result = git::checkout::checkout(&path, &target);
+                    let _ = tx.send(Msg::Checkout(result, target.remote.is_some()));
+                });
+            }
         }
         // Fetch details for the selected commit if they are stale.
         if let (Some(r), Some(id)) = (repo.as_ref(), app.selected_id())
@@ -511,15 +583,18 @@ fn run(
                 .map(|c| StatsReq {
                     key: c.key,
                     files: Arc::clone(&c.files),
-                    todo: (0..c.stats.len()).filter(|&i| c.stats[i].is_none()).collect(),
+                    todo: (0..c.stats.len())
+                        .filter(|&i| c.stats[i].is_none())
+                        .collect(),
                 });
             if let Some(req) = want
                 && stats_sent_for != Some(req.key)
             {
                 stats_sent_for = Some(req.key);
                 stats_latest.store(req.key, Ordering::Relaxed);
-                let stx = stats_tx
-                    .get_or_insert_with(|| spawn_stats_worker(r.clone(), tx.clone(), Arc::clone(&stats_latest)));
+                let stx = stats_tx.get_or_insert_with(|| {
+                    spawn_stats_worker(r.clone(), tx.clone(), Arc::clone(&stats_latest))
+                });
                 let _ = stx.send(req);
             }
         }
@@ -529,8 +604,18 @@ fn run(
             let now = ui::time::now_unix();
             ui::draw(app, screen, &areas, now);
             screen.flush(console);
+            if app.branches.open && !branch_frame {
+                timing.mark(format!(
+                    "branch browser frame ({} branches)",
+                    app.branches.entries.len()
+                ));
+            }
+            branch_frame = app.branches.open;
             app.needs_redraw = false;
-            if !first_frame && !app.history.is_empty() {
+            if !first_frame
+                && (!app.history.is_empty()
+                    || matches!(app.load, LoadState::Cached | LoadState::Complete))
+            {
                 first_frame = true;
                 first_frame_at = Some(Instant::now());
                 timing.mark(format!("first frame ({} rows)", app.history.len()));
@@ -556,7 +641,13 @@ fn run(
                     .clone()
                     .map(|p| (p, git::git_dir(r), refs.fingerprint))
             };
-            walker = Some(spawn_walk(id, r.clone(), refs.tips.clone(), target, tx.clone()));
+            walker = Some(spawn_walk(
+                id,
+                r.clone(),
+                refs.tips.clone(),
+                target,
+                tx.clone(),
+            ));
             app.start_walk();
             timing.mark("walk started");
         }
@@ -580,6 +671,66 @@ fn run(
 
         for msg in pending {
             match msg {
+                Msg::Remote(event) => {
+                    match event {
+                        remote::Event::Configured(remotes) => {
+                            app.branches.remotes.retain(|name, update| {
+                                remotes
+                                    .iter()
+                                    .any(|(n, url)| n == name && url == &update.remote.url)
+                            });
+                            if let Some(refs) = app.refs.clone() {
+                                app.set_refs(refs);
+                            }
+                        }
+                        remote::Event::Branches(update) => {
+                            timing.mark(format!(
+                                "remote {} branches ({})",
+                                if update.cached { "cached" } else { "live" },
+                                update.branches.len()
+                            ));
+                            app.branches.update(update, app.refs.as_ref());
+                            app.remote_labels();
+                        }
+                        remote::Event::Status(error) => app.branches.errors.push(error),
+                        remote::Event::Done => {
+                            app.branches.loading = false;
+                            app.branches.last_check = Some(Instant::now());
+                            timing.mark("remote discovery done");
+                        }
+                    }
+                    app.needs_redraw = true;
+                }
+                Msg::Checkout(result, remote) => {
+                    app.branches.busy = false;
+                    if result.is_ok() && remote {
+                        app.branches.want_refresh = Some(true);
+                    }
+                    app.branches.status = match result {
+                        Ok(message) => message,
+                        Err(error) => format!("Checkout failed: {error}"),
+                    };
+                    app.want_refresh = true;
+                    app.needs_redraw = true;
+                    timing.mark("checkout done");
+                }
+                Msg::Refreshed(result) => {
+                    refreshing = false;
+                    match *result {
+                        Ok((r, snap)) => {
+                            let changed = app
+                                .refs
+                                .as_ref()
+                                .is_none_or(|old| old.fingerprint != snap.fingerprint);
+                            app.set_refs(snap);
+                            repo = Some(r);
+                            if changed {
+                                app.want_rewalk = true;
+                            }
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    }
+                }
                 Msg::Input(Event::Key(k)) => app.handle_key(k),
                 Msg::Input(Event::Mouse(m)) => {
                     app.handle_mouse(m, &areas, screen.width(), screen.height())
@@ -652,7 +803,11 @@ fn run(
                     }
                 }
                 Msg::CacheWritten(ok) => {
-                    timing.mark(if ok { "cache written" } else { "cache write failed" });
+                    timing.mark(if ok {
+                        "cache written"
+                    } else {
+                        "cache write failed"
+                    });
                     // Reap finished threads.
                     finishing.retain(|w| w.handle.as_ref().is_some_and(|h| !h.is_finished()));
                 }
@@ -710,7 +865,9 @@ fn run(
 
 /// Both the cache and the repository are known: decide whether a walk is needed.
 fn decide(app: &mut App, cache_fp: Option<u64>) {
-    let Some(refs) = app.refs.as_ref() else { return };
+    let Some(refs) = app.refs.as_ref() else {
+        return;
+    };
     let fresh = cache_fp == Some(refs.fingerprint) && app.history.complete;
     if fresh {
         app.load = LoadState::Cached;

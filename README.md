@@ -47,7 +47,7 @@ performance; performance changes still require comparable Windows benchmarks.
 git-rustle [OPTIONS] [PATH]
 
   PATH          Repository (or any directory inside it); defaults to the cwd
-  --no-cache    Ignore and do not write the layout cache
+  --no-cache    Ignore and do not write disk caches (graph and remote branches)
   -h, --help
   -V, --version
 ```
@@ -60,12 +60,13 @@ git-rustle [OPTIONS] [PATH]
 | `PgUp` / `PgDn` | Page |
 | `Home` / `End`, `g` / `G` | First / last commit |
 | `H` | Jump to `HEAD` |
+| `b` | Browse, filter, and check out local or remote branches |
 | `Tab`, `→` / `←`, `l` / `h` | Switch focus between graph and details |
 | `[` / `]` | Shrink / grow the details panel |
 | `Space` | Mark / unmark the selected commit (at most two) |
 | `d` | Diff: the two marked commits, or the marked/selected commit against its parent |
 | `Del` | Clear marks |
-| `r` | Refresh (re-walk the repository) |
+| `r` | Reload local refs and refresh the graph when they changed |
 | `q`, `Ctrl+C` | Quit |
 | `Esc` | Clear marks, or quit when none are set |
 
@@ -106,6 +107,116 @@ very large files are summarised instead of diffed.
 
 Mouse: click a file to show it, click a folder to fold it, wheel to scroll
 either panel (`Shift`+wheel or a tilt wheel pans), drag the splitter to resize.
+
+### Remote branches and checkout
+
+Press **`b`** to open the branch browser. Local branches and locally stored
+remote-tracking refs appear immediately. GitHub and GitLab branch names and tip
+IDs load through their read-only REST APIs on background workers. Opening the
+application itself makes **no remote requests**; browsing branches performs
+**no Git fetch** and writes no repository refs or objects.
+
+| Key | Action in the branch browser |
+| --- | --- |
+| Type / `Backspace` | Filter branch names (including remote names) |
+| `Ctrl+U` | Clear filter |
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Select a branch |
+| `Enter` | Check out the selected branch |
+| `Tab` | Locate its tip in the local graph, if available |
+| `F5`, `Ctrl+R` | Revalidate remote branches and reload local refs |
+| `Esc` | Return to the graph |
+
+API labels are shown on commits already in the local graph. A remote branch
+whose objects are absent is still listed in the browser; its history becomes
+available after checkout fetches that branch. A successful API listing replaces
+obsolete remote labels without changing the graph cache or its walk tips.
+
+Checkout requires **Git for Windows on PATH**. It runs on a separate worker;
+the browser and graph remain usable. Git's normal dirty-file, untracked-file,
+in-progress-operation, and worktree protections apply. Git Rustle never uses
+force checkout, reset, clean, or automatic stashing.
+
+- A local branch is switched to directly.
+- An existing local branch tracking the selected remote branch is reused,
+  including a differently named local branch. This does not pull or reset it.
+- Otherwise, a new local branch tracks the selected remote branch. If its
+  displayed API tip is already in the object database, no fetch is needed.
+  Missing objects, or a selection based only on local tracking refs, trigger
+  an explicit fetch of that branch, without tags, submodules, or other refs.
+- A conflicting local name is reported instead of overwritten. Select that
+  local branch explicitly, or rename it with Git. Ambiguous tracking branches
+  likewise require selecting the intended local branch.
+- Single-branch clones gain a fetch mapping for the selected branch only.
+  Bare repositories can be browsed but need a working tree for checkout.
+
+While checkout is running, exit waits for you to retry after completion; this
+prevents closing the application halfway through a worktree update. API discovery
+does not delay exit. Git operations have a five-minute timeout and API requests
+have a twelve-second timeout; failures remain visible in the browser.
+
+#### Providers and authentication
+
+HTTPS, SSH and SCP-style remote URLs on `github.com` and `gitlab.com` are
+recognized automatically, including GitLab subgroups. Public repositories need
+no token. For private repositories or higher API limits, set `GH_TOKEN`
+(or `GITHUB_TOKEN`) for GitHub, or `GITLAB_TOKEN` (or `GLAB_TOKEN`) for GitLab.
+GitHub tokens need repository **Contents: read**; GitLab tokens need API read
+access. See the [GitHub branch API](https://docs.github.com/en/rest/branches/branches)
+and [GitLab branch API](https://docs.gitlab.com/api/branches/).
+
+When anonymous access fails, Git Rustle also tries the configured Git credential
+helper for the repository's HTTPS host/path. Prompts are disabled inside the TUI;
+sign in using Git outside the app if authentication is needed. Fetch uses Git's
+own HTTPS/SSH authentication, independently of API environment tokens.
+
+For a self-hosted provider, explicitly identify the remote:
+
+```powershell
+git config remote.origin.rustle-provider gitlab
+# Or: git config remote.origin.rustle-provider github
+```
+
+Self-hosted GitLab uses `/api/v4`; GitHub Enterprise uses `/api/v3`. The API
+must be hosted at the HTTPS root of the remote host (HTTPS ports are preserved;
+SSH ports are not treated as API ports). SSH host aliases and providers served
+under a custom URL prefix require a canonical remote URL. Cloud environment
+tokens are never sent to custom hosts; configure a Git credential helper for
+those hosts. HTTPS uses Windows Schannel and the Windows certificate store.
+API redirects are reported rather than followed with credentials.
+
+#### Caching and offline behavior
+
+Branch lists have a five-minute TTL. Cached results appear while stale data is
+revalidated; `F5` forces revalidation. Every page is conditionally requested
+with its ETag when available, and only complete successful lists replace the
+disk cache. Network failures and rate limits retain the previous list. Different
+repositories, remote URLs, and environment tokens have separate cache entries.
+No tokens are written into cache files. Credential-helper-authenticated lists
+are retained in memory for the session, without being saved to the anonymous
+disk cache. Cache entries are under `%LOCALAPPDATA%\git-rustle\cache\remotes`.
+
+At most four remotes are queried concurrently. Listings are bounded to 100,000
+branches, 60 seconds plus the active request, and 8 MiB per page. Unsupported
+providers still expose local tracking refs and support Git-based checkout.
+`--no-cache` disables both graph and remote disk caches; in-session branch lists
+remain reusable.
+
+### Performance benchmarks
+
+See [the remote-support benchmark report](docs/remote-benchmarks.md) for measured
+startup and branch-browser results on the 85,593-commit Git repository. Preserve
+a baseline release executable before editing, then compare release builds with:
+
+```powershell
+.\scripts\benchmark.ps1 -Repository "$env:TEMP\gr-repos\git" `
+  -Baseline .\target\bench\baseline.exe -Samples 15
+```
+
+The script alternates the two executables, warms each mode once, and records
+first-frame and full-walk timings from hidden native consoles. Raw samples and
+median/p95 summaries are written under `target/bench/comparison`. Uncached means
+Git Rustle's layout cache is disabled; it does not flush the Windows filesystem
+cache. Do not build or run other benchmarks concurrently with the comparison.
 
 ## How it stays fast
 

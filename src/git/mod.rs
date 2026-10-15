@@ -14,6 +14,9 @@ use gix::prelude::FindExt;
 use crate::graph::layout::Layout;
 use crate::model::History;
 
+pub mod checkout;
+pub mod command;
+
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
 

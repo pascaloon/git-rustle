@@ -1,5 +1,6 @@
 //! Drawing: header, commit list with graph, details panel, status bar.
 
+pub mod branches;
 pub mod details;
 pub mod diff;
 pub mod list;
@@ -96,6 +97,10 @@ pub fn default_right_width(w: u16) -> u16 {
 }
 
 pub fn draw(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
+    if app.branches.open {
+        branches::draw(&mut app.branches, screen, &app.repo_name);
+        return;
+    }
     if let Mode::Diff(view) = &mut app.mode {
         let da = diff::compute_areas(screen.width(), screen.height(), view.sidebar_width);
         diff::draw(&app.repo_name, view, screen, &da);
@@ -134,7 +139,13 @@ fn draw_header(app: &App, screen: &mut Screen, area: Rect) {
             .head_branch
             .clone()
             .unwrap_or_else(|| "HEAD detached".to_string());
-        x += screen.put_str(x, area.y, "  on ", Style::new().fg(theme::FG_DIM).bg(bg), area.w);
+        x += screen.put_str(
+            x,
+            area.y,
+            "  on ",
+            Style::new().fg(theme::FG_DIM).bg(bg),
+            area.w,
+        );
         screen.put_str_ellipsis(
             x,
             area.y,
@@ -205,6 +216,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             ("q", "quit"),
         ],
         (Focus::List, _) => &[
+            ("b", "branches"),
             ("↑↓", "move"),
             ("PgUp/PgDn", "page"),
             ("Home/End", "ends"),
