@@ -4,6 +4,7 @@ pub mod details;
 pub mod diff;
 pub mod list;
 pub mod time;
+pub mod tree;
 
 use crate::app::{App, Focus, LoadState, Mode};
 use crate::term::{Color, Rect, Screen, Style};
@@ -208,6 +209,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             ("PgUp/PgDn", "page"),
             ("Home/End", "ends"),
             ("H", "head"),
+            ("d", "diff"),
             ("Space", "mark"),
             ("Tab", "details"),
             ("[ ]", "panel"),
@@ -217,9 +219,18 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
         (Focus::Details, _) => &[
             ("↑↓", "scroll"),
             ("PgUp/PgDn", "page"),
-            ("Tab", "list"),
+            ("Tab", "files"),
             ("[ ]", "panel"),
             ("r", "reload"),
+            ("q", "quit"),
+        ],
+        (Focus::Files, _) => &[
+            ("↑↓", "move"),
+            ("←→", "fold"),
+            ("Enter", "diff"),
+            ("e/c", "expand/collapse"),
+            ("Tab", "list"),
+            ("[ ]", "panel"),
             ("q", "quit"),
         ],
     };

@@ -40,25 +40,34 @@ git-rustle [OPTIONS] [PATH]
 | `Tab`, `→` / `←`, `l` / `h` | Switch focus between graph and details |
 | `[` / `]` | Shrink / grow the details panel |
 | `Space` | Mark / unmark the selected commit (at most two) |
-| `d` | Diff the two marked commits |
+| `d` | Diff: the two marked commits, or the marked/selected commit against its parent |
 | `Del` | Clear marks |
 | `r` | Refresh (re-walk the repository) |
 | `q`, `Ctrl+C` | Quit |
 | `Esc` | Clear marks, or quit when none are set |
 
+The details panel ends with a **Files** section: the tree of files changed by
+the selected commit, each with `+added −removed` counts (folders total their
+contents). `Tab` cycles graph → details → files; in the files tree `↑`/`↓`
+move, `←`/`→` fold, `e`/`c` expand/collapse all, and `Enter` on a file opens
+the full diff view at that file.
+
 ### Mouse
 
-Click a row to select it, `Ctrl`+click to mark it, scroll the wheel over
-either panel, and drag the splitter between the panels to resize them.
+Click a row to select it, double-click to open its diff against its parent,
+`Ctrl`+click to mark it, scroll the wheel over any panel, and drag the
+splitter between the panels to resize them. In the files tree, click a folder
+to fold it and double-click a file to open the diff view.
 
 ### Diff view
 
-Mark two commits (`Space` or `Ctrl`+click) and press `d` for a full-screen
-diff of the older commit against the newer one: a collapsible file tree on the
-left, and a side-by-side view of the selected file on the right with
-added/removed/changed lines coloured and the changed span within a line
-highlighted. Exact renames are detected; binary and very large files are
-summarised instead of diffed.
+Press `d` (or double-click a commit) for a full-screen diff — of the two
+marked commits, older against newer, or of one commit against its first
+parent (root commits diff against the empty tree). A collapsible file tree
+with per-file and per-folder line counts sits on the left; the right shows the
+selected file side by side, with added/removed/changed lines coloured and the
+changed span within a line highlighted. Exact renames are detected; binary and
+very large files are summarised instead of diffed.
 
 | Key | Action |
 | --- | --- |
@@ -83,6 +92,9 @@ either panel (`Shift`+wheel or a tilt wheel pans), drag the splitter to resize.
   the fresh graph is swapped in when complete, preserving the selection.
 - The commit walk streams batches into the UI, so even an uncached large
   repository shows its first screen in tens of milliseconds.
+- Tree diffs only descend into subtrees whose ids differ; per-file line counts
+  are computed on a separate thread and stream into the tree in chunks, so a
+  5,000-file diff never delays the file you are looking at.
 - Rendering diffs against the previous frame and wraps each flush in
   synchronized output (`DECSET 2026`), so Windows Terminal never shows a
   partially drawn screen.

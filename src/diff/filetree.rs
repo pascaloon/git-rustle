@@ -179,6 +179,135 @@ impl FileTree {
     }
 }
 
+/// Selection and scroll state over a `FileTree`'s visible rows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TreeCursor {
+    pub sel: usize,
+    pub scroll: usize,
+    /// Rows visible, set by the renderer.
+    pub rows: usize,
+}
+
+impl TreeCursor {
+    pub fn node(&self, tree: &FileTree) -> Option<usize> {
+        tree.visible.get(self.sel).map(|v| v.node)
+    }
+
+    /// Change index of the selected row if it is a file.
+    pub fn file(&self, tree: &FileTree) -> Option<usize> {
+        tree.nodes[self.node(tree)?].file
+    }
+
+    pub fn clamp(&mut self, tree: &FileTree) {
+        self.sel = self.sel.min(tree.visible.len().saturating_sub(1));
+        let max_scroll = tree.visible.len().saturating_sub(self.rows.max(1));
+        self.scroll = self.scroll.min(max_scroll);
+    }
+
+    pub fn ensure_visible(&mut self) {
+        let rows = self.rows.max(1);
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        } else if self.sel >= self.scroll + rows {
+            self.scroll = self.sel + 1 - rows;
+        }
+    }
+
+    /// Select a row (clamped); returns the file now under the cursor, if any.
+    pub fn select(&mut self, tree: &FileTree, row: usize) -> Option<usize> {
+        if tree.visible.is_empty() {
+            return None;
+        }
+        self.sel = row.min(tree.visible.len() - 1);
+        self.ensure_visible();
+        self.file(tree)
+    }
+
+    pub fn move_by(&mut self, tree: &FileTree, delta: isize) -> Option<usize> {
+        let n = tree.visible.len() as isize;
+        if n == 0 {
+            return None;
+        }
+        let target = (self.sel as isize + delta).clamp(0, n - 1);
+        self.select(tree, target as usize)
+    }
+
+    /// Jump to the next/previous file row.
+    pub fn step_file(&mut self, tree: &FileTree, forward: bool) -> Option<usize> {
+        let row = tree.neighbour_file(self.sel, forward)?;
+        self.select(tree, row)
+    }
+
+    /// Select the first file in display order.
+    pub fn first_file(&mut self, tree: &FileTree) -> Option<usize> {
+        let row = tree.visible.iter().position(|v| !tree.nodes[v.node].is_folder())?;
+        self.select(tree, row)
+    }
+
+    /// Toggle the selected folder; returns `false` if the selection is a file.
+    pub fn toggle(&mut self, tree: &mut FileTree) -> bool {
+        let Some(node) = self.node(tree) else { return false };
+        if !tree.nodes[node].is_folder() {
+            return false;
+        }
+        tree.toggle(node);
+        self.clamp(tree);
+        true
+    }
+
+    /// Left: collapse an expanded folder, otherwise jump to the parent.
+    pub fn left(&mut self, tree: &mut FileTree) {
+        let Some(node) = self.node(tree) else { return };
+        if tree.nodes[node].is_folder() && tree.set_expanded(node, false) {
+            return;
+        }
+        if let Some(p) = tree.nodes[node].parent
+            && let Some(row) = tree.visible.iter().position(|v| v.node == p)
+        {
+            self.sel = row;
+            self.ensure_visible();
+        }
+    }
+
+    /// Right: expand a collapsed folder or step into an expanded one.
+    /// Returns `true` if the selection is a file (nothing to expand).
+    pub fn right(&mut self, tree: &mut FileTree) -> bool {
+        let Some(node) = self.node(tree) else { return false };
+        if !tree.nodes[node].is_folder() {
+            return true;
+        }
+        if !tree.set_expanded(node, true) && !tree.nodes[node].children.is_empty() {
+            self.select(tree, self.sel + 1);
+        }
+        false
+    }
+
+    pub fn set_all_expanded(&mut self, tree: &mut FileTree, expanded: bool) {
+        let keep = self.node(tree);
+        tree.set_all_expanded(expanded);
+        self.sel = keep
+            .and_then(|n| tree.visible.iter().position(|v| v.node == n))
+            .or_else(|| {
+                // Selected node got hidden: select its nearest visible ancestor.
+                let mut n = keep?;
+                while let Some(p) = tree.nodes[n].parent {
+                    if let Some(row) = tree.visible.iter().position(|v| v.node == p) {
+                        return Some(row);
+                    }
+                    n = p;
+                }
+                None
+            })
+            .unwrap_or(0);
+        self.ensure_visible();
+    }
+
+    pub fn scroll_view(&mut self, tree: &FileTree, delta: isize) {
+        let max = tree.visible.len().saturating_sub(self.rows.max(1)) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

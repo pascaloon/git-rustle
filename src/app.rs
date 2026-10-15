@@ -4,16 +4,20 @@ use std::collections::HashMap;
 
 use gix::ObjectId;
 
-use crate::diffview::DiffView;
+use crate::diff::changes::ChangeSet;
+use crate::diff::filetree::TreeCursor;
+use crate::diffview::{DiffReq, DiffView};
 use crate::git::{CommitDetails, RefKind, RefSnapshot};
 use crate::model::History;
-use crate::term::{Button, KeyCode, KeyEvent, MouseEvent, MouseKind};
+use crate::term::{Button, KeyCode, KeyEvent, MouseEvent, MouseKind, Rect};
 use crate::ui::Areas;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     List,
     Details,
+    /// The changed-files tree at the bottom of the details panel.
+    Files,
 }
 
 /// Which screen is shown.
@@ -72,6 +76,12 @@ pub struct App {
     /// Sidebar width for the diff view, remembered between views.
     pub sidebar_width: u16,
     next_view_id: u32,
+    /// Files changed by the selected commit (vs. its first parent).
+    pub details_changes: Option<ChangeSet>,
+    pub details_cursor: TreeCursor,
+    /// Where the details panel drew the file tree, for hit-testing.
+    pub files_area: Rect,
+    next_key: u32,
 
     pub quit: bool,
     pub want_rewalk: bool,
@@ -101,6 +111,10 @@ impl App {
             mode: Mode::Graph,
             sidebar_width: 32,
             next_view_id: 1,
+            details_changes: None,
+            details_cursor: TreeCursor::default(),
+            files_area: Rect::default(),
+            next_key: 1,
             quit: false,
             want_rewalk: false,
             needs_redraw: true,
@@ -136,28 +150,121 @@ impl App {
         }
     }
 
-    /// Open the diff of the two marked commits (older on the left).
-    pub fn open_diff(&mut self) {
-        if self.marks.len() != MAX_MARKS {
+    fn new_key(&mut self) -> u32 {
+        let k = self.next_key;
+        self.next_key += 1;
+        k
+    }
+
+    /// First parent of a commit in the loaded history.
+    pub fn parent_of(&self, id: &ObjectId) -> Option<ObjectId> {
+        let i = self.history.index_of(id)?;
+        self.history.parents(i).first().copied()
+    }
+
+    /// Keep `details_changes` pointed at the selected commit.
+    pub fn sync_details_changes(&mut self) {
+        let Some(id) = self.selected_id() else { return };
+        if self.details_changes.as_ref().map(|c| c.new) == Some(id) {
             return;
         }
-        let (a, b) = (self.marks[0], self.marks[1]);
-        let time = |id: &ObjectId| self.history.index_of(id).map(|i| self.history.commits[i].commit_time);
-        let (old, new) = match (time(&a), time(&b)) {
-            (Some(ta), Some(tb)) if tb < ta => (b, a),
-            _ => (a, b),
+        let key = self.new_key();
+        let parent = self.parent_of(&id);
+        self.details_changes = Some(ChangeSet::new(key, parent, id));
+        self.details_cursor = TreeCursor {
+            rows: self.details_cursor.rows,
+            ..TreeCursor::default()
         };
+        if self.focus == Focus::Files {
+            self.focus = Focus::List;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Tree/file diff work to hand to the worker.
+    pub fn pending_requests(&mut self) -> Vec<DiffReq> {
+        match &mut self.mode {
+            Mode::Diff(view) => view.pending(),
+            Mode::Graph => match self.details_changes.as_mut() {
+                Some(cs) if !cs.requested => {
+                    cs.requested = true;
+                    vec![DiffReq::Tree {
+                        key: cs.key,
+                        old: cs.old,
+                        new: cs.new,
+                    }]
+                }
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// The change set currently on screen (view or details panel).
+    pub fn active_changes_mut(&mut self) -> Option<&mut ChangeSet> {
+        match &mut self.mode {
+            Mode::Diff(view) => Some(&mut view.changes),
+            Mode::Graph => self.details_changes.as_mut(),
+        }
+    }
+
+    /// Route a worker result to whichever change set has `key`.
+    pub fn changes_by_key_mut(&mut self, key: u32) -> Option<&mut ChangeSet> {
+        if let Mode::Diff(view) = &mut self.mode
+            && view.changes.key == key
+        {
+            return Some(&mut view.changes);
+        }
+        self.details_changes.as_mut().filter(|c| c.key == key)
+    }
+
+    /// `d`: diff the two marked commits (older on the left), or with fewer
+    /// marks the marked/selected commit against its parent.
+    pub fn open_diff(&mut self) {
+        if self.marks.len() == MAX_MARKS {
+            let (a, b) = (self.marks[0], self.marks[1]);
+            let time = |id: &ObjectId| self.history.index_of(id).map(|i| self.history.commits[i].commit_time);
+            let (old, new) = match (time(&a), time(&b)) {
+                (Some(ta), Some(tb)) if tb < ta => (b, a),
+                _ => (a, b),
+            };
+            let key = self.new_key();
+            self.show_view(ChangeSet::new(key, Some(old), new), None);
+        } else if let Some(id) = self.marks.first().copied().or_else(|| self.selected_id()) {
+            self.open_parent_diff(id);
+        }
+    }
+
+    /// Diff `id` against its first parent, reusing the details panel's change
+    /// set (and cursor) when it is the selected commit.
+    pub fn open_parent_diff(&mut self, id: ObjectId) {
+        if self.details_changes.as_ref().is_some_and(|c| c.new == id) {
+            let cs = self.details_changes.take().unwrap();
+            let cursor = self.details_cursor;
+            self.show_view(cs, Some(cursor));
+        } else {
+            let key = self.new_key();
+            let parent = self.parent_of(&id);
+            self.show_view(ChangeSet::new(key, parent, id), None);
+        }
+    }
+
+    fn show_view(&mut self, changes: ChangeSet, cursor: Option<TreeCursor>) {
         let id = self.next_view_id;
         self.next_view_id += 1;
-        self.mode = Mode::Diff(Box::new(DiffView::new(id, old, new, self.sidebar_width)));
+        self.mode = Mode::Diff(Box::new(DiffView::new(id, changes, cursor, self.sidebar_width)));
         self.needs_redraw = true;
     }
 
     pub fn close_diff(&mut self) {
-        if let Mode::Diff(view) = &self.mode {
+        if let Mode::Diff(view) = std::mem::replace(&mut self.mode, Mode::Graph) {
             self.sidebar_width = view.sidebar_width;
+            // Hand a parent diff of the selected commit back to the details panel.
+            let selected = self.selected_id();
+            if Some(view.changes.new) == selected && view.changes.old == selected.and_then(|s| self.parent_of(&s)) {
+                self.details_changes = Some(view.changes);
+                self.details_cursor = view.cursor;
+            }
         }
-        self.mode = Mode::Graph;
         self.needs_redraw = true;
     }
 
@@ -166,6 +273,21 @@ impl App {
             Mode::Diff(v) => Some(v),
             Mode::Graph => None,
         }
+    }
+
+    fn files_tree_available(&self) -> bool {
+        self.details_changes
+            .as_ref()
+            .is_some_and(|c| c.loaded && !c.files.is_empty())
+    }
+
+    fn cycle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::List => Focus::Details,
+            Focus::Details if self.files_tree_available() => Focus::Files,
+            Focus::Details | Focus::Files => Focus::List,
+        };
+        self.needs_redraw = true;
     }
 
     pub fn head_id(&self) -> Option<ObjectId> {
@@ -345,21 +467,62 @@ impl App {
             }
             (KeyCode::Delete, _) => self.clear_marks(),
             (KeyCode::Char('d'), false) => self.open_diff(),
-            (KeyCode::Tab, _) => {
-                self.focus = match self.focus {
-                    Focus::List => Focus::Details,
-                    Focus::Details => Focus::List,
-                };
-                self.needs_redraw = true;
-            }
+            (KeyCode::Tab, _) => self.cycle_focus(),
             (KeyCode::Char('r'), _) if !key.ctrl => self.want_rewalk = true,
             (KeyCode::Char('['), _) => self.resize_panel(-2),
             (KeyCode::Char(']'), _) => self.resize_panel(2),
             _ => match self.focus {
                 Focus::List => self.handle_list_key(key, page),
                 Focus::Details => self.handle_details_key(key, page),
+                Focus::Files => self.handle_files_key(key),
             },
         }
+    }
+
+    fn handle_files_key(&mut self, key: KeyEvent) {
+        let Some(cs) = self.details_changes.as_mut() else {
+            self.focus = Focus::List;
+            return;
+        };
+        let tree = &mut cs.tree;
+        let cur = &mut self.details_cursor;
+        let page = cur.rows.saturating_sub(1).max(1) as isize;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                cur.move_by(tree, -1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                cur.move_by(tree, 1);
+            }
+            KeyCode::PageUp => {
+                cur.move_by(tree, -page);
+            }
+            KeyCode::PageDown => {
+                cur.move_by(tree, page);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                cur.select(tree, 0);
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                cur.select(tree, usize::MAX);
+            }
+            KeyCode::Left | KeyCode::Char('h') => cur.left(tree),
+            KeyCode::Right | KeyCode::Char('l') => {
+                cur.right(tree);
+            }
+            KeyCode::Char('e') => cur.set_all_expanded(tree, true),
+            KeyCode::Char('c') => cur.set_all_expanded(tree, false),
+            KeyCode::Enter => {
+                // Folder: fold; file: open the full diff at this file.
+                if !cur.toggle(tree)
+                    && let Some(id) = self.selected_id()
+                {
+                    self.open_parent_diff(id);
+                }
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
     }
 
     fn handle_list_key(&mut self, key: KeyEvent, page: isize) {
@@ -423,10 +586,31 @@ impl App {
                     let idx = self.scroll + (m.y - areas.list.y) as usize;
                     if idx < self.history.len() {
                         self.select(idx);
-                        // Ctrl+click marks the commit for diffing.
+                        let id = self.history.commits[idx].id;
                         if m.ctrl {
-                            let id = self.history.commits[idx].id;
+                            // Ctrl+click marks the commit for diffing.
                             self.toggle_mark(id);
+                        } else if matches!(m.kind, MouseKind::DoubleClick(_)) {
+                            self.sync_details_changes();
+                            self.open_parent_diff(id);
+                        }
+                    }
+                    self.needs_redraw = true;
+                } else if self.files_area.contains(m.x, m.y) {
+                    self.focus = Focus::Files;
+                    let row = self.details_cursor.scroll + (m.y - self.files_area.y) as usize;
+                    if let Some(cs) = self.details_changes.as_mut()
+                        && row < cs.tree.visible.len()
+                    {
+                        let cur = &mut self.details_cursor;
+                        let file = cur.select(&cs.tree, row);
+                        let folded = cur.toggle(&mut cs.tree);
+                        if !folded
+                            && file.is_some()
+                            && matches!(m.kind, MouseKind::DoubleClick(_))
+                            && let Some(id) = self.selected_id()
+                        {
+                            self.open_parent_diff(id);
                         }
                     }
                     self.needs_redraw = true;
@@ -447,7 +631,12 @@ impl App {
             MouseKind::Up(Button::Left) => self.dragging_splitter = false,
             MouseKind::Wheel(delta) => {
                 let lines = -(delta as isize) * 3;
-                if areas.details.contains(m.x, m.y) {
+                if self.files_area.contains(m.x, m.y) {
+                    if let Some(cs) = self.details_changes.as_ref() {
+                        self.details_cursor.scroll_view(&cs.tree, lines);
+                        self.needs_redraw = true;
+                    }
+                } else if areas.details.contains(m.x, m.y) {
                     self.scroll_details(lines);
                 } else {
                     self.scroll_view(lines);
@@ -580,11 +769,28 @@ mod tests {
     #[test]
     fn marks_and_diff_mode() {
         let mut app = app_with(10);
+        // No marks: `d` diffs the selected commit against its parent.
+        app.handle_key(key(KeyCode::Char('d')));
+        match &app.mode {
+            Mode::Diff(v) => {
+                assert_eq!(v.changes.new, app.history.commits[0].id);
+                assert_eq!(v.changes.old, None, "test history has no parents");
+            }
+            Mode::Graph => panic!("expected a parent diff"),
+        }
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Graph));
+
         app.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(app.marks.len(), 1);
-        app.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(app.mode, Mode::Graph), "needs two marks");
+        // One mark: `d` diffs the marked commit, even if the selection moved.
         app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char('d')));
+        match &app.mode {
+            Mode::Diff(v) => assert_eq!(v.changes.new, app.history.commits[0].id),
+            Mode::Graph => panic!("expected a parent diff"),
+        }
+        app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Down));
         // Ctrl+click marks the clicked row.
         let a = areas();
@@ -625,6 +831,71 @@ mod tests {
         assert!(app.marks.is_empty() && !app.quit);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn double_click_opens_parent_diff_of_that_row() {
+        let mut app = app_with(10);
+        let a = areas();
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseKind::DoubleClick(Button::Left),
+                x: 5,
+                y: a.list.y + 6,
+                ctrl: false,
+                shift: false,
+            },
+            &a,
+            100,
+            12,
+        );
+        assert_eq!(app.selected, 6);
+        match &app.mode {
+            Mode::Diff(v) => assert_eq!(v.changes.new, app.history.commits[6].id),
+            Mode::Graph => panic!("expected a parent diff"),
+        }
+    }
+
+    #[test]
+    fn details_tree_hands_over_to_the_diff_view_and_back() {
+        use crate::diff::{ChangeKind, FileChange, TreeDiff};
+        let mut app = app_with(10);
+        app.sync_details_changes();
+        let reqs = app.pending_requests();
+        assert!(matches!(reqs.as_slice(), [DiffReq::Tree { old: None, .. }]));
+        assert!(app.pending_requests().is_empty());
+        let cs_key = app.details_changes.as_ref().unwrap().key;
+        let change = |p: &str| FileChange {
+            path: p.to_string(),
+            old_path: None,
+            kind: ChangeKind::Added,
+            old: None,
+            new: None,
+        };
+        app.changes_by_key_mut(cs_key).unwrap().set_tree(Ok(TreeDiff {
+            files: vec![change("src/a.rs"), change("b.rs")],
+        }));
+        app.details_cursor.rows = 5;
+        // Tab: list → details → files.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(key(KeyCode::Down)); // a.rs
+        app.handle_key(key(KeyCode::Down)); // b.rs
+        app.handle_key(key(KeyCode::Enter));
+        let Mode::Diff(v) = &app.mode else { panic!("expected diff view") };
+        assert_eq!(v.changes.key, cs_key, "change set reused, no recomputation");
+        assert_eq!(v.current, Some(1), "opened at b.rs");
+        assert!(app.details_changes.is_none());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.details_changes.as_ref().map(|c| c.key), Some(cs_key), "handed back");
+        assert_eq!(app.details_cursor.sel, 2);
+        // Selecting another commit starts a fresh set.
+        app.handle_key(key(KeyCode::Tab)); // back to the list
+        assert_eq!(app.focus, Focus::List);
+        app.handle_key(key(KeyCode::Down));
+        app.sync_details_changes();
+        assert_ne!(app.details_changes.as_ref().unwrap().key, cs_key);
     }
 
     #[test]

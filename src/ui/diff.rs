@@ -4,7 +4,8 @@
 use std::ops::Range;
 
 use super::theme;
-use crate::diff::{ChangeKind, LineKind, Row};
+use super::tree::kind_color;
+use crate::diff::{LineKind, Row};
 use crate::diffview::{DiffFocus, DiffView};
 use crate::term::{Color, Rect, Screen, Style};
 
@@ -45,19 +46,17 @@ pub fn default_sidebar_width(w: u16) -> u16 {
     ((w as u32 * 28 / 100) as u16).clamp(24, 48)
 }
 
-pub fn kind_color(kind: ChangeKind) -> Color {
-    match kind {
-        ChangeKind::Added => theme::FG_ADDED,
-        ChangeKind::Deleted => theme::FG_REMOVED,
-        ChangeKind::Modified => theme::FG_MODIFIED,
-        ChangeKind::Renamed => theme::FG_RENAMED,
-    }
-}
-
 pub fn draw(repo_name: &str, view: &mut DiffView, screen: &mut Screen, areas: &DiffAreas) {
     screen.clear();
     draw_header(repo_name, view, screen, areas.header);
-    draw_sidebar(view, screen, areas.sidebar);
+    super::tree::draw(
+        screen,
+        areas.sidebar,
+        &view.changes,
+        &mut view.cursor,
+        view.focus == DiffFocus::Files,
+        view.current,
+    );
     if areas.splitter.w > 0 {
         let color = if view.dragging_splitter {
             theme::FG_SPLITTER_ACTIVE
@@ -85,80 +84,35 @@ fn draw_header(repo_name: &str, view: &DiffView, screen: &mut Screen, area: Rect
     );
     x += screen.put_str(x, area.y, "  diff  ", Style::new().fg(theme::FG_DIM).bg(bg), area.w);
     let hash = Style::new().fg(theme::FG_HASH).bg(bg);
-    x += screen.put_str(x, area.y, &view.old.to_hex_with_len(7).to_string(), hash, area.w);
-    x += screen.put_str(x, area.y, " → ", Style::new().fg(theme::FG_DIM).bg(bg), area.w);
-    screen.put_str(x, area.y, &view.new.to_hex_with_len(7).to_string(), hash, area.w);
+    let dim = Style::new().fg(theme::FG_DIM).bg(bg);
+    x += match view.changes.old {
+        Some(old) => screen.put_str(x, area.y, &old.to_hex_with_len(7).to_string(), hash, area.w),
+        None => screen.put_str(x, area.y, "(root)", dim, area.w),
+    };
+    x += screen.put_str(x, area.y, " → ", dim, area.w);
+    screen.put_str(x, area.y, &view.changes.new.to_hex_with_len(7).to_string(), hash, area.w);
 
-    let state = if let Some(e) = &view.error {
+    let cs = &view.changes;
+    let state = if let Some(e) = &cs.error {
         format!("error: {e}")
-    } else if view.tree.is_none() {
+    } else if !cs.loaded {
         "computing…".to_string()
     } else {
-        let n = view.files.len();
-        format!("{n} file{}", if n == 1 { "" } else { "s" })
+        let n = cs.files.len();
+        let (a, r) = cs.total();
+        let mut s = format!("{n} file{}", if n == 1 { "" } else { "s" });
+        if a + r > 0 {
+            s.push_str(&format!("  +{a} −{r}"));
+            if cs.stats_pending > 0 {
+                s.push('…');
+            }
+        }
+        s
     };
     let sw = crate::term::screen::str_width(&state) as u16;
     if sw + 1 < area.w {
-        let fg = if view.error.is_some() { theme::FG_ERR } else { theme::FG_DIM };
+        let fg = if cs.error.is_some() { theme::FG_ERR } else { theme::FG_DIM };
         screen.put_str(area.right() - sw - 1, area.y, &state, Style::new().fg(fg).bg(bg), sw);
-    }
-}
-
-fn draw_sidebar(view: &mut DiffView, screen: &mut Screen, area: Rect) {
-    if area.w == 0 || area.h == 0 {
-        return;
-    }
-    view.side_rows = area.h as usize;
-    let Some(tree) = view.tree.as_ref() else {
-        let msg = if view.error.is_some() { "" } else { "Computing diff…" };
-        screen.put_str(area.x + 1, area.y + 1, msg, theme::dim(), area.w.saturating_sub(1));
-        return;
-    };
-    let n = tree.visible.len();
-    if n == 0 {
-        screen.put_str(area.x + 1, area.y + 1, "No changes", theme::dim(), area.w.saturating_sub(1));
-        return;
-    }
-    let max_scroll = n.saturating_sub(area.h as usize);
-    if view.side_scroll > max_scroll {
-        view.side_scroll = max_scroll;
-    }
-    let active = view.focus == DiffFocus::Files;
-    for (row, i) in (view.side_scroll..(view.side_scroll + area.h as usize).min(n)).enumerate() {
-        let y = area.y + row as u16;
-        let v = tree.visible[i];
-        let node = &tree.nodes[v.node];
-        let selected = i == view.side_sel;
-        let shown = node.file.is_some() && node.file == view.current;
-        let bg = if selected {
-            if active { theme::BG_SELECTED } else { theme::BG_SELECTED_INACTIVE }
-        } else if shown {
-            theme::BG_SELECTED_INACTIVE
-        } else {
-            Color::Default
-        };
-        if bg != Color::Default {
-            screen.paint_bg(area.x, y, area.w, bg);
-        }
-        let indent = (v.depth * 2).min(area.w.saturating_sub(8));
-        let mut x = area.x + 1 + indent;
-        let end = area.right();
-        if node.is_folder() {
-            let arrow = if node.expanded { "▾ " } else { "▸ " };
-            x += screen.put_str(x, y, arrow, Style::new().fg(theme::FG_DIM).bg(bg), end.saturating_sub(x));
-            let style = Style::new().fg(theme::FG_TEXT).bg(bg).bold();
-            screen.put_str_ellipsis(x, y, &node.name, style, end.saturating_sub(x));
-        } else {
-            let kind = node.kind.unwrap_or(ChangeKind::Modified);
-            let color = kind_color(kind);
-            x += screen.put_char(x, y, kind.letter(), Style::new().fg(color).bg(bg).bold());
-            x += screen.put_char(x, y, ' ', Style::new().bg(bg));
-            let mut style = Style::new().fg(color).bg(bg);
-            if selected {
-                style = style.bold();
-            }
-            screen.put_str_ellipsis(x, y, &node.name, style, end.saturating_sub(x));
-        }
     }
 }
 
@@ -197,7 +151,7 @@ fn draw_main(view: &mut DiffView, screen: &mut Screen, area: Rect) {
             sx += screen.put_str(sx, area.y, &add, Style::new().fg(theme::FG_ADDED).bg(title_bg), stats_w);
             screen.put_str(sx, area.y, &rem, Style::new().fg(theme::FG_REMOVED).bg(title_bg), stats_w);
         }
-    } else if view.tree.is_some() && view.files.is_empty() {
+    } else if view.changes.loaded && view.changes.files.is_empty() {
         screen.put_str(area.x + 1, area.y, "No differences between these commits", theme::dim().bg(title_bg), area.w);
     }
 
@@ -372,9 +326,9 @@ fn draw_status(view: &DiffView, screen: &mut Screen, area: Rect) {
     }
     let mut right = String::new();
     if let Some(cur) = view.current
-        && !view.files.is_empty()
+        && !view.changes.files.is_empty()
     {
-        right.push_str(&format!("file {}/{}", cur + 1, view.files.len()));
+        right.push_str(&format!("file {}/{}", cur + 1, view.changes.files.len()));
     }
     if let Some(d) = view.diff.as_ref()
         && !d.rows.is_empty()

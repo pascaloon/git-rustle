@@ -4,6 +4,7 @@
 //! The tree walk only descends into subtrees whose ids differ, so comparing
 //! two distant commits costs a few hundred tree reads, not a full traversal.
 
+pub mod changes;
 pub mod filetree;
 pub mod sidebyside;
 
@@ -72,15 +73,16 @@ fn tree_of(repo: &gix::Repository, commit: &ObjectId, buf: &mut Vec<u8>) -> Resu
     Err("commit has no tree".into())
 }
 
-/// Compare the trees of two commits.
-pub fn tree_diff(repo: &gix::Repository, old: &ObjectId, new: &ObjectId) -> Result<TreeDiff> {
+/// Compare the trees of two commits; `old = None` diffs against the empty tree
+/// (every file added), used for root commits.
+pub fn tree_diff(repo: &gix::Repository, old: Option<&ObjectId>, new: &ObjectId) -> Result<TreeDiff> {
     let mut buf = Vec::new();
-    let old_tree = tree_of(repo, old, &mut buf)?;
+    let old_tree = old.map(|id| tree_of(repo, id, &mut buf)).transpose()?;
     let new_tree = tree_of(repo, new, &mut buf)?;
     let mut files = Vec::new();
-    if old_tree != new_tree {
+    if old_tree != Some(new_tree) {
         let mut prefix = String::new();
-        diff_trees(repo, Some(old_tree), Some(new_tree), &mut prefix, &mut files, &mut buf)?;
+        diff_trees(repo, old_tree, Some(new_tree), &mut prefix, &mut files, &mut buf)?;
     }
     pair_renames(&mut files);
     files.sort_by(|a, b| display_order(&a.path, &b.path));
@@ -301,6 +303,45 @@ pub fn file_diff(repo: &gix::Repository, change: &FileChange) -> Result<FileDiff
         }
     };
     Ok(sidebyside::build(old, new))
+}
+
+/// Line counts for one changed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stat {
+    Lines { added: u32, removed: u32 },
+    /// Binary or too large: no line counts.
+    Opaque,
+}
+
+/// Added/removed line counts without materialising rows. Pure additions and
+/// deletions just count lines; only modifications run the diff algorithm.
+pub fn file_stats(repo: &gix::Repository, change: &FileChange) -> Result<Stat> {
+    let mut old_buf = Vec::new();
+    let mut new_buf = Vec::new();
+    let old = load_side(repo, change.old, &mut old_buf)?;
+    let new = load_side(repo, change.new, &mut new_buf)?;
+    let count = |data: &[u8]| split_lines_count(data);
+    Ok(match (old, new) {
+        (Loaded::Binary | Loaded::TooLarge, _) | (_, Loaded::Binary | Loaded::TooLarge) => Stat::Opaque,
+        (Loaded::Missing, Loaded::Missing) => Stat::Lines { added: 0, removed: 0 },
+        (Loaded::Text(o), Loaded::Missing) => Stat::Lines {
+            added: 0,
+            removed: count(o),
+        },
+        (Loaded::Missing, Loaded::Text(n)) => Stat::Lines {
+            added: count(n),
+            removed: 0,
+        },
+        (Loaded::Text(o), Loaded::Text(n)) => {
+            let (added, removed) = sidebyside::counts(o, n);
+            Stat::Lines { added, removed }
+        }
+    })
+}
+
+fn split_lines_count(data: &[u8]) -> u32 {
+    let n = data.iter().filter(|&&b| b == b'\n').count();
+    (n + usize::from(!data.is_empty() && !data.ends_with(b"\n"))) as u32
 }
 
 enum Loaded<'a> {

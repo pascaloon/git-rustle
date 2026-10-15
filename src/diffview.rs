@@ -1,10 +1,11 @@
-//! State and input handling for the full-screen diff view (two marked commits).
-//! Drawing lives in `ui::diff`; diff computation runs on a worker thread and
-//! results arrive through `set_tree` / `set_file_diff`.
+//! State and input handling for the full-screen diff view. Drawing lives in
+//! `ui::diff`; diff computation runs on worker threads and results arrive
+//! through `set_tree` / `set_file_diff` (stats go straight to the `ChangeSet`).
 
 use gix::ObjectId;
 
-use crate::diff::filetree::FileTree;
+use crate::diff::changes::ChangeSet;
+use crate::diff::filetree::TreeCursor;
 use crate::diff::{FileChange, FileDiff, TreeDiff};
 use crate::term::{Button, KeyCode, KeyEvent, MouseEvent, MouseKind};
 use crate::ui::diff::DiffAreas;
@@ -19,8 +20,8 @@ pub enum DiffFocus {
 #[derive(Debug)]
 pub enum DiffReq {
     Tree {
-        view: u32,
-        old: ObjectId,
+        key: u32,
+        old: Option<ObjectId>,
         new: ObjectId,
     },
     File {
@@ -36,18 +37,10 @@ const HSTEP: usize = 8;
 
 pub struct DiffView {
     pub id: u32,
-    pub old: ObjectId,
-    pub new: ObjectId,
-    pub files: Vec<FileChange>,
-    pub tree: Option<FileTree>,
-    tree_requested: bool,
-    pub error: Option<String>,
+    pub changes: ChangeSet,
+    pub cursor: TreeCursor,
 
     pub focus: DiffFocus,
-    pub side_sel: usize,
-    pub side_scroll: usize,
-    /// Sidebar rows visible, set by the renderer.
-    pub side_rows: usize,
     pub sidebar_width: u16,
     pub dragging_splitter: bool,
 
@@ -69,19 +62,14 @@ pub struct DiffView {
 }
 
 impl DiffView {
-    pub fn new(id: u32, old: ObjectId, new: ObjectId, sidebar_width: u16) -> Self {
-        DiffView {
+    /// Open a view over `changes`, which may already be loaded (handed over
+    /// from the details panel together with its cursor).
+    pub fn new(id: u32, changes: ChangeSet, cursor: Option<TreeCursor>, sidebar_width: u16) -> Self {
+        let mut v = DiffView {
             id,
-            old,
-            new,
-            files: Vec::new(),
-            tree: None,
-            tree_requested: false,
-            error: None,
+            changes,
+            cursor: cursor.unwrap_or_default(),
             focus: DiffFocus::Files,
-            side_sel: 0,
-            side_scroll: 0,
-            side_rows: 1,
             sidebar_width,
             dragging_splitter: false,
             current: None,
@@ -95,24 +83,32 @@ impl DiffView {
             half_cols: 40,
             close: false,
             needs_redraw: true,
+        };
+        if v.changes.loaded {
+            v.cursor.clamp(&v.changes.tree);
+            v.current = v
+                .cursor
+                .file(&v.changes.tree)
+                .or_else(|| v.cursor.first_file(&v.changes.tree));
         }
+        v
     }
 
     /// Requests that should be sent to the diff worker now.
     pub fn pending(&mut self) -> Vec<DiffReq> {
         let mut out = Vec::new();
-        if !self.tree_requested {
-            self.tree_requested = true;
+        if !self.changes.requested {
+            self.changes.requested = true;
             out.push(DiffReq::Tree {
-                view: self.id,
-                old: self.old,
-                new: self.new,
+                key: self.changes.key,
+                old: self.changes.old,
+                new: self.changes.new,
             });
         }
         if let Some(cur) = self.current
             && self.diff_for != Some(cur)
             && self.requested_for != Some(cur)
-            && let Some(change) = self.files.get(cur)
+            && let Some(change) = self.changes.files.get(cur)
         {
             self.req_seq += 1;
             self.requested_for = Some(cur);
@@ -127,19 +123,12 @@ impl DiffView {
     }
 
     pub fn set_tree(&mut self, result: Result<TreeDiff, String>) {
-        match result {
-            Ok(td) => {
-                self.files = td.files;
-                let tree = FileTree::build(&self.files);
-                // Show the first file.
-                if let Some(i) = tree.visible.iter().position(|v| !tree.nodes[v.node].is_folder()) {
-                    self.side_sel = i;
-                    self.current = tree.nodes[tree.visible[i].node].file;
-                }
-                self.tree = Some(tree);
-            }
-            Err(e) => self.error = Some(e),
-        }
+        self.changes.set_tree(result);
+        self.cursor = TreeCursor {
+            rows: self.cursor.rows,
+            ..TreeCursor::default()
+        };
+        self.current = self.cursor.first_file(&self.changes.tree);
         self.needs_redraw = true;
     }
 
@@ -161,125 +150,19 @@ impl DiffView {
     }
 
     pub fn current_change(&self) -> Option<&FileChange> {
-        self.current.and_then(|i| self.files.get(i))
+        self.current.and_then(|i| self.changes.files.get(i))
     }
 
-    fn show_file(&mut self, file: usize) {
-        if self.current != Some(file) {
+    fn show(&mut self, file: Option<usize>) {
+        if let Some(file) = file
+            && self.current != Some(file)
+        {
             self.current = Some(file);
             self.diff = None;
             self.diff_for = None;
             self.scroll = 0;
             self.hscroll = 0;
         }
-        self.needs_redraw = true;
-    }
-
-    /// Select a sidebar row; files are shown immediately.
-    fn select_row(&mut self, row: usize) {
-        let Some(tree) = self.tree.as_ref() else { return };
-        if tree.visible.is_empty() {
-            return;
-        }
-        let row = row.min(tree.visible.len() - 1);
-        self.side_sel = row;
-        let node = tree.visible[row].node;
-        if let Some(f) = tree.nodes[node].file {
-            self.show_file(f);
-        }
-        self.ensure_side_visible();
-        self.needs_redraw = true;
-    }
-
-    fn ensure_side_visible(&mut self) {
-        let rows = self.side_rows.max(1);
-        if self.side_sel < self.side_scroll {
-            self.side_scroll = self.side_sel;
-        } else if self.side_sel >= self.side_scroll + rows {
-            self.side_scroll = self.side_sel + 1 - rows;
-        }
-    }
-
-    fn move_side(&mut self, delta: isize) {
-        let n = self.tree.as_ref().map(|t| t.visible.len()).unwrap_or(0) as isize;
-        if n == 0 {
-            return;
-        }
-        let target = (self.side_sel as isize + delta).clamp(0, n - 1);
-        self.select_row(target as usize);
-    }
-
-    fn step_file(&mut self, forward: bool) {
-        let Some(tree) = self.tree.as_ref() else { return };
-        if let Some(row) = tree.neighbour_file(self.side_sel, forward) {
-            self.select_row(row);
-        }
-    }
-
-    fn selected_node(&self) -> Option<usize> {
-        self.tree.as_ref()?.visible.get(self.side_sel).map(|v| v.node)
-    }
-
-    fn toggle_selected(&mut self) {
-        let Some(node) = self.selected_node() else { return };
-        let Some(tree) = self.tree.as_mut() else { return };
-        if tree.nodes[node].is_folder() {
-            tree.toggle(node);
-            self.side_sel = self.side_sel.min(tree.visible.len().saturating_sub(1));
-        } else {
-            self.focus = DiffFocus::Diff;
-        }
-        self.needs_redraw = true;
-    }
-
-    /// Left: collapse an expanded folder, otherwise jump to the parent.
-    fn side_left(&mut self) {
-        let Some(node) = self.selected_node() else { return };
-        let Some(tree) = self.tree.as_mut() else { return };
-        if tree.nodes[node].is_folder() && tree.set_expanded(node, false) {
-            self.needs_redraw = true;
-            return;
-        }
-        if let Some(p) = tree.nodes[node].parent
-            && let Some(row) = tree.visible.iter().position(|v| v.node == p)
-        {
-            self.side_sel = row;
-            self.ensure_side_visible();
-            self.needs_redraw = true;
-        }
-    }
-
-    /// Right: expand a folder, step into an expanded one, or focus the diff for a file.
-    fn side_right(&mut self) {
-        let Some(node) = self.selected_node() else { return };
-        let Some(tree) = self.tree.as_mut() else { return };
-        if !tree.nodes[node].is_folder() {
-            self.focus = DiffFocus::Diff;
-        } else if !tree.set_expanded(node, true) && !tree.nodes[node].children.is_empty() {
-            self.select_row(self.side_sel + 1);
-        }
-        self.needs_redraw = true;
-    }
-
-    fn set_all_expanded(&mut self, expanded: bool) {
-        let keep = self.selected_node();
-        let Some(tree) = self.tree.as_mut() else { return };
-        tree.set_all_expanded(expanded);
-        self.side_sel = keep
-            .and_then(|n| tree.visible.iter().position(|v| v.node == n))
-            .or_else(|| {
-                // Selected node got hidden: select its visible ancestor.
-                let mut n = keep?;
-                while let Some(p) = tree.nodes[n].parent {
-                    if let Some(row) = tree.visible.iter().position(|v| v.node == p) {
-                        return Some(row);
-                    }
-                    n = p;
-                }
-                None
-            })
-            .unwrap_or(0);
-        self.ensure_side_visible();
         self.needs_redraw = true;
     }
 
@@ -308,13 +191,6 @@ impl DiffView {
         self.needs_redraw = true;
     }
 
-    fn scroll_side_view(&mut self, delta: isize) {
-        let n = self.tree.as_ref().map(|t| t.visible.len()).unwrap_or(0);
-        let max = n.saturating_sub(self.side_rows.max(1)) as isize;
-        self.side_scroll = (self.side_scroll as isize + delta).clamp(0, max) as usize;
-        self.needs_redraw = true;
-    }
-
     pub fn resize_sidebar(&mut self, delta: i32) {
         self.sidebar_width = (self.sidebar_width as i32 + delta).max(0) as u16;
         self.needs_redraw = true;
@@ -331,12 +207,24 @@ impl DiffView {
                 };
                 self.needs_redraw = true;
             }
-            (KeyCode::Char('n'), _) => self.step_file(true),
-            (KeyCode::Char('p'), _) => self.step_file(false),
+            (KeyCode::Char('n'), _) => {
+                let f = self.cursor.step_file(&self.changes.tree, true);
+                self.show(f);
+            }
+            (KeyCode::Char('p'), _) => {
+                let f = self.cursor.step_file(&self.changes.tree, false);
+                self.show(f);
+            }
             (KeyCode::Char('['), _) => self.resize_sidebar(-2),
             (KeyCode::Char(']'), _) => self.resize_sidebar(2),
-            (KeyCode::Char('e'), _) => self.set_all_expanded(true),
-            (KeyCode::Char('c'), false) => self.set_all_expanded(false),
+            (KeyCode::Char('e'), _) => {
+                self.cursor.set_all_expanded(&mut self.changes.tree, true);
+                self.needs_redraw = true;
+            }
+            (KeyCode::Char('c'), false) => {
+                self.cursor.set_all_expanded(&mut self.changes.tree, false);
+                self.needs_redraw = true;
+            }
             _ => match self.focus {
                 DiffFocus::Files => self.handle_files_key(key),
                 DiffFocus::Diff => self.handle_diff_key(key),
@@ -345,17 +233,52 @@ impl DiffView {
     }
 
     fn handle_files_key(&mut self, key: KeyEvent) {
-        let page = self.side_rows.saturating_sub(1).max(1) as isize;
+        let page = self.cursor.rows.saturating_sub(1).max(1) as isize;
+        let tree = &mut self.changes.tree;
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.move_side(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_side(1),
-            KeyCode::PageUp => self.move_side(-page),
-            KeyCode::PageDown => self.move_side(page),
-            KeyCode::Home | KeyCode::Char('g') => self.select_row(0),
-            KeyCode::End | KeyCode::Char('G') => self.select_row(usize::MAX),
-            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected(),
-            KeyCode::Left | KeyCode::Char('h') => self.side_left(),
-            KeyCode::Right | KeyCode::Char('l') => self.side_right(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                let f = self.cursor.move_by(tree, -1);
+                self.show(f);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let f = self.cursor.move_by(tree, 1);
+                self.show(f);
+            }
+            KeyCode::PageUp => {
+                let f = self.cursor.move_by(tree, -page);
+                self.show(f);
+            }
+            KeyCode::PageDown => {
+                let f = self.cursor.move_by(tree, page);
+                self.show(f);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                let f = self.cursor.select(tree, 0);
+                self.show(f);
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                let f = self.cursor.select(tree, usize::MAX);
+                self.show(f);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !self.cursor.toggle(tree) {
+                    self.focus = DiffFocus::Diff;
+                }
+                self.needs_redraw = true;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.cursor.left(tree);
+                self.needs_redraw = true;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.cursor.right(tree) {
+                    self.focus = DiffFocus::Diff;
+                } else {
+                    let f = self.cursor.file(tree);
+                    self.show(f);
+                }
+                self.needs_redraw = true;
+            }
             _ => {}
         }
     }
@@ -382,15 +305,12 @@ impl DiffView {
                     self.dragging_splitter = true;
                 } else if areas.sidebar.contains(m.x, m.y) {
                     self.focus = DiffFocus::Files;
-                    let row = self.side_scroll + (m.y - areas.sidebar.y) as usize;
-                    let n = self.tree.as_ref().map(|t| t.visible.len()).unwrap_or(0);
-                    if row < n {
-                        self.select_row(row);
-                        if let Some(node) = self.selected_node()
-                            && self.tree.as_ref().is_some_and(|t| t.nodes[node].is_folder())
-                        {
-                            self.toggle_selected();
-                        }
+                    let row = self.cursor.scroll + (m.y - areas.sidebar.y) as usize;
+                    let tree = &mut self.changes.tree;
+                    if row < tree.visible.len() {
+                        let f = self.cursor.select(tree, row);
+                        self.cursor.toggle(tree);
+                        self.show(f);
                     }
                     self.needs_redraw = true;
                 } else if areas.main.contains(m.x, m.y) {
@@ -410,7 +330,8 @@ impl DiffView {
             MouseKind::Wheel(delta) => {
                 let lines = -(delta as isize) * 3;
                 if areas.sidebar.contains(m.x, m.y) {
-                    self.scroll_side_view(lines);
+                    self.cursor.scroll_view(&self.changes.tree, lines);
+                    self.needs_redraw = true;
                 } else {
                     self.scroll_by(lines);
                 }
@@ -441,11 +362,11 @@ mod tests {
     }
 
     fn view() -> DiffView {
-        let mut v = DiffView::new(1, id(1), id(2), 30);
-        v.side_rows = 10;
+        let mut v = DiffView::new(1, ChangeSet::new(7, Some(id(1)), id(2)), None, 30);
+        v.cursor.rows = 10;
         v.rows = 10;
         let reqs = v.pending();
-        assert!(matches!(reqs.as_slice(), [DiffReq::Tree { .. }]));
+        assert!(matches!(reqs.as_slice(), [DiffReq::Tree { key: 7, .. }]));
         v.set_tree(Ok(TreeDiff {
             files: vec![change("src/a.rs"), change("src/b.rs"), change("top.rs")],
         }));
@@ -465,7 +386,7 @@ mod tests {
     fn first_file_is_shown_and_requested_once() {
         let mut v = view();
         // Visible: src, a.rs, b.rs, top.rs → first file is a.rs (index 0).
-        assert_eq!(v.side_sel, 1);
+        assert_eq!(v.cursor.sel, 1);
         assert_eq!(v.current, Some(0));
         let reqs = v.pending();
         assert!(matches!(reqs.as_slice(), [DiffReq::File { file: 0, seq: 1, .. }]));
@@ -490,15 +411,33 @@ mod tests {
     }
 
     #[test]
+    fn preloaded_changes_open_at_the_cursor() {
+        let mut cs = ChangeSet::new(3, Some(id(1)), id(2));
+        cs.requested = true;
+        cs.set_tree(Ok(TreeDiff {
+            files: vec![change("src/a.rs"), change("src/b.rs"), change("top.rs")],
+        }));
+        let cursor = TreeCursor {
+            sel: 3,
+            scroll: 0,
+            rows: 5,
+        };
+        let mut v = DiffView::new(2, cs, Some(cursor), 30);
+        assert_eq!(v.current, Some(2), "top.rs under the cursor");
+        let reqs = v.pending();
+        assert!(matches!(reqs.as_slice(), [DiffReq::File { file: 2, .. }]), "no tree request");
+    }
+
+    #[test]
     fn folder_keys_and_mouse() {
         let mut v = view();
         v.handle_key(key(KeyCode::Home)); // the "src" folder
         v.handle_key(key(KeyCode::Left)); // collapse
-        assert_eq!(v.tree.as_ref().unwrap().visible.len(), 2);
+        assert_eq!(v.changes.tree.visible.len(), 2);
         v.handle_key(key(KeyCode::Right)); // expand again
-        assert_eq!(v.tree.as_ref().unwrap().visible.len(), 4);
+        assert_eq!(v.changes.tree.visible.len(), 4);
         v.handle_key(key(KeyCode::Right)); // step into first child
-        assert_eq!(v.side_sel, 1);
+        assert_eq!(v.cursor.sel, 1);
         v.handle_key(key(KeyCode::Enter)); // file: focus the diff
         assert_eq!(v.focus, DiffFocus::Diff);
         let areas = DiffAreas {
@@ -517,7 +456,7 @@ mod tests {
         };
         v.handle_mouse(click(5, 1), &areas); // click "src": selects and collapses
         assert_eq!(v.focus, DiffFocus::Files);
-        assert_eq!(v.tree.as_ref().unwrap().visible.len(), 2);
+        assert_eq!(v.changes.tree.visible.len(), 2);
         v.handle_mouse(click(5, 2), &areas); // "top.rs"
         assert_eq!(v.current, Some(2));
         v.handle_key(key(KeyCode::Esc));

@@ -9,9 +9,28 @@ use crate::term::{Rect, Screen, Style};
 type Line = Vec<(String, Style)>;
 
 pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
+    app.files_area = Rect::default();
     if area.w < 4 || area.h == 0 {
         return;
     }
+    // Bottom section: files changed by this commit (when known and non-empty).
+    let files_h = match app.details_changes.as_ref() {
+        Some(cs) if !cs.loaded && cs.error.is_none() => 2,
+        Some(cs) if cs.loaded && !cs.files.is_empty() => {
+            let want = cs.tree.visible.len() as u16 + 1;
+            want.min((area.h * 45 / 100).max(4))
+        }
+        _ => 0,
+    };
+    let files_h = if area.h < 8 { 0 } else { files_h.min(area.h - 4) };
+    let area = if files_h > 0 {
+        let files = Rect::new(area.x, area.bottom() - files_h, area.w, files_h);
+        draw_files(app, screen, files);
+        Rect::new(area.x, area.y, area.w, area.h - files_h)
+    } else {
+        area
+    };
+
     let inner = Rect::new(area.x + 1, area.y, area.w.saturating_sub(2), area.h);
     let lines = build_lines(app, inner.w as usize, now);
     app.details_lines = lines.len();
@@ -42,6 +61,43 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             let ch = if r == thumb_pos { '█' } else { '░' };
             screen.put_char(area.right() - 1, inner.y + r as u16, ch, Style::new().fg(color));
         }
+    }
+}
+
+/// Header row ("Files N  +a −r") followed by the changed-files tree.
+fn draw_files(app: &mut App, screen: &mut Screen, area: Rect) {
+    let Some(cs) = app.details_changes.as_ref() else { return };
+    let bg = theme::BG_SELECTED_INACTIVE;
+    screen.fill(Rect::new(area.x, area.y, area.w, 1), ' ', Style::new().bg(bg));
+    let mut x = area.x + 1;
+    x += screen.put_str(x, area.y, "Files", Style::new().fg(theme::FG_TEXT).bg(bg).bold(), area.w);
+    if cs.loaded {
+        let n = cs.files.len();
+        x += screen.put_str(x, area.y, &format!(" {n}"), Style::new().fg(theme::FG_DIM).bg(bg), area.w);
+        let (a, r) = cs.total();
+        if a + r > 0 {
+            let add = format!("+{a}");
+            let rem = format!(" −{r}");
+            let pending = if cs.stats_pending > 0 { "…" } else { "" };
+            let w = (add.len() + rem.chars().count() + pending.len()) as u16;
+            if x + w + 2 < area.right() {
+                let mut sx = area.right() - w - 1;
+                sx += screen.put_str(sx, area.y, &add, Style::new().fg(theme::FG_ADDED).bg(bg), w);
+                sx += screen.put_str(sx, area.y, &rem, Style::new().fg(theme::FG_REMOVED).bg(bg), w);
+                screen.put_str(sx, area.y, pending, Style::new().fg(theme::FG_DIM).bg(bg), w);
+            }
+        }
+    }
+    let tree_area = Rect::new(area.x, area.y + 1, area.w.saturating_sub(1), area.h - 1);
+    app.files_area = tree_area;
+    let active = app.focus == Focus::Files;
+    let App {
+        details_changes,
+        details_cursor,
+        ..
+    } = app;
+    if let Some(cs) = details_changes.as_ref() {
+        super::tree::draw(screen, tree_area, cs, details_cursor, active, None);
     }
 }
 

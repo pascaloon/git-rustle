@@ -93,6 +93,13 @@ fn split_lines(data: &[u8]) -> Vec<&[u8]> {
     v
 }
 
+/// Added and removed line counts only.
+pub fn counts(old: &[u8], new: &[u8]) -> (u32, u32) {
+    let input = InternedInput::new(imara_diff::sources::byte_lines(old), imara_diff::sources::byte_lines(new));
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    (diff.count_additions(), diff.count_removals())
+}
+
 /// Build side-by-side rows from the raw old and new file contents.
 pub fn build(old: &[u8], new: &[u8]) -> FileDiff {
     let old_lines = split_lines(old);

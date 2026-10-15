@@ -17,7 +17,7 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,36 +34,37 @@ enum Msg {
     Batch(u32, History),
     WalkDone(u32, git::Result<()>),
     CacheWritten(bool),
-    /// Tree diff for diff view `id`.
+    /// Tree diff for the change set with this key.
     TreeDiff(u32, Result<diff::TreeDiff, String>),
+    /// Per-file line counts for the change set with this key.
+    Stats(u32, Vec<(usize, diff::Stat)>),
     /// File diff for diff view `id`: (view, seq, file index, result).
     FileDiff(u32, u32, usize, Result<diff::FileDiff, String>),
 }
 
-/// Diff requests run on one worker thread. A burst of file requests (holding
-/// an arrow key) is collapsed to the newest one; tree requests are never dropped.
+/// Diff requests run on one worker thread. A burst of requests (holding an
+/// arrow key) is collapsed to the newest tree request and the newest file
+/// request; older ones would only produce results nobody is waiting for.
 fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>) -> Sender<DiffReq> {
     let (req_tx, req_rx) = mpsc::channel::<DiffReq>();
     thread::Builder::new()
         .name("diff".into())
         .spawn(move || {
             while let Ok(first) = req_rx.recv() {
-                let mut trees = Vec::new();
+                let mut tree: Option<DiffReq> = None;
                 let mut file: Option<DiffReq> = None;
                 let mut next = Some(first);
                 while let Some(req) = next.take() {
                     match req {
-                        DiffReq::Tree { .. } => trees.push(req),
+                        DiffReq::Tree { .. } => tree = Some(req),
                         DiffReq::File { .. } => file = Some(req),
                     }
                     next = req_rx.try_recv().ok();
                 }
-                for req in trees {
-                    if let DiffReq::Tree { view, old, new } = req {
-                        let result = diff::tree_diff(&repo, &old, &new).map_err(|e| e.to_string());
-                        if tx.send(Msg::TreeDiff(view, result)).is_err() {
-                            return;
-                        }
+                if let Some(DiffReq::Tree { key, old, new }) = tree {
+                    let result = diff::tree_diff(&repo, old.as_ref(), &new).map_err(|e| e.to_string());
+                    if tx.send(Msg::TreeDiff(key, result)).is_err() {
+                        return;
                     }
                 }
                 if let Some(DiffReq::File {
@@ -81,6 +82,50 @@ fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>) -> Sender<DiffReq> 
             }
         })
         .expect("spawn diff worker");
+    req_tx
+}
+
+/// Line counts for a change set's files.
+struct StatsReq {
+    key: u32,
+    files: Arc<Vec<diff::FileChange>>,
+    /// Indices still lacking stats.
+    todo: Vec<usize>,
+}
+
+/// Stats run on their own thread so a 5,000-file commit never delays the file
+/// diff the user is looking at. Results stream in chunks; the job stops as
+/// soon as `latest` names a different change set.
+fn spawn_stats_worker(repo: gix::Repository, tx: Sender<Msg>, latest: Arc<AtomicU32>) -> Sender<StatsReq> {
+    let (req_tx, req_rx) = mpsc::channel::<StatsReq>();
+    thread::Builder::new()
+        .name("diff-stats".into())
+        .spawn(move || {
+            'jobs: while let Ok(mut req) = req_rx.recv() {
+                while let Ok(newer) = req_rx.try_recv() {
+                    req = newer;
+                }
+                let mut chunk = Vec::new();
+                let mut last_send = Instant::now();
+                for &i in &req.todo {
+                    if latest.load(Ordering::Relaxed) != req.key {
+                        continue 'jobs;
+                    }
+                    let stat = diff::file_stats(&repo, &req.files[i]).unwrap_or(diff::Stat::Opaque);
+                    chunk.push((i, stat));
+                    if chunk.len() >= 64 || last_send.elapsed() > Duration::from_millis(30) {
+                        if tx.send(Msg::Stats(req.key, std::mem::take(&mut chunk))).is_err() {
+                            return;
+                        }
+                        last_send = Instant::now();
+                    }
+                }
+                if !chunk.is_empty() && tx.send(Msg::Stats(req.key, chunk)).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("spawn stats worker");
     req_tx
 }
 
@@ -387,6 +432,9 @@ fn run(
 ) -> Result<(), String> {
     let mut repo: Option<gix::Repository> = None;
     let mut diff_tx: Option<Sender<DiffReq>> = None;
+    let mut stats_tx: Option<Sender<StatsReq>> = None;
+    let stats_latest = Arc::new(AtomicU32::new(0));
+    let mut stats_sent_for: Option<u32> = None;
     let mut cache_fp: Option<u64> = None;
     let mut cache_seen = false;
     let mut repo_seen = false;
@@ -443,11 +491,10 @@ fn run(
             app.details = git::commit_details(r, &id).ok();
             app.needs_redraw = true;
         }
-        // Hand new diff work to the worker.
-        if let Some(r) = repo.as_ref()
-            && let Some(view) = app.diff_view_mut()
-        {
-            let reqs = view.pending();
+        // Hand new diff work to the workers.
+        if let Some(r) = repo.as_ref() {
+            app.sync_details_changes();
+            let reqs = app.pending_requests();
             if !reqs.is_empty() {
                 let dtx = diff_tx.get_or_insert_with(|| spawn_diff_worker(r.clone(), tx.clone()));
                 for req in reqs {
@@ -456,6 +503,24 @@ fn run(
                     }
                     let _ = dtx.send(req);
                 }
+            }
+            // Line counts for whichever change set is on screen.
+            let want = app
+                .active_changes_mut()
+                .filter(|c| c.wants_stats())
+                .map(|c| StatsReq {
+                    key: c.key,
+                    files: Arc::clone(&c.files),
+                    todo: (0..c.stats.len()).filter(|&i| c.stats[i].is_none()).collect(),
+                });
+            if let Some(req) = want
+                && stats_sent_for != Some(req.key)
+            {
+                stats_sent_for = Some(req.key);
+                stats_latest.store(req.key, Ordering::Relaxed);
+                let stx = stats_tx
+                    .get_or_insert_with(|| spawn_stats_worker(r.clone(), tx.clone(), Arc::clone(&stats_latest)));
+                let _ = stx.send(req);
             }
         }
 
@@ -591,14 +656,26 @@ fn run(
                     // Reap finished threads.
                     finishing.retain(|w| w.handle.as_ref().is_some_and(|h| !h.is_finished()));
                 }
-                Msg::TreeDiff(view_id, result) => {
+                Msg::TreeDiff(key, result) => {
+                    if let Ok(td) = &result {
+                        timing.mark(format!("tree diff ({} files)", td.files.len()));
+                    }
                     if let Some(view) = app.diff_view_mut()
-                        && view.id == view_id
+                        && view.changes.key == key
                     {
-                        if let Ok(td) = &result {
-                            timing.mark(format!("tree diff ({} files)", td.files.len()));
-                        }
                         view.set_tree(result);
+                        app.needs_redraw = true;
+                    } else if let Some(cs) = app.changes_by_key_mut(key) {
+                        cs.set_tree(result);
+                        app.needs_redraw = true;
+                    }
+                }
+                Msg::Stats(key, chunk) => {
+                    if let Some(cs) = app.changes_by_key_mut(key) {
+                        cs.apply_stats(&chunk);
+                        if !cs.wants_stats() {
+                            timing.mark("stats done");
+                        }
                         app.needs_redraw = true;
                     }
                 }
