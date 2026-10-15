@@ -18,6 +18,29 @@ cargo build --release
 Requires Windows 10/11 with Windows Terminal (or any console host with VT
 processing) and a stable Rust toolchain (edition 2024).
 
+## Windows CI artifacts
+
+Pushing any tag runs the **Windows release** GitHub Actions workflow. It builds
+with stable Rust for `x86_64-pc-windows-msvc` using `cargo build --release --locked`,
+runs release-mode tests, smoke-tests the executable, and uploads **only
+`git-rustle.exe`** as a direct, unzipped Actions artifact retained for 90 days.
+The existing release optimization settings are unchanged.
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tagged commit must contain `.github/workflows/windows-release.yml`.
+Download the executable from the completed run under **Actions → Windows
+release → Artifacts** (GitHub sign-in required). This is an Actions artifact,
+not a permanent GitHub Release asset. The workflow can also be started manually
+with **Run workflow** without creating a tag.
+
+Each run records the release build duration, executable size, and SHA-256 in
+its summary. Build duration measures CI throughput, **not** application runtime
+performance; performance changes still require comparable Windows benchmarks.
+
 ## Usage
 
 ```

@@ -1,0 +1,77 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and test Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust (Windows x64 MSVC)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc --toolchain stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc +stable --version --verbose
+          cargo +stable --version
+
+      - name: Build release executable and record build timing
+        run: |
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          cargo +stable build --release --locked --target x86_64-pc-windows-msvc --bin git-rustle
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $timer.Stop()
+          $exe = Get-Item 'target/x86_64-pc-windows-msvc/release/git-rustle.exe'
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            '## Windows release build',
+            "- Commit: $env:GITHUB_SHA",
+            "- Ref: $env:GITHUB_REF",
+            "- Clean release build (including dependency downloads): $($timer.Elapsed.TotalSeconds.ToString('F3')) s",
+            "- Executable size: $($exe.Length) bytes",
+            "- SHA-256: $hash",
+            '- Build timing measures CI throughput, not TUI runtime performance.'
+          ) | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Run release-mode tests
+        run: |
+          cargo +stable test --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke-test release executable
+        run: |
+          & './target/x86_64-pc-windows-msvc/release/git-rustle.exe' --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & './target/x86_64-pc-windows-msvc/release/git-rustle.exe' --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload single release executable
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: target/x86_64-pc-windows-msvc/release/git-rustle.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
+          include-hidden-files: false
