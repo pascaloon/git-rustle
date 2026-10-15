@@ -1,10 +1,11 @@
 //! Drawing: header, commit list with graph, details panel, status bar.
 
 pub mod details;
+pub mod diff;
 pub mod list;
 pub mod time;
 
-use crate::app::{App, Focus, LoadState};
+use crate::app::{App, Focus, LoadState, Mode};
 use crate::term::{Color, Rect, Screen, Style};
 
 /// Screen regions for one frame.
@@ -37,6 +38,20 @@ pub mod theme {
     pub const FG_SPLITTER_ACTIVE: Color = Color::rgb(0x7d, 0xcf, 0xff);
     pub const FG_KEY: Color = Color::rgb(0xff, 0xb8, 0x6c);
     pub const FG_ERR: Color = Color::rgb(0xff, 0x6b, 0x6b);
+    /// Chip background for commits marked for diffing.
+    pub const BG_MARK: Color = Color::rgb(0xff, 0x79, 0xc6);
+
+    // Diff view.
+    pub const FG_ADDED: Color = Color::rgb(0x8c, 0xf5, 0x8c);
+    pub const FG_REMOVED: Color = Color::rgb(0xff, 0x8a, 0x80);
+    pub const FG_MODIFIED: Color = Color::rgb(0xe2, 0xb8, 0x5a);
+    pub const FG_RENAMED: Color = Color::rgb(0xc7, 0xa8, 0xff);
+    pub const BG_ADDED: Color = Color::rgb(0x1a, 0x36, 0x24);
+    pub const BG_REMOVED: Color = Color::rgb(0x3d, 0x1e, 0x24);
+    pub const BG_ADDED_HL: Color = Color::rgb(0x2c, 0x6e, 0x3e);
+    pub const BG_REMOVED_HL: Color = Color::rgb(0x80, 0x2e, 0x38);
+    pub const BG_FILLER: Color = Color::rgb(0x1a, 0x1c, 0x22);
+    pub const BG_SEPARATOR: Color = Color::rgb(0x22, 0x27, 0x33);
 
     pub const fn text() -> Style {
         Style::new().fg(FG_TEXT)
@@ -80,6 +95,12 @@ pub fn default_right_width(w: u16) -> u16 {
 }
 
 pub fn draw(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
+    if let Mode::Diff(view) = &mut app.mode {
+        let da = diff::compute_areas(screen.width(), screen.height(), view.sidebar_width);
+        diff::draw(&app.repo_name, view, screen, &da);
+        view.needs_redraw = false;
+        return;
+    }
     screen.clear();
     draw_header(app, screen, areas.header);
     list::draw(app, screen, areas.list, now);
@@ -164,18 +185,36 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
     let key = Style::new().fg(theme::FG_KEY).bg(bg).bold();
     let txt = Style::new().fg(theme::FG_DIM).bg(bg);
     let mut x = area.x + 1;
-    let hints: &[(&str, &str)] = match app.focus {
-        Focus::List => &[
+    let hints: &[(&str, &str)] = match (app.focus, app.marks.len()) {
+        (Focus::List, 2) => &[
+            ("d", "diff marked"),
+            ("Space", "unmark"),
+            ("Del", "clear"),
+            ("↑↓", "move"),
+            ("Tab", "details"),
+            ("q", "quit"),
+        ],
+        (Focus::List, 1) => &[
+            ("Space", "mark 2nd"),
+            ("Del", "clear"),
+            ("↑↓", "move"),
+            ("PgUp/PgDn", "page"),
+            ("H", "head"),
+            ("Tab", "details"),
+            ("q", "quit"),
+        ],
+        (Focus::List, _) => &[
             ("↑↓", "move"),
             ("PgUp/PgDn", "page"),
             ("Home/End", "ends"),
             ("H", "head"),
+            ("Space", "mark"),
             ("Tab", "details"),
             ("[ ]", "panel"),
             ("r", "reload"),
             ("q", "quit"),
         ],
-        Focus::Details => &[
+        (Focus::Details, _) => &[
             ("↑↓", "scroll"),
             ("PgUp/PgDn", "page"),
             ("Tab", "list"),

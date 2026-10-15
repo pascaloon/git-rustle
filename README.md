@@ -39,13 +39,41 @@ git-rustle [OPTIONS] [PATH]
 | `H` | Jump to `HEAD` |
 | `Tab`, `→` / `←`, `l` / `h` | Switch focus between graph and details |
 | `[` / `]` | Shrink / grow the details panel |
+| `Space` | Mark / unmark the selected commit (at most two) |
+| `d` | Diff the two marked commits |
+| `Del` | Clear marks |
 | `r` | Refresh (re-walk the repository) |
-| `q`, `Esc`, `Ctrl+C` | Quit |
+| `q`, `Ctrl+C` | Quit |
+| `Esc` | Clear marks, or quit when none are set |
 
 ### Mouse
 
-Click a row to select it, scroll the wheel over either panel, and drag the
-splitter between the panels to resize them.
+Click a row to select it, `Ctrl`+click to mark it, scroll the wheel over
+either panel, and drag the splitter between the panels to resize them.
+
+### Diff view
+
+Mark two commits (`Space` or `Ctrl`+click) and press `d` for a full-screen
+diff of the older commit against the newer one: a collapsible file tree on the
+left, and a side-by-side view of the selected file on the right with
+added/removed/changed lines coloured and the changed span within a line
+highlighted. Exact renames are detected; binary and very large files are
+summarised instead of diffed.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓`, `j` / `k` | Move in the file tree / scroll the diff |
+| `←` / `→`, `h` / `l` | Collapse / expand folders (tree) or pan horizontally (diff) |
+| `Enter`, `Space` | Toggle a folder, or jump to the diff for a file |
+| `n` / `p` | Next / previous file |
+| `e` / `c` | Expand / collapse all folders |
+| `PgUp` / `PgDn`, `Home` / `End` | Page / jump |
+| `Tab` | Switch focus between the file tree and the diff |
+| `[` / `]` | Shrink / grow the file tree |
+| `Esc`, `q` | Back to the graph |
+
+Mouse: click a file to show it, click a folder to fold it, wheel to scroll
+either panel (`Shift`+wheel or a tilt wheel pans), drag the splitter to resize.
 
 ## How it stays fast
 
@@ -64,3 +92,5 @@ splitter between the panels to resize them.
 - `GIT_RUSTLE_TIMING=1` prints startup timing marks to stderr on exit.
 - `GIT_RUSTLE_AUTOQUIT=<ms>` quits automatically after the first frame.
 - `GIT_RUSTLE_DUMP=<file>` writes the last rendered frame as text on exit.
+- `GIT_RUSTLE_KEYS=<script>` replays key presses after the first frame, e.g.
+  `"<space><down><space>d"`; named keys go in angle brackets.

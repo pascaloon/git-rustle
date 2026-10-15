@@ -91,9 +91,14 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             continue;
         }
 
-        // Short hash.
+        // Short hash; marked commits show it as a chip.
         let hash = rec.id.to_hex_with_len(HASH_LEN as usize).to_string();
-        x += screen.put_str(x, y, &hash, Style::new().fg(theme::FG_HASH).bg(bg), area.right() - x);
+        let hash_style = if app.is_marked(&rec.id) {
+            Style::new().fg(Color::rgb(0x12, 0x14, 0x1a)).bg(theme::BG_MARK).bold()
+        } else {
+            Style::new().fg(theme::FG_HASH).bg(bg)
+        };
+        x += screen.put_str(x, y, &hash, hash_style, area.right() - x);
         x += screen.put_str(x, y, " ", Style::new().bg(bg), area.right() - x);
 
         let text_end = area.right().saturating_sub(right_cols);

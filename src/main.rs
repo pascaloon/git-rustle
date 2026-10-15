@@ -7,6 +7,8 @@
 
 mod app;
 mod cache;
+mod diff;
+mod diffview;
 mod git;
 mod graph;
 mod model;
@@ -21,6 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use app::{App, LoadState};
+use diffview::DiffReq;
 use model::History;
 use term::{Console, Event, Screen};
 
@@ -31,6 +34,54 @@ enum Msg {
     Batch(u32, History),
     WalkDone(u32, git::Result<()>),
     CacheWritten(bool),
+    /// Tree diff for diff view `id`.
+    TreeDiff(u32, Result<diff::TreeDiff, String>),
+    /// File diff for diff view `id`: (view, seq, file index, result).
+    FileDiff(u32, u32, usize, Result<diff::FileDiff, String>),
+}
+
+/// Diff requests run on one worker thread. A burst of file requests (holding
+/// an arrow key) is collapsed to the newest one; tree requests are never dropped.
+fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>) -> Sender<DiffReq> {
+    let (req_tx, req_rx) = mpsc::channel::<DiffReq>();
+    thread::Builder::new()
+        .name("diff".into())
+        .spawn(move || {
+            while let Ok(first) = req_rx.recv() {
+                let mut trees = Vec::new();
+                let mut file: Option<DiffReq> = None;
+                let mut next = Some(first);
+                while let Some(req) = next.take() {
+                    match req {
+                        DiffReq::Tree { .. } => trees.push(req),
+                        DiffReq::File { .. } => file = Some(req),
+                    }
+                    next = req_rx.try_recv().ok();
+                }
+                for req in trees {
+                    if let DiffReq::Tree { view, old, new } = req {
+                        let result = diff::tree_diff(&repo, &old, &new).map_err(|e| e.to_string());
+                        if tx.send(Msg::TreeDiff(view, result)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                if let Some(DiffReq::File {
+                    view,
+                    seq,
+                    file,
+                    change,
+                }) = file
+                {
+                    let result = diff::file_diff(&repo, &change).map_err(|e| e.to_string());
+                    if tx.send(Msg::FileDiff(view, seq, file, result)).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawn diff worker");
+    req_tx
 }
 
 /// Startup milestone timings, printed to stderr at exit when `GIT_RUSTLE_TIMING` is set.
@@ -63,6 +114,56 @@ impl Timing {
     }
 }
 
+/// Debug aid: `GIT_RUSTLE_KEYS` is a script of key presses replayed after the
+/// first complete frame, e.g. `" <down>d<tab><pgdn>"`. Plain characters are
+/// typed as-is; named keys go in angle brackets (`<down>`, `<esc>`, `<c-c>`).
+fn parse_key_script(script: &str) -> Vec<term::KeyEvent> {
+    use term::KeyCode::*;
+    let plain = |code| term::KeyEvent {
+        code,
+        ctrl: false,
+        shift: false,
+        alt: false,
+    };
+    let mut out = Vec::new();
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            out.push(plain(Char(c)));
+            continue;
+        }
+        let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
+        let (ctrl, name) = match name.strip_prefix("c-") {
+            Some(rest) => (true, rest),
+            None => (false, name.as_str()),
+        };
+        let code = match name {
+            "up" => Up,
+            "down" => Down,
+            "left" => Left,
+            "right" => Right,
+            "pgup" => PageUp,
+            "pgdn" => PageDown,
+            "home" => Home,
+            "end" => End,
+            "enter" => Enter,
+            "esc" => Esc,
+            "tab" => Tab,
+            "space" => Char(' '),
+            "del" => Delete,
+            "bs" => Backspace,
+            other => match other.chars().next() {
+                Some(ch) if other.chars().count() == 1 => Char(ch),
+                _ => continue,
+            },
+        };
+        let mut ev = plain(code);
+        ev.ctrl = ctrl;
+        out.push(ev);
+    }
+    out
+}
+
 struct Options {
     path: PathBuf,
     no_cache: bool,
@@ -77,7 +178,7 @@ fn parse_args() -> Result<Options, String> {
         match arg.to_str() {
             Some("-h") | Some("--help") => {
                 println!(
-                    "git-rustle {}\n\nUsage: git-rustle [OPTIONS] [PATH]\n\n  PATH          repository or any directory inside one (default: .)\n  --no-cache    ignore and do not write the layout cache\n  -h, --help    show this help\n  -V, --version show the version\n\nEnvironment:\n  GIT_RUSTLE_TIMING=1        print startup timings to stderr on exit\n  GIT_RUSTLE_AUTOQUIT=<ms>   quit automatically after the first frame (benchmarking)\n  GIT_RUSTLE_DUMP=<file>     write the last frame as plain text on exit (debugging)",
+                    "git-rustle {}\n\nUsage: git-rustle [OPTIONS] [PATH]\n\n  PATH          repository or any directory inside one (default: .)\n  --no-cache    ignore and do not write the layout cache\n  -h, --help    show this help\n  -V, --version show the version\n\nEnvironment:\n  GIT_RUSTLE_TIMING=1        print startup timings to stderr on exit\n  GIT_RUSTLE_AUTOQUIT=<ms>   quit automatically after the first frame (benchmarking)\n  GIT_RUSTLE_DUMP=<file>     write the last frame as plain text on exit (debugging)\n  GIT_RUSTLE_KEYS=<script>   replay key presses after the first frame, e.g. \"<down>d\" (debugging)",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -239,6 +340,7 @@ fn main() {
 
     let mut app = App::new();
     app.right_width = ui::default_right_width(w);
+    app.sidebar_width = ui::diff::default_sidebar_width(w);
     app.repo_name = opts
         .path
         .file_name()
@@ -284,6 +386,7 @@ fn run(
     no_cache: bool,
 ) -> Result<(), String> {
     let mut repo: Option<gix::Repository> = None;
+    let mut diff_tx: Option<Sender<DiffReq>> = None;
     let mut cache_fp: Option<u64> = None;
     let mut cache_seen = false;
     let mut repo_seen = false;
@@ -300,6 +403,8 @@ fn run(
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis);
     let mut first_frame_at: Option<Instant> = None;
+    let mut key_script: Option<Vec<term::KeyEvent>> =
+        std::env::var("GIT_RUSTLE_KEYS").ok().map(|s| parse_key_script(&s));
 
     loop {
         if let (Some(delay), Some(at)) = (autoquit, first_frame_at)
@@ -307,6 +412,19 @@ fn run(
             && walker.is_none()
         {
             app.quit = true;
+        }
+        // Replay scripted keys once the graph is complete, spaced out so each
+        // one is handled (and its async work finished) before the next.
+        if let Some(keys) = key_script.take_if(|_| first_frame_at.is_some() && walker.is_none()) {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                for k in keys {
+                    thread::sleep(Duration::from_millis(40));
+                    if tx.send(Msg::Input(Event::Key(k))).is_err() {
+                        break;
+                    }
+                }
+            });
         }
         if app.quit {
             if let Some(wk) = walker.take() {
@@ -324,6 +442,21 @@ fn run(
         {
             app.details = git::commit_details(r, &id).ok();
             app.needs_redraw = true;
+        }
+        // Hand new diff work to the worker.
+        if let Some(r) = repo.as_ref()
+            && let Some(view) = app.diff_view_mut()
+        {
+            let reqs = view.pending();
+            if !reqs.is_empty() {
+                let dtx = diff_tx.get_or_insert_with(|| spawn_diff_worker(r.clone(), tx.clone()));
+                for req in reqs {
+                    if matches!(req, DiffReq::Tree { .. }) {
+                        timing.mark("diff requested");
+                    }
+                    let _ = dtx.send(req);
+                }
+            }
         }
 
         if app.needs_redraw {
@@ -383,7 +516,9 @@ fn run(
         for msg in pending {
             match msg {
                 Msg::Input(Event::Key(k)) => app.handle_key(k),
-                Msg::Input(Event::Mouse(m)) => app.handle_mouse(m, &areas, screen.width()),
+                Msg::Input(Event::Mouse(m)) => {
+                    app.handle_mouse(m, &areas, screen.width(), screen.height())
+                }
                 Msg::Input(Event::Resize) => {
                     let (w, h) = console.size();
                     screen.resize(w, h);
@@ -455,6 +590,28 @@ fn run(
                     timing.mark(if ok { "cache written" } else { "cache write failed" });
                     // Reap finished threads.
                     finishing.retain(|w| w.handle.as_ref().is_some_and(|h| !h.is_finished()));
+                }
+                Msg::TreeDiff(view_id, result) => {
+                    if let Some(view) = app.diff_view_mut()
+                        && view.id == view_id
+                    {
+                        if let Ok(td) = &result {
+                            timing.mark(format!("tree diff ({} files)", td.files.len()));
+                        }
+                        view.set_tree(result);
+                        app.needs_redraw = true;
+                    }
+                }
+                Msg::FileDiff(view_id, seq, file, result) => {
+                    if let Some(view) = app.diff_view_mut()
+                        && view.id == view_id
+                    {
+                        if let Ok(d) = &result {
+                            timing.mark(format!("file diff ({} rows)", d.rows.len()));
+                        }
+                        view.set_file_diff(seq, file, result);
+                        app.needs_redraw = true;
+                    }
                 }
             }
             if app.quit {

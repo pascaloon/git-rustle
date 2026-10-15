@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "sha1"] }
 unicode-width = "0.2"
+imara-diff = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

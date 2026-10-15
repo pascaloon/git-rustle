@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use gix::ObjectId;
 
+use crate::diffview::DiffView;
 use crate::git::{CommitDetails, RefKind, RefSnapshot};
 use crate::model::History;
 use crate::term::{Button, KeyCode, KeyEvent, MouseEvent, MouseKind};
@@ -14,6 +15,15 @@ pub enum Focus {
     List,
     Details,
 }
+
+/// Which screen is shown.
+pub enum Mode {
+    Graph,
+    Diff(Box<DiffView>),
+}
+
+/// Upper bound on marked commits (a diff needs exactly two).
+pub const MAX_MARKS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadState {
@@ -56,6 +66,13 @@ pub struct App {
     pub right_width: u16,
     pub dragging_splitter: bool,
 
+    /// Commits marked for diffing, in marking order (at most `MAX_MARKS`).
+    pub marks: Vec<ObjectId>,
+    pub mode: Mode,
+    /// Sidebar width for the diff view, remembered between views.
+    pub sidebar_width: u16,
+    next_view_id: u32,
+
     pub quit: bool,
     pub want_rewalk: bool,
     pub needs_redraw: bool,
@@ -80,6 +97,10 @@ impl App {
             details_lines: 0,
             right_width: 0,
             dragging_splitter: false,
+            marks: Vec::new(),
+            mode: Mode::Graph,
+            sidebar_width: 32,
+            next_view_id: 1,
             quit: false,
             want_rewalk: false,
             needs_redraw: true,
@@ -89,6 +110,62 @@ impl App {
 
     pub fn selected_id(&self) -> Option<ObjectId> {
         self.history.commits.get(self.selected).map(|c| c.id)
+    }
+
+    pub fn is_marked(&self, id: &ObjectId) -> bool {
+        self.marks.contains(id)
+    }
+
+    /// Mark or unmark a commit; marking a third drops the oldest mark.
+    pub fn toggle_mark(&mut self, id: ObjectId) {
+        if let Some(i) = self.marks.iter().position(|m| *m == id) {
+            self.marks.remove(i);
+        } else {
+            if self.marks.len() >= MAX_MARKS {
+                self.marks.remove(0);
+            }
+            self.marks.push(id);
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn clear_marks(&mut self) {
+        if !self.marks.is_empty() {
+            self.marks.clear();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Open the diff of the two marked commits (older on the left).
+    pub fn open_diff(&mut self) {
+        if self.marks.len() != MAX_MARKS {
+            return;
+        }
+        let (a, b) = (self.marks[0], self.marks[1]);
+        let time = |id: &ObjectId| self.history.index_of(id).map(|i| self.history.commits[i].commit_time);
+        let (old, new) = match (time(&a), time(&b)) {
+            (Some(ta), Some(tb)) if tb < ta => (b, a),
+            _ => (a, b),
+        };
+        let id = self.next_view_id;
+        self.next_view_id += 1;
+        self.mode = Mode::Diff(Box::new(DiffView::new(id, old, new, self.sidebar_width)));
+        self.needs_redraw = true;
+    }
+
+    pub fn close_diff(&mut self) {
+        if let Mode::Diff(view) = &self.mode {
+            self.sidebar_width = view.sidebar_width;
+        }
+        self.mode = Mode::Graph;
+        self.needs_redraw = true;
+    }
+
+    pub fn diff_view_mut(&mut self) -> Option<&mut DiffView> {
+        match &mut self.mode {
+            Mode::Diff(v) => Some(v),
+            Mode::Graph => None,
+        }
     }
 
     pub fn head_id(&self) -> Option<ObjectId> {
@@ -242,11 +319,32 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if let Mode::Diff(view) = &mut self.mode {
+            view.handle_key(key);
+            let (close, redraw) = (view.close, view.needs_redraw);
+            if close {
+                self.close_diff();
+            }
+            self.needs_redraw |= redraw;
+            return;
+        }
         let page = self.list_rows.saturating_sub(1).max(1) as isize;
         match (key.code, key.ctrl) {
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => {
-                self.quit = true
+            (KeyCode::Char('q'), _) | (KeyCode::Char('c'), true) => self.quit = true,
+            (KeyCode::Esc, _) => {
+                if self.marks.is_empty() {
+                    self.quit = true;
+                } else {
+                    self.clear_marks();
+                }
             }
+            (KeyCode::Char(' '), _) => {
+                if let Some(id) = self.selected_id() {
+                    self.toggle_mark(id);
+                }
+            }
+            (KeyCode::Delete, _) => self.clear_marks(),
+            (KeyCode::Char('d'), false) => self.open_diff(),
             (KeyCode::Tab, _) => {
                 self.focus = match self.focus {
                     Focus::List => Focus::Details,
@@ -309,7 +407,13 @@ impl App {
         self.needs_redraw = true;
     }
 
-    pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16) {
+    pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16, screen_h: u16) {
+        if let Mode::Diff(view) = &mut self.mode {
+            let da = crate::ui::diff::compute_areas(screen_w, screen_h, view.sidebar_width);
+            view.handle_mouse(m, &da);
+            self.needs_redraw |= view.needs_redraw;
+            return;
+        }
         match m.kind {
             MouseKind::Down(Button::Left) | MouseKind::DoubleClick(Button::Left) => {
                 if areas.splitter.contains(m.x, m.y) {
@@ -319,6 +423,11 @@ impl App {
                     let idx = self.scroll + (m.y - areas.list.y) as usize;
                     if idx < self.history.len() {
                         self.select(idx);
+                        // Ctrl+click marks the commit for diffing.
+                        if m.ctrl {
+                            let id = self.history.commits[idx].id;
+                            self.toggle_mark(id);
+                        }
                     }
                     self.needs_redraw = true;
                 } else if areas.details.contains(m.x, m.y) {
@@ -436,15 +545,15 @@ mod tests {
             ctrl: false,
             shift: false,
         };
-        app.handle_mouse(click(10, 4, MouseKind::Down(Button::Left)), &a, 100);
+        app.handle_mouse(click(10, 4, MouseKind::Down(Button::Left)), &a, 100, 12);
         assert_eq!(app.selected, 3);
-        app.handle_mouse(click(10, 4, MouseKind::Wheel(-1)), &a, 100);
+        app.handle_mouse(click(10, 4, MouseKind::Wheel(-1)), &a, 100, 12);
         assert_eq!(app.scroll, 3);
-        app.handle_mouse(click(10, 4, MouseKind::Down(Button::Left)), &a, 100);
+        app.handle_mouse(click(10, 4, MouseKind::Down(Button::Left)), &a, 100, 12);
         assert_eq!(app.selected, 6);
         // Wheel over the details panel scrolls the panel, not the list.
         app.details_lines = 40;
-        app.handle_mouse(click(70, 4, MouseKind::Wheel(-1)), &a, 100);
+        app.handle_mouse(click(70, 4, MouseKind::Wheel(-1)), &a, 100, 12);
         assert_eq!(app.scroll, 3);
         assert_eq!(app.details_scroll, 3);
     }
@@ -460,12 +569,62 @@ mod tests {
             ctrl: false,
             shift: false,
         };
-        app.handle_mouse(ev(60, MouseKind::Down(Button::Left)), &a, 100);
+        app.handle_mouse(ev(60, MouseKind::Down(Button::Left)), &a, 100, 12);
         assert!(app.dragging_splitter);
-        app.handle_mouse(ev(50, MouseKind::Drag(Button::Left)), &a, 100);
+        app.handle_mouse(ev(50, MouseKind::Drag(Button::Left)), &a, 100, 12);
         assert_eq!(app.right_width, 49);
-        app.handle_mouse(ev(50, MouseKind::Up(Button::Left)), &a, 100);
+        app.handle_mouse(ev(50, MouseKind::Up(Button::Left)), &a, 100, 12);
         assert!(!app.dragging_splitter);
+    }
+
+    #[test]
+    fn marks_and_diff_mode() {
+        let mut app = app_with(10);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.marks.len(), 1);
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::Graph), "needs two marks");
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        // Ctrl+click marks the clicked row.
+        let a = areas();
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseKind::Down(Button::Left),
+                x: 5,
+                y: a.list.y + 4,
+                ctrl: true,
+                shift: false,
+            },
+            &a,
+            100,
+            12,
+        );
+        assert_eq!(app.selected, 4);
+        assert_eq!(app.marks.len(), 2);
+        assert!(app.is_marked(&app.history.commits[0].id));
+        assert!(app.is_marked(&app.history.commits[4].id));
+        // A third mark replaces the oldest.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.marks.len(), 2);
+        assert!(!app.is_marked(&app.history.commits[0].id));
+        // Space on a marked commit unmarks it.
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.marks.len(), 1);
+        app.handle_key(key(KeyCode::Char(' ')));
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::Diff(_)));
+        // Keys go to the diff view now; Esc returns to the graph without quitting.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Graph));
+        assert!(!app.quit);
+        // Esc with marks clears them; a second Esc quits.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.marks.is_empty() && !app.quit);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.quit);
     }
 
     #[test]
