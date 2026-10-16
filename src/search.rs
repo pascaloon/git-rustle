@@ -43,25 +43,9 @@ impl Query {
             terms: value.split_whitespace().map(str::to_lowercase).collect(),
         }
     }
-    /// Human-readable fields require complete words. Identifier fields allow
-    /// contiguous fragments (short SHAs, filename suffixes and ref components).
+    /// Each term is a contiguous substring, including inside a longer word.
     /// All terms must match the same field; their order is unimportant.
     pub fn matches(&self, normalized: &str) -> bool {
-        if matches!(self.field, Field::Sha | Field::File) {
-            return self.matches_fragment(normalized);
-        }
-        let word = |c: char| c.is_alphanumeric() || c == '_';
-        self.terms.iter().all(|term| {
-            let left = term.chars().next().is_some_and(word);
-            let right = term.chars().next_back().is_some_and(word);
-            normalized.match_indices(term.as_str()).any(|(start, _)| {
-                let end = start + term.len();
-                (!left || !normalized[..start].chars().next_back().is_some_and(word))
-                    && (!right || !normalized[end..].chars().next().is_some_and(word))
-            })
-        })
-    }
-    fn matches_fragment(&self, normalized: &str) -> bool {
         self.terms
             .iter()
             .all(|term| normalized.contains(term.as_str()))
@@ -611,7 +595,7 @@ impl Index {
                 unavailable += 1;
             }
             let base = self.base.as_ref().unwrap();
-            let sha = || query.matches_fragment(&base.sha[i]);
+            let sha = || query.matches(&base.sha[i]);
             let author = || query.matches(&base.authors[i]);
             let message = || {
                 self.docs
@@ -632,7 +616,7 @@ impl Index {
                     sha()
                         || author()
                         || message()
-                        || base.labels[i].iter().any(|s| query.matches_fragment(s))
+                        || base.labels[i].iter().any(|s| query.matches(s))
                 }
             };
             if matched {
@@ -833,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn words_are_case_insensitive_unicode_and_prefixes_are_anchored() {
+    fn terms_are_case_insensitive_unicode_and_prefixes_are_anchored() {
         let q = Query::parse(" a: BÓB ");
         assert_eq!(q.field, Field::Author);
         assert!(q.matches("bób builder"));
@@ -847,17 +831,17 @@ mod tests {
     }
 
     #[test]
-    fn all_query_words_must_match_completely_without_letter_gaps() {
+    fn all_query_terms_match_contiguously_including_inside_words() {
         for text in ["mold contracts", "m: mold contracts", "a: mold contracts"] {
             let query = Query::parse(text);
             assert!(query.matches("update mold and contracts"));
             assert!(query.matches("contracts: update mold"));
             assert!(query.matches("mold-contracts"));
             assert!(query.matches("mold\n\ncontracts"));
+            assert!(query.matches("molding contracts"));
+            assert!(query.matches("mold subcontracts"));
+            assert!(query.matches("mold_contracts"));
             for unrelated in [
-                "molding contracts",
-                "mold subcontracts",
-                "mold_contracts",
                 "mold",
                 "contracts",
                 "manager for simplify and activity more consistent istartupservice created tracking activities",
@@ -866,15 +850,32 @@ mod tests {
             }
         }
         assert!(Query::parse(" MÖLD\tCÔNTRACTS ").matches("côntracts / möld"));
-        assert!(!Query::parse("möld").matches("mölder"));
-        assert!(!Query::parse("a: Bob").matches("bobby smith"));
+        assert!(Query::parse("möld").matches("mölder"));
+        assert!(Query::parse("a: Bob").matches("bobby smith"));
+        for text in ["frag", "m: FRAG", "a: frag", "s: frag", "f: frag"] {
+            let query = Query::parse(text);
+            for value in ["frag", "fragment", "defrag", "defragment"] {
+                assert!(query.matches(value), "{text} did not match {value}");
+            }
+            for value in ["flag", "f-r-a-g", "far ranging"] {
+                assert!(!query.matches(value), "{text} matched {value}");
+            }
+        }
         assert!(Query::parse("s: dd4d723").matches("aadd4d7230000"));
         assert!(!Query::parse("s: dd4d723").matches("dd04d0723"));
         assert!(Query::parse("f: .sharpmake.cs").matches("src/project.sharpmake.cs"));
         assert!(!Query::parse("f: .sharpmake.cs").matches("src/project.sharp_extra_make.cs"));
-        assert!(
-            Query::parse("mold contracts").matches_fragment("origin/feature/mold-contracts-v2")
-        );
+        assert!(Query::parse("mold contracts").matches("origin/feature/mold-contracts-v2"));
+    }
+
+    #[test]
+    fn partial_text_terms_filter_actual_commit_fields() {
+        let (_dir, repo, input) = fixture();
+        let mut index = Index::default();
+        assert_eq!(run(&mut index, &repo, &input, "zebrac").rows, [2]);
+        assert_eq!(run(&mut index, &repo, &input, "m: ump thin").rows, [0]);
+        assert_eq!(run(&mut index, &repo, &input, "a: ób").rows, [1, 2]);
+        assert_eq!(run(&mut index, &repo, &input, "ture-need").rows, [0]);
     }
 
     #[test]
@@ -1277,6 +1278,7 @@ mod tests {
             ("sha", "s: 6de20f6"),
             ("message", "m: fix typo"),
             ("default", "gitk"),
+            ("partial", "frag"),
             ("words", "mold contracts"),
             ("files", "f: .sharpmake.cs"),
             ("files_common", "f: readme"),

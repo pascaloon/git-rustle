@@ -81,14 +81,14 @@ history continues loading.
 ### Graph search
 
 Press `/` and type to filter commits immediately. Search is case-insensitive.
-Messages and author names require complete words: `mold contracts` must find both
-`mold` and `contracts`, in any order, in the same field. It will not match
-`molding`, `subcontracts`, or letters scattered across unrelated words.
-SHA1s, file paths, branch names and tags accept contiguous fragments, so short
-hashes and filename suffixes still work; letters cannot have gaps. Results keep
-graph order and connect through hidden ancestors. The default search covers full
-SHA1s, full commit messages (including their bodies), author names, branch names, and tags attached
-to each commit. File paths require the `f:` prefix.
+Each space-separated term matches a contiguous fragment: `frag` matches `frag`,
+`fragment`, `defrag` and `defragment`. All terms must occur in the same field,
+in any order: `mold contracts` requires both `mold` and `contracts`, allowing
+longer words but never gaps between a term's letters. Short hashes and filename
+suffixes work the same way. Results keep graph order and connect through hidden
+ancestors. The default search covers full SHA1s, full commit messages (including
+their bodies), author names, branch names, and tags attached to each commit.
+File paths require the `f:` prefix.
 
 | Query | Search field |
 | --- | --- |
@@ -401,8 +401,9 @@ remain reusable.
 
 The [graph search report](docs/graph-search-benchmarks.md) records first indexing,
 interactive results, complete filtered graphs and startup comparisons.
-The [whole-word search report](docs/search-words-benchmarks.md) compares the stricter
-matching rules against the original scattered-letter search.
+The [partial search report](docs/search-partial-benchmarks.md) measures the current
+contiguous partial matching. The historical [whole-word search report](docs/search-words-benchmarks.md)
+compares the earlier matching rules against the original scattered-letter search.
 
 Start with the [benchmark workflow for agents](docs/benchmarking.md): baseline
 preservation, reproducible commands, regression analysis, and reporting conventions.

@@ -16,6 +16,7 @@ $queries = @{
     'author' = 'a: Junio'; 'sha' = 's: 6de20f6'; 'message' = 'm: fix typo';
     'default' = 'gitk'; 'files' = 'f: .sharpmake.cs'; 'files-common' = 'f: readme'
     'words' = 'mold contracts'
+    'partial' = 'frag'
 }
 try {
     $env:GIT_RUSTLE_TIMING='1'
