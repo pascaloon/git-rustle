@@ -128,7 +128,80 @@ fn draw_underlay(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
     draw_status(app, screen, areas.status);
 }
 
+fn draw_search(app: &App, screen: &mut Screen, area: Rect) {
+    let style = theme::text().bg(theme::BG_HEADER);
+    screen.fill(area, ' ', style);
+    let state = if let Some(r) = &app.search.result {
+        let progress = if r.done {
+            String::new()
+        } else {
+            format!(" · {}/{}", r.examined, r.total)
+        };
+        let missing = if r.unavailable == 0 {
+            String::new()
+        } else {
+            format!(" · {} unavailable", r.unavailable)
+        };
+        format!("{} matches{progress}{missing}", r.rows.len())
+    } else if app.search.busy {
+        "Searching…".into()
+    } else {
+        "a: author  m: message  s: SHA  f: file".into()
+    };
+    let tail = format!(
+        " {state}  {} ",
+        if app.search.editing {
+            "Enter apply · Esc clear"
+        } else {
+            "/ edit · Esc clear"
+        }
+    );
+    let tail_w = crate::term::screen::str_width(&tail) as u16;
+    let query_w = area.w.saturating_sub(tail_w.min(area.w / 2) + 3);
+    screen.put_str(
+        area.x,
+        area.y,
+        " / ",
+        Style::new().fg(theme::FG_KEY).bg(theme::BG_HEADER).bold(),
+        area.w,
+    );
+    let text = &app.search.text.value;
+    let cursor = app.search.text.cursor.min(text.len());
+    let mut start = 0;
+    if app.search.editing {
+        while start < cursor
+            && crate::term::screen::str_width(&text[start..cursor]) >= query_w.max(1) as usize
+        {
+            start += text[start..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    screen.put_str(area.x + 3, area.y, &text[start..], style, query_w);
+    if app.search.editing && query_w > 0 {
+        let x = area.x + 3 + crate::term::screen::str_width(&text[start..cursor]) as u16;
+        let ch = text[cursor..].chars().next().unwrap_or('▏').to_string();
+        screen.put_str(
+            x,
+            area.y,
+            &ch,
+            theme::text().bg(theme::BG_MARK),
+            2.min(query_w),
+        );
+    }
+    let x = area.x + 3 + query_w;
+    screen.put_str_ellipsis(
+        x,
+        area.y,
+        &tail,
+        theme::dim().bg(theme::BG_HEADER),
+        area.right().saturating_sub(x),
+    );
+}
+
 fn draw_header(app: &App, screen: &mut Screen, area: Rect) {
+    if app.search.editing || app.search.active() {
+        draw_search(app, screen, area);
+        return;
+    }
     let bg = theme::BG_HEADER;
     screen.fill(area, ' ', Style::new().bg(bg));
     let mut x = area.x + 1;
@@ -206,6 +279,24 @@ fn draw_splitter(app: &App, screen: &mut Screen, area: Rect) {
 
 fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
     let bg = theme::BG_HEADER;
+    if app.search.editing || app.search.active() {
+        screen.fill(area, ' ', theme::dim().bg(bg));
+        let hint = if let Some(error) = app.search.result.as_ref().and_then(|r| r.error.as_ref()) {
+            format!("Search incomplete: {error}")
+        } else if app.search.editing {
+            "Search · a: author  m: message  s: SHA  f: changed file · ↑↓ select · Enter apply · Esc clear".into()
+        } else {
+            "/ edit search  Esc clear  ↑↓ move  Enter checkout  Space mark  d diff  b branches  F5 refresh".into()
+        };
+        screen.put_str_ellipsis(
+            area.x + 1,
+            area.y,
+            &hint,
+            theme::dim().bg(bg),
+            area.w.saturating_sub(2),
+        );
+        return;
+    }
     if app.pending.selected {
         screen.fill(area, ' ', theme::dim().bg(bg));
         let hint = if app.pending.busy {
@@ -294,6 +385,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             ("q", "quit"),
         ],
         (Focus::List, _) => &[
+            ("/", "search"),
             ("Enter", "checkout"),
             ("b", "branches"),
             ("s", "settings"),

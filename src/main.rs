@@ -17,6 +17,7 @@ mod graph;
 mod model;
 mod pending;
 mod remote;
+mod search;
 mod settings;
 mod term;
 mod ui;
@@ -34,6 +35,7 @@ use model::History;
 use term::{Console, Event, Screen};
 
 enum Msg {
+    Search(search::Matches),
     Pending(u32, Result<pending::Snapshot, String>),
     Committed(Result<String, String>),
     Remote(u32, remote::Event),
@@ -500,6 +502,11 @@ fn run(
     let mut pending_checked = Instant::now();
     let mut pending_frame = false;
     let mut diff_tx: Option<Sender<DiffReq>> = None;
+    let mut search_tx: Option<Sender<search::Request>> = None;
+    let mut file_search_tx: Option<Sender<search::Request>> = None;
+    let search_latest = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut search_frame = None;
+    let mut search_results_frame = None;
     let mut remote_diff_tx: Option<Sender<DiffReq>> = None;
     let mut stats_tx: Option<Sender<StatsReq>> = None;
     let stats_latest = Arc::new(AtomicU32::new(0));
@@ -547,6 +554,8 @@ fn run(
             && app.pending.request.is_none()
             && !app.branches.busy
             && !app.settings.saving
+            && !app.search.busy
+            && !app.needs_redraw
         {
             app.quit = true;
         }
@@ -564,6 +573,7 @@ fn run(
             });
         }
         if app.quit {
+            search_latest.store(u64::MAX, Ordering::Relaxed);
             preview_cancel.store(true, Ordering::Relaxed);
             if let Some(wk) = walker.take() {
                 wk.cancel();
@@ -800,6 +810,40 @@ fn run(
         }
         // Hand new diff work to the workers.
         if let Some(r) = repo.as_ref() {
+            search_latest.store(app.search.generation, Ordering::Relaxed);
+            if app.search.wanted {
+                timing.mark(format!("search requested ({})", app.search.generation));
+            }
+            if let Some(request) = app.search_request() {
+                // A slow ghost file-list request cannot hold up metadata searches.
+                let slot = if search::Query::parse(&request.text).field == search::Field::File {
+                    &mut file_search_tx
+                } else {
+                    &mut search_tx
+                };
+                let worker = slot.get_or_insert_with(|| {
+                    let (stx, srx) = mpsc::channel::<search::Request>();
+                    let repo = r.clone();
+                    let tx = tx.clone();
+                    let latest = search_latest.clone();
+                    thread::Builder::new()
+                        .name("graph-search".into())
+                        .spawn(move || {
+                            let mut index = search::Index::default();
+                            while let Ok(mut request) = srx.recv() {
+                                while let Ok(newer) = srx.try_recv() {
+                                    request = newer;
+                                }
+                                index.run(&repo, request, &latest, no_cache, |result| {
+                                    let _ = tx.send(Msg::Search(result));
+                                });
+                            }
+                        })
+                        .expect("spawn graph search");
+                    stx
+                });
+                let _ = worker.send(request);
+            }
             app.sync_details_changes();
             let reqs = app.pending_requests();
             if !reqs.is_empty() {
@@ -872,6 +916,32 @@ fn run(
             let now = ui::time::now_unix();
             ui::draw(app, screen, &areas, now);
             screen.flush(console);
+            if let Some(result) = &app.search.result
+                && result.examined == result.total
+                && search_results_frame != Some(result.generation)
+                && matches!(app.mode, app::Mode::Graph)
+                && !app.branches.open
+            {
+                timing.mark(format!(
+                    "search results frame ({}; {} matches)",
+                    result.generation,
+                    result.rows.len()
+                ));
+                search_results_frame = Some(result.generation);
+            }
+            if let Some(result) = &app.search.result
+                && result.done
+                && search_frame != Some(result.generation)
+                && matches!(app.mode, app::Mode::Graph)
+                && !app.branches.open
+            {
+                timing.mark(format!(
+                    "search frame ({}; {} matches)",
+                    result.generation,
+                    result.rows.len()
+                ));
+                search_frame = Some(result.generation);
+            }
             let showing_pending =
                 app.pending.selected && matches!(app.mode, app::Mode::Graph) && !app.branches.open;
             if showing_pending && !pending_frame {
@@ -953,6 +1023,14 @@ fn run(
 
         for msg in pending {
             match msg {
+                Msg::Search(result) => {
+                    let done = result.done;
+                    let generation = result.generation;
+                    let count = result.rows.len();
+                    if app.install_search(result) && done {
+                        timing.mark(format!("search ready ({generation}; {count} matches)"));
+                    }
+                }
                 Msg::Pending(generation, result) => {
                     if generation == pending_generation {
                         if let Ok(snapshot) = &result {
@@ -1164,7 +1242,11 @@ fn run(
                     if k.code == term::KeyCode::Enter {
                         timing.mark("enter input");
                     }
-                    app.handle_key(k)
+                    let generation = app.search.generation;
+                    app.handle_key(k);
+                    if generation != app.search.generation {
+                        timing.mark(format!("search input ({})", app.search.generation));
+                    }
                 }
                 Msg::Input(Event::Mouse(m)) => {
                     app.handle_mouse(m, &areas, screen.width(), screen.height())

@@ -9,6 +9,10 @@ use crate::term::{Rect, Screen, Style};
 type Line = Vec<(String, Style)>;
 
 pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
+    if app.search.active() && app.graph_len() == 0 {
+        app.files_area = Rect::default();
+        return;
+    }
     if app.pending.selected {
         super::pending::draw(app, screen, area);
         return;

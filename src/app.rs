@@ -51,6 +51,7 @@ pub struct Label {
 }
 
 pub struct App {
+    pub search: crate::search::Search,
     pub pending: crate::pending::Pending,
     pub local_history: Option<std::sync::Arc<History>>,
     pub ghosts: HashMap<ObjectId, CommitDetails>,
@@ -108,6 +109,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         App {
+            search: crate::search::Search::default(),
             pending: crate::pending::Pending::default(),
             local_history: None,
             ghosts: HashMap::new(),
@@ -152,16 +154,88 @@ impl App {
     }
 
     pub fn selected_id(&self) -> Option<ObjectId> {
-        if self.pending.selected {
+        if self.pending.selected || (self.search.active() && self.graph_len() == 0) {
             return None;
         }
         self.history.commits.get(self.selected).map(|c| c.id)
     }
 
+    pub fn clear_search(&mut self) {
+        self.search.text.value.clear();
+        self.search.text.cursor = 0;
+        self.search.editing = false;
+        self.search.changed();
+        self.ensure_visible();
+        self.needs_redraw = true;
+    }
+
+    pub fn search_request(&mut self) -> Option<crate::search::Request> {
+        if !self.search.wanted {
+            return None;
+        }
+        self.search.wanted = false;
+        if self.pending.selected {
+            self.remember_pending_checks();
+            self.pending.selected = false;
+        }
+        let input = self.search.input.get_or_insert_with(|| {
+            std::sync::Arc::new(crate::search::Input {
+                history: self.history.clone(),
+                labels: self
+                    .labels
+                    .iter()
+                    .map(|(id, labels)| (*id, labels.iter().map(|l| l.name.clone()).collect()))
+                    .collect(),
+                ghosts: self.ghosts.clone(),
+                sources: self.ghost_sources.clone(),
+            })
+        });
+        Some(crate::search::Request {
+            generation: self.search.generation,
+            text: self.search.text.value.clone(),
+            input: input.clone(),
+        })
+    }
+
+    pub fn install_search(&mut self, result: crate::search::Matches) -> bool {
+        if result.generation != self.search.generation || !self.search.active() {
+            return false;
+        }
+        let first = self.search.result.is_none();
+        self.search.busy = !result.done;
+        let keep = result
+            .positions
+            .get(self.selected)
+            .is_some_and(|&p| p != usize::MAX);
+        self.search.result = Some(result);
+        if !keep {
+            self.select_graph(0);
+        }
+        self.clamp();
+        if first {
+            self.ensure_visible();
+        }
+        self.needs_redraw = true;
+        true
+    }
+
     pub fn graph_len(&self) -> usize {
+        if self.search.active() {
+            return self.search.result.as_ref().map_or(0, |r| r.rows.len());
+        }
         self.history.len() + usize::from(self.pending.exists())
     }
     pub fn graph_selected(&self) -> usize {
+        if self.search.active() {
+            return self
+                .search
+                .result
+                .as_ref()
+                .and_then(|r| r.positions.get(self.selected))
+                .copied()
+                .filter(|&p| p != usize::MAX)
+                .unwrap_or(0);
+        }
         if self.pending.selected {
             self.pending.row()
         } else {
@@ -170,6 +244,9 @@ impl App {
         }
     }
     pub fn history_index(&self, row: usize) -> Option<usize> {
+        if self.search.active() {
+            return self.search.result.as_ref()?.rows.get(row).copied();
+        }
         if !self.pending.exists() {
             Some(row)
         } else if row == self.pending.row() {
@@ -179,6 +256,9 @@ impl App {
         }
     }
     pub fn select_graph(&mut self, row: usize) {
+        if self.graph_len() == 0 {
+            return;
+        }
         let row = row.min(self.graph_len().saturating_sub(1));
         if let Some(index) = self.history_index(row) {
             self.select(index);
@@ -439,6 +519,9 @@ impl App {
 
     /// Tree/file diff work to hand to the worker.
     pub fn pending_requests(&mut self) -> Vec<DiffReq> {
+        if matches!(self.mode, Mode::Graph) && self.search.active() && self.graph_len() == 0 {
+            return Vec::new();
+        }
         match &mut self.mode {
             Mode::Diff(view) => view.pending(),
             Mode::Graph => match self.details_changes.as_mut() {
@@ -460,6 +543,9 @@ impl App {
 
     /// The change set currently on screen (view or details panel).
     pub fn active_changes_mut(&mut self) -> Option<&mut ChangeSet> {
+        if matches!(self.mode, Mode::Graph) && self.search.active() && self.graph_len() == 0 {
+            return None;
+        }
         match &mut self.mode {
             Mode::Diff(view) => Some(&mut view.changes),
             Mode::Graph => self.details_changes.as_mut(),
@@ -663,6 +749,7 @@ impl App {
     }
 
     pub fn remote_labels(&mut self) {
+        self.search.invalidate();
         // API metadata adds labels only. It never changes the local walk tips or cache.
         for (name, update) in &self.branches.remotes {
             let prefix = format!("{name}/");
@@ -702,7 +789,9 @@ impl App {
 
     pub fn install_preview(&mut self, preview: crate::remote::history::Preview) {
         let startup_pending = self.startup_head_search.is_some();
-        let keep = self.selected_id();
+        let keep = (!self.pending.selected)
+            .then(|| self.history.commits.get(self.selected).map(|c| c.id))
+            .flatten();
         let offset = self.graph_selected().saturating_sub(self.scroll);
         let was_top = self.scroll == 0;
         if let Some(history) = preview.history {
@@ -748,6 +837,7 @@ impl App {
     pub fn finish_branch_jump(&mut self) {
         if let Some(id) = self.branches.pending_jump.take() {
             if let Some(index) = self.history.index_of(&id) {
+                self.clear_search();
                 self.mode = Mode::Graph;
                 self.focus = Focus::List;
                 self.select(index);
@@ -762,6 +852,7 @@ impl App {
 
     /// Install a history read from the cache.
     pub fn set_cached(&mut self, history: History, fresh: bool) {
+        self.search.invalidate();
         self.local_history = None;
         self.ghosts.clear();
         self.ghost_sources.clear();
@@ -796,8 +887,11 @@ impl App {
                     .get_or_insert_with(History::default)
                     .append(batch);
                 if complete {
+                    self.search.invalidate();
                     let fresh = self.incoming.take().unwrap_or_default();
-                    let keep = self.selected_id();
+                    let keep = (!self.pending.selected)
+                        .then(|| self.history.commits.get(self.selected).map(|c| c.id))
+                        .flatten();
                     self.history = fresh;
                     if let Some(id) = keep
                         && let Some(i) = self.history.index_of(&id)
@@ -811,6 +905,7 @@ impl App {
                 }
             }
             _ => {
+                self.search.invalidate();
                 self.history.append(batch);
                 self.load = if complete {
                     LoadState::Complete
@@ -847,7 +942,9 @@ impl App {
     fn clamp(&mut self) {
         let n = self.graph_len();
         if n == 0 {
-            self.selected = 0;
+            // An empty filter must not erase the underlying selection. It is
+            // also temporarily empty while refreshing the same query.
+            self.selected = self.selected.min(self.history.len().saturating_sub(1));
             self.scroll = 0;
             return;
         }
@@ -985,6 +1082,38 @@ impl App {
         }
         if self.settings.open {
             self.settings.handle_key(key);
+            self.needs_redraw = true;
+            return;
+        }
+        if !self.branches.open && matches!(self.mode, Mode::Graph) && self.search.editing {
+            match key.code {
+                KeyCode::Esc => self.clear_search(),
+                KeyCode::F(5) => {
+                    self.want_refresh = true;
+                    self.pending.want_refresh = true;
+                    self.branches.want_refresh = Some(true);
+                }
+                KeyCode::Char('c') if key.ctrl => self.quit = true,
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.search.editing = false;
+                    self.focus = Focus::List;
+                }
+                KeyCode::Up => self.move_selection(-1),
+                KeyCode::Down => self.move_selection(1),
+                KeyCode::PageUp => self.move_selection(-(self.list_rows.max(1) as isize)),
+                KeyCode::PageDown => self.move_selection(self.list_rows.max(1) as isize),
+                _ => {
+                    let before = self.search.text.value.clone();
+                    self.search.text.edit(key, false);
+                    if self.search.text.value != before {
+                        self.search.changed();
+                        self.scroll = 0;
+                        if !self.search.active() {
+                            self.ensure_visible();
+                        }
+                    }
+                }
+            }
             self.needs_redraw = true;
             return;
         }
@@ -1134,6 +1263,11 @@ impl App {
         }
         let page = self.list_rows.saturating_sub(1).max(1) as isize;
         match (key.code, key.ctrl) {
+            (KeyCode::Char('/'), false) => {
+                self.search.editing = true;
+                self.focus = Focus::List;
+                self.needs_redraw = true;
+            }
             (KeyCode::Char('b'), false) => {
                 self.branches.show(self.refs.as_ref());
                 self.want_refresh = true;
@@ -1148,7 +1282,9 @@ impl App {
                 }
             }
             (KeyCode::Esc, _) => {
-                if self.branches.busy {
+                if self.search.active() {
+                    self.clear_search();
+                } else if self.branches.busy {
                     self.branches.open = true;
                     self.needs_redraw = true;
                 } else if self.marks.is_empty() {
@@ -1241,6 +1377,15 @@ impl App {
                 if let Some(h) = self.head_id()
                     && let Some(i) = self.history.index_of(&h)
                 {
+                    if self.search.active()
+                        && !self
+                            .search
+                            .result
+                            .as_ref()
+                            .is_some_and(|r| r.positions.get(i).is_some_and(|&p| p != usize::MAX))
+                    {
+                        self.clear_search();
+                    }
                     self.select(i);
                 }
             }
@@ -1307,6 +1452,12 @@ impl App {
             view.handle_mouse(m, &da);
             self.needs_redraw |= view.needs_redraw;
             return;
+        }
+        if matches!(m.kind, MouseKind::Down(Button::Left))
+            && (self.search.editing || self.search.active())
+        {
+            self.search.editing = areas.header.contains(m.x, m.y);
+            self.needs_redraw = true;
         }
         if self.pending.selected
             && areas.details.contains(m.x, m.y)

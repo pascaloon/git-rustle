@@ -47,7 +47,7 @@ performance; performance changes still require comparable Windows benchmarks.
 git-rustle [OPTIONS] [PATH]
 
   PATH          Repository (or any directory inside it); defaults to the cwd
-  --no-cache    Ignore and do not write disk caches (graph and remote branches)
+  --no-cache    Ignore and do not write disk caches (graph, search, remote branches)
   -h, --help
   -V, --version
 ```
@@ -60,6 +60,7 @@ git-rustle [OPTIONS] [PATH]
 | `PgUp` / `PgDn` | Page |
 | `Home` / `End`, `g` / `G` | First / last commit |
 | `H` | Jump to `HEAD` |
+| `/` | Search the graph; `Enter` keeps the filter, `Esc` clears it |
 | `b` | Browse, filter, and check out local or remote branches |
 | `Enter` | Confirm checkout of the selected graph branch or commit |
 | `Tab`, `→` / `←`, `l` / `h` | Switch focus between graph and details |
@@ -69,13 +70,45 @@ git-rustle [OPTIONS] [PATH]
 | `Del` | Clear marks |
 | `F5` | Reload local refs, revalidate remote branches, and refresh the graph |
 | `q`, `Ctrl+C` | Quit |
-| `Esc` | Clear marks, or quit when none are set |
+| `Esc` | Clear search, then marks, or quit when neither is active |
 
 On launch, the graph selects **Pending changes** when the working tree is dirty,
 otherwise HEAD, and scrolls the selection into view. The checked-out
 commit has a green `HEAD` badge before its branch labels, including when HEAD
 is detached. Early keyboard or mouse navigation keeps your selection while
 history continues loading.
+
+### Graph search
+
+Press `/` and type to filter commits immediately. Search is case-insensitive.
+Messages and author names require complete words: `mold contracts` must find both
+`mold` and `contracts`, in any order, in the same field. It will not match
+`molding`, `subcontracts`, or letters scattered across unrelated words.
+SHA1s, file paths, branch names and tags accept contiguous fragments, so short
+hashes and filename suffixes still work; letters cannot have gaps. Results keep
+graph order and connect through hidden ancestors. The default search covers full
+SHA1s, full commit messages (including their bodies), author names, branch names, and tags attached
+to each commit. File paths require the `f:` prefix.
+
+| Query | Search field |
+| --- | --- |
+| `f: .sharpmake.cs` | Changed file paths |
+| `a: Bob` | Author name |
+| `m: Bump thingy` | Full commit message |
+| `s: dd4d723` | SHA1 |
+
+Use arrows or Page Up/Down to navigate while typing. `Enter` leaves the filter
+applied so normal marking, diffs and checkout work on the results; `/` edits it
+again. `Esc` clears the filter without quitting. Jumping to a branch from the
+branches view clears the filter; `H` clears it if needed to reveal HEAD.
+
+Messages and file paths are indexed lazily on a background worker and reused
+across searches and launches. The first file search streams results and shows
+its progress while it builds the index. Paths are changes against the first
+parent (all files for a root commit); renames match both names. Ghost commits use
+their API file lists, so their first file search also depends on network speed.
+Missing objects or API errors are reported as incomplete results. `--no-cache`
+disables persistent search indexes as well as the other caches.
 
 ### Pending changes and commits
 
@@ -365,6 +398,11 @@ providers still expose local tracking refs and support Git-based checkout.
 remain reusable.
 
 ### Performance benchmarks
+
+The [graph search report](docs/graph-search-benchmarks.md) records first indexing,
+interactive results, complete filtered graphs and startup comparisons.
+The [whole-word search report](docs/search-words-benchmarks.md) compares the stricter
+matching rules against the original scattered-letter search.
 
 Start with the [benchmark workflow for agents](docs/benchmarking.md): baseline
 preservation, reproducible commands, regression analysis, and reporting conventions.

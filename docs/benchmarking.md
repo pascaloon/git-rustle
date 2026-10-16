@@ -428,6 +428,42 @@ These tiny-worktree results do not establish large-worktree or remote fetch
 latency. Keep the native logs, screen dumps, raw JSON, and source/executable hashes
 with the report; compare native startup separately when shared input/state changes.
 
+## Graph search measurements
+
+After preserving a baseline and completing release validation/builds, run startup
+comparisons as above, then the search measurements sequentially:
+
+```powershell
+$env:GIT_RUSTLE_BENCH_REPO = $benchRepo
+cargo test --release search::tests::benchmark_search -- --ignored --exact --nocapture |
+  Tee-Object -FilePath (Join-Path $benchRun 'search-components.txt')
+.\scripts\benchmark-search-fixture.ps1 -Repository $benchRepo `
+  -OutputDirectory (Join-Path $benchRun 'search-fixture')
+.\scripts\benchmark-search.ps1 `
+  -Repository (Join-Path $benchRun 'search-fixture/repository') -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'search-native')
+```
+
+The component harness reports one initial sample followed by 15 repeated samples
+for each field, including matching time and time through complete graph layout.
+The initial message/file samples build their in-memory indexes without disk cache
+I/O; these one-off samples are not p95 estimates. Paths are shared across commits.
+The disposable native fixture has identical refs and shared read-only objects;
+its local origin avoids live remote discovery changing the measured graph.
+
+The native harness types each query at 40 ms intervals, then presses Enter. It
+records final-keystroke-to-interactive-results-frame and final-keystroke-to-complete-
+graph-frame separately, plus the entire first-keystroke-to-final-frame interval
+(which includes typing). Each operation has one warm-up plus 15 measured launches.
+Persistent search caches are enabled. Keep the warm-up logs: the first file search
+on a previously unindexed repository can take much longer than subsequent queries.
+Autoquit waits for search completion. Inspect dumps for the query, result count,
+filtered commit rows and selected details, including an empty-result case.
+
+Do not describe match availability as complete graph latency or use warm queries
+to characterize first-time indexing. Provider/API file-list latency requires a
+separate fixture or explicitly identified live measurement.
+
 ## Worked decision log: connection dimming
 
 The [connection-dimming report](connection-dimming-benchmarks.md) records this

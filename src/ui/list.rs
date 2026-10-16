@@ -24,7 +24,13 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         app.scroll = max_scroll;
     }
     if n == 0 {
-        let msg = if app.is_walking() {
+        let msg = if app.search.active() {
+            if app.search.busy {
+                "Searching…"
+            } else {
+                "No matching commits"
+            }
+        } else if app.is_walking() {
             "Reading history…"
         } else {
             "No commits"
@@ -48,6 +54,15 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
     let widest = visible
         .clone()
         .filter_map(|i| {
+            if app.search.active() {
+                return app
+                    .search
+                    .result
+                    .as_ref()?
+                    .graph
+                    .get(i)
+                    .map(|(cells, ..)| cells.len() as u16);
+            }
             app.history_index(i)
                 .or(app.pending.head_index)
                 .and_then(|i| app.history.commits.get(i))
@@ -88,6 +103,7 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             draw_pending(app, screen, area.x, y, graph_w + gap, area.w, bg);
             continue;
         };
+        let graph_row = i;
         let i = index;
         let rec = app.history.commits[i];
         let ghost = app.ghosts.contains_key(&rec.id);
@@ -95,14 +111,51 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
 
         // Graph.
         let is_head = head.is_some_and(|h| h == rec.id);
+        let filtered = app
+            .search
+            .result
+            .as_ref()
+            .filter(|_| app.search.active())
+            .and_then(|r| r.graph.get(graph_row));
+        const SEARCH_NODE: [crate::graph::layout::GraphCell; 1] =
+            [crate::graph::layout::GraphCell::new(
+                crate::graph::layout::CellKind::Node,
+                0,
+            )];
         render_row(
             screen,
             x,
             y,
-            app.history.row_cells(i),
-            rec.node_lane,
+            filtered.map_or_else(
+                || {
+                    if app.search.active() {
+                        &SEARCH_NODE[..]
+                    } else {
+                        app.history.row_cells(i)
+                    }
+                },
+                |(cells, ..)| cells.as_slice(),
+            ),
+            filtered.map_or(
+                if app.search.active() {
+                    0
+                } else {
+                    rec.node_lane
+                },
+                |(_, lane, _)| *lane,
+            ),
             is_head,
-            app.history.remote_cells.get(rec.row.range()).unwrap_or(&[]),
+            if let Some((_, _, flags)) = filtered {
+                flags
+            } else if app.search.active() {
+                if ghost {
+                    &[crate::graph::dimming::GLYPH]
+                } else {
+                    &[]
+                }
+            } else {
+                app.history.remote_cells.get(rec.row.range()).unwrap_or(&[])
+            },
             bg,
             graph_w,
         );

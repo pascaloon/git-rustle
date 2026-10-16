@@ -83,6 +83,30 @@ pub fn tree_diff(
     old: Option<&ObjectId>,
     new: &ObjectId,
 ) -> Result<TreeDiff> {
+    let mut files = raw_tree_diff(repo, old, new)?;
+    pair_renames(&mut files);
+    files.sort_by(|a, b| display_order(&a.path, &b.path));
+    Ok(TreeDiff { files })
+}
+
+/// Path-only indexing avoids rename pairing and presentation sorting. Renames
+/// naturally contribute both the deleted and added name.
+pub fn changed_paths(
+    repo: &gix::Repository,
+    old: Option<&ObjectId>,
+    new: &ObjectId,
+) -> Result<Vec<String>> {
+    Ok(raw_tree_diff(repo, old, new)?
+        .into_iter()
+        .map(|f| f.path)
+        .collect())
+}
+
+fn raw_tree_diff(
+    repo: &gix::Repository,
+    old: Option<&ObjectId>,
+    new: &ObjectId,
+) -> Result<Vec<FileChange>> {
     let mut buf = Vec::new();
     let old_tree = old.map(|id| tree_of(repo, id, &mut buf)).transpose()?;
     let new_tree = tree_of(repo, new, &mut buf)?;
@@ -98,9 +122,7 @@ pub fn tree_diff(
             &mut buf,
         )?;
     }
-    pair_renames(&mut files);
-    files.sort_by(|a, b| display_order(&a.path, &b.path));
-    Ok(TreeDiff { files })
+    Ok(files)
 }
 
 /// Sidebar order: at each level folders before files, names case-insensitively.
