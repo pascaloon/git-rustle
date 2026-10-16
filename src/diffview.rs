@@ -23,6 +23,7 @@ pub enum DiffReq {
         key: u32,
         old: Option<ObjectId>,
         new: ObjectId,
+        remote: Option<crate::remote::Remote>,
     },
     File {
         view: u32,
@@ -64,7 +65,12 @@ pub struct DiffView {
 impl DiffView {
     /// Open a view over `changes`, which may already be loaded (handed over
     /// from the details panel together with its cursor).
-    pub fn new(id: u32, changes: ChangeSet, cursor: Option<TreeCursor>, sidebar_width: u16) -> Self {
+    pub fn new(
+        id: u32,
+        changes: ChangeSet,
+        cursor: Option<TreeCursor>,
+        sidebar_width: u16,
+    ) -> Self {
         let mut v = DiffView {
             id,
             changes,
@@ -103,6 +109,7 @@ impl DiffView {
                 key: self.changes.key,
                 old: self.changes.old,
                 new: self.changes.new,
+                remote: None,
             });
         }
         if let Some(cur) = self.current
@@ -325,7 +332,9 @@ impl DiffView {
                 }
             }
             MouseKind::Up(Button::Left) => self.dragging_splitter = false,
-            MouseKind::Wheel(delta) if m.shift => self.hscroll_by(-(delta as isize) * HSTEP as isize),
+            MouseKind::Wheel(delta) if m.shift => {
+                self.hscroll_by(-(delta as isize) * HSTEP as isize)
+            }
             MouseKind::HWheel(delta) => self.hscroll_by(delta as isize * HSTEP as isize),
             MouseKind::Wheel(delta) => {
                 let lines = -(delta as isize) * 3;
@@ -353,6 +362,7 @@ mod tests {
 
     fn change(path: &str) -> FileChange {
         FileChange {
+            remote: None,
             path: path.to_string(),
             old_path: None,
             kind: ChangeKind::Modified,
@@ -389,8 +399,18 @@ mod tests {
         assert_eq!(v.cursor.sel, 1);
         assert_eq!(v.current, Some(0));
         let reqs = v.pending();
-        assert!(matches!(reqs.as_slice(), [DiffReq::File { file: 0, seq: 1, .. }]));
-        assert!(v.pending().is_empty(), "no duplicate request while in flight");
+        assert!(matches!(
+            reqs.as_slice(),
+            [DiffReq::File {
+                file: 0,
+                seq: 1,
+                ..
+            }]
+        ));
+        assert!(
+            v.pending().is_empty(),
+            "no duplicate request while in flight"
+        );
         v.set_file_diff(1, 0, Ok(FileDiff::message("x".into())));
         assert_eq!(v.diff_for, Some(0));
         assert!(v.pending().is_empty());
@@ -403,7 +423,14 @@ mod tests {
         v.handle_key(key(KeyCode::Char('n'))); // b.rs
         assert_eq!(v.current, Some(1));
         let reqs = v.pending();
-        assert!(matches!(reqs.as_slice(), [DiffReq::File { file: 1, seq: 2, .. }]));
+        assert!(matches!(
+            reqs.as_slice(),
+            [DiffReq::File {
+                file: 1,
+                seq: 2,
+                ..
+            }]
+        ));
         v.set_file_diff(1, 0, Ok(FileDiff::message("old".into())));
         assert!(v.diff.is_none());
         v.set_file_diff(2, 1, Ok(FileDiff::message("new".into())));
@@ -425,7 +452,10 @@ mod tests {
         let mut v = DiffView::new(2, cs, Some(cursor), 30);
         assert_eq!(v.current, Some(2), "top.rs under the cursor");
         let reqs = v.pending();
-        assert!(matches!(reqs.as_slice(), [DiffReq::File { file: 2, .. }]), "no tree request");
+        assert!(
+            matches!(reqs.as_slice(), [DiffReq::File { file: 2, .. }]),
+            "no tree request"
+        );
     }
 
     #[test]

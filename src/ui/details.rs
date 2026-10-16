@@ -22,7 +22,11 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         }
         _ => 0,
     };
-    let files_h = if area.h < 8 { 0 } else { files_h.min(area.h - 4) };
+    let files_h = if area.h < 8 {
+        0
+    } else {
+        files_h.min(area.h - 4)
+    };
     let area = if files_h > 0 {
         let files = Rect::new(area.x, area.bottom() - files_h, area.w, files_h);
         draw_files(app, screen, files);
@@ -38,7 +42,12 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
     if app.details_scroll > max_scroll {
         app.details_scroll = max_scroll;
     }
-    for (row, line) in lines.iter().skip(app.details_scroll).take(inner.h as usize).enumerate() {
+    for (row, line) in lines
+        .iter()
+        .skip(app.details_scroll)
+        .take(inner.h as usize)
+        .enumerate()
+    {
         let y = inner.y + row as u16;
         let mut x = inner.x;
         for (text, style) in line {
@@ -59,21 +68,44 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         };
         for r in 0..track_h {
             let ch = if r == thumb_pos { '█' } else { '░' };
-            screen.put_char(area.right() - 1, inner.y + r as u16, ch, Style::new().fg(color));
+            screen.put_char(
+                area.right() - 1,
+                inner.y + r as u16,
+                ch,
+                Style::new().fg(color),
+            );
         }
     }
 }
 
 /// Header row ("Files N  +a −r") followed by the changed-files tree.
 fn draw_files(app: &mut App, screen: &mut Screen, area: Rect) {
-    let Some(cs) = app.details_changes.as_ref() else { return };
+    let Some(cs) = app.details_changes.as_ref() else {
+        return;
+    };
     let bg = theme::BG_SELECTED_INACTIVE;
-    screen.fill(Rect::new(area.x, area.y, area.w, 1), ' ', Style::new().bg(bg));
+    screen.fill(
+        Rect::new(area.x, area.y, area.w, 1),
+        ' ',
+        Style::new().bg(bg),
+    );
     let mut x = area.x + 1;
-    x += screen.put_str(x, area.y, "Files", Style::new().fg(theme::FG_TEXT).bg(bg).bold(), area.w);
+    x += screen.put_str(
+        x,
+        area.y,
+        "Files",
+        Style::new().fg(theme::FG_TEXT).bg(bg).bold(),
+        area.w,
+    );
     if cs.loaded {
         let n = cs.files.len();
-        x += screen.put_str(x, area.y, &format!(" {n}"), Style::new().fg(theme::FG_DIM).bg(bg), area.w);
+        x += screen.put_str(
+            x,
+            area.y,
+            &format!(" {n}"),
+            Style::new().fg(theme::FG_DIM).bg(bg),
+            area.w,
+        );
         let (a, r) = cs.total();
         if a + r > 0 {
             let add = format!("+{a}");
@@ -83,8 +115,20 @@ fn draw_files(app: &mut App, screen: &mut Screen, area: Rect) {
             if x + w + 2 < area.right() {
                 let mut sx = area.right() - w - 1;
                 sx += screen.put_str(sx, area.y, &add, Style::new().fg(theme::FG_ADDED).bg(bg), w);
-                sx += screen.put_str(sx, area.y, &rem, Style::new().fg(theme::FG_REMOVED).bg(bg), w);
-                screen.put_str(sx, area.y, pending, Style::new().fg(theme::FG_DIM).bg(bg), w);
+                sx += screen.put_str(
+                    sx,
+                    area.y,
+                    &rem,
+                    Style::new().fg(theme::FG_REMOVED).bg(bg),
+                    w,
+                );
+                screen.put_str(
+                    sx,
+                    area.y,
+                    pending,
+                    Style::new().fg(theme::FG_DIM).bg(bg),
+                    w,
+                );
             }
         }
     }
@@ -107,6 +151,15 @@ fn build_lines(app: &App, width: usize, now: i64) -> Vec<Line> {
         lines.push(vec![("No commit selected".into(), theme::dim())]);
         return lines;
     };
+    if app.ghosts.contains_key(&id) {
+        for line in wrap(
+            "Remote commit. Files and diffs load on demand and are cached.",
+            width,
+        ) {
+            lines.push(vec![(line, theme::dim())]);
+        }
+        lines.push(Vec::new());
+    }
     let label_style_key = Style::new().fg(theme::FG_DIM);
     let value = theme::text();
 
@@ -114,7 +167,10 @@ fn build_lines(app: &App, width: usize, now: i64) -> Vec<Line> {
     for l in wrap(&subject, width) {
         lines.push(vec![(l, theme::text().bold())]);
     }
-    lines.push(vec![("─".repeat(width), Style::new().fg(theme::FG_SPLITTER))]);
+    lines.push(vec![(
+        "─".repeat(width),
+        Style::new().fg(theme::FG_SPLITTER),
+    )]);
 
     let key = |s: &str| -> (String, Style) { (format!("{s:<9} "), label_style_key) };
 
@@ -172,7 +228,10 @@ fn build_lines(app: &App, width: usize, now: i64) -> Vec<Line> {
             let rec = app.history.commits[app.selected];
             lines.push(vec![
                 key("Date"),
-                (time::format_absolute(rec.author_time, rec.author_offset), value),
+                (
+                    time::format_absolute(rec.author_time, rec.author_offset),
+                    value,
+                ),
             ]);
             let parents = app.history.parents(app.selected);
             if !parents.is_empty() {
@@ -197,11 +256,17 @@ fn build_lines(app: &App, width: usize, now: i64) -> Vec<Line> {
             if i > 0 {
                 line.push((", ".into(), theme::dim()));
             }
-            line.push((l.name.clone(), label_style(l.kind, crate::term::Color::Default)));
+            line.push((
+                l.name.clone(),
+                label_style(l.kind, crate::term::Color::Default),
+            ));
         }
         lines.push(line);
     }
-    lines.push(vec![key("SHA"), (id.to_string(), Style::new().fg(theme::FG_HASH))]);
+    lines.push(vec![
+        key("SHA"),
+        (id.to_string(), Style::new().fg(theme::FG_HASH)),
+    ]);
     lines.push(Vec::new());
 
     if let Some(d) = app.details.as_ref().filter(|d| d.id == id) {

@@ -174,7 +174,9 @@ impl FileTree {
         if forward {
             (from + 1..self.visible.len()).find(|&i| !self.nodes[self.visible[i].node].is_folder())
         } else {
-            (0..from).rev().find(|&i| !self.nodes[self.visible[i].node].is_folder())
+            (0..from)
+                .rev()
+                .find(|&i| !self.nodes[self.visible[i].node].is_folder())
         }
     }
 }
@@ -240,13 +242,18 @@ impl TreeCursor {
 
     /// Select the first file in display order.
     pub fn first_file(&mut self, tree: &FileTree) -> Option<usize> {
-        let row = tree.visible.iter().position(|v| !tree.nodes[v.node].is_folder())?;
+        let row = tree
+            .visible
+            .iter()
+            .position(|v| !tree.nodes[v.node].is_folder())?;
         self.select(tree, row)
     }
 
     /// Toggle the selected folder; returns `false` if the selection is a file.
     pub fn toggle(&mut self, tree: &mut FileTree) -> bool {
-        let Some(node) = self.node(tree) else { return false };
+        let Some(node) = self.node(tree) else {
+            return false;
+        };
         if !tree.nodes[node].is_folder() {
             return false;
         }
@@ -272,7 +279,9 @@ impl TreeCursor {
     /// Right: expand a collapsed folder or step into an expanded one.
     /// Returns `true` if the selection is a file (nothing to expand).
     pub fn right(&mut self, tree: &mut FileTree) -> bool {
-        let Some(node) = self.node(tree) else { return false };
+        let Some(node) = self.node(tree) else {
+            return false;
+        };
         if !tree.nodes[node].is_folder() {
             return true;
         }
@@ -314,6 +323,7 @@ mod tests {
 
     fn change(path: &str, kind: ChangeKind) -> FileChange {
         FileChange {
+            remote: None,
             path: path.to_string(),
             old_path: None,
             kind,
@@ -341,7 +351,15 @@ mod tests {
         let t = FileTree::build(&files);
         assert_eq!(
             names(&t),
-            vec!["docs/a/b", " c.txt", "src/ui", " list.rs", " mod.rs", "Cargo.toml", "README.md"]
+            vec![
+                "docs/a/b",
+                " c.txt",
+                "src/ui",
+                " list.rs",
+                " mod.rs",
+                "Cargo.toml",
+                "README.md"
+            ]
         );
     }
 

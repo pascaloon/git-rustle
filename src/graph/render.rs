@@ -1,5 +1,6 @@
 //! Turn [`GraphCell`]s into glyphs and colours on the screen.
 
+use super::dimming::{CONNECTOR, GLYPH};
 use super::layout::{CellKind, GraphCell};
 use crate::term::{Color, Screen, Style};
 
@@ -77,6 +78,7 @@ pub fn render_row(
     cells: &[GraphCell],
     node_lane: u16,
     is_head: bool,
+    dimming: &[u8],
     bg: Color,
     max_width: u16,
 ) {
@@ -88,17 +90,31 @@ pub fn render_row(
         }
         let kind = cell.kind();
         let color = lane_color(cell.color());
+        let flags = dimming.get(i).copied().unwrap_or(0);
+        let color = if flags & GLYPH != 0 {
+            color.dimmed()
+        } else {
+            color
+        };
         let mut style = Style::new().fg(color).bg(bg);
         if matches!(kind, CellKind::Node | CellKind::MergeNode) {
             style = style.bold();
         }
-        screen.put_char(cx, y, glyph(kind, is_head && i == node_lane as usize), style);
+        let ch = glyph(kind, is_head && i == node_lane as usize);
+        screen.put_char(cx, y, ch, style);
         cx += 1;
         if cx >= end {
             break;
         }
         let (conn, conn_color) = match cells.get(i + 1) {
-            Some(next) if continues_left(next.kind()) => ('─', lane_color(next.color())),
+            Some(next) if continues_left(next.kind()) => (
+                '─',
+                if flags & CONNECTOR != 0 {
+                    lane_color(next.color()).dimmed()
+                } else {
+                    lane_color(next.color())
+                },
+            ),
             _ => (' ', color),
         };
         screen.put_char(cx, y, conn, Style::new().fg(conn_color).bg(bg));

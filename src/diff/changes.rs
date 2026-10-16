@@ -84,7 +84,9 @@ impl ChangeSet {
         // Files first, then propagate to ancestors.
         for (i, n) in self.tree.nodes.iter().enumerate() {
             let Some(file) = n.file else { continue };
-            let Some(Some(Stat::Lines { added, removed })) = self.stats.get(file) else { continue };
+            let Some(Some(Stat::Lines { added, removed })) = self.stats.get(file) else {
+                continue;
+            };
             let mut cur = Some(i);
             while let Some(c) = cur {
                 let t = &mut self.totals[c];
@@ -104,11 +106,7 @@ impl ChangeSet {
                 Some(Stat::Lines { added, removed }) => Some((added, removed)),
                 _ => None,
             },
-            None => self
-                .totals
-                .get(node)
-                .filter(|t| t.2)
-                .map(|t| (t.0, t.1)),
+            None => self.totals.get(node).filter(|t| t.2).map(|t| (t.0, t.1)),
         }
     }
 
@@ -132,6 +130,7 @@ mod tests {
     #[test]
     fn totals_roll_up_to_folders() {
         let change = |p: &str| FileChange {
+            remote: None,
             path: p.to_string(),
             old_path: None,
             kind: ChangeKind::Modified,
@@ -143,18 +142,39 @@ mod tests {
             files: vec![change("src/a.rs"), change("src/b.rs"), change("img.png")],
         }));
         assert!(cs.wants_stats());
-        cs.apply_stats(&[(0, Stat::Lines { added: 5, removed: 1 }), (2, Stat::Opaque)]);
+        cs.apply_stats(&[
+            (
+                0,
+                Stat::Lines {
+                    added: 5,
+                    removed: 1,
+                },
+            ),
+            (2, Stat::Opaque),
+        ]);
         assert_eq!(cs.stats_pending, 1);
         let src = cs.tree.visible[0].node;
         assert_eq!(cs.node_total(src), Some((5, 1)));
-        cs.apply_stats(&[(1, Stat::Lines { added: 2, removed: 2 })]);
+        cs.apply_stats(&[(
+            1,
+            Stat::Lines {
+                added: 2,
+                removed: 2,
+            },
+        )]);
         assert_eq!(cs.node_total(src), Some((7, 3)));
         assert_eq!(cs.total(), (7, 3));
         let img = cs.tree.visible[3].node;
         assert_eq!(cs.node_total(img), None, "binary has no counts");
         assert!(!cs.wants_stats());
         // Duplicate delivery is ignored.
-        cs.apply_stats(&[(1, Stat::Lines { added: 9, removed: 9 })]);
+        cs.apply_stats(&[(
+            1,
+            Stat::Lines {
+                added: 9,
+                removed: 9,
+            },
+        )]);
         assert_eq!(cs.total(), (7, 3));
     }
 }

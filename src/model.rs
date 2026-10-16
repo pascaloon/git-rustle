@@ -46,6 +46,9 @@ pub struct History {
     pub parents: Vec<ObjectId>,
     pub text: Vec<u8>,
     pub cells: Vec<GraphCell>,
+    /// Derived remote edge styles, parallel to `cells`; empty for local history.
+    /// Rebuilt on the preview worker rather than serialized in the graph cache.
+    pub remote_cells: Vec<u8>,
     pub max_lanes: u16,
     pub complete: bool,
 }

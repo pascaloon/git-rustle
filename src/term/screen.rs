@@ -18,6 +18,12 @@ pub enum Color {
 }
 
 impl Color {
+    pub const fn dimmed(self) -> Self {
+        match self {
+            Self::Rgb(r, g, b) => Self::Rgb(r / 2, g / 2, b / 2),
+            Self::Default => Self::Default,
+        }
+    }
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Color::Rgb(r, g, b)
     }
@@ -110,6 +116,11 @@ pub struct Screen {
 }
 
 impl Screen {
+    #[cfg(test)]
+    pub fn test_cells(&self) -> &[Cell] {
+        &self.cur
+    }
+
     pub fn new(w: u16, h: u16) -> Self {
         let n = w as usize * h as usize;
         Screen {
@@ -356,7 +367,11 @@ fn sanitize(ch: char) -> char {
 
 pub fn str_width(s: &str) -> usize {
     s.chars()
-        .map(|c| UnicodeWidthChar::width(sanitize(c)).unwrap_or(1).clamp(1, 2))
+        .map(|c| {
+            UnicodeWidthChar::width(sanitize(c))
+                .unwrap_or(1)
+                .clamp(1, 2)
+        })
         .sum()
 }
 

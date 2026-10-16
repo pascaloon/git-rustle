@@ -7,6 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::git::command;
 use serde::{Deserialize, Serialize};
 
+pub mod files;
+pub mod history;
+
 const TTL: u64 = 300;
 const MAX_PAGES: usize = 1000;
 const MAX_CACHE: u64 = 32 * 1024 * 1024;
@@ -17,13 +20,12 @@ pub enum Provider {
     Gitlab,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Remote {
     pub name: String,
     pub url: String,
     pub provider: Provider,
     pub endpoint: String,
-    pub host: String,
     pub project: String,
 }
 
@@ -37,6 +39,7 @@ pub struct Branch {
 pub struct Update {
     pub remote: Remote,
     pub branches: Vec<Branch>,
+    pub scoped: bool,
     pub cached: bool,
     pub stale: bool,
 }
@@ -63,6 +66,16 @@ fn encode(value: &str) -> String {
 
 impl Remote {
     pub fn parse(name: &str, value: &str, provider: Option<&str>) -> Option<Self> {
+        Self::parse_options(name, value, provider, None, None)
+    }
+
+    fn parse_options(
+        name: &str,
+        value: &str,
+        provider: Option<&str>,
+        api_url: Option<&str>,
+        project_override: Option<&str>,
+    ) -> Option<Self> {
         let normalized;
         let raw = if !value.contains("://") {
             let (host, path) = value.split_once(':')?;
@@ -86,7 +99,13 @@ impl Remote {
         };
         // Decode URL path before encoding it as API path segments (including subgroups).
         let project = percent_decode(url.path().trim_matches('/'))?;
-        let project = project.strip_suffix(".git").unwrap_or(&project).to_string();
+        let project = project_override
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| project.strip_suffix(".git").unwrap_or(&project))
+            .to_string();
+        if project.chars().any(char::is_control) {
+            return None;
+        }
         let parts: Vec<_> = project.split('/').collect();
         if parts.len() < 2
             || parts
@@ -100,14 +119,21 @@ impl Remote {
             ("https" | "http", Some(port)) => format!("{host}:{port}"),
             _ => host.clone(),
         };
+        let root = api_url
+            .filter(|s| !s.is_empty())
+            .map(|s| api_base(provider, s))
+            .transpose()
+            .ok()?;
         let endpoint = match provider {
             Provider::Github if parts.len() != 2 => return None,
             Provider::Github => {
-                let root = if host == "github.com" {
-                    "https://api.github.com".to_string()
-                } else {
-                    format!("https://{authority}/api/v3")
-                };
+                let root = root.unwrap_or_else(|| {
+                    if host == "github.com" {
+                        "https://api.github.com".to_string()
+                    } else {
+                        format!("https://{authority}/api/v3")
+                    }
+                });
                 format!(
                     "{root}/repos/{}/{}/branches",
                     encode(parts[0]),
@@ -115,7 +141,8 @@ impl Remote {
                 )
             }
             Provider::Gitlab => format!(
-                "https://{authority}/api/v4/projects/{}/repository/branches",
+                "{}/projects/{}/repository/branches",
+                root.unwrap_or_else(|| format!("https://{authority}/api/v4")),
                 encode(&project)
             ),
         };
@@ -124,8 +151,70 @@ impl Remote {
             url: value.into(),
             provider,
             endpoint,
-            host,
             project,
+        })
+    }
+}
+
+/// Accept either a server URL (including an installation prefix) or an API base.
+pub fn api_base(provider: Provider, value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value.trim())
+        .map_err(|_| "Enter a valid HTTPS server or API URL".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Use an HTTPS URL without credentials, a query, or a fragment".into());
+    }
+    let base = url.as_str().trim_end_matches('/');
+    if provider == Provider::Github
+        && matches!(base, "https://github.com" | "https://api.github.com")
+    {
+        return Ok("https://api.github.com".into());
+    }
+    let suffix = match provider {
+        Provider::Github => "/api/v3",
+        Provider::Gitlab => "/api/v4",
+    };
+    Ok(if base.ends_with(suffix) {
+        base.into()
+    } else {
+        format!("{base}{suffix}")
+    })
+}
+
+#[derive(Clone, Default)]
+pub struct Configuration {
+    pub name: String,
+    pub url: String,
+    pub provider: Option<String>,
+    pub api_url: Option<String>,
+    pub project: Option<String>,
+}
+
+impl Configuration {
+    pub fn remote(&self) -> Result<Remote, String> {
+        if let Some(api) = &self.api_url {
+            let provider = if self.provider.as_deref() == Some("github") {
+                Provider::Github
+            } else {
+                Provider::Gitlab
+            };
+            api_base(provider, api)?;
+        }
+        Remote::parse_options(
+            &self.name,
+            &self.url,
+            self.provider.as_deref(),
+            self.api_url.as_deref(),
+            self.project.as_deref(),
+        )
+        .ok_or_else(|| {
+            "Check the provider, remote URL, and project path (group/project or owner/repository)"
+                .into()
         })
     }
 }
@@ -150,14 +239,20 @@ fn percent_decode(s: &str) -> Option<String> {
     }
 }
 
-pub fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>), String> {
+type Upstreams = BTreeMap<String, (Option<String>, Option<String>)>;
+
+pub fn configurations(path: &Path) -> Result<Vec<Configuration>, String> {
+    configuration_data(path).map(|(config, _)| config)
+}
+
+fn configuration_data(path: &Path) -> Result<(Vec<Configuration>, Upstreams), String> {
     let out = command::run(
         path,
         &[
             "config",
             "--null",
             "--get-regexp",
-            r"^remote\..*\.(url|rustle-provider)$",
+            r"^(remote\..*\.(url|rustle-provider|rustle-api-url|rustle-project)|branch\..*\.(remote|merge))$",
         ],
         None,
         Duration::from_secs(10),
@@ -165,7 +260,8 @@ pub fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>), String> {
     if !out.status.success() && out.status.code() != Some(1) {
         return Err("Could not read remote configuration".into());
     }
-    let mut entries: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    let mut entries: BTreeMap<String, Configuration> = BTreeMap::new();
+    let mut upstreams = Upstreams::new();
     for entry in out.stdout.split(|b| *b == 0) {
         let Some((key, value)) = std::str::from_utf8(entry)
             .ok()
@@ -173,35 +269,60 @@ pub fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>), String> {
         else {
             continue;
         };
+        if let Some((name, field)) = key.strip_prefix("branch.").and_then(|s| s.rsplit_once('.')) {
+            let entry = upstreams.entry(name.to_string()).or_default();
+            match field {
+                "remote" => entry.0 = Some(value.to_string()),
+                "merge" => entry.1 = Some(value.to_string()),
+                _ => {}
+            }
+            continue;
+        }
         let Some((name, field)) = key.strip_prefix("remote.").and_then(|s| s.rsplit_once('.'))
         else {
             continue;
         };
         let item = entries.entry(name.to_string()).or_default();
+        item.name = name.to_string();
         match field {
-            "url" if item.0.is_none() => item.0 = Some(value.to_string()),
-            "rustle-provider" => item.1 = Some(value.to_string()),
+            "url" if item.url.is_empty() => item.url = value.to_string(),
+            "rustle-provider" => item.provider = Some(value.to_string()),
+            "rustle-api-url" => item.api_url = Some(value.to_string()),
+            "rustle-project" => item.project = Some(value.to_string()),
             _ => {}
         }
     }
+    Ok((
+        entries
+            .into_values()
+            .filter(|entry| !entry.url.is_empty())
+            .collect(),
+        upstreams,
+    ))
+}
+
+fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>, Upstreams), String> {
+    let (configurations, upstreams) = configuration_data(path)?;
     let mut remotes = Vec::new();
     let mut unsupported = Vec::new();
-    for (name, (value, provider)) in entries {
-        if let Some(value) = value {
-            match Remote::parse(&name, &value, provider.as_deref()) {
-                Some(remote) => remotes.push(remote),
-                None => unsupported.push(command::clean(&name)),
-            }
+    for config in configurations {
+        match config.remote() {
+            Ok(remote) => remotes.push(remote),
+            Err(_) => unsupported.push(command::clean(&config.name)),
         }
     }
-    Ok((remotes, unsupported))
+    Ok((remotes, unsupported, upstreams))
 }
 
 fn env_token(remote: &Remote) -> Option<String> {
     // Cloud tokens must never be sent to a host supplied by a repository.
-    let names: &[&str] = match (remote.provider, remote.host.as_str()) {
-        (Provider::Github, "github.com") => &["GH_TOKEN", "GITHUB_TOKEN"],
-        (Provider::Gitlab, "gitlab.com") => &["GITLAB_TOKEN", "GLAB_TOKEN"],
+    let origin = url::Url::parse(&remote.endpoint)
+        .ok()?
+        .origin()
+        .ascii_serialization();
+    let names: &[&str] = match (remote.provider, origin.as_str()) {
+        (Provider::Github, "https://api.github.com") => &["GH_TOKEN", "GITHUB_TOKEN"],
+        (Provider::Gitlab, "https://gitlab.com") => &["GITLAB_TOKEN", "GLAB_TOKEN"],
         _ => &[],
     };
     names
@@ -211,9 +332,14 @@ fn env_token(remote: &Remote) -> Option<String> {
 
 fn credential(path: &Path, remote: &Remote) -> Option<String> {
     let endpoint = url::Url::parse(&remote.endpoint).ok()?;
+    let host = if endpoint.host_str()? == "api.github.com" {
+        "github.com"
+    } else {
+        endpoint.host_str()?
+    };
     let authority = match endpoint.port() {
-        Some(port) => format!("{}:{port}", remote.host),
-        None => remote.host.clone(),
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
     };
     let credential_path = if remote.url.trim_end_matches('/').ends_with(".git") {
         format!("{}.git", remote.project)
@@ -235,6 +361,85 @@ fn credential(path: &Path, remote: &Remote) -> Option<String> {
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("password=").map(str::to_string))
+}
+
+// Helper-authenticated data uses the same credential-partitioned caches as saved tokens.
+// The marker contains no credential: it only avoids another anonymous request next launch.
+type HelperKey = (PathBuf, String);
+static HELPER_TOKENS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<HelperKey, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub fn clear_auth_cache() {
+    HELPER_TOKENS.lock().unwrap().clear();
+}
+
+fn helper_token(path: &Path, remote: &Remote) -> Option<String> {
+    let key = (path.to_path_buf(), remote.endpoint.clone());
+    if let Some(token) = HELPER_TOKENS.lock().unwrap().get(&key).cloned() {
+        return Some(token);
+    }
+    let token = credential(path, remote)?;
+    HELPER_TOKENS.lock().unwrap().insert(key, token.clone());
+    if let Ok(repo) = crate::git::open(path)
+        && let Some((file, _)) = cache_file(&crate::git::git_dir(&repo), remote, None)
+    {
+        let _ = std::fs::create_dir_all(file.parent().unwrap());
+        let _ = std::fs::write(file.with_extension("helper"), b"1");
+    }
+    Some(token)
+}
+
+fn cached_token(path: &Path, git_dir: &Path, remote: &Remote) -> Result<Option<String>, String> {
+    if let Some(token) = crate::credentials::read(&remote.endpoint)?.or_else(|| env_token(remote)) {
+        return Ok(Some(token));
+    }
+    let key = (path.to_path_buf(), remote.endpoint.clone());
+    if let Some(token) = HELPER_TOKENS.lock().unwrap().get(&key).cloned() {
+        return Ok(Some(token));
+    }
+    Ok(
+        if cache_file(git_dir, remote, None)
+            .is_some_and(|(p, _)| p.with_extension("helper").exists())
+        {
+            helper_token(path, remote)
+        } else {
+            None
+        },
+    )
+}
+
+/// Tags can refer to trees/blobs, and GitLab may omit a peeled commit for those.
+/// A tag without a valid commit target cannot label a commit graph; skip it alone.
+fn parse_tags(provider: Provider, response: Response) -> Result<Page, String> {
+    if response.status != 200 {
+        return parse_page(provider, response, None);
+    }
+    let values: Vec<serde_json::Value> =
+        serde_json::from_slice(&response.body).map_err(|_| "Invalid tags API response")?;
+    if values.len() > 100 {
+        return Err("Oversized tags API page".into());
+    }
+    let more = response.next.unwrap_or(values.len() == 100);
+    let branches = values
+        .iter()
+        .filter_map(|v| {
+            let name = v.get("name")?.as_str()?.to_string();
+            let key = if provider == Provider::Github {
+                "sha"
+            } else {
+                "id"
+            };
+            let sha = v.get("commit")?.get(key)?.as_str()?.to_string();
+            let tag = Branch { name, sha };
+            valid_branch(&tag).then_some(tag)
+        })
+        .collect();
+    Ok(Page {
+        etag: response.etag,
+        branches,
+        more,
+    })
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -355,11 +560,32 @@ impl Http {
         token: Option<&str>,
     ) -> Result<Response, String> {
         let url = format!("{}?per_page=100&page={page}", remote.endpoint);
+        self.get_url(remote, &url, etag, token)
+    }
+
+    fn get_url(
+        &self,
+        remote: &Remote,
+        url: &str,
+        etag: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Response, String> {
+        self.get_url_accept(remote, url, etag, token, "application/json")
+    }
+
+    fn get_url_accept(
+        &self,
+        remote: &Remote,
+        url: &str,
+        etag: Option<&str>,
+        token: Option<&str>,
+        accept: &str,
+    ) -> Result<Response, String> {
         let mut req = self
             .agent
-            .get(&url)
+            .get(url)
             .header("User-Agent", "git-rustle/0.1")
-            .header("Accept", "application/json");
+            .header("Accept", accept);
         if remote.provider == Provider::Github {
             req = req.header("X-GitHub-Api-Version", "2022-11-28");
         }
@@ -371,8 +597,14 @@ impl Http {
         if let Some(etag) = etag {
             req = req.header("If-None-Match", etag);
         }
-        let mut response = req.call().map_err(|_| {
-            "API connection failed or timed out; cached branches remain available".to_string()
+        let mut response = req.call().map_err(|error| {
+            match error {
+                ureq::Error::HostNotFound => "DNS lookup failed; check the server URL and VPN",
+                ureq::Error::Timeout(_) => "API request timed out; check VPN, firewall, and proxy",
+                ureq::Error::NativeTls(_) | ureq::Error::Tls(_) => "TLS connection failed; check the server certificate and Windows certificate trust",
+                ureq::Error::ConnectProxyFailed(_) | ureq::Error::InvalidProxyUrl => "Proxy connection failed; check HTTPS_PROXY configuration",
+                _ => "API connection failed; check the server URL, network, VPN, and proxy",
+            }.to_string()
         })?;
         let status = response.status().as_u16();
         let etag = response
@@ -508,13 +740,50 @@ fn load_one(
     no_cache: bool,
     emit: &(impl Fn(Event) + Sync),
 ) {
-    let token = env_token(remote);
+    let token = match cached_token(path, git_dir, remote) {
+        Ok(token) => token,
+        Err(error) => {
+            emit(Event::Status(error));
+            env_token(remote)
+        }
+    };
     let location = if no_cache {
         None
     } else {
         cache_file(git_dir, remote, token.as_deref())
     };
     load_cached(path, remote, force, location, token, emit);
+}
+
+pub fn test_connection(
+    path: &Path,
+    remote: &Remote,
+    replacement: Option<&str>,
+    forget: bool,
+) -> Result<String, String> {
+    let saved = if forget || replacement.is_some() {
+        None
+    } else {
+        crate::credentials::read(&remote.endpoint)?
+    };
+    let mut token = replacement
+        .map(str::to_string)
+        .or(saved)
+        .or_else(|| env_token(remote));
+    let http = Http::new();
+    let mut response = http.get(remote, 1, None, token.as_deref())?;
+    if matches!(response.status, 401 | 403 | 404) && token.is_none() {
+        token = helper_token(path, remote);
+        if token.is_some() {
+            response = http.get(remote, 1, None, token.as_deref())?;
+        }
+    }
+    let page = parse_page(remote.provider, response, None)?;
+    Ok(format!(
+        "Connected: {} branches on the first page{}",
+        page.branches.len(),
+        if page.more { " (more available)" } else { "" }
+    ))
 }
 
 fn load_cached(
@@ -532,6 +801,7 @@ fn load_cached(
         emit(Event::Branches(Update {
             remote: remote.clone(),
             branches: branches(&cached.pages),
+            scoped: false,
             cached: true,
             stale: !fresh,
         }));
@@ -549,7 +819,7 @@ fn load_cached(
         let response = http.get(remote, n, etag, token.as_deref())?;
         if matches!(response.status, 401 | 403 | 404) && token.is_none() && !used_helper {
             used_helper = true;
-            token = credential(path, remote);
+            token = helper_token(path, remote);
             if token.is_some() {
                 return http.get(remote, n, None, token.as_deref());
             }
@@ -561,12 +831,19 @@ fn load_cached(
             emit(Event::Branches(Update {
                 remote: remote.clone(),
                 branches: branches(&pages),
+                scoped: false,
                 cached: false,
                 stale: false,
             }));
-            // Helper credentials may change accounts. Do not persist their private data
-            // into the anonymous cache; env-token caches are partitioned by token.
-            if !used_helper && let Some((path, identity)) = location {
+            // Partition helper data by the resolved token, including when accounts change.
+            let location = if used_helper && location.is_some() {
+                crate::git::open(path).ok().and_then(|repo| {
+                    cache_file(&crate::git::git_dir(&repo), remote, token.as_deref())
+                })
+            } else {
+                location
+            };
+            if let Some((path, identity)) = location {
                 write_cache(
                     &path,
                     &Cache {
@@ -585,16 +862,135 @@ fn load_cached(
     }
 }
 
+/// Graph startup asks only about actual local heads; the full branch list is lazy (b).
+#[allow(clippy::too_many_arguments)]
+fn load_heads(
+    path: &Path,
+    git_dir: &Path,
+    remote: &Remote,
+    force: bool,
+    no_cache: bool,
+    emit: &(impl Fn(Event) + Sync),
+    upstreams: &Upstreams,
+) -> Result<(), String> {
+    let names = history::eligible_from_config(path, remote, upstreams)?;
+    let mut token = cached_token(path, git_dir, remote)?;
+    let mut sorted: Vec<_> = names.iter().collect();
+    sorted.sort();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    sorted.hash(&mut hash);
+    let extension = format!("{:016x}.heads.json", hash.finish());
+    let location = if no_cache {
+        None
+    } else {
+        cache_file(git_dir, remote, token.as_deref())
+    };
+    let cached = location.as_ref().and_then(|(p, id)| {
+        read_cache(&p.with_extension(&extension), id).or_else(|| read_cache(p, id))
+    });
+    if let Some(cached) = &cached {
+        let fresh = now().saturating_sub(cached.saved) < TTL;
+        emit(Event::Branches(Update {
+            remote: remote.clone(),
+            branches: branches(&cached.pages)
+                .into_iter()
+                .filter(|b| names.contains(&b.name))
+                .collect(),
+            scoped: true,
+            cached: true,
+            stale: !fresh,
+        }));
+        if fresh && !force {
+            return Ok(());
+        }
+    }
+    let http = Http::new();
+    let mut found = Vec::new();
+    for name in sorted {
+        let url = format!("{}/{}", remote.endpoint, encode(name));
+        let mut response = http.get_url(remote, &url, None, token.as_deref())?;
+        if matches!(response.status, 401 | 403 | 404) && token.is_none() {
+            token = helper_token(path, remote);
+            if token.is_some() {
+                response = http.get_url(remote, &url, None, token.as_deref())?;
+            }
+        }
+        if response.status == 404 {
+            // A private/inaccessible repository must not masquerade as a deleted branch.
+            let root = remote.endpoint.strip_suffix("/branches").unwrap();
+            let root = if remote.provider == Provider::Gitlab {
+                root.strip_suffix("/repository").unwrap_or(root)
+            } else {
+                root
+            };
+            let access = http.get_url(remote, root, None, token.as_deref())?;
+            if access.status != 200 {
+                return Err(parse_page(remote.provider, access, None)
+                    .err()
+                    .unwrap_or_else(|| "Repository unavailable".into()));
+            }
+            continue;
+        }
+        if response.status == 200 {
+            let value: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|_| "Invalid branch API response")?;
+            response.body = serde_json::to_vec(&vec![value]).unwrap();
+        }
+        let page = parse_page(remote.provider, response, None)?;
+        found.extend(page.branches.into_iter().filter(|b| &b.name == name));
+    }
+    emit(Event::Branches(Update {
+        remote: remote.clone(),
+        branches: found.clone(),
+        scoped: true,
+        cached: false,
+        stale: false,
+    }));
+    if !no_cache && let Some((path, identity)) = cache_file(git_dir, remote, token.as_deref()) {
+        let mut pages: Vec<_> = found
+            .chunks(100)
+            .map(|b| Page {
+                etag: None,
+                branches: b.to_vec(),
+                more: true,
+            })
+            .collect();
+        if let Some(last) = pages.last_mut() {
+            last.more = false;
+        } else {
+            pages.push(Page {
+                etag: None,
+                branches: Vec::new(),
+                more: false,
+            });
+        }
+        write_cache(
+            &path.with_extension(extension),
+            &Cache {
+                version: 1,
+                identity,
+                saved: now(),
+                pages,
+            },
+        );
+    }
+    Ok(())
+}
+
 /// At most four providers concurrently, and only one scan is scheduled by the UI.
 pub fn discover(
     path: &Path,
     git_dir: &Path,
     force: bool,
     no_cache: bool,
+    local_only: bool,
     emit: impl Fn(Event) + Sync,
 ) {
+    if force {
+        clear_auth_cache();
+    }
     match configured(path) {
-        Ok((remotes, unsupported)) => {
+        Ok((remotes, unsupported, upstreams)) => {
             emit(Event::Configured(
                 remotes
                     .iter()
@@ -614,7 +1010,18 @@ pub fn discover(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(remote) = remotes.get(i) else { break };
-                            load_one(path, git_dir, remote, force, no_cache, &emit);
+                            if local_only {
+                                if let Err(error) = load_heads(
+                                    path, git_dir, remote, force, no_cache, &emit, &upstreams,
+                                ) {
+                                    emit(Event::Status(format!(
+                                        "{}: {error}",
+                                        command::clean(&remote.name)
+                                    )));
+                                }
+                            } else {
+                                load_one(path, git_dir, remote, force, no_cache, &emit);
+                            }
                         }
                     });
                 }
@@ -672,6 +1079,67 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn explicit_api_handles_ssh_alias_prefix_and_port() {
+        let config = Configuration {
+            name: "origin".into(),
+            url: "git@work-alias:team/project.git".into(),
+            provider: Some("gitlab".into()),
+            api_url: Some("https://code.example:8443/gitlab/".into()),
+            project: Some("team/subgroup/project".into()),
+        };
+        let remote = config.remote().unwrap();
+        assert_eq!(
+            remote.endpoint,
+            "https://code.example:8443/gitlab/api/v4/projects/team%2Fsubgroup%2Fproject/repository/branches"
+        );
+        assert!(env_token(&remote).is_none());
+        assert_eq!(
+            api_base(Provider::Gitlab, "https://code.example/gitlab/api/v4/").unwrap(),
+            "https://code.example/gitlab/api/v4"
+        );
+        assert_eq!(
+            api_base(Provider::Github, "https://github.com/").unwrap(),
+            "https://api.github.com"
+        );
+        assert_eq!(
+            api_base(Provider::Github, "https://code.example:8443/").unwrap(),
+            "https://code.example:8443/api/v3"
+        );
+        for invalid in [
+            "http://code.example",
+            "https://user:secret@code.example",
+            "https://code.example/?token=secret",
+            "https://code.example/#token",
+        ] {
+            assert!(api_base(Provider::Gitlab, invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn connection_test_checks_one_page_without_saving_or_fetching() {
+        let body = serde_json::to_vec(
+            &serde_json::json!([{"name":"main", "commit":{"id":"a".repeat(40)}}]),
+        )
+        .unwrap();
+        let (url, server) = server(vec![(200, "X-Next-Page: 2\r\n".into(), body)]);
+        let mut remote =
+            Remote::parse("origin", "git@work-alias:team/project.git", Some("gitlab")).unwrap();
+        remote.endpoint = format!("{url}/api/v4/projects/team%2Fproject/repository/branches");
+        let dir = tempfile::tempdir().unwrap();
+        let result = test_connection(dir.path(), &remote, Some("synthetic-token"), false).unwrap();
+        assert!(result.contains("more available"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .to_lowercase()
+                .contains("authorization: bearer synthetic-token")
+        );
+        assert!(requests[0].contains("page=1"));
     }
 
     #[test]
@@ -759,7 +1227,7 @@ mod tests {
         assert_eq!(branches(&result).len(), 101);
     }
 
-    fn server(
+    pub(super) fn server(
         responses: Vec<(u16, String, Vec<u8>)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
@@ -780,6 +1248,7 @@ mod tests {
                     );
                     std::thread::sleep(Duration::from_millis(5));
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -828,6 +1297,7 @@ mod tests {
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(Event::Branches(Update {
+                scoped: false,
                 cached: true,
                 stale: false,
                 ..
@@ -852,6 +1322,131 @@ mod tests {
         assert!(read_cache(&file, "different-remote").is_none());
         std::fs::write(&file, b"{corrupt").unwrap();
         assert!(read_cache(&file, "test-id").is_none());
+    }
+
+    #[test]
+    fn scoped_discovery_queries_only_local_heads_and_reuses_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q", "-b", "team/topic"]).unwrap();
+        command::checked(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "root",
+            ],
+        )
+        .unwrap();
+        command::checked(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/unrelated", "HEAD"],
+        )
+        .unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let (url, server) = server(vec![(
+            200,
+            String::new(),
+            serde_json::to_vec(
+                &serde_json::json!({"name":"team/topic", "commit":{"sha":"a".repeat(40)}}),
+            )
+            .unwrap(),
+        )]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        let events = std::sync::Mutex::new(Vec::new());
+        let emit = |event| events.lock().unwrap().push(event);
+        load_heads(
+            dir.path(),
+            &crate::git::git_dir(&repo),
+            &remote,
+            false,
+            false,
+            &emit,
+            &configuration_data(dir.path()).unwrap().1,
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("/branches/team%2Ftopic "));
+        load_heads(
+            dir.path(),
+            &crate::git::git_dir(&repo),
+            &remote,
+            false,
+            false,
+            &emit,
+            &configuration_data(dir.path()).unwrap().1,
+        )
+        .unwrap();
+        assert!(
+            matches!(events.lock().unwrap().last(), Some(Event::Branches(Update { scoped: true, cached: true, branches, .. })) if branches.len() == 1)
+        );
+    }
+
+    #[test]
+    fn credential_helper_results_persist_in_the_resolved_token_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        command::checked(dir.path(), &["config", "credential.helper", ""]).unwrap();
+        command::checked(
+            dir.path(),
+            &[
+                "config",
+                "--add",
+                "credential.helper",
+                "!f() { printf 'username=test\npassword=fixture-cache-token\n'; }; f",
+            ],
+        )
+        .unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let git_dir = crate::git::git_dir(&repo);
+        let (url, server) = server(vec![
+            (401, String::new(), Vec::new()),
+            (200, String::new(), response(&["main"], false).body),
+        ]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        let events = std::sync::Mutex::new(Vec::new());
+        let emit = |event| events.lock().unwrap().push(event);
+        load_one(dir.path(), &git_dir, &remote, false, false, &emit);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("Bearer fixture-cache-token"));
+        let (anonymous, _) = cache_file(&git_dir, &remote, None).unwrap();
+        let (private, identity) =
+            cache_file(&git_dir, &remote, Some("fixture-cache-token")).unwrap();
+        assert!(!anonymous.exists());
+        assert!(read_cache(&private, &identity).is_some());
+        assert!(
+            !String::from_utf8(std::fs::read(&private).unwrap())
+                .unwrap()
+                .contains("fixture-cache-token")
+        );
+        // Simulate another launch: only the non-secret helper marker and disk cache remain.
+        HELPER_TOKENS
+            .lock()
+            .unwrap()
+            .remove(&(dir.path().to_path_buf(), remote.endpoint.clone()));
+        load_one(dir.path(), &git_dir, &remote, false, false, &emit);
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(Event::Branches(Update { cached: true, .. }))
+        ));
     }
 
     #[test]

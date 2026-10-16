@@ -90,7 +90,7 @@ pub fn draw(browser: &mut Browser, screen: &mut Screen, repo: &str) {
     screen.put_str_ellipsis(
         1,
         h.saturating_sub(2),
-        "Remote-only history appears after checkout downloads missing objects. * = current branch",
+        "Ghost rows preview known branches; checkout downloads missing objects. * = current branch",
         theme::dim(),
         w.saturating_sub(2),
     );
@@ -98,7 +98,7 @@ pub fn draw(browser: &mut Browser, screen: &mut Screen, repo: &str) {
     screen.put_str_ellipsis(
         1,
         h.saturating_sub(1),
-        "↑↓ select  Enter checkout  Tab locate in graph  F5 refresh  Ctrl+U clear filter  Esc back",
+        "↑↓ select  Enter checkout  Tab locate in graph  F5 refresh  F2 settings  Ctrl+U clear filter  Esc back",
         header,
         w.saturating_sub(2),
     );

@@ -48,6 +48,7 @@ pub struct Side {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
+    pub remote: Option<Box<crate::remote::files::RemoteFile>>,
     /// Path on the new side (old side for deletions).
     pub path: String,
     /// Old path, for renames.
@@ -75,14 +76,25 @@ fn tree_of(repo: &gix::Repository, commit: &ObjectId, buf: &mut Vec<u8>) -> Resu
 
 /// Compare the trees of two commits; `old = None` diffs against the empty tree
 /// (every file added), used for root commits.
-pub fn tree_diff(repo: &gix::Repository, old: Option<&ObjectId>, new: &ObjectId) -> Result<TreeDiff> {
+pub fn tree_diff(
+    repo: &gix::Repository,
+    old: Option<&ObjectId>,
+    new: &ObjectId,
+) -> Result<TreeDiff> {
     let mut buf = Vec::new();
     let old_tree = old.map(|id| tree_of(repo, id, &mut buf)).transpose()?;
     let new_tree = tree_of(repo, new, &mut buf)?;
     let mut files = Vec::new();
     if old_tree != Some(new_tree) {
         let mut prefix = String::new();
-        diff_trees(repo, old_tree, Some(new_tree), &mut prefix, &mut files, &mut buf)?;
+        diff_trees(
+            repo,
+            old_tree,
+            Some(new_tree),
+            &mut prefix,
+            &mut files,
+            &mut buf,
+        )?;
     }
     pair_renames(&mut files);
     files.sort_by(|a, b| display_order(&a.path, &b.path));
@@ -90,17 +102,23 @@ pub fn tree_diff(repo: &gix::Repository, old: Option<&ObjectId>, new: &ObjectId)
 }
 
 /// Sidebar order: at each level folders before files, names case-insensitively.
-fn display_order(a: &str, b: &str) -> Ordering {
+pub(crate) fn display_order(a: &str, b: &str) -> Ordering {
     let mut ia = a.split('/').peekable();
     let mut ib = b.split('/').peekable();
     loop {
-        let (Some(x), Some(y)) = (ia.next(), ib.next()) else { return Ordering::Equal };
+        let (Some(x), Some(y)) = (ia.next(), ib.next()) else {
+            return Ordering::Equal;
+        };
         let (x_dir, y_dir) = (ia.peek().is_some(), ib.peek().is_some());
         match y_dir.cmp(&x_dir) {
             Ordering::Equal => {}
             other => return other, // the directory sorts first
         }
-        match x.to_lowercase().cmp(&y.to_lowercase()).then_with(|| x.cmp(y)) {
+        match x
+            .to_lowercase()
+            .cmp(&y.to_lowercase())
+            .then_with(|| x.cmp(y))
+        {
             Ordering::Equal if x_dir => continue,
             other => return other,
         }
@@ -125,7 +143,11 @@ impl Entry {
     }
 }
 
-fn read_entries(repo: &gix::Repository, id: Option<ObjectId>, buf: &mut Vec<u8>) -> Result<Vec<Entry>> {
+fn read_entries(
+    repo: &gix::Repository,
+    id: Option<ObjectId>,
+    buf: &mut Vec<u8>,
+) -> Result<Vec<Entry>> {
     let Some(id) = id else { return Ok(Vec::new()) };
     let iter = repo.objects.find_tree_iter(&id, buf)?;
     let mut out = Vec::new();
@@ -200,6 +222,7 @@ fn diff_trees(
                     prefix.truncate(saved);
                 } else {
                     out.push(FileChange {
+                        remote: None,
                         path: join(prefix, &a.name),
                         old_path: None,
                         kind: ChangeKind::Modified,
@@ -225,14 +248,23 @@ fn emit_whole(
     if e.is_tree() {
         let saved = prefix.len();
         *prefix = join(prefix, &e.name);
-        let (o, n) = if added { (None, Some(e.id)) } else { (Some(e.id), None) };
+        let (o, n) = if added {
+            (None, Some(e.id))
+        } else {
+            (Some(e.id), None)
+        };
         diff_trees(repo, o, n, prefix, out, buf)?;
         prefix.truncate(saved);
     } else {
         out.push(FileChange {
+            remote: None,
             path: join(prefix, &e.name),
             old_path: None,
-            kind: if added { ChangeKind::Added } else { ChangeKind::Deleted },
+            kind: if added {
+                ChangeKind::Added
+            } else {
+                ChangeKind::Deleted
+            },
             old: (!added).then(|| e.side()),
             new: added.then(|| e.side()),
         });
@@ -258,7 +290,9 @@ fn pair_renames(files: &mut Vec<FileChange>) {
         if files[i].kind != ChangeKind::Added {
             continue;
         }
-        let Some(id) = files[i].new.map(|s| s.id) else { continue };
+        let Some(id) = files[i].new.map(|s| s.id) else {
+            continue;
+        };
         if let Some(cands) = deleted.get_mut(&id)
             && let Some(d) = cands.pop()
         {
@@ -282,6 +316,9 @@ const MAX_BLOB: usize = 8 * 1024 * 1024;
 
 /// Compute the side-by-side diff of one changed file.
 pub fn file_diff(repo: &gix::Repository, change: &FileChange) -> Result<FileDiff> {
+    if let Some(source) = &change.remote {
+        return crate::remote::files::file(repo, change, source).map_err(Into::into);
+    }
     let mut old_buf = Vec::new();
     let mut new_buf = Vec::new();
     let old = load_side(repo, change.old, &mut old_buf)?;
@@ -308,7 +345,10 @@ pub fn file_diff(repo: &gix::Repository, change: &FileChange) -> Result<FileDiff
 /// Line counts for one changed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stat {
-    Lines { added: u32, removed: u32 },
+    Lines {
+        added: u32,
+        removed: u32,
+    },
     /// Binary or too large: no line counts.
     Opaque,
 }
@@ -316,14 +356,22 @@ pub enum Stat {
 /// Added/removed line counts without materialising rows. Pure additions and
 /// deletions just count lines; only modifications run the diff algorithm.
 pub fn file_stats(repo: &gix::Repository, change: &FileChange) -> Result<Stat> {
+    if let Some(source) = &change.remote {
+        return Ok(source.stat.unwrap_or(Stat::Opaque));
+    }
     let mut old_buf = Vec::new();
     let mut new_buf = Vec::new();
     let old = load_side(repo, change.old, &mut old_buf)?;
     let new = load_side(repo, change.new, &mut new_buf)?;
     let count = |data: &[u8]| split_lines_count(data);
     Ok(match (old, new) {
-        (Loaded::Binary | Loaded::TooLarge, _) | (_, Loaded::Binary | Loaded::TooLarge) => Stat::Opaque,
-        (Loaded::Missing, Loaded::Missing) => Stat::Lines { added: 0, removed: 0 },
+        (Loaded::Binary | Loaded::TooLarge, _) | (_, Loaded::Binary | Loaded::TooLarge) => {
+            Stat::Opaque
+        }
+        (Loaded::Missing, Loaded::Missing) => Stat::Lines {
+            added: 0,
+            removed: 0,
+        },
         (Loaded::Text(o), Loaded::Missing) => Stat::Lines {
             added: 0,
             removed: count(o),
@@ -351,8 +399,14 @@ enum Loaded<'a> {
     TooLarge,
 }
 
-fn load_side<'a>(repo: &gix::Repository, side: Option<Side>, buf: &'a mut Vec<u8>) -> Result<Loaded<'a>> {
-    let Some(side) = side else { return Ok(Loaded::Missing) };
+fn load_side<'a>(
+    repo: &gix::Repository,
+    side: Option<Side>,
+    buf: &'a mut Vec<u8>,
+) -> Result<Loaded<'a>> {
+    let Some(side) = side else {
+        return Ok(Loaded::Missing);
+    };
     match side.kind {
         EntryKind::Commit => {
             // Submodule: show the pointed-to commit.
@@ -398,27 +452,60 @@ mod tests {
         Entry {
             name: name.to_string(),
             id: ObjectId::null(gix::hash::Kind::Sha1),
-            kind: if tree { EntryKind::Tree } else { EntryKind::Blob },
+            kind: if tree {
+                EntryKind::Tree
+            } else {
+                EntryKind::Blob
+            },
         }
     }
 
     #[test]
     fn tree_order_matches_git() {
         // "a" < "a-b" < "a/" (tree a) < "a0"
-        assert_eq!(tree_order(&entry("a", false), &entry("a-b", false)), Ordering::Less);
-        assert_eq!(tree_order(&entry("a-b", false), &entry("a", true)), Ordering::Less);
-        assert_eq!(tree_order(&entry("a", true), &entry("a0", false)), Ordering::Less);
-        assert_eq!(tree_order(&entry("a", false), &entry("a", true)), Ordering::Less);
-        assert_eq!(tree_order(&entry("x", true), &entry("x", true)), Ordering::Equal);
+        assert_eq!(
+            tree_order(&entry("a", false), &entry("a-b", false)),
+            Ordering::Less
+        );
+        assert_eq!(
+            tree_order(&entry("a-b", false), &entry("a", true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            tree_order(&entry("a", true), &entry("a0", false)),
+            Ordering::Less
+        );
+        assert_eq!(
+            tree_order(&entry("a", false), &entry("a", true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            tree_order(&entry("x", true), &entry("x", true)),
+            Ordering::Equal
+        );
     }
 
     #[test]
     fn display_order_is_folders_first() {
-        let mut v = vec!["src/ui/list.rs", "README.md", "src/main.rs", "Cargo.toml", "docs/a.md", "src/ui/mod.rs"];
+        let mut v = vec![
+            "src/ui/list.rs",
+            "README.md",
+            "src/main.rs",
+            "Cargo.toml",
+            "docs/a.md",
+            "src/ui/mod.rs",
+        ];
         v.sort_by(|a, b| display_order(a, b));
         assert_eq!(
             v,
-            vec!["docs/a.md", "src/ui/list.rs", "src/ui/mod.rs", "src/main.rs", "Cargo.toml", "README.md"]
+            vec![
+                "docs/a.md",
+                "src/ui/list.rs",
+                "src/ui/mod.rs",
+                "src/main.rs",
+                "Cargo.toml",
+                "README.md"
+            ]
         );
     }
 
@@ -433,6 +520,7 @@ mod tests {
         };
         let mut files = vec![
             FileChange {
+                remote: None,
                 path: "old/a.rs".into(),
                 old_path: None,
                 kind: ChangeKind::Deleted,
@@ -440,6 +528,7 @@ mod tests {
                 new: None,
             },
             FileChange {
+                remote: None,
                 path: "b.rs".into(),
                 old_path: None,
                 kind: ChangeKind::Modified,
@@ -447,6 +536,7 @@ mod tests {
                 new: side(3),
             },
             FileChange {
+                remote: None,
                 path: "new/a.rs".into(),
                 old_path: None,
                 kind: ChangeKind::Added,
@@ -454,6 +544,7 @@ mod tests {
                 new: side(1),
             },
             FileChange {
+                remote: None,
                 path: "c.rs".into(),
                 old_path: None,
                 kind: ChangeKind::Added,
@@ -463,10 +554,17 @@ mod tests {
         ];
         pair_renames(&mut files);
         assert_eq!(files.len(), 3);
-        let r = files.iter().find(|f| f.kind == ChangeKind::Renamed).unwrap();
+        let r = files
+            .iter()
+            .find(|f| f.kind == ChangeKind::Renamed)
+            .unwrap();
         assert_eq!(r.path, "new/a.rs");
         assert_eq!(r.old_path.as_deref(), Some("old/a.rs"));
         assert_eq!(r.old, side(1));
-        assert!(files.iter().any(|f| f.path == "c.rs" && f.kind == ChangeKind::Added));
+        assert!(
+            files
+                .iter()
+                .any(|f| f.path == "c.rs" && f.kind == ChangeKind::Added)
+        );
     }
 }

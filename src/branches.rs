@@ -55,9 +55,10 @@ impl Browser {
         self.open = true;
         self.rebuild(refs);
         if !self.loading
-            && self
-                .last_check
-                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(300))
+            && (self.remotes.values().any(|u| u.scoped)
+                || self
+                    .last_check
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(300)))
         {
             self.want_refresh = Some(false);
         }
@@ -124,7 +125,7 @@ impl Browser {
         }
         for (name, update) in &self.remotes {
             // A successful complete list is authoritative, including branch deletions.
-            if !update.stale {
+            if !update.stale && !update.scoped {
                 entries.retain(|(remote, _), _| remote.as_ref() != Some(name));
             }
             for branch in &update.branches {
@@ -270,6 +271,7 @@ mod tests {
                     sha: "a".repeat(40),
                 })
                 .collect(),
+            scoped: false,
             cached: false,
             stale: false,
         };

@@ -2,6 +2,7 @@
 
 use super::{chip_style, theme, time};
 use crate::app::{App, Focus};
+use crate::git::RefKind;
 use crate::graph::render::{LANE_WIDTH, render_row};
 use crate::term::{Color, Rect, Screen, Style};
 
@@ -28,7 +29,13 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         } else {
             "No commits"
         };
-        screen.put_str(area.x + 2, area.y + 1, msg, theme::dim(), area.w.saturating_sub(2));
+        screen.put_str(
+            area.x + 2,
+            area.y + 1,
+            msg,
+            theme::dim(),
+            area.w.saturating_sub(2),
+        );
         return;
     }
 
@@ -54,7 +61,8 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         (cap - 1, 1)
     };
 
-    let right_cols = (if show_author { AUTHOR_W + 1 } else { 0 }) + if show_age { AGE_W + 1 } else { 0 };
+    let right_cols =
+        (if show_author { AUTHOR_W + 1 } else { 0 }) + if show_age { AGE_W + 1 } else { 0 };
 
     for (row, i) in visible.enumerate() {
         let y = area.y + row as u16;
@@ -72,6 +80,7 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             screen.paint_bg(area.x, y, area.w, bg);
         }
         let rec = app.history.commits[i];
+        let ghost = app.ghosts.contains_key(&rec.id);
         let mut x = area.x;
 
         // Graph.
@@ -83,6 +92,7 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             app.history.row_cells(i),
             rec.node_lane,
             is_head,
+            app.history.remote_cells.get(rec.row.range()).unwrap_or(&[]),
             bg,
             graph_w,
         );
@@ -94,7 +104,10 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         // Short hash; marked commits show it as a chip.
         let hash = rec.id.to_hex_with_len(HASH_LEN as usize).to_string();
         let hash_style = if app.is_marked(&rec.id) {
-            Style::new().fg(Color::rgb(0x12, 0x14, 0x1a)).bg(theme::BG_MARK).bold()
+            Style::new()
+                .fg(Color::rgb(0x12, 0x14, 0x1a))
+                .bg(theme::BG_MARK)
+                .bold()
         } else {
             Style::new().fg(theme::FG_HASH).bg(bg)
         };
@@ -109,7 +122,10 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
                 if x + 5 >= text_end {
                     break;
                 }
-                let style = chip_style(label.kind);
+                let mut style = chip_style(label.kind);
+                if ghost && label.kind == RefKind::Remote {
+                    style.bg = style.bg.dimmed();
+                }
                 let max = (text_end - x).saturating_sub(3).min(MAX_CHIP_W);
                 x += screen.put_str(x, y, " ", style, 1);
                 x += screen.put_str_ellipsis(x, y, &label.name, style, max);
@@ -135,7 +151,13 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             rx -= AGE_W;
             let age = time::format_relative(rec.author_time, now);
             let pad = AGE_W.saturating_sub(age.len() as u16);
-            screen.put_str(rx + pad, y, &age, Style::new().fg(theme::FG_DATE).bg(bg), AGE_W);
+            screen.put_str(
+                rx + pad,
+                y,
+                &age,
+                Style::new().fg(theme::FG_DATE).bg(bg),
+                AGE_W,
+            );
             rx -= 1;
         }
         if show_author {

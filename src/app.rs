@@ -51,6 +51,13 @@ pub struct Label {
 }
 
 pub struct App {
+    pub local_history: Option<std::sync::Arc<History>>,
+    pub ghosts: HashMap<ObjectId, CommitDetails>,
+    pub ghost_sources: HashMap<ObjectId, crate::remote::Remote>,
+    pub ghost_branches: Vec<(ObjectId, String)>,
+    pub ghost_tags: Vec<(ObjectId, String)>,
+    pub ghost_status: String,
+    pub settings: crate::settings::Settings,
     pub branches: crate::branches::Browser,
     pub repo_name: String,
     pub history: History,
@@ -95,6 +102,13 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         App {
+            local_history: None,
+            ghosts: HashMap::new(),
+            ghost_sources: HashMap::new(),
+            ghost_branches: Vec::new(),
+            ghost_tags: Vec::new(),
+            ghost_status: String::new(),
+            settings: crate::settings::Settings::default(),
             branches: crate::branches::Browser::default(),
             repo_name: String::new(),
             history: History::default(),
@@ -136,6 +150,9 @@ impl App {
 
     /// Mark or unmark a commit; marking a third drops the oldest mark.
     pub fn toggle_mark(&mut self, id: ObjectId) {
+        if self.ghosts.contains_key(&id) {
+            return;
+        }
         if let Some(i) = self.marks.iter().position(|m| *m == id) {
             self.marks.remove(i);
         } else {
@@ -196,6 +213,7 @@ impl App {
                         key: cs.key,
                         old: cs.old,
                         new: cs.new,
+                        remote: None,
                     }]
                 }
                 _ => Vec::new(),
@@ -341,6 +359,13 @@ impl App {
             }
             for branch in &update.branches {
                 if let Ok(id) = ObjectId::from_hex(branch.sha.as_bytes()) {
+                    if self.ghosts.contains_key(&id)
+                        && !self.ghost_branches.iter().any(|(tip, name)| {
+                            *tip == id && *name == format!("{}/{}", update.remote.name, branch.name)
+                        })
+                    {
+                        continue;
+                    }
                     self.labels.entry(id).or_default().push(Label {
                         name: format!("{name}/{}", branch.name),
                         kind: RefKind::Remote,
@@ -348,11 +373,70 @@ impl App {
                 }
             }
         }
+        for (id, name) in &self.ghost_tags {
+            let labels = self.labels.entry(*id).or_default();
+            if !labels
+                .iter()
+                .any(|l| l.name == *name && l.kind == RefKind::Tag)
+            {
+                labels.push(Label {
+                    name: name.clone(),
+                    kind: RefKind::Tag,
+                });
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn install_preview(&mut self, preview: crate::remote::history::Preview) {
+        let keep = self.selected_id();
+        let offset = self.selected.saturating_sub(self.scroll);
+        let was_top = self.scroll == 0;
+        if let Some(history) = preview.history {
+            self.history = history;
+        } else if let Some(local) = &self.local_history
+            && (!self.ghosts.is_empty() || self.history.len() != local.len())
+        {
+            self.history = (**local).clone();
+        }
+        self.ghosts = preview.ghosts;
+        self.ghost_sources = preview.sources;
+        self.ghost_branches = preview.branches;
+        self.ghost_tags = preview.tags;
+        self.ghost_status = if preview.errors.is_empty() {
+            if self.ghosts.is_empty() {
+                String::new()
+            } else {
+                format!("{} ghost commits (remote only)", self.ghosts.len())
+            }
+        } else {
+            format!("Remote preview incomplete: {}", preview.errors.join(" | "))
+        };
+        self.details = None;
+        if let Some(refs) = self.refs.clone() {
+            self.set_refs(refs);
+        }
+        if let Some(id) = keep
+            && let Some(i) = self.history.index_of(&id)
+        {
+            self.selected = i;
+            self.scroll = if was_top && i < self.list_rows {
+                0
+            } else {
+                i.saturating_sub(offset)
+            };
+        }
+        self.clamp();
         self.needs_redraw = true;
     }
 
     /// Install a history read from the cache.
     pub fn set_cached(&mut self, history: History, fresh: bool) {
+        self.local_history = None;
+        self.ghosts.clear();
+        self.ghost_sources.clear();
+        self.ghost_branches.clear();
+        self.ghost_tags.clear();
         self.history = history;
         self.load = if fresh {
             LoadState::Cached
@@ -365,6 +449,13 @@ impl App {
 
     /// A batch arrived from the walker.
     pub fn push_batch(&mut self, batch: History) {
+        if batch.complete {
+            self.local_history = None;
+            self.ghosts.clear();
+            self.ghost_sources.clear();
+            self.ghost_branches.clear();
+            self.ghost_tags.clear();
+        }
         let complete = batch.complete;
         match self.load {
             LoadState::Refreshing | LoadState::Cached => {
@@ -481,6 +572,20 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.settings.open {
+            self.settings.handle_key(key);
+            self.needs_redraw = true;
+            return;
+        }
+        if !self.branches.busy
+            && (key.code == KeyCode::F(2)
+                || (!self.branches.open && !key.ctrl && key.code == KeyCode::Char('s')))
+        {
+            self.settings.show();
+            self.dragging_splitter = false;
+            self.needs_redraw = true;
+            return;
+        }
         if key.ctrl && key.code == KeyCode::Char('c') {
             if self.branches.busy {
                 self.branches.status =
@@ -649,6 +754,11 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16, screen_h: u16) {
+        if self.settings.open {
+            crate::ui::settings::handle_mouse(&mut self.settings, m, screen_w, screen_h);
+            self.needs_redraw = true;
+            return;
+        }
         if self.branches.open {
             match m.kind {
                 MouseKind::Wheel(delta) => self.branches.move_by(-(delta as isize) * 3),
@@ -958,6 +1068,7 @@ mod tests {
         assert!(app.pending_requests().is_empty());
         let cs_key = app.details_changes.as_ref().unwrap().key;
         let change = |p: &str| FileChange {
+            remote: None,
             path: p.to_string(),
             old_path: None,
             kind: ChangeKind::Added,

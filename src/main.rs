@@ -8,12 +8,14 @@
 mod app;
 mod branches;
 mod cache;
+mod credentials;
 mod diff;
 mod diffview;
 mod git;
 mod graph;
 mod model;
 mod remote;
+mod settings;
 mod term;
 mod ui;
 
@@ -30,7 +32,10 @@ use model::History;
 use term::{Console, Event, Screen};
 
 enum Msg {
-    Remote(remote::Event),
+    Remote(u32, remote::Event),
+    Settings(u32, settings::Outcome),
+    Preview(u32, remote::history::Preview),
+    PreviewTags(u32, Vec<(gix::ObjectId, String)>, Vec<String>),
     Refreshed(Box<git::Result<(gix::Repository, git::RefSnapshot)>>),
     Checkout(Result<String, String>, bool),
     Input(Event),
@@ -50,7 +55,7 @@ enum Msg {
 /// Diff requests run on one worker thread. A burst of requests (holding an
 /// arrow key) is collapsed to the newest tree request and the newest file
 /// request; older ones would only produce results nobody is waiting for.
-fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>) -> Sender<DiffReq> {
+fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>, no_cache: bool) -> Sender<DiffReq> {
     let (req_tx, req_rx) = mpsc::channel::<DiffReq>();
     thread::Builder::new()
         .name("diff".into())
@@ -66,9 +71,18 @@ fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>) -> Sender<DiffReq> 
                     }
                     next = req_rx.try_recv().ok();
                 }
-                if let Some(DiffReq::Tree { key, old, new }) = tree {
-                    let result =
-                        diff::tree_diff(&repo, old.as_ref(), &new).map_err(|e| e.to_string());
+                if let Some(DiffReq::Tree {
+                    key,
+                    old,
+                    new,
+                    remote,
+                }) = tree
+                {
+                    let result = if let Some(remote) = remote {
+                        remote::files::tree(&repo, &remote, old, new, no_cache)
+                    } else {
+                        diff::tree_diff(&repo, old.as_ref(), &new).map_err(|e| e.to_string())
+                    };
                     if tx.send(Msg::TreeDiff(key, result)).is_err() {
                         return;
                     }
@@ -196,6 +210,8 @@ fn parse_key_script(script: &str) -> Vec<term::KeyEvent> {
             None => (false, name.as_str()),
         };
         let code = match name {
+            "f1" => F(1),
+            "f2" => F(2),
             "up" => Up,
             "down" => Down,
             "left" => Left,
@@ -455,6 +471,7 @@ fn run(
 ) -> Result<(), String> {
     let mut repo: Option<gix::Repository> = None;
     let mut diff_tx: Option<Sender<DiffReq>> = None;
+    let mut remote_diff_tx: Option<Sender<DiffReq>> = None;
     let mut stats_tx: Option<Sender<StatsReq>> = None;
     let stats_latest = Arc::new(AtomicU32::new(0));
     let mut stats_sent_for: Option<u32> = None;
@@ -468,6 +485,14 @@ fn run(
     let mut next_walk_id: u32 = 1;
     let mut first_frame = false;
     let mut branch_frame = false;
+    let mut settings_frame = false;
+    let mut remote_generation = 0u32;
+    let mut preview_epoch = 0u32;
+    let mut preview_cancel = Arc::new(AtomicBool::new(false));
+    let mut preview_busy = false;
+    let mut preview_wanted = false;
+    let mut preview_force = false;
+    let mut auto_remote = false;
     let mut areas = ui::compute_areas(screen.width(), screen.height(), app.right_width);
     let mut last_tick = Instant::now();
     // Benchmark aid: GIT_RUSTLE_AUTOQUIT=<ms> quits after the first frame plus that delay.
@@ -485,6 +510,7 @@ fn run(
             && at.elapsed() >= delay
             && walker.is_none()
             && !app.branches.busy
+            && !app.settings.saving
         {
             app.quit = true;
         }
@@ -502,6 +528,7 @@ fn run(
             });
         }
         if app.quit {
+            preview_cancel.store(true, Ordering::Relaxed);
             if let Some(wk) = walker.take() {
                 wk.cancel();
                 wk.join();
@@ -511,9 +538,70 @@ fn run(
             }
             return Ok(());
         }
-        if (app.want_refresh
-            || app.branches.want_refresh.is_some()
-            || app.branches.checkout.is_some())
+        // Start network work only after the local graph has rendered and finished loading.
+        if first_frame && !app.is_walking() && repo.is_some() && !auto_remote {
+            auto_remote = true;
+            app.branches.want_refresh.get_or_insert(false);
+        }
+        if preview_wanted
+            && !preview_busy
+            && !app.is_walking()
+            && !app.want_rewalk
+            && !app.settings.saving
+            && !app.branches.busy
+            && let Some(r) = repo.as_ref()
+            && let Some(refs) = app.refs.clone()
+        {
+            preview_wanted = false;
+            {
+                preview_busy = true;
+                let local = app
+                    .local_history
+                    .get_or_insert_with(|| Arc::new(app.history.clone()))
+                    .clone();
+                let updates = app.branches.remotes.values().cloned().collect::<Vec<_>>();
+                let r = r.clone();
+                let tx = tx.clone();
+                let epoch = preview_epoch;
+                let force = std::mem::take(&mut preview_force);
+                preview_cancel = Arc::new(AtomicBool::new(false));
+                let cancel = preview_cancel.clone();
+                app.ghost_status = "Checking remote commits and tags…".into();
+                app.needs_redraw = true;
+                timing.mark("ghost preview requested");
+                thread::spawn(move || {
+                    let preview = remote::history::load_stream(
+                        &r,
+                        &local,
+                        &refs,
+                        &updates,
+                        force,
+                        no_cache,
+                        &cancel,
+                        Some(&mut |preview| {
+                            let _ = tx.send(Msg::Preview(epoch, preview));
+                        }),
+                    );
+                    let _ = tx.send(Msg::PreviewTags(epoch, preview.tags, preview.errors));
+                });
+            }
+        }
+        if !app.branches.busy
+            && let Some(r) = repo.as_ref()
+            && let Some(request) = app.settings.request.take()
+        {
+            let path = r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf();
+            let session = app.settings.session;
+            let tx = tx.clone();
+            timing.mark("settings requested");
+            thread::spawn(move || {
+                let _ = tx.send(Msg::Settings(session, settings::execute(&path, request)));
+            });
+        }
+        if !app.settings.saving
+            && (app.want_refresh
+                || app.branches.want_refresh.is_some()
+                || app.branches.checkout.is_some())
             && let Some(r) = repo.as_ref()
         {
             let path = r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf();
@@ -526,16 +614,23 @@ fn run(
                 && !app.branches.busy
                 && let Some(force) = app.branches.want_refresh.take()
             {
+                preview_epoch = preview_epoch.wrapping_add(1);
+                preview_cancel.store(true, Ordering::Relaxed);
+                preview_wanted = false;
+                remote_generation = remote_generation.wrapping_add(1);
+                let generation = remote_generation;
+                preview_force |= force;
                 app.branches.loading = true;
                 app.branches.errors.clear();
                 app.needs_redraw = true;
                 let git_dir = git::git_dir(r);
                 let tx = tx.clone();
                 let path = path.clone();
+                let local_only = !app.branches.open;
                 timing.mark("remote discovery requested");
                 thread::spawn(move || {
-                    remote::discover(&path, &git_dir, force, no_cache, |event| {
-                        let _ = tx.send(Msg::Remote(event));
+                    remote::discover(&path, &git_dir, force, no_cache, local_only, |event| {
+                        let _ = tx.send(Msg::Remote(generation, event));
                     })
                 });
                 if force {
@@ -560,7 +655,11 @@ fn run(
         if let (Some(r), Some(id)) = (repo.as_ref(), app.selected_id())
             && app.details.as_ref().map(|d| d.id) != Some(id)
         {
-            app.details = git::commit_details(r, &id).ok();
+            app.details = app
+                .ghosts
+                .get(&id)
+                .cloned()
+                .or_else(|| git::commit_details(r, &id).ok());
             app.needs_redraw = true;
         }
         // Hand new diff work to the workers.
@@ -568,11 +667,24 @@ fn run(
             app.sync_details_changes();
             let reqs = app.pending_requests();
             if !reqs.is_empty() {
-                let dtx = diff_tx.get_or_insert_with(|| spawn_diff_worker(r.clone(), tx.clone()));
-                for req in reqs {
+                for mut req in reqs {
+                    if let DiffReq::Tree { new, remote, .. } = &mut req {
+                        *remote = app.ghost_sources.get(new).cloned();
+                    }
                     if matches!(req, DiffReq::Tree { .. }) {
                         timing.mark("diff requested");
                     }
+                    let remote_request = match &req {
+                        DiffReq::Tree { remote, .. } => remote.is_some(),
+                        DiffReq::File { change, .. } => change.remote.is_some(),
+                    };
+                    let worker = if remote_request {
+                        &mut remote_diff_tx
+                    } else {
+                        &mut diff_tx
+                    };
+                    let dtx = worker
+                        .get_or_insert_with(|| spawn_diff_worker(r.clone(), tx.clone(), no_cache));
                     let _ = dtx.send(req);
                 }
             }
@@ -611,6 +723,10 @@ fn run(
                 ));
             }
             branch_frame = app.branches.open;
+            if app.settings.open && !settings_frame {
+                timing.mark("settings popup frame");
+            }
+            settings_frame = app.settings.open;
             app.needs_redraw = false;
             if !first_frame
                 && (!app.history.is_empty()
@@ -671,9 +787,68 @@ fn run(
 
         for msg in pending {
             match msg {
-                Msg::Remote(event) => {
+                Msg::Preview(epoch, mut preview) => {
+                    if epoch == preview_epoch && !app.is_walking() && !app.want_rewalk {
+                        timing.mark(format!(
+                            "ghost preview ready ({} commits)",
+                            preview.ghosts.len()
+                        ));
+                        preview.errors.extend(app.branches.errors.iter().cloned());
+                        app.install_preview(preview);
+                    }
+                }
+                Msg::PreviewTags(epoch, tags, errors) => {
+                    preview_busy = false;
+                    if epoch == preview_epoch && !app.is_walking() && !app.want_rewalk {
+                        app.ghost_tags = tags;
+                        if !errors.is_empty() {
+                            app.ghost_status =
+                                format!("Remote preview incomplete: {}", errors.join(" | "));
+                        }
+                        if let Some(refs) = app.refs.clone() {
+                            app.set_refs(refs);
+                        }
+                    }
+                }
+                Msg::Settings(session, outcome) => {
+                    if matches!(&outcome, settings::Outcome::Saved(Ok(_))) {
+                        preview_epoch = preview_epoch.wrapping_add(1);
+                        preview_cancel.store(true, Ordering::Relaxed);
+                        preview_wanted = false;
+                        app.install_preview(remote::history::Preview {
+                            history: None,
+                            ghosts: Default::default(),
+                            sources: Default::default(),
+                            branches: Vec::new(),
+                            tags: Vec::new(),
+                            errors: Vec::new(),
+                        });
+                        remote::clear_auth_cache();
+                        app.local_history = None;
+                        remote_generation = remote_generation.wrapping_add(1);
+                        app.branches.loading = false;
+                        app.branches.remotes.clear();
+                        app.branches.last_check = None;
+                        app.branches.want_refresh = Some(true);
+                        if let Some(refs) = app.refs.clone() {
+                            app.set_refs(refs);
+                        }
+                    }
+                    if app.settings.open && session == app.settings.session {
+                        app.settings.finish(outcome);
+                    }
+                    app.needs_redraw = true;
+                    timing.mark("settings completed");
+                }
+                Msg::Remote(generation, event) => {
+                    if generation != remote_generation {
+                        continue;
+                    }
                     match event {
                         remote::Event::Configured(remotes) => {
+                            if remotes.is_empty() && app.local_history.is_some() {
+                                preview_wanted = true;
+                            }
                             app.branches.remotes.retain(|name, update| {
                                 remotes
                                     .iter()
@@ -684,6 +859,13 @@ fn run(
                             }
                         }
                         remote::Event::Branches(update) => {
+                            preview_wanted |= preview_force
+                                || app.branches.remotes.get(&update.remote.name).is_none_or(
+                                    |old| {
+                                        old.remote != update.remote
+                                            || old.branches != update.branches
+                                    },
+                                );
                             timing.mark(format!(
                                 "remote {} branches ({})",
                                 if update.cached { "cached" } else { "live" },
@@ -692,10 +874,20 @@ fn run(
                             app.branches.update(update, app.refs.as_ref());
                             app.remote_labels();
                         }
-                        remote::Event::Status(error) => app.branches.errors.push(error),
+                        remote::Event::Status(error) => {
+                            app.ghost_status = format!("Remote: {error}");
+                            app.branches.errors.push(error);
+                        }
                         remote::Event::Done => {
                             app.branches.loading = false;
                             app.branches.last_check = Some(Instant::now());
+                            // If b was opened during the startup head check, finish with a full listing.
+                            if app.branches.open
+                                && app.branches.errors.is_empty()
+                                && app.branches.remotes.values().any(|u| u.scoped)
+                            {
+                                app.branches.want_refresh = Some(false);
+                            }
                             timing.mark("remote discovery done");
                         }
                     }
@@ -725,13 +917,25 @@ fn run(
                             app.set_refs(snap);
                             repo = Some(r);
                             if changed {
+                                preview_epoch = preview_epoch.wrapping_add(1);
+                                preview_cancel.store(true, Ordering::Relaxed);
+                                preview_wanted = true;
                                 app.want_rewalk = true;
                             }
                         }
                         Err(error) => app.set_error(error.to_string()),
                     }
                 }
-                Msg::Input(Event::Key(k)) => app.handle_key(k),
+                Msg::Input(Event::Key(k)) => {
+                    if !app.settings.open
+                        && !app.branches.open
+                        && matches!(k.code, term::KeyCode::Char('r') | term::KeyCode::F(5))
+                        && !k.ctrl
+                    {
+                        app.branches.want_refresh = Some(true);
+                    }
+                    app.handle_key(k)
+                }
                 Msg::Input(Event::Mouse(m)) => {
                     app.handle_mouse(m, &areas, screen.width(), screen.height())
                 }

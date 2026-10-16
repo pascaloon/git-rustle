@@ -336,6 +336,7 @@ fn parse(data: &[u8]) -> Option<Cached> {
             parents,
             text: text.to_vec(),
             cells,
+            remote_cells: Vec::new(),
             max_lanes,
             complete,
         },

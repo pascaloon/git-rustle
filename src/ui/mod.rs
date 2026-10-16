@@ -4,6 +4,7 @@ pub mod branches;
 pub mod details;
 pub mod diff;
 pub mod list;
+pub mod settings;
 pub mod time;
 pub mod tree;
 
@@ -97,6 +98,13 @@ pub fn default_right_width(w: u16) -> u16 {
 }
 
 pub fn draw(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
+    draw_underlay(app, screen, areas, now);
+    if app.settings.open {
+        settings::draw(&app.settings, screen);
+    }
+}
+
+fn draw_underlay(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
     if app.branches.open {
         branches::draw(&mut app.branches, screen, &app.repo_name);
         return;
@@ -193,6 +201,18 @@ fn draw_splitter(app: &App, screen: &mut Screen, area: Rect) {
 
 fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
     let bg = theme::BG_HEADER;
+    if !app.ghost_status.is_empty() {
+        screen.fill(area, ' ', theme::dim().bg(bg));
+        let status = format!("b branches  s settings  r refresh  | {}", app.ghost_status);
+        screen.put_str_ellipsis(
+            area.x + 1,
+            area.y,
+            &status,
+            theme::dim().bg(bg),
+            area.w.saturating_sub(2),
+        );
+        return;
+    }
     screen.fill(area, ' ', Style::new().bg(bg));
     let key = Style::new().fg(theme::FG_KEY).bg(bg).bold();
     let txt = Style::new().fg(theme::FG_DIM).bg(bg);
@@ -217,6 +237,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
         ],
         (Focus::List, _) => &[
             ("b", "branches"),
+            ("s", "settings"),
             ("↑↓", "move"),
             ("PgUp/PgDn", "page"),
             ("Home/End", "ends"),
