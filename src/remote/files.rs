@@ -236,6 +236,7 @@ pub fn tree(
                 )
             };
             files.push(FileChange {
+                worktree: false,
                 path,
                 old_path,
                 kind,
@@ -284,6 +285,7 @@ pub fn compare(
         let old_side = before.remove(&path);
         if old_side != Some(side) {
             files.push(FileChange {
+                worktree: false,
                 kind: if old_side.is_some() {
                     ChangeKind::Modified
                 } else {
@@ -299,6 +301,7 @@ pub fn compare(
     }
     for (path, side) in before {
         files.push(FileChange {
+            worktree: false,
             path,
             old_path: None,
             kind: ChangeKind::Deleted,

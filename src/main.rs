@@ -15,6 +15,7 @@ mod diffview;
 mod git;
 mod graph;
 mod model;
+mod pending;
 mod remote;
 mod settings;
 mod term;
@@ -33,6 +34,8 @@ use model::History;
 use term::{Console, Event, Screen};
 
 enum Msg {
+    Pending(u32, Result<pending::Snapshot, String>),
+    Committed(Result<String, String>),
     Remote(u32, remote::Event),
     Settings(u32, settings::Outcome),
     Preview(u32, remote::history::Preview),
@@ -489,7 +492,13 @@ fn run(
     cache_path: Option<PathBuf>,
     no_cache: bool,
 ) -> Result<(), String> {
+    app.pending.known = false;
+    app.pending.autofocus = true;
+    app.pending.want_refresh = true;
     let mut repo: Option<gix::Repository> = None;
+    let mut pending_generation = 0u32;
+    let mut pending_checked = Instant::now();
+    let mut pending_frame = false;
     let mut diff_tx: Option<Sender<DiffReq>> = None;
     let mut remote_diff_tx: Option<Sender<DiffReq>> = None;
     let mut stats_tx: Option<Sender<StatsReq>> = None;
@@ -532,6 +541,10 @@ fn run(
         if let (Some(delay), Some(at)) = (autoquit, first_frame_at)
             && at.elapsed() >= delay
             && walker.is_none()
+            && app.pending.known
+            && !app.pending.loading
+            && !app.pending.busy
+            && app.pending.request.is_none()
             && !app.branches.busy
             && !app.settings.saving
         {
@@ -565,6 +578,44 @@ fn run(
         if first_frame && !app.is_walking() && repo.is_some() && !auto_remote {
             auto_remote = true;
             app.branches.want_refresh.get_or_insert(false);
+        }
+        if let Some(r) = repo.as_ref() {
+            if !app.pending.busy
+                && !app.branches.busy
+                && let Some(request) = app.pending.request.take()
+            {
+                app.pending.busy = true;
+                app.pending.loading = false;
+                pending_generation = pending_generation.wrapping_add(1);
+                app.pending.status = "Committing changes…".into();
+                app.pending.error = false;
+                app.needs_redraw = true;
+                let path = r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf();
+                let tx = tx.clone();
+                timing.mark("commit requested");
+                thread::spawn(move || {
+                    let _ = tx.send(Msg::Committed(git::worktree::commit(&path, &request)));
+                });
+            }
+            if first_frame
+                && !app.pending.busy
+                && !app.branches.busy
+                && !app.pending.loading
+                && matches!(app.mode, app::Mode::Graph)
+                && (app.pending.want_refresh || pending_checked.elapsed() >= Duration::from_secs(2))
+            {
+                app.pending.want_refresh = false;
+                app.pending.loading = true;
+                pending_checked = Instant::now();
+                pending_generation = pending_generation.wrapping_add(1);
+                let generation = pending_generation;
+                let r = r.clone();
+                let tx = tx.clone();
+                timing.mark("pending status requested");
+                thread::spawn(move || {
+                    let _ = tx.send(Msg::Pending(generation, git::worktree::snapshot(&r)));
+                });
+            }
         }
         if std::mem::take(&mut app.branches.preview_requested) {
             preview_epoch = preview_epoch.wrapping_add(1);
@@ -675,8 +726,11 @@ fn run(
                 }
             }
             if !app.branches.busy
+                && !app.pending.busy
                 && let Some(target) = app.checkout_request.take()
             {
+                pending_generation = pending_generation.wrapping_add(1);
+                app.pending.loading = false;
                 app.branches.busy = true;
                 app.branches.status = format!("Checking out {}…", target.label());
                 app.checkout_notice = Some(Ok(app.branches.status.clone()));
@@ -773,6 +827,8 @@ fn run(
                     }
                     if matches!(req, DiffReq::Tree { .. }) {
                         timing.mark("diff requested");
+                    } else {
+                        timing.mark("file diff requested");
                     }
                     let remote_request = match &req {
                         DiffReq::Tree { remote, .. } => remote.is_some(),
@@ -816,6 +872,12 @@ fn run(
             let now = ui::time::now_unix();
             ui::draw(app, screen, &areas, now);
             screen.flush(console);
+            let showing_pending =
+                app.pending.selected && matches!(app.mode, app::Mode::Graph) && !app.branches.open;
+            if showing_pending && !pending_frame {
+                timing.mark("pending changes frame");
+            }
+            pending_frame = showing_pending;
             if app.checkout_confirmation.is_some() && !checkout_frame {
                 timing.mark("checkout confirmation frame");
             }
@@ -891,6 +953,43 @@ fn run(
 
         for msg in pending {
             match msg {
+                Msg::Pending(generation, result) => {
+                    if generation == pending_generation {
+                        if let Ok(snapshot) = &result {
+                            timing.mark(format!(
+                                "pending status ready ({} files)",
+                                snapshot.files.len()
+                            ));
+                            if snapshot.head != app.head_id()
+                                || app
+                                    .refs
+                                    .as_ref()
+                                    .is_some_and(|r| r.head_branch != snapshot.branch)
+                            {
+                                app.want_refresh = true;
+                            }
+                        } else {
+                            timing.mark("pending status failed");
+                        }
+                        app.install_pending(result);
+                    }
+                }
+                Msg::Committed(result) => {
+                    timing.mark("commit done");
+                    app.pending.busy = false;
+                    app.pending.error = result.is_err();
+                    app.pending.status = match &result {
+                        Ok(message) => message.clone(),
+                        Err(error) => format!("Commit failed: {error}"),
+                    };
+                    if result.is_ok() {
+                        app.pending.description = Default::default();
+                        app.pending.branch = Default::default();
+                    }
+                    app.pending.want_refresh = true;
+                    app.want_refresh = true;
+                    app.needs_redraw = true;
+                }
                 Msg::BranchActivity(generation, values, error) => {
                     activity_busy = false;
                     if generation == remote_generation {
@@ -1027,6 +1126,7 @@ fn run(
                     app.needs_redraw = true;
                 }
                 Msg::Checkout(result, remote) => {
+                    app.pending.want_refresh = true;
                     app.branches.busy = false;
                     if result.is_ok() && remote {
                         app.branches.want_refresh = Some(true);

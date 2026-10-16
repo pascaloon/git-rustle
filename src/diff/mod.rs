@@ -48,6 +48,8 @@ pub struct Side {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
+    /// New side comes from the working tree rather than an immutable object.
+    pub worktree: bool,
     pub remote: Option<Box<crate::remote::files::RemoteFile>>,
     /// Path on the new side (old side for deletions).
     pub path: String,
@@ -222,6 +224,7 @@ fn diff_trees(
                     prefix.truncate(saved);
                 } else {
                     out.push(FileChange {
+                        worktree: false,
                         remote: None,
                         path: join(prefix, &a.name),
                         old_path: None,
@@ -257,6 +260,7 @@ fn emit_whole(
         prefix.truncate(saved);
     } else {
         out.push(FileChange {
+            worktree: false,
             remote: None,
             path: join(prefix, &e.name),
             old_path: None,
@@ -322,7 +326,7 @@ pub fn file_diff(repo: &gix::Repository, change: &FileChange) -> Result<FileDiff
     let mut old_buf = Vec::new();
     let mut new_buf = Vec::new();
     let old = load_side(repo, change.old, &mut old_buf)?;
-    let new = load_side(repo, change.new, &mut new_buf)?;
+    let new = load_new(repo, change, &mut new_buf)?;
     let (old, new) = match (old, new) {
         (Loaded::Text(o), Loaded::Text(n)) => (o, n),
         (Loaded::Text(o), Loaded::Missing) => (o, &b""[..]),
@@ -332,7 +336,11 @@ pub fn file_diff(repo: &gix::Repository, change: &FileChange) -> Result<FileDiff
             return Ok(FileDiff::message(format!(
                 "Binary files differ ({} → {})",
                 size_of(change.old, &old_buf),
-                size_of(change.new, &new_buf)
+                if change.worktree {
+                    format!("{} B (working tree)", new_buf.len())
+                } else {
+                    size_of(change.new, &new_buf)
+                }
             )));
         }
         (Loaded::TooLarge, _) | (_, Loaded::TooLarge) => {
@@ -362,7 +370,7 @@ pub fn file_stats(repo: &gix::Repository, change: &FileChange) -> Result<Stat> {
     let mut old_buf = Vec::new();
     let mut new_buf = Vec::new();
     let old = load_side(repo, change.old, &mut old_buf)?;
-    let new = load_side(repo, change.new, &mut new_buf)?;
+    let new = load_new(repo, change, &mut new_buf)?;
     let count = |data: &[u8]| split_lines_count(data);
     Ok(match (old, new) {
         (Loaded::Binary | Loaded::TooLarge, _) | (_, Loaded::Binary | Loaded::TooLarge) => {
@@ -397,6 +405,47 @@ enum Loaded<'a> {
     Text(&'a [u8]),
     Binary,
     TooLarge,
+}
+
+fn load_new<'a>(
+    repo: &gix::Repository,
+    change: &FileChange,
+    buf: &'a mut Vec<u8>,
+) -> Result<Loaded<'a>> {
+    if !change.worktree {
+        return load_side(repo, change.new, buf);
+    }
+    let root = repo
+        .workdir()
+        .ok_or("Pending changes need a working tree")?;
+    let path = root.join(&change.path);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Missing),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() {
+        let id = crate::git::command::checked(&path, &["rev-parse", "HEAD"])?;
+        buf.extend_from_slice(b"Subproject commit ");
+        buf.extend_from_slice(&id);
+    } else if metadata.file_type().is_symlink() {
+        buf.extend_from_slice(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
+    } else {
+        if metadata.len() > MAX_BLOB as u64 {
+            return Ok(Loaded::TooLarge);
+        }
+        use std::io::Read;
+        std::fs::File::open(&path)?
+            .take(MAX_BLOB as u64 + 1)
+            .read_to_end(buf)?;
+    }
+    if buf.len() > MAX_BLOB {
+        return Ok(Loaded::TooLarge);
+    }
+    if buf[..buf.len().min(8000)].contains(&0) {
+        return Ok(Loaded::Binary);
+    }
+    Ok(Loaded::Text(buf))
 }
 
 fn load_side<'a>(
@@ -520,6 +569,7 @@ mod tests {
         };
         let mut files = vec![
             FileChange {
+                worktree: false,
                 remote: None,
                 path: "old/a.rs".into(),
                 old_path: None,
@@ -528,6 +578,7 @@ mod tests {
                 new: None,
             },
             FileChange {
+                worktree: false,
                 remote: None,
                 path: "b.rs".into(),
                 old_path: None,
@@ -536,6 +587,7 @@ mod tests {
                 new: side(3),
             },
             FileChange {
+                worktree: false,
                 remote: None,
                 path: "new/a.rs".into(),
                 old_path: None,
@@ -544,6 +596,7 @@ mod tests {
                 new: side(1),
             },
             FileChange {
+                worktree: false,
                 remote: None,
                 path: "c.rs".into(),
                 old_path: None,

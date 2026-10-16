@@ -51,6 +51,7 @@ pub struct Label {
 }
 
 pub struct App {
+    pub pending: crate::pending::Pending,
     pub local_history: Option<std::sync::Arc<History>>,
     pub ghosts: HashMap<ObjectId, CommitDetails>,
     pub ghost_sources: HashMap<ObjectId, crate::remote::Remote>,
@@ -107,6 +108,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         App {
+            pending: crate::pending::Pending::default(),
             local_history: None,
             ghosts: HashMap::new(),
             ghost_sources: HashMap::new(),
@@ -150,7 +152,221 @@ impl App {
     }
 
     pub fn selected_id(&self) -> Option<ObjectId> {
+        if self.pending.selected {
+            return None;
+        }
         self.history.commits.get(self.selected).map(|c| c.id)
+    }
+
+    pub fn graph_len(&self) -> usize {
+        self.history.len() + usize::from(self.pending.exists())
+    }
+    pub fn graph_selected(&self) -> usize {
+        if self.pending.selected {
+            self.pending.row()
+        } else {
+            self.selected
+                + usize::from(self.pending.exists() && self.selected >= self.pending.row())
+        }
+    }
+    pub fn history_index(&self, row: usize) -> Option<usize> {
+        if !self.pending.exists() {
+            Some(row)
+        } else if row == self.pending.row() {
+            None
+        } else {
+            Some(row - usize::from(row > self.pending.row()))
+        }
+    }
+    pub fn select_graph(&mut self, row: usize) {
+        let row = row.min(self.graph_len().saturating_sub(1));
+        if let Some(index) = self.history_index(row) {
+            self.select(index);
+        } else {
+            self.pending.selected = true;
+            self.details = None;
+            self.ensure_visible();
+            self.needs_redraw = true;
+        }
+    }
+    fn update_pending_row(&mut self, replaced: bool) {
+        if let Some(id) = self.pending.return_to_head
+            && let Some(index) = self.history.index_of(&id)
+        {
+            self.pending.return_to_head = None;
+            self.select(index);
+        }
+        if !self.pending.exists() {
+            return;
+        }
+        let previous_row = self.pending.row();
+        let offset = previous_row.saturating_sub(self.scroll);
+        let was_visible =
+            previous_row >= self.scroll && previous_row < self.scroll + self.list_rows.max(1);
+        if replaced {
+            self.pending.head_index = None;
+            self.pending.searched = 0;
+        }
+        if self.pending.head_index.is_none() {
+            let start = self.pending.searched.min(self.history.len());
+            if let Some(head) = self.head_id() {
+                self.pending.head_index = self.history.commits[start..]
+                    .iter()
+                    .position(|c| c.id == head)
+                    .map(|i| start + i);
+            }
+            self.pending.searched = self.history.len();
+        }
+        if self.pending.selected && previous_row != self.pending.row() && was_visible {
+            self.scroll = self.pending.row().saturating_sub(offset);
+        }
+    }
+    pub fn install_pending(&mut self, result: Result<crate::pending::Snapshot, String>) {
+        if self.pending.known && result.as_ref().is_ok_and(|s| *s == self.pending.snapshot) {
+            self.pending.loading = false;
+            return;
+        }
+        self.pending.known = true;
+        self.pending.loading = false;
+        match result {
+            Ok(snapshot) => {
+                self.pending.snapshot = snapshot;
+                let paths: std::collections::HashSet<_> = self
+                    .pending
+                    .snapshot
+                    .files
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect();
+                self.pending
+                    .checks
+                    .retain(|path, _| paths.contains(path.as_str()));
+                if !self.pending.exists() && self.pending.selected {
+                    self.pending.selected = false;
+                    self.pending.return_to_head = self.pending.snapshot.head;
+                }
+                if self.pending.selected && matches!(self.mode, Mode::Graph) {
+                    self.rebuild_pending_changes();
+                }
+                self.update_pending_row(true);
+                if self.pending.autofocus {
+                    self.pending.autofocus = false;
+                    if self.pending.exists() {
+                        self.startup_head_search = None;
+                        self.pending.selected = true;
+                        self.ensure_visible();
+                    }
+                }
+                self.focus_startup_head(true);
+            }
+            Err(error) => {
+                self.pending.autofocus = false;
+                self.pending.status = format!("Cannot read pending changes: {error}");
+                self.pending.error = true;
+                self.focus_startup_head(true);
+            }
+        }
+        self.clamp();
+        self.needs_redraw = true;
+    }
+    fn rebuild_pending_changes(&mut self) {
+        let mut previous = self.pending.checks.clone();
+        previous.extend(
+            self.details_changes
+                .as_ref()
+                .filter(|cs| cs.checked.is_some())
+                .map(|cs| {
+                    cs.files
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| (f.path.clone(), cs.checked.as_ref().unwrap()[i]))
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default(),
+        );
+        let mut changes = ChangeSet::new(
+            self.new_key(),
+            self.pending.snapshot.head,
+            ObjectId::null(gix::hash::Kind::Sha1),
+        );
+        changes.requested = true;
+        changes.set_tree(Ok(crate::diff::TreeDiff {
+            files: self.pending.snapshot.files.clone(),
+        }));
+        changes.enable_checks();
+        for (i, file) in changes.files.iter().enumerate() {
+            if let Some(checked) = previous.get(&file.path) {
+                changes.checked.as_mut().unwrap()[i] = *checked;
+            }
+        }
+        changes.recompute_checks();
+        self.pending.checks = changes
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.path.clone(), changes.checked.as_ref().unwrap()[i]))
+            .collect();
+        self.details_changes = Some(changes);
+        self.details_cursor
+            .clamp(&self.details_changes.as_ref().unwrap().tree);
+    }
+
+    fn remember_pending_checks(&mut self) {
+        if let Some(cs) = &self.details_changes
+            && let Some(checks) = &cs.checked
+        {
+            self.pending.checks = cs
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.path.clone(), checks[i]))
+                .collect();
+        }
+    }
+    pub fn request_commit(&mut self) {
+        if self.pending.busy
+            || self.pending.request.is_some()
+            || self.branches.busy
+            || self.checkout_request.is_some()
+        {
+            return;
+        }
+        self.sync_details_changes();
+        let error = if self.pending.description.value.trim().is_empty() {
+            Some("Enter a commit description")
+        } else if self.pending.snapshot.conflicts {
+            Some("Resolve file conflicts before committing")
+        } else if self
+            .details_changes
+            .as_ref()
+            .is_none_or(|cs| cs.checked_count() == 0)
+        {
+            Some("Check at least one file to commit")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.pending.status = error.into();
+            self.pending.error = true;
+            self.needs_redraw = true;
+            return;
+        }
+        let cs = self.details_changes.as_ref().unwrap();
+        let files = cs
+            .files
+            .iter()
+            .zip(cs.checked.as_ref().unwrap())
+            .filter(|(_, yes)| **yes)
+            .map(|(f, _)| f.clone())
+            .collect();
+        self.pending.request = Some(crate::pending::Request {
+            head: self.pending.snapshot.head,
+            branch: self.pending.snapshot.branch.clone(),
+            new_branch: self.pending.branch.value.clone(),
+            description: self.pending.description.value.clone(),
+            files,
+        });
+        self.needs_redraw = true;
     }
 
     pub fn is_marked(&self, id: &ObjectId) -> bool {
@@ -191,6 +407,19 @@ impl App {
 
     /// Keep `details_changes` pointed at the selected commit.
     pub fn sync_details_changes(&mut self) {
+        if self.pending.selected {
+            if matches!(self.mode, Mode::Diff(_)) {
+                return;
+            }
+            if self
+                .details_changes
+                .as_ref()
+                .is_none_or(|cs| cs.checked.is_none())
+            {
+                self.rebuild_pending_changes();
+            }
+            return;
+        }
         let Some(id) = self.selected_id() else { return };
         if self.details_changes.as_ref().map(|c| c.new) == Some(id) {
             return;
@@ -250,6 +479,14 @@ impl App {
     /// `d`: diff the two marked commits (older on the left), or with fewer
     /// marks the marked/selected commit against its parent.
     pub fn open_diff(&mut self) {
+        if self.pending.selected {
+            self.sync_details_changes();
+            self.remember_pending_checks();
+            if let Some(changes) = self.details_changes.take() {
+                self.show_view(changes, Some(self.details_cursor));
+            }
+            return;
+        }
         if self.marks.len() == MAX_MARKS {
             let (a, b) = (self.marks[0], self.marks[1]);
             let time = |id: &ObjectId| {
@@ -299,8 +536,9 @@ impl App {
             self.sidebar_width = view.sidebar_width;
             // Hand a parent diff of the selected commit back to the details panel.
             let selected = self.selected_id();
-            if Some(view.changes.new) == selected
-                && view.changes.old == selected.and_then(|s| self.parent_of(&s))
+            if (self.pending.selected && view.changes.checked.is_some())
+                || (Some(view.changes.new) == selected
+                    && view.changes.old == selected.and_then(|s| self.parent_of(&s)))
             {
                 self.details_changes = Some(view.changes);
                 self.details_cursor = view.cursor;
@@ -323,6 +561,19 @@ impl App {
     }
 
     fn cycle_focus(&mut self) {
+        if self.pending.selected {
+            match self.focus {
+                Focus::List => {
+                    self.focus = Focus::Details;
+                    self.pending.field = 0;
+                }
+                Focus::Details if self.pending.field < 4 => self.pending.field += 1,
+                Focus::Details => self.focus = Focus::Files,
+                Focus::Files => self.focus = Focus::List,
+            }
+            self.needs_redraw = true;
+            return;
+        }
         self.focus = match self.focus {
             Focus::List => Focus::Details,
             Focus::Details if self.files_tree_available() => Focus::Files,
@@ -339,6 +590,13 @@ impl App {
         let Some(searched) = self.startup_head_search else {
             return;
         };
+        if self.pending.exists() {
+            self.startup_head_search = None;
+            self.pending.selected = true;
+            self.ensure_visible();
+            self.needs_redraw = true;
+            return;
+        }
         let Some(refs) = self.refs.as_ref() else {
             return;
         };
@@ -399,6 +657,7 @@ impl App {
             self.branches.rebuild(self.refs.as_ref());
         }
         self.remote_labels();
+        self.update_pending_row(true);
         self.focus_startup_head(true);
         self.needs_redraw = true;
     }
@@ -444,7 +703,7 @@ impl App {
     pub fn install_preview(&mut self, preview: crate::remote::history::Preview) {
         let startup_pending = self.startup_head_search.is_some();
         let keep = self.selected_id();
-        let offset = self.selected.saturating_sub(self.scroll);
+        let offset = self.graph_selected().saturating_sub(self.scroll);
         let was_top = self.scroll == 0;
         if let Some(history) = preview.history {
             self.history = history;
@@ -475,10 +734,11 @@ impl App {
             && let Some(i) = self.history.index_of(&id)
         {
             self.selected = i;
-            self.scroll = if was_top && i < self.list_rows {
+            let row = self.graph_selected();
+            self.scroll = if was_top && row < self.list_rows {
                 0
             } else {
-                i.saturating_sub(offset)
+                row.saturating_sub(offset)
             };
         }
         self.clamp();
@@ -514,6 +774,7 @@ impl App {
             LoadState::Refreshing
         };
         self.clamp();
+        self.update_pending_row(true);
         self.focus_startup_head(true);
         self.needs_redraw = true;
     }
@@ -545,6 +806,7 @@ impl App {
                     }
                     self.load = LoadState::Complete;
                     self.clamp();
+                    self.update_pending_row(true);
                     self.focus_startup_head(true);
                 }
             }
@@ -556,6 +818,7 @@ impl App {
                     LoadState::Loading
                 };
                 self.clamp();
+                self.update_pending_row(false);
                 self.focus_startup_head(false);
             }
         }
@@ -582,14 +845,14 @@ impl App {
     }
 
     fn clamp(&mut self) {
-        let n = self.history.len();
+        let n = self.graph_len();
         if n == 0 {
             self.selected = 0;
             self.scroll = 0;
             return;
         }
-        if self.selected >= n {
-            self.selected = n - 1;
+        if self.selected >= self.history.len() {
+            self.selected = self.history.len().saturating_sub(1);
         }
         let max_scroll = n.saturating_sub(self.list_rows.max(1));
         if self.scroll > max_scroll {
@@ -599,14 +862,19 @@ impl App {
 
     pub fn ensure_visible(&mut self) {
         let rows = self.list_rows.max(1);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + rows {
-            self.scroll = self.selected + 1 - rows;
+        let selected = self.graph_selected();
+        if selected < self.scroll {
+            self.scroll = selected;
+        } else if selected >= self.scroll + rows {
+            self.scroll = selected + 1 - rows;
         }
     }
 
     pub fn select(&mut self, idx: usize) {
+        if self.pending.selected {
+            self.remember_pending_checks();
+        }
+        self.pending.selected = false;
         let n = self.history.len();
         if n == 0 {
             return;
@@ -621,16 +889,16 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let n = self.history.len() as isize;
+        let n = self.graph_len() as isize;
         if n == 0 {
             return;
         }
-        let target = (self.selected as isize + delta).clamp(0, n - 1);
-        self.select(target as usize);
+        let target = (self.graph_selected() as isize + delta).clamp(0, n - 1);
+        self.select_graph(target as usize);
     }
 
     fn scroll_view(&mut self, delta: isize) {
-        let n = self.history.len();
+        let n = self.graph_len();
         let max_scroll = n.saturating_sub(self.list_rows.max(1));
         let target = (self.scroll as isize + delta).clamp(0, max_scroll as isize);
         self.scroll = target as usize;
@@ -645,6 +913,9 @@ impl App {
     }
 
     fn confirm_checkout(&mut self, choices: Vec<crate::checkout::Request>) {
+        if self.pending.busy || self.pending.request.is_some() {
+            return;
+        }
         if self.branches.busy || self.checkout_request.is_some() || choices.is_empty() {
             return;
         }
@@ -685,6 +956,16 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.startup_head_search = None;
+        self.pending.autofocus = false;
+        self.pending.return_to_head = None;
+        if (self.pending.busy || self.pending.request.is_some())
+            && (matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                || (key.ctrl && key.code == KeyCode::Char('c')))
+        {
+            self.pending.status = "Wait for the commit to finish before exiting".into();
+            self.needs_redraw = true;
+            return;
+        }
         if let Some(dialog) = &mut self.checkout_confirmation {
             match key.code {
                 KeyCode::Enter if dialog.ready && !key.ctrl && !key.alt => {
@@ -710,7 +991,10 @@ impl App {
         if !self.branches.busy
             && self.checkout_request.is_none()
             && (key.code == KeyCode::F(2)
-                || (!self.branches.open && !key.ctrl && key.code == KeyCode::Char('s')))
+                || (!self.branches.open
+                    && !(self.pending.selected && self.focus == Focus::Details)
+                    && !key.ctrl
+                    && key.code == KeyCode::Char('s')))
         {
             self.settings.show();
             self.dragging_splitter = false;
@@ -776,6 +1060,78 @@ impl App {
             self.needs_redraw |= redraw;
             return;
         }
+        if self.pending.selected {
+            if key.ctrl && key.code == KeyCode::Enter {
+                self.request_commit();
+                return;
+            }
+            if key.code == KeyCode::Tab {
+                if key.shift {
+                    match self.focus {
+                        Focus::List => self.focus = Focus::Files,
+                        Focus::Files => {
+                            self.focus = Focus::Details;
+                            self.pending.field = 4;
+                        }
+                        Focus::Details if self.pending.field > 0 => self.pending.field -= 1,
+                        Focus::Details => self.focus = Focus::List,
+                    }
+                    self.needs_redraw = true;
+                } else {
+                    self.cycle_focus();
+                }
+                return;
+            }
+            if key.code == KeyCode::Esc && self.focus != Focus::List {
+                self.focus = Focus::List;
+                self.needs_redraw = true;
+                return;
+            }
+            if self.focus == Focus::Details && key.code != KeyCode::F(5) {
+                if !self.pending.busy {
+                    match self.pending.field {
+                        0 => self.pending.description.edit(key, true),
+                        1 => self.pending.branch.edit(key, false),
+                        2 if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) => {
+                            self.request_commit()
+                        }
+                        3 | 4 if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) => {
+                            if let Some(cs) = &mut self.details_changes {
+                                cs.set_all_checked(self.pending.field == 3);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.needs_redraw = true;
+                return;
+            }
+            if self.focus == Focus::Files && key.code == KeyCode::Char(' ') {
+                if let Some(cs) = &mut self.details_changes
+                    && let Some(row) = cs.tree.visible.get(self.details_cursor.sel)
+                {
+                    cs.toggle_checked(row.node);
+                }
+                self.needs_redraw = true;
+                return;
+            }
+            if key.code == KeyCode::Enter {
+                if self.focus == Focus::List {
+                    self.focus = Focus::Details;
+                    self.pending.field = 0;
+                } else {
+                    let folder = self
+                        .details_changes
+                        .as_mut()
+                        .is_some_and(|cs| self.details_cursor.toggle(&mut cs.tree));
+                    if !folder {
+                        self.open_diff();
+                    }
+                }
+                self.needs_redraw = true;
+                return;
+            }
+        }
         let page = self.list_rows.saturating_sub(1).max(1) as isize;
         match (key.code, key.ctrl) {
             (KeyCode::Char('b'), false) => {
@@ -814,6 +1170,7 @@ impl App {
             (KeyCode::Tab, _) => self.cycle_focus(),
             (KeyCode::F(5), false) => {
                 self.want_refresh = true;
+                self.pending.want_refresh = true;
                 self.branches.want_refresh = Some(true);
             }
             (KeyCode::Char('['), _) => self.resize_panel(-2),
@@ -878,8 +1235,8 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-page),
             KeyCode::PageDown => self.move_selection(page),
-            KeyCode::Home | KeyCode::Char('g') => self.select(0),
-            KeyCode::End | KeyCode::Char('G') => self.select(usize::MAX),
+            KeyCode::Home | KeyCode::Char('g') => self.select_graph(0),
+            KeyCode::End | KeyCode::Char('G') => self.select_graph(usize::MAX),
             KeyCode::Char('H') => {
                 if let Some(h) = self.head_id()
                     && let Some(i) = self.history.index_of(&h)
@@ -920,6 +1277,8 @@ impl App {
     pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16, screen_h: u16) {
         if !matches!(m.kind, MouseKind::Move | MouseKind::Up(_)) {
             self.startup_head_search = None;
+            self.pending.autofocus = false;
+            self.pending.return_to_head = None;
         }
         if self.checkout_confirmation.is_some() {
             return;
@@ -949,6 +1308,50 @@ impl App {
             self.needs_redraw |= view.needs_redraw;
             return;
         }
+        if self.pending.selected
+            && areas.details.contains(m.x, m.y)
+            && matches!(
+                m.kind,
+                MouseKind::Down(Button::Left) | MouseKind::DoubleClick(Button::Left)
+            )
+        {
+            let a = self.pending.areas;
+            if a.description.contains(m.x, m.y) {
+                self.focus = Focus::Details;
+                self.pending.field = 0;
+                self.pending.description.cursor = self.pending.description.value.len();
+            } else if a.branch.contains(m.x, m.y) {
+                self.focus = Focus::Details;
+                self.pending.field = 1;
+                self.pending.branch.cursor = self.pending.branch.value.len();
+            } else if a.commit.contains(m.x, m.y) {
+                self.request_commit();
+            } else if a.check_all.contains(m.x, m.y) || a.uncheck_all.contains(m.x, m.y) {
+                if let Some(cs) = &mut self.details_changes {
+                    cs.set_all_checked(a.check_all.contains(m.x, m.y));
+                }
+            } else if self.files_area.contains(m.x, m.y) {
+                self.focus = Focus::Files;
+                let row = self.details_cursor.scroll + (m.y - self.files_area.y) as usize;
+                if let Some(cs) = &mut self.details_changes
+                    && let Some(visible) = cs.tree.visible.get(row).copied()
+                {
+                    self.details_cursor.select(&cs.tree, row);
+                    let checkbox_x = self.files_area.x
+                        + 1
+                        + (visible.depth * 2).min(self.files_area.w.saturating_sub(10));
+                    if m.x >= checkbox_x && m.x < checkbox_x + 3 {
+                        cs.toggle_checked(visible.node);
+                    } else if cs.tree.nodes[visible.node].is_folder() {
+                        self.details_cursor.toggle(&mut cs.tree);
+                    } else if matches!(m.kind, MouseKind::DoubleClick(_)) {
+                        self.open_diff();
+                    }
+                }
+            }
+            self.needs_redraw = true;
+            return;
+        }
         match m.kind {
             MouseKind::Down(Button::Left) | MouseKind::DoubleClick(Button::Left) => {
                 if areas.splitter.contains(m.x, m.y) {
@@ -956,9 +1359,17 @@ impl App {
                 } else if areas.list.contains(m.x, m.y) {
                     self.focus = Focus::List;
                     let idx = self.scroll + (m.y - areas.list.y) as usize;
-                    if idx < self.history.len() {
-                        self.select(idx);
-                        let id = self.history.commits[idx].id;
+                    if idx < self.graph_len() {
+                        self.select_graph(idx);
+                        if self.pending.selected {
+                            self.sync_details_changes();
+                            if matches!(m.kind, MouseKind::DoubleClick(_)) {
+                                self.open_diff();
+                            }
+                            self.needs_redraw = true;
+                            return;
+                        }
+                        let id = self.history.commits[self.selected].id;
                         if m.ctrl {
                             // Ctrl+click marks the commit for diffing.
                             self.toggle_mark(id);
@@ -1076,6 +1487,200 @@ mod tests {
             details: Rect::new(61, 1, 39, 10),
             status: Rect::new(0, 11, 100, 1),
         }
+    }
+
+    fn dirty_snapshot(head: ObjectId) -> crate::pending::Snapshot {
+        crate::pending::Snapshot {
+            head: Some(head),
+            branch: Some("main".into()),
+            files: ["src/a.rs", "src/b.rs", "root.txt"]
+                .into_iter()
+                .map(|path| crate::diff::FileChange {
+                    worktree: true,
+                    remote: None,
+                    path: path.into(),
+                    old_path: None,
+                    kind: crate::diff::ChangeKind::Modified,
+                    old: None,
+                    new: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn pending_startup_has_priority_and_navigation_maps_back_to_real_commits() {
+        let mut app = App::new();
+        app.list_rows = 10;
+        app.pending.known = false;
+        app.pending.autofocus = true;
+        app.set_cached(history(80), true);
+        let head = app.history.commits[20].id;
+        app.set_refs(RefSnapshot {
+            head_id: Some(head),
+            ..Default::default()
+        });
+        assert_eq!(app.selected_id(), Some(head)); // HEAD is available before slow status work.
+        app.install_pending(Ok(dirty_snapshot(head)));
+        assert!(app.pending.selected);
+        assert_eq!(app.graph_selected(), 20);
+        assert_eq!(app.graph_len(), 81);
+        assert_eq!(app.history.len(), 80);
+        assert_eq!(app.history_index(20), None);
+        assert_eq!(app.history_index(21), Some(20));
+        assert!(app.scroll <= 20 && 20 < app.scroll + app.list_rows);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_id(), Some(head));
+        app.handle_key(key(KeyCode::Up));
+        assert!(app.pending.selected);
+        app.handle_key(key(KeyCode::Char('H')));
+        assert_eq!(app.selected_id(), Some(head));
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.selected, 79);
+        let mut early = App::new();
+        early.pending.autofocus = true;
+        early.set_cached(history(80), true);
+        early.handle_key(key(KeyCode::Down));
+        early.install_pending(Ok(dirty_snapshot(head)));
+        assert!(!early.pending.selected);
+        assert_eq!(early.selected, 1);
+    }
+    #[test]
+    fn pending_refresh_does_not_recenter_after_manual_graph_scrolling() {
+        let mut app = app_with(80);
+        let head = app.history.commits[20].id;
+        app.set_refs(RefSnapshot {
+            head_id: Some(head),
+            ..Default::default()
+        });
+        app.pending.autofocus = true;
+        app.install_pending(Ok(dirty_snapshot(head)));
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseKind::Wheel(-10),
+                x: 5,
+                y: 3,
+                ctrl: false,
+                shift: false,
+            },
+            &areas(),
+            100,
+            12,
+        );
+        let scroll = app.scroll;
+        assert!(scroll > app.pending.row());
+        let mut changed = dirty_snapshot(head);
+        changed.fingerprint = 1;
+        app.install_pending(Ok(changed));
+        assert_eq!(app.scroll, scroll);
+    }
+    #[test]
+    fn pending_composer_keeps_text_checks_and_diff_selection_without_global_shortcuts() {
+        let mut app = app_with(4);
+        let head = app.history.commits[1].id;
+        app.set_refs(RefSnapshot {
+            head_id: Some(head),
+            ..Default::default()
+        });
+        app.pending.autofocus = true;
+        app.install_pending(Ok(dirty_snapshot(head)));
+        app.sync_details_changes();
+        app.handle_key(key(KeyCode::Tab));
+        for ch in "Describe b s q é".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.pending.description.value, "Describe b s q é\nx");
+        assert!(!app.settings.open && !app.branches.open && !app.quit);
+        app.handle_key(key(KeyCode::Tab));
+        for ch in "feature/commit".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.focus = Focus::Files;
+        app.details_cursor.sel = 0;
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.details_changes.as_ref().unwrap().checked_count(), 1);
+        assert!(app.marks.is_empty());
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::Diff(_)));
+        if let Mode::Diff(view) = &mut app.mode {
+            assert!(view.changes.files.iter().all(|f| f.worktree));
+            view.cursor.select(&view.changes.tree, 0);
+            view.handle_key(key(KeyCode::Char(' ')));
+            assert_eq!(view.changes.checked_count(), 3);
+        }
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.pending.selected);
+        assert_eq!(app.details_changes.as_ref().unwrap().checked_count(), 3);
+        app.details_changes
+            .as_mut()
+            .unwrap()
+            .checked
+            .as_mut()
+            .unwrap()[1] = false;
+        app.details_changes.as_mut().unwrap().recompute_checks();
+        app.select(0);
+        app.sync_details_changes();
+        app.select_graph(app.pending.row());
+        app.sync_details_changes();
+        assert_eq!(app.details_changes.as_ref().unwrap().checked_count(), 2);
+        let mut screen = crate::term::Screen::new(120, 34);
+        let areas = crate::ui::compute_areas(120, 34, 45);
+        crate::ui::draw(&mut app, &mut screen, &areas, 0);
+        let text: String = screen.test_cells().iter().map(|c| c.ch).collect();
+        for required in [
+            "Commit changes",
+            "Description",
+            "New branch",
+            "Modified files (2/3)",
+            "Check all",
+            "Uncheck all",
+            "[-]",
+            "[ ]",
+        ] {
+            assert!(text.contains(required), "Missing {required}");
+        }
+        let mut submit = key(KeyCode::Enter);
+        submit.ctrl = true;
+        app.handle_key(submit);
+        let request = app.pending.request.as_ref().unwrap();
+        assert_eq!(request.files.len(), 2);
+        assert_eq!(request.new_branch, "feature/commit");
+        assert_eq!(request.description, "Describe b s q é\nx");
+        app.pending.request = None;
+        let button = app.pending.areas.commit;
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseKind::Down(Button::Left),
+                x: button.x + 1,
+                y: button.y,
+                ctrl: false,
+                shift: false,
+            },
+            &areas,
+            120,
+            34,
+        );
+        assert_eq!(app.pending.request.as_ref().unwrap().files.len(), 2);
+    }
+    #[test]
+    fn removing_pending_node_selects_new_head_when_its_walk_arrives() {
+        let mut app = app_with(4);
+        let head = app.history.commits[1].id;
+        app.pending.autofocus = true;
+        app.install_pending(Ok(dirty_snapshot(head)));
+        let next = history(5).commits[4].id;
+        app.install_pending(Ok(crate::pending::Snapshot {
+            head: Some(next),
+            ..Default::default()
+        }));
+        assert!(!app.pending.selected);
+        assert_eq!(app.pending.return_to_head, Some(next));
+        app.start_walk();
+        app.push_batch(history(5));
+        assert_eq!(app.selected_id(), Some(next));
+        assert!(app.pending.return_to_head.is_none());
     }
 
     #[test]
@@ -1609,6 +2214,7 @@ mod tests {
         assert!(app.pending_requests().is_empty());
         let cs_key = app.details_changes.as_ref().unwrap().key;
         let change = |p: &str| FileChange {
+            worktree: false,
             remote: None,
             path: p.to_string(),
             old_path: None,

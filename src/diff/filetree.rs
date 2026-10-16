@@ -323,6 +323,7 @@ mod tests {
 
     fn change(path: &str, kind: ChangeKind) -> FileChange {
         FileChange {
+            worktree: false,
             remote: None,
             path: path.to_string(),
             old_path: None,

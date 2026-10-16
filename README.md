@@ -71,10 +71,54 @@ git-rustle [OPTIONS] [PATH]
 | `q`, `Ctrl+C` | Quit |
 | `Esc` | Clear marks, or quit when none are set |
 
-On launch, the graph selects HEAD and scrolls it into view. The checked-out
+On launch, the graph selects **Pending changes** when the working tree is dirty,
+otherwise HEAD, and scrolls the selection into view. The checked-out
 commit has a green `HEAD` badge before its branch labels, including when HEAD
 is detached. Early keyboard or mouse navigation keeps your selection while
 history continues loading.
+
+### Pending changes and commits
+
+Staged, unstaged, and untracked files appear in a **Pending changes** node directly
+above HEAD. Ignored files are excluded. The node is a display row, never a Git
+commit or a cached history entry. Status updates in the background every two
+seconds; `F5` refreshes it immediately.
+
+Select that node to replace the details panel with **Commit changes**. Enter a
+description (Enter adds a new line), optionally enter a **new branch** name, then
+click **Commit** or press **Ctrl+Enter**. A blank branch field commits on the current
+branch, or on detached HEAD; a name creates and switches to a new branch from
+HEAD. Existing branch names are rejected. Empty repositories are supported too.
+
+The **Modified files** tree remains at the bottom. Files start checked; checkboxes
+select whole files, using their **current working-tree contents**, including staged
+and unstaged edits together. Unchecked files and their existing staged contents
+are preserved. Folder checkboxes toggle their descendants; `[-]` means a folder
+is partly checked. **Check all** and **Uncheck all** work with clicks or Tab/Enter.
+
+| Key | Action while Pending changes is selected |
+| --- | --- |
+| `Tab` / `Shift+Tab` | Move through graph, description, branch, buttons, and files |
+| `Enter` in the graph | Focus the description |
+| `Ctrl+Enter` | Commit the checked files |
+| `Space` in the files tree | Toggle the selected file or folder checkbox |
+| `Enter` in the files tree | Fold a folder or open a file in the diff view |
+| `d` in the graph/files tree | Review all pending files in the usual diff view |
+| `Esc` in the composer/files tree | Return focus to the graph |
+
+Click a checkbox to toggle it; double-click a file name to inspect its diff.
+Pending diffs compare HEAD with the current working files, including untracked
+files. Their sidebar also supports checkbox clicks and Space. Checks and the
+commit draft survive moving between the composer and diff view. Pending nodes
+cannot be checked out or marked as real commits.
+
+Commit creation requires Git for Windows on PATH with `git hook run` support.
+Git's author identity and signing settings apply. Commit hooks run against the
+selected files; a hook that stages unchecked paths is rejected before committing.
+Unresolved conflicts and ongoing merge/rebase/cherry-pick operations must be
+finished first. Failures keep the draft and file choices available for retry.
+The app waits for an active commit before exiting. After success it refreshes
+the graph and clears the draft; remaining unchecked changes stay available.
 
 The details panel ends with a **Files** section: the tree of files changed by
 the selected commit, each with `+added −removed` counts (folders total their
@@ -336,6 +380,8 @@ The [HEAD badge report](docs/head-label-benchmarks.md) measures label installati
 graph selection/drawing, and startup with an explicit HEAD label.
 The [startup HEAD focus report](docs/startup-head-benchmarks.md) compares startup
 and validates automatic selection of an off-screen attached or detached HEAD.
+The [pending changes report](docs/pending-changes-benchmarks.md) records startup,
+status, checkbox/drawing, working-file diffs, and selected-file commit measurements.
 The [connection-dimming report](docs/connection-dimming-benchmarks.md) includes
 the latest graph-styling measurements and startup comparison.
 

@@ -26,6 +26,8 @@ pub struct ChangeSet {
     /// Per-file stats; `None` until computed.
     pub stats: Vec<Option<Stat>>,
     pub stats_pending: usize,
+    pub checked: Option<Vec<bool>>,
+    check_totals: Vec<(usize, usize)>,
     /// Per-node totals (folders sum their descendants) and whether any
     /// descendant has counts yet.
     totals: Vec<(u32, u32, bool)>,
@@ -44,6 +46,8 @@ impl ChangeSet {
             error: None,
             stats: Vec::new(),
             stats_pending: 0,
+            checked: None,
+            check_totals: Vec::new(),
             totals: Vec::new(),
         }
     }
@@ -60,6 +64,71 @@ impl ChangeSet {
             Err(e) => self.error = Some(e),
         }
         self.loaded = true;
+    }
+
+    pub fn enable_checks(&mut self) {
+        self.checked = Some(vec![true; self.files.len()]);
+        self.recompute_checks();
+    }
+
+    pub fn set_all_checked(&mut self, checked: bool) {
+        if let Some(values) = &mut self.checked {
+            values.fill(checked);
+        }
+        self.recompute_checks();
+    }
+
+    pub fn toggle_checked(&mut self, node: usize) {
+        let target = self
+            .check_totals
+            .get(node)
+            .is_some_and(|&(yes, total)| yes != total);
+        let Some(values) = &mut self.checked else {
+            return;
+        };
+        let mut stack = vec![node];
+        while let Some(index) = stack.pop() {
+            let item = &self.tree.nodes[index];
+            if let Some(file) = item.file {
+                values[file] = target;
+            } else {
+                stack.extend_from_slice(&item.children);
+            }
+        }
+        self.recompute_checks();
+    }
+
+    pub fn recompute_checks(&mut self) {
+        self.check_totals = vec![(0, 0); self.tree.nodes.len()];
+        let Some(values) = &self.checked else { return };
+        for (i, node) in self.tree.nodes.iter().enumerate() {
+            if let Some(file) = node.file {
+                let mut parent = Some(i);
+                while let Some(index) = parent {
+                    self.check_totals[index].0 += usize::from(values[file]);
+                    self.check_totals[index].1 += 1;
+                    parent = self.tree.nodes[index].parent;
+                }
+            }
+        }
+    }
+
+    pub fn checkbox(&self, node: usize) -> Option<&'static str> {
+        self.checked.as_ref()?;
+        let (yes, total) = self.check_totals.get(node).copied().unwrap_or_default();
+        Some(if yes == 0 {
+            "[ ] "
+        } else if yes == total {
+            "[x] "
+        } else {
+            "[-] "
+        })
+    }
+
+    pub fn checked_count(&self) -> usize {
+        self.checked
+            .as_ref()
+            .map_or(0, |v| v.iter().filter(|&&yes| yes).count())
     }
 
     /// Stats are only needed when there are files without them.
@@ -130,6 +199,7 @@ mod tests {
     #[test]
     fn totals_roll_up_to_folders() {
         let change = |p: &str| FileChange {
+            worktree: false,
             remote: None,
             path: p.to_string(),
             old_path: None,

@@ -73,7 +73,13 @@ fn draw_header(repo_name: &str, view: &DiffView, screen: &mut Screen, area: Rect
     let bg = theme::BG_HEADER;
     screen.fill(area, ' ', Style::new().bg(bg));
     let mut x = area.x + 1;
-    x += screen.put_str(x, area.y, "git-rustle", Style::new().fg(theme::FG_KEY).bg(bg).bold(), area.w);
+    x += screen.put_str(
+        x,
+        area.y,
+        "git-rustle",
+        Style::new().fg(theme::FG_KEY).bg(bg).bold(),
+        area.w,
+    );
     x += screen.put_str(x, area.y, "  ", Style::new().bg(bg), area.w);
     x += screen.put_str_ellipsis(
         x,
@@ -82,7 +88,13 @@ fn draw_header(repo_name: &str, view: &DiffView, screen: &mut Screen, area: Rect
         Style::new().fg(theme::FG_TEXT).bg(bg).bold(),
         area.right().saturating_sub(x),
     );
-    x += screen.put_str(x, area.y, "  diff  ", Style::new().fg(theme::FG_DIM).bg(bg), area.w);
+    x += screen.put_str(
+        x,
+        area.y,
+        "  diff  ",
+        Style::new().fg(theme::FG_DIM).bg(bg),
+        area.w,
+    );
     let hash = Style::new().fg(theme::FG_HASH).bg(bg);
     let dim = Style::new().fg(theme::FG_DIM).bg(bg);
     x += match view.changes.old {
@@ -90,7 +102,12 @@ fn draw_header(repo_name: &str, view: &DiffView, screen: &mut Screen, area: Rect
         None => screen.put_str(x, area.y, "(root)", dim, area.w),
     };
     x += screen.put_str(x, area.y, " → ", dim, area.w);
-    screen.put_str(x, area.y, &view.changes.new.to_hex_with_len(7).to_string(), hash, area.w);
+    let target = if view.changes.checked.is_some() {
+        "Pending changes".into()
+    } else {
+        view.changes.new.to_hex_with_len(7).to_string()
+    };
+    screen.put_str(x, area.y, &target, hash, area.w);
 
     let cs = &view.changes;
     let state = if let Some(e) = &cs.error {
@@ -111,8 +128,18 @@ fn draw_header(repo_name: &str, view: &DiffView, screen: &mut Screen, area: Rect
     };
     let sw = crate::term::screen::str_width(&state) as u16;
     if sw + 1 < area.w {
-        let fg = if cs.error.is_some() { theme::FG_ERR } else { theme::FG_DIM };
-        screen.put_str(area.right() - sw - 1, area.y, &state, Style::new().fg(fg).bg(bg), sw);
+        let fg = if cs.error.is_some() {
+            theme::FG_ERR
+        } else {
+            theme::FG_DIM
+        };
+        screen.put_str(
+            area.right() - sw - 1,
+            area.y,
+            &state,
+            Style::new().fg(fg).bg(bg),
+            sw,
+        );
     }
 }
 
@@ -127,7 +154,12 @@ fn draw_main(view: &mut DiffView, screen: &mut Screen, area: Rect) {
     if let Some(change) = view.current_change() {
         let mut x = area.x + 1;
         let color = kind_color(change.kind);
-        x += screen.put_char(x, area.y, change.kind.letter(), Style::new().fg(color).bg(title_bg).bold());
+        x += screen.put_char(
+            x,
+            area.y,
+            change.kind.letter(),
+            Style::new().fg(color).bg(title_bg).bold(),
+        );
         x += screen.put_str(x, area.y, " ", Style::new().bg(title_bg), 1);
         let stats = view
             .diff
@@ -148,11 +180,29 @@ fn draw_main(view: &mut DiffView, screen: &mut Screen, area: Rect) {
         screen.put_str_ellipsis(x, area.y, &change.path, name, text_end.saturating_sub(x));
         if let Some((add, rem)) = stats {
             let mut sx = area.right() - stats_w + 1;
-            sx += screen.put_str(sx, area.y, &add, Style::new().fg(theme::FG_ADDED).bg(title_bg), stats_w);
-            screen.put_str(sx, area.y, &rem, Style::new().fg(theme::FG_REMOVED).bg(title_bg), stats_w);
+            sx += screen.put_str(
+                sx,
+                area.y,
+                &add,
+                Style::new().fg(theme::FG_ADDED).bg(title_bg),
+                stats_w,
+            );
+            screen.put_str(
+                sx,
+                area.y,
+                &rem,
+                Style::new().fg(theme::FG_REMOVED).bg(title_bg),
+                stats_w,
+            );
         }
     } else if view.changes.loaded && view.changes.files.is_empty() {
-        screen.put_str(area.x + 1, area.y, "No differences between these commits", theme::dim().bg(title_bg), area.w);
+        screen.put_str(
+            area.x + 1,
+            area.y,
+            "No differences between these commits",
+            theme::dim().bg(title_bg),
+            area.w,
+        );
     }
 
     let body = Rect::new(area.x, area.y + 1, area.w, area.h - 1);
@@ -189,9 +239,24 @@ fn draw_main(view: &mut DiffView, screen: &mut Screen, area: Rect) {
             Row::Separator { skipped } => {
                 let style = Style::new().fg(theme::FG_DIM).bg(theme::BG_SEPARATOR);
                 screen.fill(Rect::new(body.x, y, text_w, 1), ' ', style);
-                let msg = format!("⋯ {skipped} unchanged line{}", if *skipped == 1 { "" } else { "s" });
-                screen.put_str(body.x + num_w + 2, y, &msg, style, text_w.saturating_sub(num_w + 2));
-                screen.put_str(right.x + num_w + 2, y, &msg, style, right.w.saturating_sub(num_w + 2));
+                let msg = format!(
+                    "⋯ {skipped} unchanged line{}",
+                    if *skipped == 1 { "" } else { "s" }
+                );
+                screen.put_str(
+                    body.x + num_w + 2,
+                    y,
+                    &msg,
+                    style,
+                    text_w.saturating_sub(num_w + 2),
+                );
+                screen.put_str(
+                    right.x + num_w + 2,
+                    y,
+                    &msg,
+                    style,
+                    right.w.saturating_sub(num_w + 2),
+                );
             }
             Row::Message(m) => {
                 screen.put_str_ellipsis(body.x + 2, y, m, theme::dim(), text_w.saturating_sub(2));
@@ -206,9 +271,16 @@ fn draw_main(view: &mut DiffView, screen: &mut Screen, area: Rect) {
         }
         let h = body.h as usize;
         let thumb_h = ((h * h) / total).clamp(1, h);
-        let thumb_y = (view.scroll * (h - thumb_h)).checked_div(max_scroll).unwrap_or(0);
+        let thumb_y = (view.scroll * (h - thumb_h))
+            .checked_div(max_scroll)
+            .unwrap_or(0);
         for y in 0..thumb_h {
-            screen.put_char(x, body.y + (thumb_y + y) as u16, '█', Style::new().fg(theme::FG_DIM));
+            screen.put_char(
+                x,
+                body.y + (thumb_y + y) as u16,
+                '█',
+                Style::new().fg(theme::FG_DIM),
+            );
         }
     }
 }
@@ -226,7 +298,11 @@ fn draw_half(
         return;
     }
     let Some(line) = line else {
-        screen.fill(Rect::new(area.x, y, area.w, 1), ' ', Style::new().bg(theme::BG_FILLER));
+        screen.fill(
+            Rect::new(area.x, y, area.w, 1),
+            ' ',
+            Style::new().bg(theme::BG_FILLER),
+        );
         return;
     };
     let (bg, hl_bg) = match line.kind {
@@ -243,7 +319,9 @@ fn draw_half(
     let text_w = area.right().saturating_sub(x);
     let base = Style::new().fg(theme::FG_TEXT).bg(bg);
     let hl = Style::new().fg(theme::FG_TEXT).bg(hl_bg).bold();
-    put_text(screen, x, y, &line.text, &line.hl, base, hl, hscroll, text_w);
+    put_text(
+        screen, x, y, &line.text, &line.hl, base, hl, hscroll, text_w,
+    );
 }
 
 /// Draw `text` starting `skip` display columns in, switching to `hl_style`
@@ -281,7 +359,11 @@ fn put_text(
         while ri < ranges.len() && ranges[ri].end <= ci {
             ri += 1;
         }
-        let style = if ri < ranges.len() && ranges[ri].contains(&ci) { hl_style } else { base };
+        let style = if ri < ranges.len() && ranges[ri].contains(&ci) {
+            hl_style
+        } else {
+            base
+        };
         used += screen.put_char(x + used, y, ch, style);
         col += cw;
     }

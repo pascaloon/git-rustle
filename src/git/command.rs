@@ -10,6 +10,16 @@ pub fn run(
     input: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<Output, String> {
+    run_env(path, args, input, timeout, &[])
+}
+
+pub fn run_env(
+    path: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    environment: &[(&str, &std::ffi::OsStr)],
+) -> Result<Output, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(path)
@@ -24,6 +34,9 @@ pub fn run(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in environment {
+        cmd.env(name, value);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

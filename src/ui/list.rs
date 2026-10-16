@@ -17,7 +17,7 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         return;
     }
     app.list_rows = area.h as usize;
-    let n = app.history.len();
+    let n = app.graph_len();
     // Keep scroll consistent with the current viewport.
     let max_scroll = n.saturating_sub(area.h as usize);
     if app.scroll > max_scroll {
@@ -47,7 +47,12 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
     let visible = app.scroll..(app.scroll + area.h as usize).min(n);
     let widest = visible
         .clone()
-        .map(|i| app.history.commits[i].row.len)
+        .filter_map(|i| {
+            app.history_index(i)
+                .or(app.pending.head_index)
+                .and_then(|i| app.history.commits.get(i))
+                .map(|rec| rec.row.len)
+        })
         .max()
         .unwrap_or(1)
         .max(1);
@@ -66,7 +71,7 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
 
     for (row, i) in visible.enumerate() {
         let y = area.y + row as u16;
-        let selected = i == app.selected;
+        let selected = i == app.graph_selected();
         let bg = if selected {
             if app.focus == Focus::List {
                 theme::BG_SELECTED
@@ -79,6 +84,11 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
         if selected {
             screen.paint_bg(area.x, y, area.w, bg);
         }
+        let Some(index) = app.history_index(i) else {
+            draw_pending(app, screen, area.x, y, graph_w + gap, area.w, bg);
+            continue;
+        };
+        let i = index;
         let rec = app.history.commits[i];
         let ghost = app.ghosts.contains_key(&rec.id);
         let mut x = area.x;
@@ -172,4 +182,53 @@ pub fn draw(app: &mut App, screen: &mut Screen, area: Rect, now: i64) {
             );
         }
     }
+}
+
+fn draw_pending(
+    app: &App,
+    screen: &mut Screen,
+    x: u16,
+    y: u16,
+    graph_w: u16,
+    width: u16,
+    bg: Color,
+) {
+    use crate::graph::layout::CellKind;
+    let style = Style::new().fg(theme::FG_MODIFIED).bg(bg).bold();
+    let lane = app
+        .pending
+        .head_index
+        .and_then(|i| app.history.commits.get(i))
+        .map_or(0, |r| r.node_lane);
+    if let Some(index) = app.pending.head_index {
+        for (column, cell) in app.history.row_cells(index).iter().enumerate() {
+            if (column as u16) * LANE_WIDTH >= graph_w {
+                break;
+            }
+            if matches!(
+                cell.kind(),
+                CellKind::Vertical
+                    | CellKind::Cross
+                    | CellKind::JoinFromLeft
+                    | CellKind::JoinFromRight
+            ) {
+                screen.put_char(
+                    x + column as u16 * LANE_WIDTH,
+                    y,
+                    '│',
+                    Style::new()
+                        .fg(crate::graph::render::lane_color(cell.color()))
+                        .bg(bg),
+                );
+            }
+        }
+    }
+    if lane * LANE_WIDTH < graph_w {
+        screen.put_char(x + lane * LANE_WIDTH, y, '◌', style);
+    }
+    let label = format!(
+        "worktree Pending changes ({} files)",
+        app.pending.snapshot.files.len()
+    );
+    screen.put_str_ellipsis(x + graph_w, y, &label, style, width.saturating_sub(graph_w));
 }

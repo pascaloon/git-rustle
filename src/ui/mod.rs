@@ -5,6 +5,7 @@ pub mod checkout;
 pub mod details;
 pub mod diff;
 pub mod list;
+pub mod pending;
 pub mod settings;
 pub mod time;
 pub mod tree;
@@ -205,6 +206,22 @@ fn draw_splitter(app: &App, screen: &mut Screen, area: Rect) {
 
 fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
     let bg = theme::BG_HEADER;
+    if app.pending.selected {
+        screen.fill(area, ' ', theme::dim().bg(bg));
+        let hint = if app.pending.busy {
+            "Committing changes…"
+        } else {
+            "Tab fields  Ctrl+Enter commit  Space check file  Enter diff  F5 refresh  Esc graph"
+        };
+        screen.put_str_ellipsis(
+            area.x + 1,
+            area.y,
+            hint,
+            theme::dim().bg(bg),
+            area.w.saturating_sub(2),
+        );
+        return;
+    }
     if let Some(notice) = &app.checkout_notice {
         screen.fill(area, ' ', theme::dim().bg(bg));
         let (message, color) = match notice {
@@ -216,6 +233,23 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             area.y,
             &message,
             theme::text().fg(color).bg(bg),
+            area.w.saturating_sub(2),
+        );
+        return;
+    }
+    if !app.pending.status.is_empty() {
+        screen.fill(area, ' ', theme::dim().bg(bg));
+        screen.put_str_ellipsis(
+            area.x + 1,
+            area.y,
+            &app.pending.status,
+            Style::new()
+                .fg(if app.pending.error {
+                    theme::FG_ERR
+                } else {
+                    theme::FG_TEXT
+                })
+                .bg(bg),
             area.w.saturating_sub(2),
         );
         return;
@@ -316,7 +350,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             );
         }
     } else if !app.history.is_empty() {
-        let pos = format!("{}/{}", app.selected + 1, app.history.len());
+        let pos = format!("{}/{}", app.graph_selected() + 1, app.graph_len());
         let w = pos.len() as u16;
         if x + w < area.right() {
             screen.put_str(area.right() - w - 1, area.y, &pos, txt, w);

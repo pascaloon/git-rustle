@@ -208,6 +208,16 @@ impl DiffView {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.changes.checked.is_some()
+            && self.focus == DiffFocus::Files
+            && key.code == KeyCode::Char(' ')
+        {
+            if let Some(row) = self.changes.tree.visible.get(self.cursor.sel) {
+                self.changes.toggle_checked(row.node);
+            }
+            self.needs_redraw = true;
+            return;
+        }
         match (key.code, key.ctrl) {
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => self.close = true,
             (KeyCode::Char('c'), true) => self.close = true,
@@ -310,6 +320,24 @@ impl DiffView {
     }
 
     pub fn handle_mouse(&mut self, m: MouseEvent, areas: &DiffAreas) {
+        if self.changes.checked.is_some()
+            && matches!(m.kind, MouseKind::Down(Button::Left))
+            && areas.sidebar.contains(m.x, m.y)
+        {
+            let row = self.cursor.scroll + (m.y - areas.sidebar.y) as usize;
+            if let Some(visible) = self.changes.tree.visible.get(row).copied() {
+                let x = areas.sidebar.x
+                    + 1
+                    + (visible.depth * 2).min(areas.sidebar.w.saturating_sub(10));
+                if m.x >= x && m.x < x + 3 {
+                    self.cursor.select(&self.changes.tree, row);
+                    self.changes.toggle_checked(visible.node);
+                    self.focus = DiffFocus::Files;
+                    self.needs_redraw = true;
+                    return;
+                }
+            }
+        }
         match m.kind {
             MouseKind::Down(Button::Left) | MouseKind::DoubleClick(Button::Left) => {
                 if areas.splitter.contains(m.x, m.y) {
@@ -366,6 +394,7 @@ mod tests {
 
     fn change(path: &str) -> FileChange {
         FileChange {
+            worktree: false,
             remote: None,
             path: path.to_string(),
             old_path: None,

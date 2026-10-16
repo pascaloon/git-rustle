@@ -35,13 +35,29 @@ pub fn draw(
     cursor.rows = area.h as usize;
     let tree = &changes.tree;
     if !changes.loaded {
-        let msg = if changes.error.is_some() { "" } else { "Computing…" };
-        screen.put_str(area.x + 1, area.y, msg, theme::dim(), area.w.saturating_sub(1));
+        let msg = if changes.error.is_some() {
+            ""
+        } else {
+            "Computing…"
+        };
+        screen.put_str(
+            area.x + 1,
+            area.y,
+            msg,
+            theme::dim(),
+            area.w.saturating_sub(1),
+        );
         return;
     }
     let n = tree.visible.len();
     if n == 0 {
-        screen.put_str(area.x + 1, area.y, "No changes", theme::dim(), area.w.saturating_sub(1));
+        screen.put_str(
+            area.x + 1,
+            area.y,
+            "No changes",
+            theme::dim(),
+            area.w.saturating_sub(1),
+        );
         return;
     }
     cursor.clamp(tree);
@@ -52,7 +68,11 @@ pub fn draw(
         let selected = i == cursor.sel;
         let is_shown = node.file.is_some() && node.file == shown;
         let bg = if selected {
-            if active { theme::BG_SELECTED } else { theme::BG_SELECTED_INACTIVE }
+            if active {
+                theme::BG_SELECTED
+            } else {
+                theme::BG_SELECTED_INACTIVE
+            }
         } else if is_shown {
             theme::BG_SELECTED_INACTIVE
         } else {
@@ -74,7 +94,11 @@ pub fn draw(
             let w = (add.chars().count() + rem.chars().count()) as u16;
             if w + 12 < area.w {
                 let mut sx = end - w - 1;
-                let add_style = if add == "…" { theme::dim().bg(bg) } else { Style::new().fg(theme::FG_ADDED).bg(bg) };
+                let add_style = if add == "…" {
+                    theme::dim().bg(bg)
+                } else {
+                    Style::new().fg(theme::FG_ADDED).bg(bg)
+                };
                 sx += screen.put_str(sx, y, add, add_style, w);
                 screen.put_str(sx, y, rem, Style::new().fg(theme::FG_REMOVED).bg(bg), w);
                 end -= w + 2;
@@ -83,9 +107,24 @@ pub fn draw(
 
         let indent = (v.depth * 2).min(area.w.saturating_sub(10));
         let mut x = area.x + 1 + indent;
+        if let Some(check) = changes.checkbox(v.node) {
+            x += screen.put_str(
+                x,
+                y,
+                check,
+                Style::new().fg(theme::FG_KEY).bg(bg),
+                end.saturating_sub(x),
+            );
+        }
         if node.is_folder() {
             let arrow = if node.expanded { "▾ " } else { "▸ " };
-            x += screen.put_str(x, y, arrow, Style::new().fg(theme::FG_DIM).bg(bg), end.saturating_sub(x));
+            x += screen.put_str(
+                x,
+                y,
+                arrow,
+                Style::new().fg(theme::FG_DIM).bg(bg),
+                end.saturating_sub(x),
+            );
             let style = Style::new().fg(theme::FG_TEXT).bg(bg).bold();
             screen.put_str_ellipsis(x, y, &node.name, style, end.saturating_sub(x));
         } else {

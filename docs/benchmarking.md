@@ -290,6 +290,39 @@ Restore any pre-existing benchmark environment variables after these commands.
 Run these suites sequentially after all builds have finished, and retain their
 raw output and limitations alongside startup and preview comparisons.
 
+## Pending changes and commit measurements
+
+Preserve a baseline before editing, complete release validation/builds, then run
+the suites sequentially:
+
+```powershell
+.\scripts\benchmark.ps1 -Repository $benchRepo -Baseline $baselineExe `
+  -Samples 15 -OutputDirectory (Join-Path $benchRun 'startup')
+.\scripts\benchmark-pending.ps1 -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'pending')
+cargo test --release git::worktree::tests::benchmark_pending -- --ignored --exact --nocapture
+```
+
+If Cargo builds the component harness, discard that run and repeat after the
+build finishes. The native pending suite creates disposable repositories under
+its output directory, with staged, unstaged and untracked files. Each mode has
+one discarded warm-up and 15 samples. Preview validates automatic startup focus
+and composer controls. Diff opens a working-file diff. Commit modes create a
+fresh fixture for every launch, uncheck all files, check one, and submit through
+Ctrl+Enter on the current or a new branch. They verify HEAD contents, description,
+branch, preservation of unchecked staged contents, and the untouched untracked file.
+No checkout, staging or commits run in the user's large benchmark clone.
+
+Status timing is worker request to result receipt; pending-frame time is since
+main entry through the composer console flush. File-diff and commit intervals
+run from request dispatch to result receipt, excluding scripted typing and delays.
+The baseline cannot perform these new actions, so they are candidate-only.
+The 1,000-file component fixture separately measures status, whole-tree checkbox
+updates, one working-file diff, and mean selection/draw time over 200 frames per
+sample. Drawing includes both graph and composer on a 120×40 in-memory screen,
+excluding terminal flushing and input delivery. Retain raw samples and screens;
+small fixtures do not establish large-worktree commit or live-hook latency.
+
 ## Startup HEAD selection measurements
 
 After preserving a baseline and finishing release builds/tests, compare the
