@@ -290,6 +290,54 @@ Restore any pre-existing benchmark environment variables after these commands.
 Run these suites sequentially after all builds have finished, and retain their
 raw output and limitations alongside startup and preview comparisons.
 
+## Startup HEAD selection measurements
+
+After preserving a baseline and finishing release builds/tests, compare the
+large repository's normal startup and then the off-screen HEAD fixture:
+
+```powershell
+.\scripts\benchmark.ps1 -Repository $benchRepo -Baseline $baselineExe `
+  -Samples 15 -OutputDirectory (Join-Path $benchRun 'startup')
+.\scripts\benchmark-startup-head.ps1 -Baseline $baselineExe `
+  -Samples 15 -OutputDirectory (Join-Path $benchRun 'focus')
+```
+
+The focus script requires a new output directory. It creates 120 commits using
+fast-import, checks out a branch at commit 20, then detaches HEAD at commit 10.
+Both are below the initial graph viewport. Each state/cache mode discards one
+warm-up per executable and retains 15 alternating native launches. No keys are
+replayed. Screen dumps must show the candidate's details panel on HEAD and a
+visible HEAD label; baseline dumps must show the newest commit. The first-frame
+timing includes startup selection work when history and refs are ready, but is
+not a separate milestone for HEAD becoming visible after later batch delivery.
+State/order regressions cover late metadata, streaming and stale cache swaps.
+This tiny fixture does not replace large-repository startup measurements or
+establish scrolling FPS. All checkout/ref writes remain inside the new fixture.
+
+## Graph label rendering measurements
+
+For changes to graph reference labels, preserve the release executable and run
+the component harness before editing production code, then repeat after final
+builds and validation:
+
+```powershell
+$previousBenchRepo = $env:GIT_RUSTLE_BENCH_REPO
+try {
+    $env:GIT_RUSTLE_BENCH_REPO = $benchRepo
+    cargo test --release app::tests::benchmark_graph_labels -- --ignored --exact --nocapture
+} finally {
+    $env:GIT_RUSTLE_BENCH_REPO = $previousBenchRepo
+}
+```
+
+If Cargo compiled the harness, let the build finish and rerun for recorded
+measurements. It loads the real local history once, measures label installation
+separately, and draws 200 selection steps per sample near HEAD on a 120×40 screen
+with 38 graph rows. It records one discarded warm-up plus 15 samples, reporting
+mean selection/draw time per step. This excludes terminal flushing, input
+delivery, network requests, and the initial history walk. Compare startup with
+the preserved native executable separately and verify native screen contents.
+
 ## Graph refresh shortcut measurements
 
 After preserving the baseline and completing builds/tests, compare the former

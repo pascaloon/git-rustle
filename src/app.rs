@@ -69,6 +69,8 @@ pub struct App {
     pub refs: Option<RefSnapshot>,
     pub labels: HashMap<ObjectId, Vec<Label>>,
     pub load: LoadState,
+    /// Next row to inspect while waiting for the initial HEAD selection.
+    startup_head_search: Option<usize>,
 
     pub selected: usize,
     pub scroll: usize,
@@ -122,6 +124,7 @@ impl App {
             refs: None,
             labels: HashMap::new(),
             load: LoadState::Empty,
+            startup_head_search: Some(0),
             selected: 0,
             scroll: 0,
             focus: Focus::List,
@@ -332,6 +335,33 @@ impl App {
         self.refs.as_ref().and_then(|r| r.head_id)
     }
 
+    fn focus_startup_head(&mut self, replaced: bool) {
+        let Some(searched) = self.startup_head_search else {
+            return;
+        };
+        let Some(refs) = self.refs.as_ref() else {
+            return;
+        };
+        let Some(head) = refs.head_id else {
+            self.startup_head_search = None;
+            return;
+        };
+        let start = if replaced {
+            0
+        } else {
+            searched.min(self.history.len())
+        };
+        if let Some(offset) = self.history.commits[start..]
+            .iter()
+            .position(|commit| commit.id == head)
+        {
+            self.startup_head_search = None;
+            self.select(start + offset);
+        } else {
+            self.startup_head_search = Some(self.history.len());
+        }
+    }
+
     pub fn set_refs(&mut self, refs: RefSnapshot) {
         let mut labels: HashMap<ObjectId, Vec<Label>> = HashMap::new();
         for (id, entries) in refs.labels_by_commit() {
@@ -346,12 +376,30 @@ impl App {
                     .collect(),
             );
         }
+        if let Some(id) = refs.head_id {
+            let head_labels = labels.entry(id).or_default();
+            // Keep HEAD explicit and first even when the checked-out branch has
+            // a long name. Detached snapshots already contain this label.
+            if !head_labels
+                .iter()
+                .any(|label| label.kind == RefKind::Head && label.name == "HEAD")
+            {
+                head_labels.insert(
+                    0,
+                    Label {
+                        name: "HEAD".into(),
+                        kind: RefKind::Head,
+                    },
+                );
+            }
+        }
         self.labels = labels;
         self.refs = Some(refs);
         if self.branches.open || !self.branches.entries.is_empty() {
             self.branches.rebuild(self.refs.as_ref());
         }
         self.remote_labels();
+        self.focus_startup_head(true);
         self.needs_redraw = true;
     }
 
@@ -394,6 +442,7 @@ impl App {
     }
 
     pub fn install_preview(&mut self, preview: crate::remote::history::Preview) {
+        let startup_pending = self.startup_head_search.is_some();
         let keep = self.selected_id();
         let offset = self.selected.saturating_sub(self.scroll);
         let was_top = self.scroll == 0;
@@ -422,6 +471,7 @@ impl App {
             self.set_refs(refs);
         }
         if let Some(id) = keep
+            && (!startup_pending || self.startup_head_search.is_some())
             && let Some(i) = self.history.index_of(&id)
         {
             self.selected = i;
@@ -464,6 +514,7 @@ impl App {
             LoadState::Refreshing
         };
         self.clamp();
+        self.focus_startup_head(true);
         self.needs_redraw = true;
     }
 
@@ -494,6 +545,7 @@ impl App {
                     }
                     self.load = LoadState::Complete;
                     self.clamp();
+                    self.focus_startup_head(true);
                 }
             }
             _ => {
@@ -504,6 +556,7 @@ impl App {
                     LoadState::Loading
                 };
                 self.clamp();
+                self.focus_startup_head(false);
             }
         }
         self.needs_redraw = true;
@@ -631,6 +684,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.startup_head_search = None;
         if let Some(dialog) = &mut self.checkout_confirmation {
             match key.code {
                 KeyCode::Enter if dialog.ready && !key.ctrl && !key.alt => {
@@ -864,6 +918,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16, screen_h: u16) {
+        if !matches!(m.kind, MouseKind::Move | MouseKind::Up(_)) {
+            self.startup_head_search = None;
+        }
         if self.checkout_confirmation.is_some() {
             return;
         }
@@ -1019,6 +1076,208 @@ mod tests {
             details: Rect::new(61, 1, 39, 10),
             status: Rect::new(0, 11, 100, 1),
         }
+    }
+
+    #[test]
+    fn startup_selects_head_with_cache_and_refs_in_either_order_only_once() {
+        let head = history(100).commits[70].id;
+        for refs_first in [false, true] {
+            let mut app = App::new();
+            app.list_rows = 10;
+            let refs = RefSnapshot {
+                head_id: Some(head),
+                ..Default::default()
+            };
+            if refs_first {
+                app.set_refs(refs);
+                app.set_cached(history(100), true);
+            } else {
+                app.set_cached(history(100), true);
+                app.set_refs(refs);
+            }
+            assert_eq!(app.selected_id(), Some(head));
+            assert!(app.scroll <= 70 && 70 < app.scroll + app.list_rows);
+            assert!(app.startup_head_search.is_none());
+            // Later ref refreshes do not turn startup focus into ongoing follow mode.
+            app.set_refs(RefSnapshot {
+                head_id: Some(app.history.commits[90].id),
+                head_branch: Some("other".into()),
+                ..Default::default()
+            });
+            assert_eq!(app.selected_id(), Some(head));
+        }
+    }
+
+    #[test]
+    fn startup_finds_head_in_later_batches_and_after_a_stale_cache_swap() {
+        let head = history(100).commits[70].id;
+        for stale in [false, true] {
+            let mut app = App::new();
+            app.list_rows = 10;
+            app.set_refs(RefSnapshot {
+                head_id: Some(head),
+                ..Default::default()
+            });
+            if stale {
+                app.set_cached(history(20), false);
+            }
+            app.start_walk();
+            let mut first = history(40);
+            first.complete = false;
+            app.push_batch(first);
+            assert_eq!(app.startup_head_search, Some(if stale { 20 } else { 40 }));
+            assert_ne!(app.selected_id(), Some(head));
+            let mut tail = history(100);
+            tail.commits.drain(..40);
+            app.push_batch(tail);
+            assert_eq!(app.selected_id(), Some(head));
+            assert!(app.scroll <= 70 && 70 < app.scroll + app.list_rows);
+        }
+    }
+
+    #[test]
+    fn startup_focus_respects_early_input_but_ignores_mouse_motion() {
+        let head = history(100).commits[70].id;
+        for action in 0..3 {
+            let mut app = app_with(100);
+            let mouse = |kind| MouseEvent {
+                kind,
+                x: 5,
+                y: 3,
+                ctrl: false,
+                shift: false,
+            };
+            match action {
+                0 => app.handle_key(key(KeyCode::Down)),
+                1 => app.handle_mouse(mouse(MouseKind::Down(Button::Left)), &areas(), 100, 12),
+                _ => app.handle_mouse(mouse(MouseKind::Move), &areas(), 100, 12),
+            }
+            let selected = app.selected_id();
+            app.set_refs(RefSnapshot {
+                head_id: Some(head),
+                ..Default::default()
+            });
+            assert_eq!(
+                app.selected_id(),
+                if action == 2 { Some(head) } else { selected }
+            );
+        }
+    }
+
+    #[test]
+    fn head_badge_is_visible_attached_detached_and_after_ref_updates() {
+        use crate::git::RefEntry;
+        let mut app = app_with(3);
+        let first = app.history.commits[0].id;
+        let last = app.history.commits[2].id;
+        let branch = "a-very-long-checked-out-branch-name";
+        app.set_refs(RefSnapshot {
+            head_id: Some(first),
+            head_branch: Some(branch.into()),
+            refs: vec![RefEntry {
+                name: branch.into(),
+                id: first,
+                kind: RefKind::Head,
+            }],
+            ..Default::default()
+        });
+        let labels = &app.labels[&first];
+        assert_eq!(labels[0].name, "HEAD");
+        assert_eq!(labels[1].name, branch);
+        // The badge is display metadata, not a new branch or checkout target.
+        assert_eq!(app.refs.as_ref().unwrap().refs.len(), 1);
+        app.branches.show(app.refs.as_ref());
+        assert_eq!(app.branches.entries.len(), 1);
+        app.branches.open = false;
+        app.select(1);
+        for width in [20, 50, 120] {
+            let mut screen = crate::term::Screen::new(width, 3);
+            crate::ui::list::draw(&mut app, &mut screen, Rect::new(0, 0, width, 3), 0);
+            let row = &screen.test_cells()[..width as usize];
+            let text: String = row.iter().map(|cell| cell.ch).collect();
+            let pos = row
+                .windows(4)
+                .position(|cells| cells.iter().map(|cell| cell.ch).eq("HEAD".chars()));
+            let pos = pos.unwrap_or_else(|| panic!("Missing HEAD at width {width}: {text}"));
+            for cell in &row[pos..pos + 4] {
+                assert_eq!(cell.style.bg, crate::ui::theme::FG_HEAD);
+                assert_ne!(cell.style.attrs & crate::term::screen::BOLD, 0);
+            }
+            let other_row: String = screen.test_cells()[width as usize..width as usize * 2]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            assert!(!other_row.contains("HEAD"));
+        }
+        let detached = RefSnapshot {
+            head_id: Some(last),
+            refs: vec![RefEntry {
+                name: "HEAD".into(),
+                id: last,
+                kind: RefKind::Head,
+            }],
+            ..Default::default()
+        };
+        app.set_refs(detached.clone());
+        app.set_refs(detached);
+        assert!(!app.labels.contains_key(&first));
+        assert_eq!(app.labels[&last].len(), 1);
+        assert_eq!(app.labels[&last][0].name, "HEAD");
+        app.select(2);
+        let mut screen = crate::term::Screen::new(80, 3);
+        crate::ui::list::draw(&mut app, &mut screen, Rect::new(0, 0, 80, 3), 0);
+        let text: String = screen.test_cells()[160..240]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect();
+        assert_eq!(text.matches("HEAD").count(), 1);
+        app.set_refs(RefSnapshot::default());
+        assert!(app.labels.is_empty()); // Unborn HEAD has no commit to label.
+    }
+
+    #[test]
+    #[ignore = "explicit large-repository graph label performance measurement"]
+    fn benchmark_graph_labels() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("GIT_RUSTLE_BENCH_REPO").expect("repository required"),
+        );
+        let repo = crate::git::open(&path).unwrap();
+        let refs = crate::git::snapshot_refs(&repo).unwrap();
+        let mut history = History::default();
+        crate::git::walk(&repo, &refs.tips, &mut |chunk| {
+            history.append(chunk);
+            true
+        })
+        .unwrap();
+        let mut app = App::new();
+        app.set_cached(history, true);
+        let head = app.history.index_of(&refs.head_id.unwrap()).unwrap();
+        let now = crate::ui::time::now_unix();
+        let mut samples = Vec::new();
+        for n in 0..16 {
+            let snapshot = refs.clone();
+            let start = std::time::Instant::now();
+            app.set_refs(snapshot);
+            let labels_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let mut screen = crate::term::Screen::new(120, 40);
+            let area = Rect::new(0, 0, 120, 38);
+            let start = std::time::Instant::now();
+            for step in 0..200 {
+                app.select((head + step % 40).min(app.history.len() - 1));
+                screen.clear();
+                crate::ui::list::draw(&mut app, &mut screen, area, now);
+                std::hint::black_box(screen.test_cells());
+            }
+            let draw_ms = start.elapsed().as_secs_f64() * 1000.0 / 200.0;
+            if n > 0 {
+                samples.push(serde_json::json!({"sample":n-1,"installLabelsMs":labels_ms,"selectDrawMs":draw_ms}));
+            }
+        }
+        println!(
+            "{} commits; one warm-up, 15 samples: {}",
+            app.history.len(),
+            serde_json::to_string(&samples).unwrap()
+        );
     }
 
     #[test]

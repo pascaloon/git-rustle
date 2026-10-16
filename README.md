@@ -71,6 +71,11 @@ git-rustle [OPTIONS] [PATH]
 | `q`, `Ctrl+C` | Quit |
 | `Esc` | Clear marks, or quit when none are set |
 
+On launch, the graph selects HEAD and scrolls it into view. The checked-out
+commit has a green `HEAD` badge before its branch labels, including when HEAD
+is detached. Early keyboard or mouse navigation keeps your selection while
+history continues loading.
+
 The details panel ends with a **Files** section: the tree of files changed by
 the selected commit, each with `+added −removed` counts (folders total their
 contents). `Tab` cycles graph → details → files; in the files tree `↑`/`↓`
@@ -327,6 +332,10 @@ The [checkout confirmation report](docs/checkout-confirmation-benchmarks.md) rec
 popup latency and confirmed checkout measurements.
 The [Graph refresh shortcut report](docs/graph-refresh-benchmarks.md) compares
 the former `r` binding with `F5`, including native refresh and startup samples.
+The [HEAD badge report](docs/head-label-benchmarks.md) measures label installation,
+graph selection/drawing, and startup with an explicit HEAD label.
+The [startup HEAD focus report](docs/startup-head-benchmarks.md) compares startup
+and validates automatic selection of an off-screen attached or detached HEAD.
 The [connection-dimming report](docs/connection-dimming-benchmarks.md) includes
 the latest graph-styling measurements and startup comparison.
 
