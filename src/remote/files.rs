@@ -1,12 +1,17 @@
 //! Immutable, on-demand API diffs. No branch fetch or Git ref writes.
 use super::*;
+use crate::diff::Side;
 use crate::diff::{ChangeKind, FileChange, FileDiff, Stat, TreeDiff};
 use gix::ObjectId;
+use gix::objs::tree::EntryKind;
+use gix::prelude::FindExt;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
     pub remote: Arc<Remote>,
+    pub old_remote: Option<Arc<Remote>>,
     pub old: Option<ObjectId>,
     pub new: ObjectId,
     pub stat: Option<Stat>,
@@ -238,6 +243,7 @@ pub fn tree(
                 new: None,
                 remote: Some(Box::new(RemoteFile {
                     remote: remote.clone(),
+                    old_remote: None,
                     old,
                     new,
                     stat,
@@ -256,6 +262,147 @@ pub fn tree(
     Err("Remote diff exceeded the API file limit".into())
 }
 
+/// Compare complete endpoint trees, including divergent histories. Provider compare
+/// endpoints can use a merge base, which is not the two marked snapshots.
+pub fn compare(
+    repo: &gix::Repository,
+    remote: &Remote,
+    old_remote: Option<&Remote>,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    no_cache: bool,
+) -> Result<TreeDiff, String> {
+    let mut client = Session::new(repo, remote, no_cache)?;
+    let mut old_client = Session::new(repo, old_remote.unwrap_or(remote), no_cache)?;
+    let mut before = old
+        .map(|id| snapshot(&mut old_client, id))
+        .transpose()?
+        .unwrap_or_default();
+    let after = snapshot(&mut client, new)?;
+    let mut files = Vec::new();
+    for (path, side) in after {
+        let old_side = before.remove(&path);
+        if old_side != Some(side) {
+            files.push(FileChange {
+                kind: if old_side.is_some() {
+                    ChangeKind::Modified
+                } else {
+                    ChangeKind::Added
+                },
+                path,
+                old_path: None,
+                old: old_side,
+                new: Some(side),
+                remote: None,
+            });
+        }
+    }
+    for (path, side) in before {
+        files.push(FileChange {
+            path,
+            old_path: None,
+            kind: ChangeKind::Deleted,
+            old: Some(side),
+            new: None,
+            remote: None,
+        });
+    }
+    crate::diff::pair_renames(&mut files);
+    let remote = Arc::new(remote.clone());
+    for f in &mut files {
+        f.remote = Some(Box::new(RemoteFile {
+            remote: remote.clone(),
+            old_remote: old_remote.map(|r| Arc::new(r.clone())),
+            old,
+            new,
+            stat: None,
+            no_cache,
+            submodule: f
+                .old
+                .iter()
+                .chain(f.new.iter())
+                .any(|s| s.kind == EntryKind::Commit),
+            blob: f.new.map(|s| s.id.to_string()),
+        }));
+    }
+    files.sort_by(|a, b| crate::diff::display_order(&a.path, &b.path));
+    Ok(TreeDiff { files })
+}
+
+fn snapshot(client: &mut Session<'_>, id: ObjectId) -> Result<BTreeMap<String, Side>, String> {
+    // A local side may contain unpushed commits, unavailable to the provider.
+    if crate::git::commit_details(client.repo, &id).is_ok() {
+        return crate::diff::tree_diff(client.repo, None, &id)
+            .map(|t| {
+                t.files
+                    .into_iter()
+                    .filter_map(|f| f.new.map(|s| (f.path, s)))
+                    .collect()
+            })
+            .map_err(|e| e.to_string());
+    }
+    let root = client
+        .remote
+        .endpoint
+        .strip_suffix("/branches")
+        .ok_or("Invalid API endpoint")?
+        .to_owned();
+    let mut entries = BTreeMap::new();
+    let start = std::time::Instant::now();
+    for page in 1..=1000 {
+        if start.elapsed() > Duration::from_secs(60) {
+            return Err("Remote tree listing exceeded 60 seconds".into());
+        }
+        let url = match client.remote.provider {
+            Provider::Github => format!("{root}/git/trees/{id}?recursive=1"),
+            Provider::Gitlab => {
+                format!("{root}/tree?ref={id}&recursive=true&per_page=100&page={page}")
+            }
+        };
+        let response = client.get(&url, "application/json")?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|_| "Invalid tree API response")?;
+        let list = if client.remote.provider == Provider::Github {
+            if value["truncated"] != false {
+                return Err("Remote tree is truncated; cannot compare complete snapshots".into());
+            }
+            &value["tree"]
+        } else {
+            &value
+        };
+        let list = list.as_array().ok_or("Tree API omitted entries")?;
+        for v in list {
+            if v["type"] == "tree" {
+                continue;
+            }
+            let path = file_path(v, "path")?;
+            let sha = v["sha"]
+                .as_str()
+                .or_else(|| v["id"].as_str())
+                .ok_or("Tree API omitted object ID")?;
+            let id = ObjectId::from_hex(sha.as_bytes()).map_err(|_| "Invalid tree object ID")?;
+            let kind = match v["mode"].as_str() {
+                Some("100644") => EntryKind::Blob,
+                Some("100755") => EntryKind::BlobExecutable,
+                Some("120000") => EntryKind::Link,
+                Some("160000") => EntryKind::Commit,
+                _ => return Err("Unknown remote tree mode".into()),
+            };
+            if entries.insert(path, Side { id, kind }).is_some() {
+                return Err("Duplicate path in remote tree".into());
+            }
+        }
+        if entries.len() > 100_000 {
+            return Err("Remote tree exceeded 100,000 files".into());
+        }
+        if client.remote.provider == Provider::Github || !response.next.unwrap_or(list.len() == 100)
+        {
+            return Ok(entries);
+        }
+    }
+    Err("Remote tree exceeded 1,000 pages".into())
+}
+
 pub fn file(
     repo: &gix::Repository,
     change: &FileChange,
@@ -267,34 +414,56 @@ pub fn file(
         ));
     }
     let mut client = Session::new(repo, &source.remote, source.no_cache)?;
-    let root = source
-        .remote
-        .endpoint
-        .strip_suffix("/branches")
-        .ok_or("Invalid API endpoint")?;
-    let mut contents = |id: ObjectId, path: &str, blob: Option<&str>| -> Result<Vec<u8>, String> {
-        let (url, accept) = match source.remote.provider {
-            Provider::Github => (
-                if let Some(blob) = blob {
-                    format!("{root}/git/blobs/{blob}")
-                } else {
-                    format!(
-                        "{root}/contents/{}?ref={id}",
-                        encode(path).replace("%2F", "/")
-                    )
-                },
-                "application/vnd.github.raw+json",
-            ),
-            Provider::Gitlab => (
-                format!("{root}/files/{}/raw?ref={id}", encode(path)),
-                "application/octet-stream",
-            ),
+    let mut old_client = source
+        .old_remote
+        .as_ref()
+        .map(|r| Session::new(repo, r, source.no_cache))
+        .transpose()?;
+    let mut contents =
+        |id: ObjectId, path: &str, blob: Option<&str>, old: bool| -> Result<Vec<u8>, String> {
+            if let Some(blob) = blob.and_then(|b| ObjectId::from_hex(b.as_bytes()).ok()) {
+                let mut buf = Vec::new();
+                if let Ok(data) = repo.objects.find_blob(&blob, &mut buf) {
+                    return Ok(data.data.to_vec());
+                }
+            }
+            let client = if old {
+                old_client.as_mut().unwrap_or(&mut client)
+            } else {
+                &mut client
+            };
+            let root = client
+                .remote
+                .endpoint
+                .strip_suffix("/branches")
+                .ok_or("Invalid API endpoint")?;
+            let (url, accept) = match client.remote.provider {
+                Provider::Github => (
+                    if let Some(blob) = blob {
+                        format!("{root}/git/blobs/{blob}")
+                    } else {
+                        format!(
+                            "{root}/contents/{}?ref={id}",
+                            encode(path).replace("%2F", "/")
+                        )
+                    },
+                    "application/vnd.github.raw+json",
+                ),
+                Provider::Gitlab => (
+                    format!("{root}/files/{}/raw?ref={id}", encode(path)),
+                    "application/octet-stream",
+                ),
+            };
+            Ok(client.get(&url, accept)?.body)
         };
-        Ok(client.get(&url, accept)?.body)
-    };
     let old = if change.kind != ChangeKind::Added {
         if let Some(id) = source.old {
-            contents(id, change.old_path.as_deref().unwrap_or(&change.path), None)?
+            contents(
+                id,
+                change.old_path.as_deref().unwrap_or(&change.path),
+                change.old.map(|s| s.id.to_string()).as_deref(),
+                true,
+            )?
         } else {
             Vec::new()
         }
@@ -302,10 +471,13 @@ pub fn file(
         Vec::new()
     };
     let new = if change.kind != ChangeKind::Deleted {
-        contents(source.new, &change.path, source.blob.as_deref())?
+        contents(source.new, &change.path, source.blob.as_deref(), false)?
     } else {
         Vec::new()
     };
+    if old.len() > 8 * 1024 * 1024 || new.len() > 8 * 1024 * 1024 {
+        return Ok(FileDiff::message("File too large to diff".into()));
+    }
     if old
         .iter()
         .take(8000)
@@ -349,12 +521,283 @@ pub(super) fn seed_native_fixture(repo: &gix::Repository, remote: &Remote, sha: 
         )
         .unwrap();
     }
+    for (sha, blob, content) in [
+        (
+            "a".repeat(40),
+            "d".repeat(40),
+            "Remote file contents\nLoaded from the persistent API cache\n",
+        ),
+        ("b".repeat(40), "c".repeat(40), "Previous remote contents\n"),
+        (
+            "f".repeat(40),
+            "e".repeat(40),
+            "Remote-only branch contents\n",
+        ),
+    ] {
+        for (url,accept,body) in [
+            (format!("{root}/git/trees/{sha}?recursive=1"),"application/json",serde_json::to_vec(&serde_json::json!({"truncated":false,"tree":[{"path":"remote-example.txt","sha":blob,"mode":"100644","type":"blob"}]})).unwrap()),
+            (format!("{root}/git/blobs/{blob}"),"application/vnd.github.raw+json",content.as_bytes().to_vec()),
+        ] {
+            let path = session.location(&url,accept).unwrap();
+            std::fs::write(path,serde_json::to_vec(&CachedResponse { url,next:Some(false),body }).unwrap()).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "explicit remote-pair performance measurement"]
+    fn benchmark_remote_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let old = ObjectId::from_hex("a".repeat(40).as_bytes()).unwrap();
+        let new = ObjectId::from_hex("b".repeat(40).as_bytes()).unwrap();
+        let entries = |offset: usize| {
+            (0..5000).map(|i| json!({"path":format!("dir/file-{i:04}.txt"),"sha":format!("{:040x}",i+offset),"mode":"100644","type":"blob"})).collect::<Vec<_>>()
+        };
+        let (url, server) = super::super::tests::server(vec![
+            (
+                200,
+                String::new(),
+                serde_json::to_vec(&json!({"truncated":false,"tree":entries(1)})).unwrap(),
+            ),
+            (
+                200,
+                String::new(),
+                serde_json::to_vec(&json!({"truncated":false,"tree":entries(10001)})).unwrap(),
+            ),
+            (200, String::new(), b"old\nunchanged\n".to_vec()),
+            (200, String::new(), b"new\nunchanged\n".to_vec()),
+        ]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        let start = std::time::Instant::now();
+        let changes = compare(&repo, &remote, None, Some(old), new, false).unwrap();
+        let network_tree = start.elapsed().as_secs_f64() * 1000.0;
+        let start = std::time::Instant::now();
+        crate::diff::file_diff(&repo, &changes.files[0]).unwrap();
+        let network_file = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(server.join().unwrap().len(), 4);
+        let mut samples = Vec::new();
+        for n in 0..16 {
+            let start = std::time::Instant::now();
+            let changes = compare(&repo, &remote, None, Some(old), new, false).unwrap();
+            let tree = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(changes.files.len(), 5000);
+            let start = std::time::Instant::now();
+            let file = crate::diff::file_diff(&repo, &changes.files[0]).unwrap();
+            let file_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!((file.added, file.removed), (1, 1));
+            if n > 0 {
+                samples.push(json!({"sample":n-1,"cachedTreeMs":tree,"cachedFileMs":file_ms}));
+            }
+        }
+        println!(
+            "5000 modified files; local HTTP fixture first tree {network_tree:.3} ms, first file {network_file:.3} ms; one offline warm-up, 15 samples: {}",
+            serde_json::to_string(&samples).unwrap()
+        );
+    }
+
+    #[test]
+    fn marked_snapshots_compare_divergent_endpoints_and_reuse_cache() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            let dir = tempfile::tempdir().unwrap();
+            command::checked(dir.path(), &["init", "-q"]).unwrap();
+            let repo = crate::git::open(dir.path()).unwrap();
+            let old = ObjectId::from_hex("a".repeat(40).as_bytes()).unwrap();
+            let new = ObjectId::from_hex("b".repeat(40).as_bytes()).unwrap();
+            let entry = |path: &str, sha: &str| match provider {
+                Provider::Github => json!({"path":path,"sha":sha,"mode":"100644","type":"blob"}),
+                Provider::Gitlab => json!({"path":path,"id":sha,"mode":"100644","type":"blob"}),
+            };
+            let tree = |entries: Vec<serde_json::Value>| match provider {
+                Provider::Github => json!({"tree":entries,"truncated":false}),
+                Provider::Gitlab => json!(entries),
+            };
+            let before = tree(vec![
+                entry("old-only.txt", &"c".repeat(40)),
+                entry("changed.txt", &"d".repeat(40)),
+                entry("before.txt", &"e".repeat(40)),
+            ]);
+            let after = tree(vec![
+                entry("new-only.txt", &"f".repeat(40)),
+                entry("changed.txt", &"1".repeat(40)),
+                entry("after.txt", &"e".repeat(40)),
+            ]);
+            let (url, server) = super::super::tests::server(vec![
+                (200, String::new(), serde_json::to_vec(&before).unwrap()),
+                (200, String::new(), serde_json::to_vec(&after).unwrap()),
+                (200, String::new(), b"old\nunchanged\n".to_vec()),
+                (200, String::new(), b"new\nunchanged\n".to_vec()),
+            ]);
+            let mut remote = Remote::parse(
+                "origin",
+                "https://example.invalid/team/repo",
+                Some(provider.key()),
+            )
+            .unwrap();
+            remote.endpoint = format!("{url}/repository/branches");
+            let changes = compare(&repo, &remote, None, Some(old), new, false).unwrap();
+            assert_eq!(changes.files.len(), 4);
+            assert!(
+                changes
+                    .files
+                    .iter()
+                    .any(|f| f.path == "old-only.txt" && f.kind == ChangeKind::Deleted)
+            );
+            assert!(
+                changes
+                    .files
+                    .iter()
+                    .any(|f| f.path == "new-only.txt" && f.kind == ChangeKind::Added)
+            );
+            assert!(changes.files.iter().any(|f| f.path == "after.txt"
+                && f.old_path.as_deref() == Some("before.txt")
+                && f.kind == ChangeKind::Renamed));
+            let changed = changes
+                .files
+                .iter()
+                .find(|f| f.path == "changed.txt")
+                .unwrap();
+            let diff = crate::diff::file_diff(&repo, changed).unwrap();
+            assert_eq!((diff.added, diff.removed), (1, 1));
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(requests[0].contains(&old.to_string()));
+            assert!(requests[1].contains(&new.to_string()));
+            assert!(!requests.iter().any(|r| r.contains("/compare")));
+            assert_eq!(
+                compare(&repo, &remote, None, Some(old), new, false)
+                    .unwrap()
+                    .files,
+                changes.files
+            );
+            assert_eq!(
+                crate::diff::file_diff(&repo, changed).unwrap().rows,
+                diff.rows
+            );
+            assert!(crate::git::commit_details(&repo, &new).is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_local_and_remote_pairs_work_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        std::fs::write(dir.path().join("file.txt"), "local only\n").unwrap();
+        command::checked(dir.path(), &["add", "file.txt"]).unwrap();
+        command::checked(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "unpushed local commit",
+            ],
+        )
+        .unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let local = crate::git::snapshot_refs(&repo).unwrap().head_id.unwrap();
+        let ghost = ObjectId::from_hex("a".repeat(40).as_bytes()).unwrap();
+        let blob = "b".repeat(40);
+        let (url,server) = super::super::tests::server(vec![
+            (200,String::new(),serde_json::to_vec(&json!({"truncated":false,"tree":[{"path":"file.txt","sha":blob,"mode":"100644","type":"blob"}]})).unwrap()),
+            (200,String::new(),b"remote only\n".to_vec()),
+        ]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        for (old, new) in [(local, ghost), (ghost, local)] {
+            let changes = compare(&repo, &remote, None, Some(old), new, false).unwrap();
+            assert_eq!(changes.files.len(), 1);
+            let diff = crate::diff::file_diff(&repo, &changes.files[0]).unwrap();
+            assert_eq!((diff.added, diff.removed), (1, 1));
+        }
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(
+            crate::git::snapshot_refs(&repo).unwrap().head_id,
+            Some(local)
+        );
+        assert!(crate::git::commit_details(&repo, &ghost).is_err());
+    }
+
+    #[test]
+    fn pairs_use_each_remote_endpoint_for_its_own_tree_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let tree = |sha: &str| {
+            serde_json::to_vec(&json!({"truncated":false,"tree":[{"path":"file.txt","sha":sha,"mode":"100644","type":"blob"}]})).unwrap()
+        };
+        let (old_url, old_server) = super::super::tests::server(vec![
+            (200, String::new(), tree(&"c".repeat(40))),
+            (200, String::new(), b"old\n".to_vec()),
+        ]);
+        let (new_url, new_server) = super::super::tests::server(vec![
+            (200, String::new(), tree(&"d".repeat(40))),
+            (200, String::new(), b"new\n".to_vec()),
+        ]);
+        let mut old_remote = Remote::parse(
+            "upstream",
+            "https://example.invalid/old/repo",
+            Some("github"),
+        )
+        .unwrap();
+        old_remote.endpoint = format!("{old_url}/branches");
+        let mut new_remote = old_remote.clone();
+        new_remote.name = "origin".into();
+        new_remote.endpoint = format!("{new_url}/branches");
+        let old = ObjectId::from_hex("a".repeat(40).as_bytes()).unwrap();
+        let new = ObjectId::from_hex("b".repeat(40).as_bytes()).unwrap();
+        let changes = compare(&repo, &new_remote, Some(&old_remote), Some(old), new, true).unwrap();
+        let diff = crate::diff::file_diff(&repo, &changes.files[0]).unwrap();
+        assert_eq!((diff.added, diff.removed), (1, 1));
+        assert_eq!(old_server.join().unwrap().len(), 2);
+        assert_eq!(new_server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn truncated_tree_is_an_error_instead_of_a_partial_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let (url, server) = super::super::tests::server(vec![(
+            200,
+            String::new(),
+            br#"{"tree":[],"truncated":true}"#.to_vec(),
+        )]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        let id = ObjectId::from_hex("a".repeat(40).as_bytes()).unwrap();
+        assert!(
+            compare(&repo, &remote, None, None, id, true)
+                .unwrap_err()
+                .contains("truncated")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 
     #[test]
     fn both_providers_load_paginated_files_and_cache_content_offline() {

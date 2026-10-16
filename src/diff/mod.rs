@@ -273,7 +273,7 @@ fn emit_whole(
 }
 
 /// Exact-content rename detection: a deleted and an added blob with the same id.
-fn pair_renames(files: &mut Vec<FileChange>) {
+pub(crate) fn pair_renames(files: &mut Vec<FileChange>) {
     let mut deleted: HashMap<ObjectId, Vec<usize>> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
         if f.kind == ChangeKind::Deleted

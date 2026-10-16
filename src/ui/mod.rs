@@ -1,6 +1,7 @@
 //! Drawing: header, commit list with graph, details panel, status bar.
 
 pub mod branches;
+pub mod checkout;
 pub mod details;
 pub mod diff;
 pub mod list;
@@ -102,11 +103,14 @@ pub fn draw(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
     if app.settings.open {
         settings::draw(&app.settings, screen);
     }
+    if let Some(dialog) = &mut app.checkout_confirmation {
+        checkout::draw(dialog, screen);
+    }
 }
 
 fn draw_underlay(app: &mut App, screen: &mut Screen, areas: &Areas, now: i64) {
     if app.branches.open {
-        branches::draw(&mut app.branches, screen, &app.repo_name);
+        branches::draw(&mut app.branches, screen, &app.repo_name, now);
         return;
     }
     if let Mode::Diff(view) = &mut app.mode {
@@ -201,9 +205,27 @@ fn draw_splitter(app: &App, screen: &mut Screen, area: Rect) {
 
 fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
     let bg = theme::BG_HEADER;
+    if let Some(notice) = &app.checkout_notice {
+        screen.fill(area, ' ', theme::dim().bg(bg));
+        let (message, color) = match notice {
+            Ok(message) => (message.clone(), theme::FG_TEXT),
+            Err(error) => (format!("Checkout failed: {error}"), theme::FG_ERR),
+        };
+        screen.put_str_ellipsis(
+            area.x + 1,
+            area.y,
+            &message,
+            theme::text().fg(color).bg(bg),
+            area.w.saturating_sub(2),
+        );
+        return;
+    }
     if !app.ghost_status.is_empty() {
         screen.fill(area, ' ', theme::dim().bg(bg));
-        let status = format!("b branches  s settings  r refresh  | {}", app.ghost_status);
+        let status = format!(
+            "Enter checkout  b branches  s settings  F5 refresh  | {}",
+            app.ghost_status
+        );
         screen.put_str_ellipsis(
             area.x + 1,
             area.y,
@@ -219,6 +241,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
     let mut x = area.x + 1;
     let hints: &[(&str, &str)] = match (app.focus, app.marks.len()) {
         (Focus::List, 2) => &[
+            ("Enter", "checkout"),
             ("d", "diff marked"),
             ("Space", "unmark"),
             ("Del", "clear"),
@@ -227,6 +250,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             ("q", "quit"),
         ],
         (Focus::List, 1) => &[
+            ("Enter", "checkout"),
             ("Space", "mark 2nd"),
             ("Del", "clear"),
             ("↑↓", "move"),
@@ -236,6 +260,7 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             ("q", "quit"),
         ],
         (Focus::List, _) => &[
+            ("Enter", "checkout"),
             ("b", "branches"),
             ("s", "settings"),
             ("↑↓", "move"),
@@ -246,15 +271,16 @@ fn draw_status(app: &App, screen: &mut Screen, area: Rect) {
             ("Space", "mark"),
             ("Tab", "details"),
             ("[ ]", "panel"),
-            ("r", "reload"),
+            ("F5", "refresh"),
             ("q", "quit"),
         ],
         (Focus::Details, _) => &[
+            ("Enter", "checkout"),
             ("↑↓", "scroll"),
             ("PgUp/PgDn", "page"),
             ("Tab", "files"),
             ("[ ]", "panel"),
-            ("r", "reload"),
+            ("F5", "refresh"),
             ("q", "quit"),
         ],
         (Focus::Files, _) => &[

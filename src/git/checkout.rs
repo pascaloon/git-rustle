@@ -4,6 +4,62 @@ use crate::branches::Target;
 use std::path::Path;
 use std::time::Duration;
 
+pub fn execute(path: &Path, request: &crate::checkout::Request) -> Result<String, String> {
+    match request {
+        crate::checkout::Request::Branch(target) => checkout(path, target),
+        crate::checkout::Request::Commit { id, remote } => {
+            if output(path, &["rev-parse", "--is-bare-repository"])? == "true" {
+                return Err("Checkout needs a working tree; this is a bare repository".into());
+            }
+            let sha = id.to_string();
+            let object = command::run(
+                path,
+                &["cat-file", "-e", &format!("{sha}^{{commit}}")],
+                None,
+                Duration::from_secs(10),
+            )?;
+            if !object.status.success() {
+                let remote = remote
+                    .as_ref()
+                    .ok_or("Commit is unavailable locally; refresh or fetch it with Git first")?;
+                if remote.name.starts_with('-') || remote.name.is_empty() {
+                    return Err("Invalid remote name".into());
+                }
+                let url = output(
+                    path,
+                    &["config", "--get", &format!("remote.{}.url", remote.name)],
+                )?;
+                if url != remote.url {
+                    return Err(
+                        "Remote URL changed; refresh before checking out this commit".into(),
+                    );
+                }
+                output(
+                    path,
+                    &[
+                        "-c",
+                        "fetch.writeCommitGraph=false",
+                        "fetch",
+                        "--no-tags",
+                        "--no-recurse-submodules",
+                        "--no-write-fetch-head",
+                        "--no-prune",
+                        "--refmap=",
+                        "--",
+                        &remote.name,
+                        &sha,
+                    ],
+                )?;
+            }
+            output(path, &["switch", "--detach", "--no-guess", "--", &sha])?;
+            Ok(format!(
+                "Checked out {} (detached HEAD)",
+                id.to_hex_with_len(12)
+            ))
+        }
+    }
+}
+
 fn output(path: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&command::checked(path, args)?)
         .trim()
@@ -263,6 +319,98 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn detached_local_checkout_does_not_fetch_or_move_branches() {
+        let f = Fixture::new();
+        output(
+            &f.repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://unavailable.invalid/repo",
+            ],
+        )
+        .unwrap();
+        let refs = output(&f.repo, &["show-ref"]).unwrap();
+        let request = crate::checkout::Request::Commit {
+            id: gix::ObjectId::from_hex(f.main.as_bytes()).unwrap(),
+            remote: None,
+        };
+        execute(&f.repo, &request).unwrap();
+        assert!(
+            output(&f.repo, &["branch", "--show-current"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), f.main);
+        assert_eq!(output(&f.repo, &["show-ref"]).unwrap(), refs);
+        execute(&f.repo, &crate::checkout::Request::Branch(f.local("main"))).unwrap();
+        assert_eq!(
+            output(&f.repo, &["branch", "--show-current"]).unwrap(),
+            "main"
+        );
+    }
+
+    #[test]
+    fn detached_remote_checkout_downloads_only_the_commit_without_writing_refs() {
+        let f = Fixture::new();
+        let remote = crate::remote::Remote {
+            name: "origin".into(),
+            url: f.source.to_string_lossy().into_owned(),
+            provider: crate::remote::Provider::Github,
+            endpoint: "https://unused.invalid/branches".into(),
+            project: "fixture".into(),
+        };
+        let id = gix::ObjectId::from_hex(f.topic.as_bytes()).unwrap();
+        let refs = output(&f.repo, &["show-ref"]).unwrap();
+        let request = crate::checkout::Request::Commit {
+            id,
+            remote: Some(remote.clone()),
+        };
+        let mut wrong = remote;
+        wrong.url = "https://wrong.invalid/repo".into();
+        assert!(
+            execute(
+                &f.repo,
+                &crate::checkout::Request::Commit {
+                    id,
+                    remote: Some(wrong)
+                }
+            )
+            .unwrap_err()
+            .contains("Remote URL changed")
+        );
+        assert!(
+            execute(
+                &f.repo,
+                &crate::checkout::Request::Commit { id, remote: None }
+            )
+            .is_err()
+        );
+        execute(&f.repo, &request).unwrap();
+        assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), f.topic);
+        assert!(
+            output(&f.repo, &["branch", "--show-current"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(output(&f.repo, &["show-ref"]).unwrap(), refs);
+        assert!(!f.repo.join(".git/FETCH_HEAD").exists());
+        assert!(!exists(&f.repo, "refs/tags/unselected-tag").unwrap());
+        output(&f.repo, &["switch", "main"]).unwrap();
+        std::fs::write(f.repo.join("file.txt"), "unsaved\n").unwrap();
+        assert!(execute(&f.repo, &request).is_err());
+        assert_eq!(
+            std::fs::read_to_string(f.repo.join("file.txt")).unwrap(),
+            "unsaved\n"
+        );
+        assert_eq!(
+            output(&f.repo, &["branch", "--show-current"]).unwrap(),
+            "main"
+        );
     }
 
     #[test]

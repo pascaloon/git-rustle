@@ -24,6 +24,8 @@ pub enum DiffReq {
         old: Option<ObjectId>,
         new: ObjectId,
         remote: Option<crate::remote::Remote>,
+        old_remote: Option<crate::remote::Remote>,
+        compare: bool,
     },
     File {
         view: u32,
@@ -110,6 +112,8 @@ impl DiffView {
                 old: self.changes.old,
                 new: self.changes.new,
                 remote: None,
+                old_remote: None,
+                compare: false,
             });
         }
         if let Some(cur) = self.current

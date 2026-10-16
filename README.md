@@ -61,12 +61,13 @@ git-rustle [OPTIONS] [PATH]
 | `Home` / `End`, `g` / `G` | First / last commit |
 | `H` | Jump to `HEAD` |
 | `b` | Browse, filter, and check out local or remote branches |
+| `Enter` | Confirm checkout of the selected graph branch or commit |
 | `Tab`, `→` / `←`, `l` / `h` | Switch focus between graph and details |
 | `[` / `]` | Shrink / grow the details panel |
 | `Space` | Mark / unmark the selected commit (at most two) |
 | `d` | Diff: the two marked commits, or the marked/selected commit against its parent |
 | `Del` | Clear marks |
-| `r` | Reload local refs and refresh the graph when they changed |
+| `F5` | Reload local refs, revalidate remote branches, and refresh the graph |
 | `q`, `Ctrl+C` | Quit |
 | `Esc` | Clear marks, or quit when none are set |
 
@@ -122,16 +123,33 @@ and write no repository refs or objects.
 | `Ctrl+U` | Clear filter |
 | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Select a branch |
 | `Enter` | Check out the selected branch |
-| `Tab` | Locate its tip in the local graph, if available |
+| `Tab` | Locate its tip, loading a remote-only branch as a ghost preview when needed |
 | `F5`, `Ctrl+R` | Revalidate remote branches and reload local refs |
 | `Esc` | Return to the graph |
+
+Branches sort by **activity**: the number of commits from the past seven days
+among their last 100 first-parent commits, then by latest commit time and branch
+name. Following the first parent avoids counting merged side histories multiple
+times. `+` marks a lower-bound count when older ancestry was not examined or was
+unavailable. The latest commit's author and compact relative date use the graph's
+format and colors. Metadata loads on background workers; unknown values show `—`
+and the browser opens at the top of the activity-sorted list. Background updates
+keep it there until you navigate; afterward they preserve your selected branch.
+Local objects and cached
+API metadata are reused. Remote enrichment makes at most one commit-list request
+per tip, automatically considers up to 100 remote tips per refresh, and prioritizes
+the selected and visible branches even beyond that background limit. `F5` updates
+the scores and retries failures.
 
 After the local graph finishes loading, Git Rustle checks supported remotes in
 the background. Only actual local branches and their configured upstreams qualify.
 Standalone remote-tracking refs do not qualify. For eligible branches it retrieves missing
 commit metadata through the provider API and connects it to the local graph.
-Branches that exist only on the server remain available in `b` without adding
-their history to the graph.
+Branches that exist only on the server remain available in `b`. Press `Tab` on one
+to add its available history to the graph and navigate to its tip, without a fetch
+or checkout. Additional Tab previews remain in the graph for the session and use
+the same preview limits and cancellation rules as automatic previews. `Esc` while
+loading cancels the pending navigation.
 
 **Remote commits** retain the normal text, tag, hash, and author colors and node
 shapes. Their branch lane and remote branch label keep their hue at lower brightness.
@@ -148,8 +166,15 @@ and contents are cached by immutable commit ID; revisiting them works offline.
 This uses the [GitHub commit API](https://docs.github.com/en/rest/commits/commits)
 and [GitLab commit diff API](https://docs.gitlab.com/api/commits/#get-the-diff-of-a-commit).
 Remote requests run separately from local diffs. Provider file limits still apply;
-remote submodules show an explanatory message. Marking arbitrary commit pairs
-requires local objects. Previews and diffs do not fetch Git objects, move refs,
+remote submodules show an explanatory message. `Space` and `Ctrl`+click can mark
+ghost commits just like local commits. Two marks compare the endpoint snapshots,
+including divergent histories, mixed local/remote commits, and separate remote
+API endpoints. Complete remote trees and file contents are cached by immutable ID;
+an unpushed local endpoint is read from local objects. Arbitrary remote pairs use
+tree listings (up to 100,000 files and 1,000 pages per endpoint, with a 60-second
+budget plus the active request). Truncated or unavailable trees produce an error
+instead of a partial diff. Pair sidebar line totals may be unavailable; the selected
+file's diff still shows its line counts. Previews and diffs do not fetch Git objects, move refs,
 or touch the working tree. Checkout keeps the existing safety rules.
 
 Immutable commit metadata and the assembled preview graph are cached separately
@@ -170,6 +195,22 @@ Checkout requires **Git for Windows on PATH**. It runs on a separate worker;
 the browser and graph remain usable. Git's normal dirty-file, untracked-file,
 in-progress-operation, and worktree protections apply. Git Rustle never uses
 force checkout, reset, clean, or automatic stashing.
+
+**Checkout confirmation:** press `Enter` on the selected graph commit (with the
+graph or details focused), or on a branch in `b`, to open the popup. Press `Enter`
+again to confirm or `Esc` to cancel. At a graph branch tip, `Up`/`Down` chooses
+among matching branches and a detached-commit option; local branches are preferred,
+with the current local branch first. Commits without a branch tip use detached
+HEAD. The popup shows whether it will switch a branch or detach HEAD, and whether
+missing objects may need to be downloaded. Opening or canceling it performs no
+checkout or Git fetch. The files tree keeps its existing `Enter` action for diffs.
+
+Detached checkout of a ghost commit downloads that exact commit when necessary,
+without updating branch or tag refs. A provider that refuses fetching a commit by
+ID reports an error; there is no automatic fallback to downloading other branches.
+Success and failure messages appear in the active view, and local refs refresh
+after checkout. Press and release Enter separately to open and confirm; holding
+the key cannot confirm the popup automatically.
 
 - A local branch is switched to directly.
 - An existing local branch tracking the selected remote branch is reused,
@@ -278,6 +319,14 @@ remain reusable.
 
 Start with the [benchmark workflow for agents](docs/benchmarking.md): baseline
 preservation, reproducible commands, regression analysis, and reporting conventions.
+The [branch activity and remote actions report](docs/branch-improvements-benchmarks.md)
+records startup, branch browsing, remote Tab previews, and marked-pair measurements.
+The [branch browser polish report](docs/branch-polish-benchmarks.md) measures the
+subsequent selection and display refinements.
+The [checkout confirmation report](docs/checkout-confirmation-benchmarks.md) records
+popup latency and confirmed checkout measurements.
+The [Graph refresh shortcut report](docs/graph-refresh-benchmarks.md) compares
+the former `r` binding with `F5`, including native refresh and startup samples.
 The [connection-dimming report](docs/connection-dimming-benchmarks.md) includes
 the latest graph-styling measurements and startup comparison.
 

@@ -238,6 +238,115 @@ Link the report from the README when useful. `target` artifacts are local and
 may disappear; retained raw samples and the Markdown report are the durable
 record. Documentation-only edits need link/command review, not new performance runs.
 
+## Branch activity and remote action measurements
+
+For branch browser changes, compare native entry frames and measure the activity
+worker separately. The branch script records screen dumps as well as timing logs:
+
+```powershell
+.\scripts\benchmark-branches.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'branches')
+
+$env:GIT_RUSTLE_BENCH_REPO = $benchRepo
+cargo test --release branches::tests::benchmark_browser -- --ignored --exact --nocapture
+$env:GIT_RUSTLE_BENCH_BRANCHES = '1000'
+cargo test --release branches::tests::benchmark_browser -- --ignored --exact --nocapture
+Remove-Item Env:GIT_RUSTLE_BENCH_BRANCHES
+```
+
+The component harness times worker scoring, browser installation/sorting, and
+200 selection-plus-draw steps per sample on a 120×40 in-memory screen. It discards
+one warm-up and retains 15 samples. The optional thousand-branch case uses the
+first 1,000 commit IDs from `git rev-list --all` as synthetic branch tips without
+writing refs. Drawing excludes terminal flushing and input delivery; native entry
+frames are measured since startup and include the scripted 40 ms input delay.
+The activity worker interval ends at message receipt, before sorting and drawing.
+
+With a freshly prepared native fixture from section 6, measure the new actions:
+
+```powershell
+.\scripts\benchmark-remote-actions.ps1 -Repository $fixturePath -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'actions')
+cargo test --release remote::files::tests::benchmark_remote_pairs -- `
+  --ignored --exact --nocapture
+```
+
+The action script checks that remote-only Tab navigation installs three ghosts,
+then separately opens a marked pair between divergent remote branches. It keeps
+one warm-up and 15 samples per action and checks final screen contents. These
+are candidate-only measurements because the older executable cannot perform the
+actions. Tab times the preview worker request-to-delivery interval; pair times
+the tree request to the tree result and to the selected file result. They exclude
+scripted typing/delays and do not measure a final terminal flush.
+
+The pair component harness creates 5,000 modified paths using a local HTTP server,
+records the first tree and selected-file timings, then closes the server and
+records one warm-up plus 15 persistent-cache samples. It exercises GitHub tree
+listings; ordinary fixture tests cover both GitHub and GitLab behavior. The small
+native fixture and the larger component fixture serve different purposes.
+
+Restore any pre-existing benchmark environment variables after these commands.
+Run these suites sequentially after all builds have finished, and retain their
+raw output and limitations alongside startup and preview comparisons.
+
+## Graph refresh shortcut measurements
+
+After preserving the baseline and completing builds/tests, compare the former
+Graph `r` shortcut with the candidate's `F5`:
+
+```powershell
+.\scripts\benchmark-refresh.ps1 -Repository $benchRepo -Baseline $baselineExe `
+  -Samples 15 -OutputDirectory (Join-Path $benchRun 'refresh')
+```
+
+The script runs hidden native consoles with warmed application caches, one
+discarded warm-up per binary and 15 alternating samples. Ten unbound `x` keys
+delay the refresh until startup discovery completes. Each log must contain two
+completed discovery cycles; overlapping startup/manual discovery invalidates a
+run. The measured interval is the manual `remote discovery requested` to
+`remote discovery done`, including worker scheduling and delivery. This excludes
+input delay, the separate local-ref reload, preview loading and screen flushing.
+It also checks that the candidate's final screen contains the F5 hint. Use local
+fixtures or separate measurements for provider/network latency claims. Compare
+startup separately if shared input routing changed.
+
+## Checkout confirmation measurements
+
+After preserving the baseline and completing all release validation/builds:
+
+```powershell
+$checkoutFixture = Join-Path $benchRun 'checkout-fixture'
+$previousCheckoutFixture = $env:GIT_RUSTLE_CHECKOUT_FIXTURE
+try {
+    $env:GIT_RUSTLE_CHECKOUT_FIXTURE = $checkoutFixture
+    cargo test --release checkout::tests::prepare_native_fixture -- --ignored --exact --nocapture
+    .\scripts\benchmark-checkout.ps1 -Repository $benchRepo -Fixture $checkoutFixture `
+      -Baseline $baselineExe -Samples 15 -OutputDirectory (Join-Path $benchRun 'checkout')
+} finally {
+    $env:GIT_RUSTLE_CHECKOUT_FIXTURE = $previousCheckoutFixture
+}
+```
+
+The fixture must be new. It has three commits, one changing text file, two local
+branches, and a marker checked by the script. All confirmed checkouts and fixture
+resets run there. Large-repository runs only open the popup, require its frame
+and screen content, and reject any `checkout requested` mark.
+
+Popup timing runs from the triggering Enter input to the first popup console
+flush, including choice construction and the underlay draw. Graph branch/commit
+checkouts have no baseline equivalent and are measured on the candidate only.
+Browser branch checkout alternates both binaries: the candidate has an extra
+confirmation Enter, while the worker interval excludes that user-input delay.
+It measures `checkout requested` to `checkout done`, including Git subprocesses,
+worker scheduling, and result delivery. HEAD and attached/detached state are
+verified after each operation. One warm-up and 15 samples are used per mode/binary.
+The script restores its environment and returns the disposable fixture to main.
+
+These tiny-worktree results do not establish large-worktree or remote fetch
+latency. Keep the native logs, screen dumps, raw JSON, and source/executable hashes
+with the report; compare native startup separately when shared input/state changes.
+
 ## Worked decision log: connection dimming
 
 The [connection-dimming report](connection-dimming-benchmarks.md) records this

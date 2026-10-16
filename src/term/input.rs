@@ -6,8 +6,8 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Console::{
     DOUBLE_CLICK, FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, INPUT_RECORD,
     KEY_EVENT, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_HWHEELED, MOUSE_MOVED,
-    MOUSE_WHEELED, ReadConsoleInputW, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED,
-    RIGHTMOST_BUTTON_PRESSED, SHIFT_PRESSED, WINDOW_BUFFER_SIZE_EVENT,
+    MOUSE_WHEELED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, RIGHTMOST_BUTTON_PRESSED,
+    ReadConsoleInputW, SHIFT_PRESSED, WINDOW_BUFFER_SIZE_EVENT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +110,7 @@ where
     let mut records: [INPUT_RECORD; 64] = [INPUT_RECORD::default(); 64];
     let mut buttons: u32 = 0;
     let mut pending_surrogate: Option<u16> = None;
+    let mut enter_down = false;
     loop {
         let mut read = 0u32;
         // SAFETY: buffer is a valid array of INPUT_RECORD with the given capacity.
@@ -120,7 +121,7 @@ where
             return;
         }
         for rec in &records[..read as usize] {
-            let events = translate(rec, &mut buttons, &mut pending_surrogate);
+            let events = translate(rec, &mut buttons, &mut pending_surrogate, &mut enter_down);
             for ev in events {
                 if !sink(ev) {
                     return;
@@ -134,12 +135,24 @@ fn translate(
     rec: &INPUT_RECORD,
     buttons: &mut u32,
     pending_surrogate: &mut Option<u16>,
+    enter_down: &mut bool,
 ) -> Vec<Event> {
     let mut out = Vec::new();
     match rec.EventType as u32 {
         KEY_EVENT => {
             // SAFETY: EventType says this is a key record.
             let k = unsafe { rec.Event.KeyEvent };
+            if k.wVirtualKeyCode == VK_RETURN {
+                if k.bKeyDown == 0 {
+                    *enter_down = false;
+                    return out;
+                }
+                // Opening and confirming a checkout require separate physical
+                // presses, even when Windows coalesces or auto-repeats Enter.
+                if std::mem::replace(enter_down, true) {
+                    return out;
+                }
+            }
             if k.bKeyDown == 0 {
                 return out;
             }
@@ -193,7 +206,11 @@ fn translate(
                     shift,
                     alt,
                 });
-                let repeat = (k.wRepeatCount.max(1) as usize).min(32);
+                let repeat = if code == KeyCode::Enter {
+                    1
+                } else {
+                    (k.wRepeatCount.max(1) as usize).min(32)
+                };
                 out.extend(std::iter::repeat_n(ev, repeat));
             }
         }
@@ -309,10 +326,34 @@ mod tests {
     fn run(records: &[INPUT_RECORD]) -> Vec<Event> {
         let mut buttons = 0;
         let mut surrogate = None;
+        let mut enter_down = false;
         records
             .iter()
-            .flat_map(|r| translate(r, &mut buttons, &mut surrogate))
+            .flat_map(|r| translate(r, &mut buttons, &mut surrogate, &mut enter_down))
             .collect()
+    }
+
+    #[test]
+    fn enter_requires_release_and_repress_instead_of_auto_repeat() {
+        let mut repeated = key(VK_RETURN, 13, 0, true);
+        repeated.Event.KeyEvent.wRepeatCount = 8;
+        let events = run(&[
+            repeated,
+            key(VK_RETURN, 13, 0, true),
+            key(VK_RETURN, 13, 0, false),
+            key(VK_RETURN, 13, 0, true),
+        ]);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| matches!(
+            e,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            })
+        )));
+        let mut arrow = key(VK_DOWN, 0, 0, true);
+        arrow.Event.KeyEvent.wRepeatCount = 3;
+        assert_eq!(run(&[arrow]).len(), 3);
     }
 
     #[test]
@@ -334,7 +375,13 @@ mod tests {
                 alt: false
             })
         );
-        assert!(matches!(ev[1], Event::Key(KeyEvent { code: KeyCode::Up, .. })));
+        assert!(matches!(
+            ev[1],
+            Event::Key(KeyEvent {
+                code: KeyCode::Up,
+                ..
+            })
+        ));
         assert!(matches!(
             ev[2],
             Event::Key(KeyEvent {

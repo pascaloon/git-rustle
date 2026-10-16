@@ -8,6 +8,7 @@
 mod app;
 mod branches;
 mod cache;
+mod checkout;
 mod credentials;
 mod diff;
 mod diffview;
@@ -36,6 +37,11 @@ enum Msg {
     Settings(u32, settings::Outcome),
     Preview(u32, remote::history::Preview),
     PreviewTags(u32, Vec<(gix::ObjectId, String)>, Vec<String>),
+    BranchActivity(
+        u32,
+        Vec<(branches::Target, branches::Activity)>,
+        Option<(branches::Target, String)>,
+    ),
     Refreshed(Box<git::Result<(gix::Repository, git::RefSnapshot)>>),
     Checkout(Result<String, String>, bool),
     Input(Event),
@@ -76,10 +82,23 @@ fn spawn_diff_worker(repo: gix::Repository, tx: Sender<Msg>, no_cache: bool) -> 
                     old,
                     new,
                     remote,
+                    old_remote,
+                    compare,
                 }) = tree
                 {
                     let result = if let Some(remote) = remote {
-                        remote::files::tree(&repo, &remote, old, new, no_cache)
+                        if compare {
+                            remote::files::compare(
+                                &repo,
+                                &remote,
+                                old_remote.as_ref(),
+                                old,
+                                new,
+                                no_cache,
+                            )
+                        } else {
+                            remote::files::tree(&repo, &remote, old, new, no_cache)
+                        }
                     } else {
                         diff::tree_diff(&repo, old.as_ref(), &new).map_err(|e| e.to_string())
                     };
@@ -212,6 +231,7 @@ fn parse_key_script(script: &str) -> Vec<term::KeyEvent> {
         let code = match name {
             "f1" => F(1),
             "f2" => F(2),
+            "f5" => F(5),
             "up" => Up,
             "down" => Down,
             "left" => Left,
@@ -486,12 +506,15 @@ fn run(
     let mut first_frame = false;
     let mut branch_frame = false;
     let mut settings_frame = false;
+    let mut checkout_frame = false;
     let mut remote_generation = 0u32;
     let mut preview_epoch = 0u32;
     let mut preview_cancel = Arc::new(AtomicBool::new(false));
     let mut preview_busy = false;
     let mut preview_wanted = false;
     let mut preview_force = false;
+    let mut activity_busy = false;
+    let mut local_activity_done = None;
     let mut auto_remote = false;
     let mut areas = ui::compute_areas(screen.width(), screen.height(), app.right_width);
     let mut last_tick = Instant::now();
@@ -543,6 +566,11 @@ fn run(
             auto_remote = true;
             app.branches.want_refresh.get_or_insert(false);
         }
+        if std::mem::take(&mut app.branches.preview_requested) {
+            preview_epoch = preview_epoch.wrapping_add(1);
+            preview_cancel.store(true, Ordering::Relaxed);
+            preview_wanted = true;
+        }
         if preview_wanted
             && !preview_busy
             && !app.is_walking()
@@ -560,6 +588,7 @@ fn run(
                     .get_or_insert_with(|| Arc::new(app.history.clone()))
                     .clone();
                 let updates = app.branches.remotes.values().cloned().collect::<Vec<_>>();
+                let requested = app.branches.preview_targets.clone();
                 let r = r.clone();
                 let tx = tx.clone();
                 let epoch = preview_epoch;
@@ -575,6 +604,7 @@ fn run(
                         &local,
                         &refs,
                         &updates,
+                        &requested,
                         force,
                         no_cache,
                         &cancel,
@@ -601,7 +631,7 @@ fn run(
         if !app.settings.saving
             && (app.want_refresh
                 || app.branches.want_refresh.is_some()
-                || app.branches.checkout.is_some())
+                || app.checkout_request.is_some())
             && let Some(r) = repo.as_ref()
         {
             let path = r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf();
@@ -616,10 +646,17 @@ fn run(
             {
                 preview_epoch = preview_epoch.wrapping_add(1);
                 preview_cancel.store(true, Ordering::Relaxed);
-                preview_wanted = false;
+                preview_wanted = app.branches.pending_jump.is_some();
                 remote_generation = remote_generation.wrapping_add(1);
                 let generation = remote_generation;
                 preview_force |= force;
+                if force {
+                    local_activity_done = None;
+                    app.branches.activity_cache.clear();
+                    app.branches.activity_attempted.clear();
+                    app.branches.activity_errors.clear();
+                    app.branches.activity_requests = 0;
+                }
                 app.branches.loading = true;
                 app.branches.errors.clear();
                 app.needs_redraw = true;
@@ -638,16 +675,61 @@ fn run(
                 }
             }
             if !app.branches.busy
-                && let Some(target) = app.branches.checkout.take()
+                && let Some(target) = app.checkout_request.take()
             {
                 app.branches.busy = true;
                 app.branches.status = format!("Checking out {}…", target.label());
+                app.checkout_notice = Some(Ok(app.branches.status.clone()));
                 app.needs_redraw = true;
                 let tx = tx.clone();
                 timing.mark("checkout requested");
                 thread::spawn(move || {
-                    let result = git::checkout::checkout(&path, &target);
-                    let _ = tx.send(Msg::Checkout(result, target.remote.is_some()));
+                    let result = git::checkout::execute(&path, &target);
+                    let _ = tx.send(Msg::Checkout(result, target.is_remote()));
+                });
+            }
+        }
+        // Browser metadata is lazy; neither the initial frame nor redraws walk history.
+        if app.branches.open
+            && !activity_busy
+            && !app.is_walking()
+            && !app.want_rewalk
+            && let Some(r) = repo.as_ref()
+            && let Some(refs) = app.refs.as_ref()
+        {
+            let generation = remote_generation;
+            if local_activity_done != Some(refs.fingerprint) {
+                local_activity_done = Some(refs.fingerprint);
+                activity_busy = true;
+                let tips = app
+                    .branches
+                    .entries
+                    .iter()
+                    .map(|e| e.target.clone())
+                    .collect::<Vec<_>>();
+                let r = r.clone();
+                let tx = tx.clone();
+                timing.mark("branch activity requested");
+                thread::spawn(move || {
+                    let values = branches::local_activity(&r, &tips, ui::time::now_unix());
+                    let _ = tx.send(Msg::BranchActivity(generation, values, None));
+                });
+            } else if let Some((target, remote)) = app.branches.next_remote_activity() {
+                activity_busy = true;
+                let r = r.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let (values, error) = match remote::history::branch_activity(
+                        &r,
+                        &remote,
+                        &target.sha,
+                        ui::time::now_unix(),
+                        no_cache,
+                    ) {
+                        Ok(value) => (vec![(target, value)], None),
+                        Err(error) => (Vec::new(), Some((target, error))),
+                    };
+                    let _ = tx.send(Msg::BranchActivity(generation, values, error));
                 });
             }
         }
@@ -668,8 +750,26 @@ fn run(
             let reqs = app.pending_requests();
             if !reqs.is_empty() {
                 for mut req in reqs {
-                    if let DiffReq::Tree { new, remote, .. } = &mut req {
-                        *remote = app.ghost_sources.get(new).cloned();
+                    if let DiffReq::Tree {
+                        old,
+                        new,
+                        remote,
+                        old_remote,
+                        compare,
+                        ..
+                    } = &mut req
+                    {
+                        *remote = app
+                            .ghost_sources
+                            .get(new)
+                            .or_else(|| old.as_ref().and_then(|id| app.ghost_sources.get(id)))
+                            .cloned();
+                        *old_remote = old
+                            .as_ref()
+                            .and_then(|id| app.ghost_sources.get(id))
+                            .cloned();
+                        *compare = remote.is_some()
+                            && (!app.ghost_sources.contains_key(new) || *old != app.parent_of(new));
                     }
                     if matches!(req, DiffReq::Tree { .. }) {
                         timing.mark("diff requested");
@@ -716,6 +816,10 @@ fn run(
             let now = ui::time::now_unix();
             ui::draw(app, screen, &areas, now);
             screen.flush(console);
+            if app.checkout_confirmation.is_some() && !checkout_frame {
+                timing.mark("checkout confirmation frame");
+            }
+            checkout_frame = app.checkout_confirmation.is_some();
             if app.branches.open && !branch_frame {
                 timing.mark(format!(
                     "branch browser frame ({} branches)",
@@ -787,19 +891,41 @@ fn run(
 
         for msg in pending {
             match msg {
+                Msg::BranchActivity(generation, values, error) => {
+                    activity_busy = false;
+                    if generation == remote_generation {
+                        timing.mark(format!("branch activity ready ({} tips)", values.len()));
+                        app.branches.install_activity(values, app.refs.as_ref());
+                        if let Some((target, error)) = error {
+                            app.branches.activity_errors.insert(target, error);
+                        }
+                        app.needs_redraw = true;
+                    } else {
+                        local_activity_done = None;
+                    }
+                }
                 Msg::Preview(epoch, mut preview) => {
-                    if epoch == preview_epoch && !app.is_walking() && !app.want_rewalk {
+                    if epoch == preview_epoch
+                        && !app.branches.preview_requested
+                        && !app.is_walking()
+                        && !app.want_rewalk
+                    {
                         timing.mark(format!(
                             "ghost preview ready ({} commits)",
                             preview.ghosts.len()
                         ));
                         preview.errors.extend(app.branches.errors.iter().cloned());
                         app.install_preview(preview);
+                        app.finish_branch_jump();
                     }
                 }
                 Msg::PreviewTags(epoch, tags, errors) => {
                     preview_busy = false;
-                    if epoch == preview_epoch && !app.is_walking() && !app.want_rewalk {
+                    if epoch == preview_epoch
+                        && !app.branches.preview_requested
+                        && !app.is_walking()
+                        && !app.want_rewalk
+                    {
                         app.ghost_tags = tags;
                         if !errors.is_empty() {
                             app.ghost_status =
@@ -828,6 +954,13 @@ fn run(
                         remote_generation = remote_generation.wrapping_add(1);
                         app.branches.loading = false;
                         app.branches.remotes.clear();
+                        app.branches.preview_targets.clear();
+                        app.branches.pending_jump = None;
+                        app.branches.activity_cache.clear();
+                        app.branches.activity_attempted.clear();
+                        app.branches.activity_errors.clear();
+                        app.branches.activity_requests = 0;
+                        local_activity_done = None;
                         app.branches.last_check = None;
                         app.branches.want_refresh = Some(true);
                         if let Some(refs) = app.refs.clone() {
@@ -898,6 +1031,7 @@ fn run(
                     if result.is_ok() && remote {
                         app.branches.want_refresh = Some(true);
                     }
+                    app.checkout_notice = Some(result.clone());
                     app.branches.status = match result {
                         Ok(message) => message,
                         Err(error) => format!("Checkout failed: {error}"),
@@ -927,12 +1061,8 @@ fn run(
                     }
                 }
                 Msg::Input(Event::Key(k)) => {
-                    if !app.settings.open
-                        && !app.branches.open
-                        && matches!(k.code, term::KeyCode::Char('r') | term::KeyCode::F(5))
-                        && !k.ctrl
-                    {
-                        app.branches.want_refresh = Some(true);
+                    if k.code == term::KeyCode::Enter {
+                        timing.mark("enter input");
                     }
                     app.handle_key(k)
                 }
@@ -940,6 +1070,9 @@ fn run(
                     app.handle_mouse(m, &areas, screen.width(), screen.height())
                 }
                 Msg::Input(Event::Resize) => {
+                    if let Some(dialog) = &mut app.checkout_confirmation {
+                        dialog.ready = false;
+                    }
                     let (w, h) = console.size();
                     screen.resize(w, h);
                     app.needs_redraw = true;

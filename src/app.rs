@@ -59,6 +59,9 @@ pub struct App {
     pub ghost_status: String,
     pub settings: crate::settings::Settings,
     pub branches: crate::branches::Browser,
+    pub checkout_confirmation: Option<crate::checkout::Confirmation>,
+    pub checkout_request: Option<crate::checkout::Request>,
+    pub checkout_notice: Option<Result<String, String>>,
     pub repo_name: String,
     pub history: History,
     /// A fresh history being built while `history` (stale cache) stays on screen.
@@ -110,6 +113,9 @@ impl App {
             ghost_status: String::new(),
             settings: crate::settings::Settings::default(),
             branches: crate::branches::Browser::default(),
+            checkout_confirmation: None,
+            checkout_request: None,
+            checkout_notice: None,
             repo_name: String::new(),
             history: History::default(),
             incoming: None,
@@ -150,9 +156,6 @@ impl App {
 
     /// Mark or unmark a commit; marking a third drops the oldest mark.
     pub fn toggle_mark(&mut self, id: ObjectId) {
-        if self.ghosts.contains_key(&id) {
-            return;
-        }
         if let Some(i) = self.marks.iter().position(|m| *m == id) {
             self.marks.remove(i);
         } else {
@@ -214,6 +217,8 @@ impl App {
                         old: cs.old,
                         new: cs.new,
                         remote: None,
+                        old_remote: None,
+                        compare: false,
                     }]
                 }
                 _ => Vec::new(),
@@ -430,6 +435,21 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn finish_branch_jump(&mut self) {
+        if let Some(id) = self.branches.pending_jump.take() {
+            if let Some(index) = self.history.index_of(&id) {
+                self.mode = Mode::Graph;
+                self.focus = Focus::List;
+                self.select(index);
+                self.branches.open = false;
+                self.branches.status.clear();
+            } else {
+                self.branches.status =
+                    format!("Could not locate remote tip. {}", self.ghost_status);
+            }
+        }
+    }
+
     /// Install a history read from the cache.
     pub fn set_cached(&mut self, history: History, fresh: bool) {
         self.local_history = None;
@@ -571,13 +591,70 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn confirm_checkout(&mut self, choices: Vec<crate::checkout::Request>) {
+        if self.branches.busy || self.checkout_request.is_some() || choices.is_empty() {
+            return;
+        }
+        self.branches.pending_jump = None;
+        self.dragging_splitter = false;
+        self.checkout_notice = None;
+        self.checkout_confirmation = Some(crate::checkout::Confirmation::new(choices));
+        self.needs_redraw = true;
+    }
+
+    pub fn confirm_graph_checkout(&mut self) {
+        if self.branches.busy || self.checkout_request.is_some() {
+            return;
+        }
+        let Some(id) = self.selected_id() else { return };
+        let sha = id.to_string();
+        // The browser is lazy and may never have been opened in this session.
+        self.branches.rebuild(self.refs.as_ref());
+        let mut branches = self
+            .branches
+            .entries
+            .iter()
+            .filter(|e| e.target.sha == sha)
+            .map(|e| e.target.clone())
+            .collect::<Vec<_>>();
+        let current = self.refs.as_ref().and_then(|r| r.head_branch.as_ref());
+        branches.sort_by_key(|t| (t.remote.is_some(), current != Some(&t.name), t.label()));
+        let mut choices = branches
+            .into_iter()
+            .map(crate::checkout::Request::Branch)
+            .collect::<Vec<_>>();
+        choices.push(crate::checkout::Request::Commit {
+            id,
+            remote: self.ghost_sources.get(&id).cloned(),
+        });
+        self.confirm_checkout(choices);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if let Some(dialog) = &mut self.checkout_confirmation {
+            match key.code {
+                KeyCode::Enter if dialog.ready && !key.ctrl && !key.alt => {
+                    self.checkout_request = Some(dialog.chosen().clone());
+                    self.checkout_confirmation = None;
+                }
+                KeyCode::Esc => self.checkout_confirmation = None,
+                KeyCode::Char('c') if key.ctrl => self.checkout_confirmation = None,
+                KeyCode::Up => dialog.move_by(-1),
+                KeyCode::Down => dialog.move_by(1),
+                KeyCode::Home => dialog.selected = 0,
+                KeyCode::End => dialog.selected = dialog.choices.len() - 1,
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
         if self.settings.open {
             self.settings.handle_key(key);
             self.needs_redraw = true;
             return;
         }
         if !self.branches.busy
+            && self.checkout_request.is_none()
             && (key.code == KeyCode::F(2)
                 || (!self.branches.open && !key.ctrl && key.code == KeyCode::Char('s')))
         {
@@ -597,13 +674,40 @@ impl App {
             return;
         }
         if self.branches.open {
+            if key.code == KeyCode::Enter && !key.ctrl && !key.alt {
+                if let Some(target) = self.branches.chosen().map(|e| e.target.clone()) {
+                    self.confirm_checkout(vec![crate::checkout::Request::Branch(target)]);
+                }
+                return;
+            }
             self.branches.handle_key(key);
+            if !self.branches.open {
+                self.branches.pending_jump = None;
+            }
             if let Some(id) = self.branches.jump.take() {
+                self.branches.pending_jump = None;
                 if let Some(index) = self.history.index_of(&id) {
+                    self.mode = Mode::Graph;
+                    self.focus = Focus::List;
                     self.select(index);
                     self.branches.open = false;
-                } else {
-                    self.branches.status = "This commit is not in the local graph. Enter checks out the branch and downloads missing history.".into();
+                } else if let Some(target) = self.branches.chosen().map(|e| e.target.clone()) {
+                    if target
+                        .remote
+                        .as_ref()
+                        .is_some_and(|name| self.branches.remotes.contains_key(name))
+                    {
+                        self.branches
+                            .preview_targets
+                            .retain(|t| t.remote != target.remote || t.name != target.name);
+                        self.branches.status =
+                            format!("Loading ghost history for {}…", target.label());
+                        self.branches.preview_targets.push(target);
+                        self.branches.pending_jump = Some(id);
+                        self.branches.preview_requested = true;
+                    } else {
+                        self.branches.status = "Remote preview needs a supported API connection; check F2 settings or retry after discovery.".into();
+                    }
                 }
             }
             self.needs_redraw = true;
@@ -650,8 +754,14 @@ impl App {
             }
             (KeyCode::Delete, _) => self.clear_marks(),
             (KeyCode::Char('d'), false) => self.open_diff(),
+            (KeyCode::Enter, false) if self.focus != Focus::Files && !key.alt => {
+                self.confirm_graph_checkout()
+            }
             (KeyCode::Tab, _) => self.cycle_focus(),
-            (KeyCode::Char('r'), _) if !key.ctrl => self.want_refresh = true,
+            (KeyCode::F(5), false) => {
+                self.want_refresh = true;
+                self.branches.want_refresh = Some(true);
+            }
             (KeyCode::Char('['), _) => self.resize_panel(-2),
             (KeyCode::Char(']'), _) => self.resize_panel(2),
             _ => match self.focus {
@@ -754,6 +864,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, m: MouseEvent, areas: &Areas, screen_w: u16, screen_h: u16) {
+        if self.checkout_confirmation.is_some() {
+            return;
+        }
         if self.settings.open {
             crate::ui::settings::handle_mouse(&mut self.settings, m, screen_w, screen_h);
             self.needs_redraw = true;
@@ -765,8 +878,8 @@ impl App {
                 MouseKind::Down(Button::Left)
                     if m.y >= 2 && (m.y as usize) < self.branches.rows + 2 =>
                 {
-                    self.branches.selected = self.branches.scroll + m.y as usize - 2;
-                    self.branches.ensure_visible();
+                    self.branches
+                        .select(self.branches.scroll + m.y as usize - 2);
                 }
                 _ => {}
             }
@@ -906,6 +1019,175 @@ mod tests {
             details: Rect::new(61, 1, 39, 10),
             status: Rect::new(0, 11, 100, 1),
         }
+    }
+
+    #[test]
+    fn graph_f5_refreshes_local_and_remote_refs_in_each_panel() {
+        for focus in [Focus::List, Focus::Details, Focus::Files] {
+            let mut app = app_with(3);
+            app.focus = focus;
+            app.handle_key(key(KeyCode::Char('r')));
+            assert!(!app.want_refresh);
+            assert_eq!(app.branches.want_refresh, None);
+            app.focus = focus;
+            app.handle_key(key(KeyCode::F(5)));
+            assert!(app.want_refresh);
+            assert_eq!(app.branches.want_refresh, Some(true));
+        }
+        let mut app = app_with(3);
+        app.branches.show(None);
+        app.handle_key(key(KeyCode::F(5)));
+        assert_eq!(app.branches.want_refresh, Some(true));
+    }
+
+    #[test]
+    fn graph_checkout_is_modal_frozen_and_requires_a_visible_confirmation() {
+        use crate::checkout::Request;
+        let mut app = app_with(3);
+        let id = app.selected_id().unwrap();
+        let refs = RefSnapshot {
+            head_id: Some(id),
+            head_branch: Some("main".into()),
+            refs: vec![
+                crate::git::RefEntry {
+                    name: "other".into(),
+                    id,
+                    kind: RefKind::Branch,
+                },
+                crate::git::RefEntry {
+                    name: "main".into(),
+                    id,
+                    kind: RefKind::Branch,
+                },
+                crate::git::RefEntry {
+                    name: "origin/main".into(),
+                    id,
+                    kind: RefKind::Remote,
+                },
+            ],
+            ..Default::default()
+        };
+        app.set_refs(refs);
+        app.toggle_mark(id);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.checkout_request.is_none());
+        let dialog = app.checkout_confirmation.as_ref().unwrap();
+        assert_eq!(dialog.choices.len(), 4);
+        assert!(
+            matches!(dialog.chosen(),Request::Branch(t) if t.name == "main" && t.remote.is_none())
+        );
+        // Buffered input cannot confirm before the dialog is visible.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.checkout_request.is_none());
+        for code in [
+            KeyCode::Char('b'),
+            KeyCode::Char('s'),
+            KeyCode::Char('d'),
+            KeyCode::Char('q'),
+            KeyCode::F(5),
+            KeyCode::Delete,
+        ] {
+            app.handle_key(key(code));
+        }
+        assert!(!app.branches.open && !app.settings.open && !app.quit);
+        assert!(!app.want_refresh && app.branches.want_refresh.is_none());
+        assert_eq!(app.marks, vec![id]);
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseKind::Down(Button::Left),
+                x: 5,
+                y: 3,
+                ctrl: false,
+                shift: false,
+            },
+            &areas(),
+            100,
+            12,
+        );
+        assert_eq!(app.selected, 0);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.checkout_confirmation.is_none() && app.checkout_request.is_none());
+        assert_eq!(app.marks, vec![id]);
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Down));
+        crate::ui::checkout::draw(
+            app.checkout_confirmation.as_mut().unwrap(),
+            &mut crate::term::Screen::new(120, 30),
+        );
+        // Refreshes or selection changes cannot retarget the pending checkout.
+        app.set_refs(RefSnapshot::default());
+        app.select(2);
+        app.handle_key(key(KeyCode::Enter));
+        let expected_sha = id.to_string();
+        assert!(
+            matches!(&app.checkout_request,Some(Request::Branch(t)) if t.name == "other" && t.sha == expected_sha)
+        );
+        assert!(app.checkout_confirmation.is_none());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.checkout_confirmation.is_none()); // already queued
+    }
+
+    #[test]
+    fn browser_checkout_uses_the_same_confirmation_and_cancel_keeps_the_browser() {
+        use crate::checkout::Request;
+        let mut app = app_with(1);
+        let id = app.selected_id().unwrap();
+        let refs = RefSnapshot {
+            refs: vec![crate::git::RefEntry {
+                name: "topic".into(),
+                id,
+                kind: RefKind::Branch,
+            }],
+            ..Default::default()
+        };
+        app.set_refs(refs);
+        app.branches.show(app.refs.as_ref());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.checkout_request.is_none());
+        assert_eq!(app.checkout_confirmation.as_ref().unwrap().choices.len(), 1);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.branches.open && app.checkout_request.is_none());
+        app.handle_key(key(KeyCode::Enter));
+        crate::ui::checkout::draw(
+            app.checkout_confirmation.as_mut().unwrap(),
+            &mut crate::term::Screen::new(120, 30),
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(&app.checkout_request,Some(Request::Branch(t)) if t.name == "topic"));
+    }
+
+    #[test]
+    fn graph_commit_confirmation_captures_remote_and_blocks_unreadable_confirmation() {
+        use crate::checkout::Request;
+        let mut app = app_with(3);
+        app.focus = Focus::Details;
+        let id = app.selected_id().unwrap();
+        let remote =
+            crate::remote::Remote::parse("origin", "https://github.com/git/git", None).unwrap();
+        app.ghost_sources.insert(id, remote.clone());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(app.checkout_confirmation.as_ref().unwrap().chosen(),Request::Commit {id:target,remote:Some(r)} if *target == id && r == &remote)
+        );
+        crate::ui::checkout::draw(
+            app.checkout_confirmation.as_mut().unwrap(),
+            &mut crate::term::Screen::new(30, 6),
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.checkout_request.is_none());
+        crate::ui::checkout::draw(
+            app.checkout_confirmation.as_mut().unwrap(),
+            &mut crate::term::Screen::new(120, 30),
+        );
+        app.ghost_sources.clear();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.checkout_request,
+            Some(Request::Commit {
+                id,
+                remote: Some(remote)
+            })
+        );
     }
 
     #[test]

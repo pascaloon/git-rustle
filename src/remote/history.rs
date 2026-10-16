@@ -279,6 +279,122 @@ pub struct Preview {
     pub errors: Vec<String>,
 }
 
+/// Browser enrichment uses at most one immutable commit-list request per tip.
+/// Reuse preview metadata and local objects before asking the provider.
+pub fn branch_activity(
+    repo: &gix::Repository,
+    remote: &Remote,
+    tip: &str,
+    now: i64,
+    no_cache: bool,
+) -> Result<crate::branches::Activity, String> {
+    let path = repo.workdir().unwrap_or_else(|| repo.git_dir());
+    let token = cached_token(path, &crate::git::git_dir(repo), remote)?;
+    let location = if no_cache {
+        None
+    } else {
+        cache_file(&crate::git::git_dir(repo), remote, token.as_deref())
+            .map(|(p, id)| (p.with_extension("history.json"), id))
+    };
+    let mut stored = location
+        .as_ref()
+        .and_then(|(p, id)| read_stored(p, id))
+        .unwrap_or_default();
+    let mut known: HashMap<_, _> = stored
+        .commits
+        .drain(..)
+        .map(|m| (m.sha.clone(), m))
+        .collect();
+    if let Some((p, id)) = &location
+        && let Some(cached) = read_stored(&p.with_extension("activity.json"), id)
+    {
+        for m in cached.commits {
+            if known.len() < MAX_COMMITS {
+                known.insert(m.sha.clone(), m);
+            }
+        }
+    }
+    let cancel = AtomicBool::new(false);
+    let mut client = Client {
+        remote,
+        path,
+        token,
+        http: Http::new(),
+        helper: false,
+        requests: 0,
+        start: Instant::now(),
+        cancel: &cancel,
+    };
+    let root = remote
+        .endpoint
+        .strip_suffix("/branches")
+        .ok_or("Invalid API endpoint")?;
+    let mut next = Some(oid(tip)?);
+    let mut first = None;
+    let mut recent = 0;
+    let mut visited = HashSet::new();
+    for _ in 0..100 {
+        let Some(id) = next else { break };
+        if !visited.insert(id) {
+            break;
+        }
+        let details = if let Ok(d) = crate::git::commit_details(repo, &id) {
+            d
+        } else {
+            if !known.contains_key(&id.to_string()) && client.requests == 0 {
+                let param = if remote.provider == Provider::Github {
+                    "sha"
+                } else {
+                    "ref_name"
+                };
+                let response =
+                    match client.get(&format!("{root}/commits?{param}={id}&per_page=100&page=1")) {
+                        Ok(response) => response,
+                        Err(_) if first.is_some() => break,
+                        Err(error) => return Err(error),
+                    };
+                let page = parse_commits(remote.provider, &response.body)?;
+                if known.len() + page.len() > MAX_COMMITS {
+                    known.clear();
+                }
+                for m in page {
+                    if known.len() < MAX_COMMITS {
+                        known.insert(m.sha.clone(), m);
+                    }
+                }
+            }
+            let Some(m) = known.get(&id.to_string()) else {
+                break;
+            };
+            m.details()?
+        };
+        recent += u32::from(
+            details.commit_time >= now - crate::branches::WEEK && details.commit_time <= now,
+        );
+        next = details.parents.first().copied();
+        first.get_or_insert(details);
+    }
+    let first = first.ok_or("Commit API did not return the branch tip")?;
+    if let Some((file, identity)) = if no_cache {
+        None
+    } else {
+        cache_file(&crate::git::git_dir(repo), remote, client.token.as_deref())
+            .map(|(p, id)| (p.with_extension("history.json"), id))
+    } {
+        stored.version = 1;
+        stored.identity = identity;
+        stored.commits = known.into_values().collect();
+        write_stored(&file.with_extension("activity.json"), &stored);
+    }
+    Ok(crate::branches::Activity {
+        author: first.author_name,
+        author_time: first.author_time,
+        commit_time: first.commit_time,
+        recent,
+        limited: next.is_some(),
+    })
+}
+
 /// Only workers call this function. The existing graph remains drawable throughout.
 #[cfg(test)]
 pub fn load(
@@ -290,7 +406,17 @@ pub fn load(
     no_cache: bool,
     cancel: &AtomicBool,
 ) -> Preview {
-    load_stream(repo, local, refs, updates, force, no_cache, cancel, None)
+    load_stream(
+        repo,
+        local,
+        refs,
+        updates,
+        &[],
+        force,
+        no_cache,
+        cancel,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,6 +425,7 @@ pub fn load_stream(
     local: &History,
     refs: &RefSnapshot,
     updates: &[Update],
+    requested: &[crate::branches::Target],
     force: bool,
     no_cache: bool,
     cancel: &AtomicBool,
@@ -321,11 +448,20 @@ pub fn load_stream(
         }
         let result = (|| -> Result<(), String> {
             let remote = &update.remote;
-            let names = if update.scoped {
+            let mut names = if update.scoped {
                 update.branches.iter().map(|b| b.name.clone()).collect()
             } else {
                 eligible(path, refs, remote)?
             };
+            names.extend(
+                requested
+                    .iter()
+                    .filter(|t| {
+                        t.remote.as_ref() == Some(&remote.name)
+                            && t.url.as_ref().is_none_or(|url| url == &remote.url)
+                    })
+                    .map(|t| t.name.clone()),
+            );
             let tips: Vec<_> = update
                 .branches
                 .iter()
@@ -729,6 +865,125 @@ mod tests {
     }
 
     #[test]
+    fn explicit_remote_only_branch_is_previewed_and_tab_navigates_without_fetching() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            let (dir, repo, refs, local) = fixture();
+            let tip = "f".repeat(40);
+            let root = refs.head_id.unwrap().to_string();
+            let (url, server) = super::super::tests::server(vec![
+                (
+                    200,
+                    String::new(),
+                    serde_json::to_vec(&json!([wire(provider, &tip, &[root])])).unwrap(),
+                ),
+                (200, String::new(), b"[]".to_vec()),
+            ]);
+            let mut remote = Remote::parse(
+                "origin",
+                "https://example.invalid/team/repo",
+                Some(provider.key()),
+            )
+            .unwrap();
+            remote.endpoint = format!("{url}/branches");
+            let update = Update {
+                remote: remote.clone(),
+                branches: vec![Branch {
+                    name: "only-server".into(),
+                    sha: tip.clone(),
+                }],
+                scoped: false,
+                cached: false,
+                stale: false,
+            };
+            let mut app = crate::app::App::new();
+            app.set_cached(local.clone(), true);
+            app.local_history = Some(std::sync::Arc::new(local.clone()));
+            app.set_refs(refs.clone());
+            app.branches.update(update.clone(), Some(&refs));
+            app.branches.show(Some(&refs));
+            app.branches.selected = app
+                .branches
+                .visible
+                .iter()
+                .position(|&i| app.branches.entries[i].target.name == "only-server")
+                .unwrap();
+            app.handle_key(crate::term::KeyEvent {
+                code: crate::term::KeyCode::Tab,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            });
+            assert_eq!(app.branches.pending_jump, Some(oid(&tip).unwrap()));
+            assert!(app.branches.preview_requested);
+            let before = command::checked(dir.path(), &["show-ref"]).unwrap();
+            let preview = load_stream(
+                &repo,
+                &local,
+                &refs,
+                &[update],
+                &app.branches.preview_targets,
+                false,
+                true,
+                &AtomicBool::new(false),
+                None,
+            );
+            assert!(preview.errors.is_empty(), "{:?}", preview.errors);
+            app.install_preview(preview);
+            app.finish_branch_jump();
+            assert_eq!(app.selected_id(), Some(oid(&tip).unwrap()));
+            assert!(!app.branches.open);
+            app.toggle_mark(oid(&tip).unwrap());
+            app.toggle_mark(refs.head_id.unwrap());
+            app.open_diff();
+            assert!(matches!(app.mode, crate::app::Mode::Diff(_)));
+            assert_eq!(app.marks.len(), 2);
+            assert_eq!(before, command::checked(dir.path(), &["show-ref"]).unwrap());
+            assert!(crate::git::commit_details(&repo, &oid(&tip).unwrap()).is_err());
+            assert_eq!(server.join().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn branch_activity_uses_first_parent_metadata_and_persists_offline() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            let (_dir, repo, _refs, _local) = fixture();
+            let tip = "a".repeat(40);
+            let parent = "b".repeat(40);
+            let side = "c".repeat(40);
+            let (url, server) = super::super::tests::server(vec![(
+                200,
+                String::new(),
+                serde_json::to_vec(&json!([
+                    wire(provider, &tip, &[parent.clone(), side.clone()]),
+                    wire(provider, &parent, &[]),
+                    wire(provider, &side, &[])
+                ]))
+                .unwrap(),
+            )]);
+            let mut remote = Remote::parse(
+                "origin",
+                "https://example.invalid/team/repo",
+                Some(provider.key()),
+            )
+            .unwrap();
+            remote.endpoint = format!("{url}/branches");
+            let now = gix::date::parse("2026-10-15T12:00:01Z", None)
+                .unwrap()
+                .seconds;
+            let activity = branch_activity(&repo, &remote, &tip, now, false).unwrap();
+            assert_eq!(activity.recent, 2);
+            assert_eq!(activity.author, "Author");
+            assert!(!activity.limited);
+            assert_eq!(server.join().unwrap().len(), 1);
+            let cached = branch_activity(&repo, &remote, &tip, now, false).unwrap();
+            assert_eq!(cached.recent, 2);
+            let expired =
+                branch_activity(&repo, &remote, &tip, now + crate::branches::WEEK, false).unwrap();
+            assert_eq!(expired.recent, 0);
+        }
+    }
+
+    #[test]
     fn providers_merge_all_missing_parents_tags_and_reuse_cache_without_fetching() {
         for provider in [Provider::Github, Provider::Gitlab] {
             let (dir, repo, refs, local) = fixture();
@@ -824,7 +1079,7 @@ mod tests {
             assert!(app.details_changes.is_some());
             app.toggle_mark(oid(&tip).unwrap());
             app.open_diff();
-            assert!(app.marks.is_empty());
+            assert_eq!(app.marks, vec![oid(&tip).unwrap()]);
             assert!(matches!(app.mode, crate::app::Mode::Diff(_)));
             app.mode = crate::app::Mode::Graph;
             let mut screen = crate::term::Screen::new(110, 25);
@@ -941,6 +1196,7 @@ mod tests {
             &local,
             &refs,
             &[update],
+            &[],
             false,
             true,
             &cancel,
@@ -1202,7 +1458,12 @@ mod tests {
             Provider::Github,
             &serde_json::to_vec(&json!([
                 wire(Provider::Github, &tip, std::slice::from_ref(&mid)),
-                wire(Provider::Github, &mid, &[root])
+                wire(Provider::Github, &mid, &[root]),
+                wire(
+                    Provider::Github,
+                    &"f".repeat(40),
+                    &[refs.head_id.unwrap().to_string()]
+                )
             ]))
             .unwrap(),
         )
@@ -1244,6 +1505,7 @@ mod tests {
             },
         );
         super::super::files::seed_native_fixture(&repo, &remote, &"a".repeat(40));
+        super::super::files::seed_native_fixture(&repo, &remote, &"f".repeat(40));
         println!("Fixture: {}", path.display());
     }
 
