@@ -276,6 +276,11 @@ remain reusable.
 
 ### Performance benchmarks
 
+Start with the [benchmark workflow for agents](docs/benchmarking.md): baseline
+preservation, reproducible commands, regression analysis, and reporting conventions.
+The [connection-dimming report](docs/connection-dimming-benchmarks.md) includes
+the latest graph-styling measurements and startup comparison.
+
 See the [remote UX and caching benchmark report](docs/remote-ux-benchmarks.md)
 for the latest corrections.
 
