@@ -2550,16 +2550,20 @@ fn diff_line(
 fn graph_node_center(bounds: Bounds<Pixels>, lane: usize) -> Point<Pixels> {
     point(
         bounds.left() + px(lane as f32 * 14. + 7.),
-        bounds.top() + px(15.),
+        bounds.top() + bounds.size.height / 2.,
     )
 }
 
-fn paint_graph_node(center: Point<Pixels>, color: Hsla, window: &mut Window) {
+fn paint_graph_node(center: Point<Pixels>, color: Hsla, hollow: bool, window: &mut Window) {
+    let radius = px(5.);
     window.paint_quad(quad(
-        Bounds::new(center - point(px(4.), px(4.)), size(px(8.), px(8.))),
-        px(4.),
-        color,
-        px(1.),
+        Bounds::new(
+            center - point(radius, radius),
+            size(radius * 2., radius * 2.),
+        ),
+        radius,
+        if hollow { rgba(0).into() } else { color },
+        px(if hollow { 2. } else { 1. }),
         color,
         BorderStyle::Solid,
     ));
@@ -2570,12 +2574,17 @@ fn pending_graph_canvas(width: f32, lane: usize) -> impl IntoElement {
         |_, _, _| (),
         move |bounds, _, window, _| {
             if lane < (width / 14.) as usize {
-                paint_graph_node(graph_node_center(bounds, lane), rgb(ACCENT).into(), window);
+                paint_graph_node(
+                    graph_node_center(bounds, lane),
+                    rgb(ACCENT).into(),
+                    true,
+                    window,
+                );
             }
         },
     )
     .w(px(width))
-    .h(px(30.))
+    .h_full()
     .flex_shrink_0()
 }
 
@@ -2622,13 +2631,19 @@ fn graph_canvas(
                 );
                 if top {
                     window.paint_quad(fill(
-                        Bounds::new(point(x - px(1.), bounds.top()), size(px(2.), px(15.))),
+                        Bounds::new(
+                            point(x - px(1.), bounds.top()),
+                            size(px(2.), middle - bounds.top()),
+                        ),
                         color,
                     ));
                 }
                 if bottom {
                     window.paint_quad(fill(
-                        Bounds::new(point(x - px(1.), middle), size(px(2.), px(15.))),
+                        Bounds::new(
+                            point(x - px(1.), middle),
+                            size(px(2.), bounds.bottom() - middle),
+                        ),
                         color,
                     ));
                 }
@@ -2659,12 +2674,13 @@ fn graph_canvas(
                     ));
                 }
                 if matches!(k, CellKind::Node | CellKind::MergeNode) {
-                    paint_graph_node(center, color, window);
+                    paint_graph_node(center, color, false, window);
                 }
             }
         },
     )
     .w(px(width))
-    .h(px(30.))
+    // Fill the commit row so adjacent canvases meet without a vertical gap.
+    .h_full()
     .flex_shrink_0()
 }
