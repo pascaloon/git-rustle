@@ -25,6 +25,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// configuration: no global/system config or environment lookups, which keeps
 /// startup time minimal.
 pub fn open(path: &Path) -> Result<gix::Repository> {
+    // Discovery preserves relative paths, which would leave the header and
+    // folder actions pointing at "." when launched from the repository root.
+    let path = std::path::absolute(path)?;
     let opts = gix::open::Options::isolated();
     let trust_map = gix::sec::trust::Mapping {
         full: opts.clone(),

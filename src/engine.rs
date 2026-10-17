@@ -1345,6 +1345,51 @@ mod tests {
         until(&mut e, |e| matches!(e.app.load, LoadState::Error(_)));
     }
     #[test]
+    fn relative_launch_paths_show_the_repository_name_and_full_path() {
+        const EXPECTED: &str = "GIT_RUSTLE_HEADER_TEST_ROOT";
+        const INPUT: &str = "GIT_RUSTLE_HEADER_TEST_PATH";
+        if let Some(root) = std::env::var_os(EXPECTED) {
+            let root = std::path::absolute(root).unwrap();
+            let input = std::env::var_os(INPUT).unwrap();
+            let mut e = Engine::new(input.into(), true, Instant::now());
+            until(&mut e, |e| e.repo.is_some());
+            assert_eq!(e.repository_path(), root.display().to_string());
+            assert_eq!(e.app.repo_name, root.file_name().unwrap().to_string_lossy());
+            return;
+        }
+
+        let dir = fixture();
+        let nested = dir.path().join("nested path é");
+        std::fs::create_dir_all(nested.join("deeper")).unwrap();
+        // Separate processes exercise the actual launch directory without
+        // changing the working directory of concurrently running tests.
+        for (cwd, input) in [
+            (dir.path(), "."),
+            (dir.path(), "nested path é/.."),
+            (dir.path(), "nested path é/deeper"),
+            (nested.as_path(), ".."),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::relative_launch_paths_show_the_repository_name_and_full_path",
+                    "--nocapture",
+                ])
+                .current_dir(cwd)
+                .env(EXPECTED, dir.path())
+                .env(INPUT, input)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "launch from {} with {input}:\n{}\n{}",
+                cwd.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+    #[test]
     fn returning_from_pending_reloads_the_same_commit_details() {
         let dir = fixture();
         std::fs::write(dir.path().join("pending.txt"), "uncommitted\n").unwrap();

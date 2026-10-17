@@ -1141,8 +1141,13 @@ impl Desktop {
                                         )),
                                 );
                         } else {
+                            let lane = app
+                                .pending
+                                .head_index
+                                .and_then(|i| app.history.commits.get(i))
+                                .map_or(0, |rec| rec.node_lane as usize);
                             r = r
-                                .child(div().w(px(graph_width)).text_color(rgb(ACCENT)).child("●"))
+                                .child(pending_graph_canvas(graph_width, lane))
                                 .child(format!(
                                     "Pending changes  ·  {} files",
                                     app.pending.snapshot.files.len()
@@ -2315,6 +2320,38 @@ fn diff_line(
             ))
         })
 }
+fn graph_node_center(bounds: Bounds<Pixels>, lane: usize) -> Point<Pixels> {
+    point(
+        bounds.left() + px(lane as f32 * 14. + 7.),
+        bounds.top() + px(15.),
+    )
+}
+
+fn paint_graph_node(center: Point<Pixels>, color: Hsla, window: &mut Window) {
+    window.paint_quad(quad(
+        Bounds::new(center - point(px(4.), px(4.)), size(px(8.), px(8.))),
+        px(4.),
+        color,
+        px(1.),
+        color,
+        BorderStyle::Solid,
+    ));
+}
+
+fn pending_graph_canvas(width: f32, lane: usize) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            if lane < (width / 14.) as usize {
+                paint_graph_node(graph_node_center(bounds, lane), rgb(ACCENT).into(), window);
+            }
+        },
+    )
+    .w(px(width))
+    .h(px(30.))
+    .flex_shrink_0()
+}
+
 fn graph_canvas(
     cells: Vec<crate::graph::layout::GraphCell>,
     flags: Vec<u8>,
@@ -2323,9 +2360,10 @@ fn graph_canvas(
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            let middle = bounds.top() + px(15.);
             for (i, c) in cells.iter().enumerate().take((width / 14.) as usize) {
-                let x = bounds.left() + px(i as f32 * 14. + 7.);
+                let center = graph_node_center(bounds, i);
+                let x = center.x;
+                let middle = center.y;
                 let color: Hsla = rgb(COLORS[c.color() as usize % 10]).into();
                 let color: Hsla = if flags.get(i).is_some_and(|f| f & 1 != 0) {
                     color.opacity(0.42)
@@ -2394,14 +2432,7 @@ fn graph_canvas(
                     ));
                 }
                 if matches!(k, CellKind::Node | CellKind::MergeNode) {
-                    window.paint_quad(quad(
-                        Bounds::new(point(x - px(4.), middle - px(4.)), size(px(8.), px(8.))),
-                        px(4.),
-                        color,
-                        px(1.),
-                        color,
-                        BorderStyle::Solid,
-                    ));
+                    paint_graph_node(center, color, window);
                 }
             }
         },
