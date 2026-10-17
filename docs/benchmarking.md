@@ -2,8 +2,10 @@
 
 Git Rustle prioritizes speed. Use this workflow to detect regressions before
 delivering notable changes. Commands below run in PowerShell from the repository
-root. This documents the workflow used for the remote UX and connection-dimming
-changes on October 15, 2026; measurements are examples, not universal budgets.
+root. Keep benchmark instructions, scripts and harness code in version control;
+write generated results to unique ignored `target/bench/<run>` directories.
+Additional scenario-specific scripts and their setup requirements are listed in
+[the benchmark helper guide](benchmarks/README.md).
 
 
 ## GPUI desktop (current implementation)
@@ -312,9 +314,8 @@ remote history. Do not claim statistical significance from these small samples.
 
 ## 9. Save evidence and a short decision log
 
-Keep transient binaries and detailed console logs under the unique `target/bench`
-folder. Copy the relevant raw JSON/text into `docs/benchmarks/<change>-*.json`
-or `.txt`, and write `docs/<change>-benchmarks.md` with:
+Keep binaries, fixtures, logs, screenshots, raw samples and summaries under the
+unique `target/bench` run folder. Write `report.md` in the same folder with:
 
 1. Problem/behavior changed and which performance paths could regress.
 2. Date, environment, repository identity/counts, baseline and candidate hashes,
@@ -324,9 +325,12 @@ or `.txt`, and write `docs/<change>-benchmarks.md` with:
 5. Findings and corrective iterations, including rejected slow implementations.
 6. Test/visual checks, limitations, and links to raw data.
 
-Link the report from the README when useful. `target` artifacts are local and
-may disappear; retained raw samples and the Markdown report are the durable
-record. Documentation-only edits need link/command review, not new performance runs.
+Include the report location and key findings when delivering the change. These
+artifacts are local and may disappear when `target` is cleaned; copy them outside
+the checkout if longer retention is needed. Do not commit generated results or
+link repository documentation to local run artifacts. Historical results remain
+available in Git history. Documentation-only edits need link/command review, not
+new performance runs.
 
 ## Branch activity and remote action measurements
 
@@ -553,30 +557,3 @@ filtered commit rows and selected details, including an empty-result case.
 Do not describe match availability as complete graph latency or use warm queries
 to characterize first-time indexing. Provider/API file-list latency requires a
 separate fixture or explicitly identified live measurement.
-
-## Worked decision log: connection dimming
-
-The [connection-dimming report](connection-dimming-benchmarks.md) records this
-actual iteration:
-
-1. Preserved the previous release as `connection-dimming-baseline.exe`.
-2. Fixed edge provenance and added regression tests for merges, crossings,
-   intervening local rows, color reuse, and cached preview styling.
-3. Measured an initial two-pass implementation on the large repository. Scanning
-   all 17.3 million graph cells cost 34–43 ms and retained roughly 17.3 MB of flags.
-   That cost was rejected despite the work running on a background thread.
-4. Limited traversal to affected connections and stopped at their endpoints.
-   Final medians were 0.834/0.897 ms for 100/1,000 added commits, retaining
-   21,657/22,557 flag bytes. Scrolling reads the precomputed flags.
-5. Rebuilt and compared final native startup: cached median 12.197 → 12.112 ms;
-   uncached median 13.428 → 13.643 ms, with p95 essentially unchanged. Reported
-   the small increase rather than claiming every metric improved. All 74 release
-   tests passed; Clippy was clean.
-
-The earlier [remote UX report](remote-ux-benchmarks.md) also caught a redundant
-configuration lookup during intermediate measurement. Its final comparison
-records cached preview readiness improving from 83.290 to 45.268 ms, alongside
-the worker interval, so the reported benefit reflects the complete startup path.
-
-Other historical reports: [remote support](remote-benchmarks.md),
-[settings](settings-benchmarks.md), and [ghost commits](ghost-benchmarks.md).

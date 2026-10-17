@@ -1,2 +1,11 @@
 /target
 *.pdb
+
+# Benchmark results stay local; retain instructions and runnable helpers.
+/docs/*-benchmarks.md
+/docs/benchmarks/**
+!/docs/benchmarks/**/
+!/docs/benchmarks/**/*.md
+!/docs/benchmarks/**/*.ps1
+!/docs/benchmarks/**/*.py
+!/docs/benchmarks/**/*.sh
