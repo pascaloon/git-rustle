@@ -20,6 +20,7 @@ mod term;
 mod ui;
 
 mod desktop;
+mod desktop_details;
 mod desktop_icons;
 mod desktop_scroll;
 mod desktop_selection;

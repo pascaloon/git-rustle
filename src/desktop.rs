@@ -101,6 +101,7 @@ enum Action {
     Diff,
     Checkout,
     Commit,
+    CopyDetails,
     CheckAll(bool),
     Select(usize, bool),
     SearchField(&'static str),
@@ -591,14 +592,12 @@ impl Desktop {
         let id = details.map(|d| d.id);
         if id != self.detail_id {
             self.detail_id = id;
-            let text = details.map(|d| format!(
-                "{}\n\nCommit  {}\n\nAuthor  {} <{}>\n{}\n\nCommitter  {} <{}>\n{}\n\nParents  {}",
-                d.message.trim_end(), d.id, d.author_name, d.author_email, crate::ui::time::format_absolute(d.author_time,d.author_offset),
-                d.committer_name,d.committer_email,crate::ui::time::format_absolute(d.commit_time,d.commit_offset),
-                d.parents.iter().map(|p|p.to_string()).collect::<Vec<_>>().join(" ")
-            )).unwrap_or_default();
-            self.detail_text
-                .update(cx, |s, cx| s.set(text, &app.search.text.value, cx));
+            let document = details
+                .map(crate::desktop_details::document)
+                .unwrap_or_default();
+            self.detail_text.update(cx, |s, cx| {
+                s.set_document(document, &app.search.text.value, cx)
+            });
         }
         self.detail_text
             .update(cx, |s, cx| s.set_query(&app.search.text.value, cx));
@@ -812,6 +811,11 @@ impl Desktop {
                 }
             }
             Action::Commit => app.request_commit(),
+            Action::CopyDetails => {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    self.detail_text.read(cx).text().to_owned(),
+                ));
+            }
             Action::CheckAll(value) => {
                 if !app.pending.busy
                     && let Some(cs) = app.active_changes_mut()
@@ -931,6 +935,7 @@ impl Desktop {
             Action::Branches => Some("branch"),
             Action::Diff => Some("diff"),
             Action::Checkout => Some("checkout"),
+            Action::CopyDetails => Some("copy"),
             Action::Expand(true) => Some("expand"),
             Action::Expand(false) => Some("collapse"),
 
@@ -978,6 +983,7 @@ impl Desktop {
                         "diff" => "Diff selected commits (one or two)",
                         "head" => "Go to HEAD",
                         "checkout" => "Checkout",
+                        "copy" => "Copy commit details",
                         "branch" => "Branches",
                         _ => "Next file",
                     })
@@ -1448,11 +1454,48 @@ impl Desktop {
             );
         } else {
             panel = panel.child(
-                div()
-                    .h(px(360.))
+                column()
+                    .h(relative(0.55))
+                    .min_h(px(240.))
                     .flex_shrink_0()
-                    .p_3()
-                    .child(self.detail_text.clone()),
+                    .child(
+                        row()
+                            .h(px(44.))
+                            .flex_shrink_0()
+                            .px_4()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                            .child(div().flex_1().child(caption("COMMIT DETAILS")))
+                            .when_some(self.detail_id, |s, id| {
+                                s.child(
+                                    div()
+                                        .font_family("Cascadia Mono")
+                                        .text_size(px(11.))
+                                        .text_color(rgb(ACCENT))
+                                        .child(id.to_hex_with_len(8).to_string()),
+                                )
+                            })
+                            .when(self.detail_id.is_some(), |s| {
+                                s.child(self.button("copy-details", "", Action::CopyDetails, cx))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .px_4()
+                            .py_3()
+                            .when(self.detail_id.is_none(), |s| {
+                                s.child(caption(if app.selected_id().is_some() {
+                                    "Loading commit details…"
+                                } else {
+                                    "Select a commit to inspect its details"
+                                }))
+                            })
+                            .when(self.detail_id.is_some(), |s| {
+                                s.child(self.detail_text.clone())
+                            }),
+                    ),
             );
         }
         panel.child(self.files(cx)).into_any_element()

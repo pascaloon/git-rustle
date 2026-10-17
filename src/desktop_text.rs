@@ -86,8 +86,57 @@ fn search_style() -> HighlightStyle {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub enum TextRole {
+    #[default]
+    Plain,
+    Title,
+    Body,
+    Label,
+    Value,
+    Muted,
+    Hash,
+}
+
+#[derive(Clone)]
+pub struct TextSection {
+    pub range: Range<usize>,
+    pub text: SharedString,
+    pub role: TextRole,
+}
+
+#[derive(Default)]
+pub struct Document {
+    pub text: String,
+    pub sections: Vec<TextSection>,
+}
+impl Document {
+    pub fn push(&mut self, role: TextRole, text: &str) {
+        if !self.text.is_empty() {
+            self.text.push('\n');
+            if matches!(role, TextRole::Label | TextRole::Body) {
+                self.text.push('\n');
+            }
+        }
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.sections.push(TextSection {
+            range: start..self.text.len(),
+            text: text.to_owned().into(),
+            role,
+        });
+    }
+}
+
+fn within(range: Range<usize>, section: &Range<usize>) -> Option<Range<usize>> {
+    let start = range.start.max(section.start);
+    let end = range.end.min(section.end);
+    (start < end).then(|| start - section.start..end - section.start)
+}
+
 pub struct TextBlock {
     text: SharedString,
+    sections: Vec<TextSection>,
     query: String,
     highlights: Vec<Range<usize>>,
     anchor: usize,
@@ -108,6 +157,7 @@ impl TextBlock {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             text: "".into(),
+            sections: vec![],
             query: String::new(),
             highlights: vec![],
             anchor: 0,
@@ -128,27 +178,129 @@ impl TextBlock {
             self.scroll.set_offset(point(px(0.), px(0.)));
         }
         self.text = text.into();
+        self.sections.clear();
         self.query = query.to_owned();
         self.highlights = Matches::new(query).ranges(&self.text);
         cx.notify();
     }
+    pub fn set_document(&mut self, doc: Document, query: &str, cx: &mut Context<Self>) {
+        self.set(doc.text, query, cx);
+        self.sections = doc.sections;
+    }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
-impl Render for TextBlock {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let search = self.highlights.iter().cloned().map(|r| (r, search_style()));
-        let selected = (self.anchor != self.end).then(|| {
+impl TextBlock {
+    fn section(
+        &self,
+        section: &TextSection,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let search = self
+            .highlights
+            .iter()
+            .filter_map(|r| within(r.clone(), &section.range).map(|r| (r, search_style())));
+        let selected = within(
+            self.anchor.min(self.end)..self.anchor.max(self.end),
+            &section.range,
+        )
+        .map(|r| {
             (
-                self.anchor.min(self.end)..self.anchor.max(self.end),
+                r,
                 HighlightStyle {
                     background_color: Some(rgba(desktop_theme::SELECTION).into()),
                     ..Default::default()
                 },
             )
         });
-        let text = StyledText::new(self.text.clone())
+        let text = StyledText::new(section.text.clone())
             .with_highlights(combine_highlights(search, selected));
         let hit = text.layout().clone();
         let drag = hit.clone();
+        let start = section.range.start;
+        let len = section.text.len();
+        let content = div()
+            .id(("text-section", index))
+            .w_full()
+            .flex_shrink_0()
+            .cursor_text();
+        let content = match section.role {
+            TextRole::Plain => content.line_height(px(21.)),
+            TextRole::Title => content
+                .text_size(px(18.))
+                .line_height(px(25.))
+                .font_weight(FontWeight::SEMIBOLD),
+            TextRole::Body => content.mt_2().text_size(px(13.)).line_height(px(21.)),
+            TextRole::Label => content
+                .mt_2()
+                .pt_2()
+                .border_t_1()
+                .border_color(rgb(desktop_theme::LINE))
+                .text_size(px(10.))
+                .line_height(px(18.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(desktop_theme::MUTED)),
+            TextRole::Value => content
+                .text_size(px(13.))
+                .line_height(px(21.))
+                .font_weight(FontWeight::MEDIUM),
+            TextRole::Muted => content
+                .text_size(px(12.))
+                .line_height(px(19.))
+                .text_color(rgb(desktop_theme::MUTED)),
+            TextRole::Hash => content
+                .font_family("Cascadia Mono")
+                .text_size(px(11.))
+                .line_height(px(19.))
+                .text_color(rgb(desktop_theme::ACCENT)),
+        };
+        content
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |v, e: &MouseDownEvent, window, cx| {
+                    let index = hit
+                        .index_for_position(e.position)
+                        .unwrap_or_else(|i| i)
+                        .min(len)
+                        + start;
+                    v.anchor = index;
+                    v.end = index;
+                    v.dragging = e.click_count < 2;
+                    if e.click_count >= 2 {
+                        v.anchor = 0;
+                        v.end = v.text.len();
+                    }
+                    window.focus(&v.focus);
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _, cx| {
+                if v.dragging && e.pressed_button == Some(MouseButton::Left) {
+                    v.end = drag
+                        .index_for_position(e.position)
+                        .unwrap_or_else(|i| i)
+                        .min(len)
+                        + start;
+                    cx.notify();
+                }
+            }))
+            .child(text)
+    }
+}
+impl Render for TextBlock {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sections = if self.sections.is_empty() {
+            vec![TextSection {
+                range: 0..self.text.len(),
+                text: self.text.clone(),
+                role: TextRole::Plain,
+            }]
+        } else {
+            self.sections.clone()
+        };
         div()
             .id("selectable-text")
             .size_full()
@@ -182,39 +334,12 @@ impl Render for TextBlock {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .child(
-                        div()
-                            .w_full()
-                            .cursor_text()
-                            .line_height(px(21.))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |v, e: &MouseDownEvent, window, cx| {
-                                    let index = hit
-                                        .index_for_position(e.position)
-                                        .unwrap_or_else(|i| i)
-                                        .min(v.text.len());
-                                    v.anchor = index;
-                                    v.end = index;
-                                    v.dragging = e.click_count < 2;
-                                    if e.click_count >= 2 {
-                                        v.anchor = 0;
-                                        v.end = v.text.len();
-                                    }
-                                    window.focus(&v.focus);
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _, cx| {
-                                if v.dragging && e.pressed_button == Some(MouseButton::Left) {
-                                    v.end = drag
-                                        .index_for_position(e.position)
-                                        .unwrap_or_else(|i| i)
-                                        .min(v.text.len());
-                                    cx.notify();
-                                }
-                            }))
-                            .child(text),
+                        div().flex().flex_col().w_full().min_w_0().children(
+                            sections
+                                .iter()
+                                .enumerate()
+                                .map(|(i, section)| self.section(section, i, cx)),
+                        ),
                     ),
             )
             .child(div().absolute().inset_0().child(
@@ -228,7 +353,22 @@ impl Render for TextBlock {
 }
 #[cfg(test)]
 mod tests {
-    use super::Matches;
+    use super::{Matches, within};
+    #[test]
+    fn selections_cross_styled_sections_with_unicode_byte_offsets() {
+        let text = "café\n\nAUTHOR\nZoë 🦀";
+        let sections = [0..5, 7..13, 14..text.len()];
+        let selected = 2..text.len();
+        let pieces = sections
+            .iter()
+            .filter_map(|section| {
+                within(selected.clone(), section)
+                    .map(|local| &text[section.start + local.start..section.start + local.end])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pieces, ["fé", "AUTHOR", "Zoë 🦀"]);
+        assert!(within(0..5, &sections[1]).is_none());
+    }
     #[test]
     fn unicode_expansion_and_multiple_terms_have_valid_original_ranges() {
         let m = Matches::new("m: i café");

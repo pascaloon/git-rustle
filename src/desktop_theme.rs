@@ -23,10 +23,10 @@ pub const REMOVED_BG: u32 = 0x251211;
 pub const ADDED_HIGHLIGHT: u32 = 0x70b87844;
 pub const REMOVED_HIGHLIGHT: u32 = 0xed8c8644;
 
-// Warm lanes lead the graph; secondary hues still distinguish parallel branches.
+// Orange anchors the UI; graph lanes use separated hues for branch tracking.
 pub const COLORS: [u32; 10] = [
-    ACCENT, 0xe5bb70, 0xe8836b, 0xc9ad91, 0xc895a5, 0xa9be8b, 0xdba354, 0xc27d52, 0xb6a2bd,
-    0x87ad9a,
+    ACCENT, 0x66d9ef, 0xc792ff, 0xa6e36d, 0xff6f91, 0xffd866, 0x6c9fff, 0x5de0b5, 0xf184df,
+    0xd9e1e8,
 ];
 
 pub fn apply(cx: &mut App) {

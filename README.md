@@ -154,6 +154,8 @@ The [selection, search and layout report](docs/gpui-design-benchmarks.md) and
 [tabs, context menus and word-wrap report](docs/gpui-tabs-benchmarks.md)
 cover the revised desktop workflow. The [OLED theme report](docs/oled-theme-benchmarks.md)
 records native visual checks and before/after startup and scrolling measurements.
+The [commit inspector and graph contrast report](docs/details-contrast-benchmarks.md)
+covers the structured sidebar, continuous text selection and distinct graph lanes.
 Historical terminal reports
 remain in `docs/`; they do not measure the desktop implementation. Terminal
 render/input adapters are retained as regression references for existing tests,
