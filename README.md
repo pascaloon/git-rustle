@@ -25,7 +25,8 @@ opening it outside that repository.
 ## Desktop workflow
 
 - Click a history row to inspect its full message, author, committer, dates,
-  parents and hash. Drag to select details text and use Ctrl+C to copy.
+  parents and hash. The inspector's **Copy SHA1** icon copies the full commit hash.
+  Drag to select details text and use Ctrl+C to copy.
 - Use **HEAD** to locate the checked-out commit. Dirty repositories initially
   select **Pending changes**; clean repositories initially select HEAD.
 - Right-click a graph row for **Diff commit** and **Checkout…**. Ctrl+click

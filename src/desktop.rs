@@ -101,7 +101,7 @@ enum Action {
     Diff,
     Checkout,
     Commit,
-    CopyDetails,
+    CopySha1,
     CheckAll(bool),
     Select(usize, bool),
     SearchField(&'static str),
@@ -811,10 +811,10 @@ impl Desktop {
                 }
             }
             Action::Commit => app.request_commit(),
-            Action::CopyDetails => {
-                cx.write_to_clipboard(ClipboardItem::new_string(
-                    self.detail_text.read(cx).text().to_owned(),
-                ));
+            Action::CopySha1 => {
+                if let Some(id) = app.selected_id() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+                }
             }
             Action::CheckAll(value) => {
                 if !app.pending.busy
@@ -935,7 +935,7 @@ impl Desktop {
             Action::Branches => Some("branch"),
             Action::Diff => Some("diff"),
             Action::Checkout => Some("checkout"),
-            Action::CopyDetails => Some("copy"),
+            Action::CopySha1 => Some("copy"),
             Action::Expand(true) => Some("expand"),
             Action::Expand(false) => Some("collapse"),
 
@@ -983,7 +983,7 @@ impl Desktop {
                         "diff" => "Diff selected commits (one or two)",
                         "head" => "Go to HEAD",
                         "checkout" => "Checkout",
-                        "copy" => "Copy commit details",
+                        "copy" => "Copy SHA1",
                         "branch" => "Branches",
                         _ => "Next file",
                     })
@@ -1021,6 +1021,8 @@ impl Desktop {
                             .w_full()
                             .h(px(32.))
                             .px_2()
+                            // Keep dates clear of the 16px overlay scrollbar, even on hover.
+                            .pr(px(24.))
                             .gap_2()
                             .bg(rgb(if selected { SELECTED } else { BG }))
                             .cursor_pointer()
@@ -1347,7 +1349,7 @@ impl Desktop {
                             .pr_3()
                             .h(px(30.))
                             .pl(px(8. + visible.depth as f32 * 14.))
-                            .bg(rgb(if selected { SELECTED } else { PANEL }))
+                            .bg(rgb(if selected { SELECTED } else { BG }))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(CONTROL)));
                         if let Some(check) = cs.checkbox(node) {
@@ -1417,9 +1419,9 @@ impl Desktop {
             .w(px(self.pane_width))
             .flex_shrink_0()
             .h_full()
-            .bg(rgb(PANEL))
+            .bg(rgb(BG))
             .border_l_1()
-            .border_color(rgb(LINE));
+            .border_color(rgb(INSPECTOR_LINE));
         if app.pending.selected {
             panel = panel.child(
                 column()
@@ -1453,50 +1455,53 @@ impl Desktop {
                     }),
             );
         } else {
-            panel = panel.child(
-                column()
-                    .h(relative(0.55))
-                    .min_h(px(240.))
-                    .flex_shrink_0()
-                    .child(
-                        row()
-                            .h(px(44.))
-                            .flex_shrink_0()
-                            .px_4()
-                            .border_b_1()
-                            .border_color(rgb(LINE))
-                            .child(div().flex_1().child(caption("COMMIT DETAILS")))
-                            .when_some(self.detail_id, |s, id| {
-                                s.child(
-                                    div()
-                                        .font_family("Cascadia Mono")
-                                        .text_size(px(11.))
-                                        .text_color(rgb(ACCENT))
-                                        .child(id.to_hex_with_len(8).to_string()),
-                                )
-                            })
-                            .when(self.detail_id.is_some(), |s| {
-                                s.child(self.button("copy-details", "", Action::CopyDetails, cx))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .px_4()
-                            .py_3()
-                            .when(self.detail_id.is_none(), |s| {
-                                s.child(caption(if app.selected_id().is_some() {
-                                    "Loading commit details…"
-                                } else {
-                                    "Select a commit to inspect its details"
-                                }))
-                            })
-                            .when(self.detail_id.is_some(), |s| {
-                                s.child(self.detail_text.clone())
-                            }),
-                    ),
-            );
+            panel =
+                panel.child(
+                    column()
+                        .h(relative(0.55))
+                        .min_h(px(240.))
+                        .flex_shrink_0()
+                        .child(
+                            row()
+                                .h(px(44.))
+                                .flex_shrink_0()
+                                .px_4()
+                                .border_b_1()
+                                .border_color(rgb(INSPECTOR_LINE))
+                                .child(div().flex_1().child(
+                                    caption("COMMIT DETAILS").text_color(rgb(INSPECTOR_MUTED)),
+                                ))
+                                .when_some(self.detail_id, |s, id| {
+                                    s.child(
+                                        div()
+                                            .font_family("Cascadia Mono")
+                                            .text_size(px(11.))
+                                            .text_color(rgb(INSPECTOR_MUTED))
+                                            .child(id.to_hex_with_len(8).to_string()),
+                                    )
+                                })
+                                .when(self.detail_id.is_some(), |s| {
+                                    s.child(self.button("copy-sha1", "", Action::CopySha1, cx))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .px_4()
+                                .py_3()
+                                .when(self.detail_id.is_none(), |s| {
+                                    s.child(caption(if app.selected_id().is_some() {
+                                        "Loading commit details…"
+                                    } else {
+                                        "Select a commit to inspect its details"
+                                    }))
+                                })
+                                .when(self.detail_id.is_some(), |s| {
+                                    s.child(self.detail_text.clone())
+                                }),
+                        ),
+                );
         }
         panel.child(self.files(cx)).into_any_element()
     }
@@ -1949,7 +1954,8 @@ impl Render for Desktop {
                         .w(px(5.))
                         .h_full()
                         .cursor_col_resize()
-                        .bg(rgb(LINE))
+                        .bg(rgb(BG))
+                        .hover(|s| s.bg(rgb(CONTROL)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|v, _, _, _| v.resizing = true),

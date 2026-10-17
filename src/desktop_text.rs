@@ -187,9 +187,6 @@ impl TextBlock {
         self.set(doc.text, query, cx);
         self.sections = doc.sections;
     }
-    pub fn text(&self) -> &str {
-        &self.text
-    }
 }
 impl TextBlock {
     fn section(
@@ -237,11 +234,11 @@ impl TextBlock {
                 .mt_2()
                 .pt_2()
                 .border_t_1()
-                .border_color(rgb(desktop_theme::LINE))
+                .border_color(rgb(desktop_theme::INSPECTOR_LINE))
                 .text_size(px(10.))
                 .line_height(px(18.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(desktop_theme::MUTED)),
+                .text_color(rgb(desktop_theme::INSPECTOR_MUTED)),
             TextRole::Value => content
                 .text_size(px(13.))
                 .line_height(px(21.))
@@ -249,12 +246,12 @@ impl TextBlock {
             TextRole::Muted => content
                 .text_size(px(12.))
                 .line_height(px(19.))
-                .text_color(rgb(desktop_theme::MUTED)),
+                .text_color(rgb(desktop_theme::INSPECTOR_MUTED)),
             TextRole::Hash => content
                 .font_family("Cascadia Mono")
                 .text_size(px(11.))
                 .line_height(px(19.))
-                .text_color(rgb(desktop_theme::ACCENT)),
+                .text_color(rgb(desktop_theme::INSPECTOR_HASH)),
         };
         content
             .on_mouse_down(
