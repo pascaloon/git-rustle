@@ -1,4 +1,4 @@
-//! Single-line selection without a retained editor or parser per visible row.
+//! Continuous diff selection without a retained editor per visible row.
 use gpui::{prelude::*, *};
 use std::{
     cell::{Cell, RefCell},
@@ -7,15 +7,65 @@ use std::{
 };
 #[derive(Default)]
 pub struct Selection {
-    pub id: Option<(u32, usize, bool)>,
-    pub text: String,
-    pub anchor: usize,
-    pub end: usize,
+    pub id: Option<(u32, bool)>,
+    pub anchor: (usize, usize),
+    pub end: (usize, usize),
     pub dragging: bool,
 }
 impl Selection {
-    pub fn selected(&self) -> &str {
-        &self.text[self.anchor.min(self.end)..self.anchor.max(self.end)]
+    pub fn range(&self, row: usize, len: usize) -> Option<Range<usize>> {
+        let (a, b) = (self.anchor.min(self.end), self.anchor.max(self.end));
+        if row < a.0 || row > b.0 {
+            return None;
+        }
+        Some(
+            (if row == a.0 { a.1.min(len) } else { 0 })..(if row == b.0 {
+                b.1.min(len)
+            } else {
+                len
+            }),
+        )
+    }
+    pub fn copy(&self, diff: &crate::diff::FileDiff) -> String {
+        let Some((_, right)) = self.id else {
+            return String::new();
+        };
+        let (a, b) = (self.anchor.min(self.end), self.anchor.max(self.end));
+        let line_at = |row| match diff.rows.get(row) {
+            Some(crate::diff::Row::Line { left, right: r }) => {
+                if right {
+                    r.as_ref()
+                } else {
+                    left.as_ref()
+                }
+            }
+            _ => None,
+        };
+        let (Some(first), Some(last)) = (line_at(a.0), line_at(b.0)) else {
+            return String::new();
+        };
+        // Clipboard work is deferred until Copy; scrolling never builds a document.
+        diff.source[usize::from(right)]
+            .split_inclusive(|&c| c == b'\n')
+            .enumerate()
+            .skip(first.no.saturating_sub(1) as usize)
+            .take((last.no - first.no + 1) as usize)
+            .map(|(i, line)| {
+                let text = crate::diff::sidebyside::decode(line);
+                let start = if i + 1 == first.no as usize {
+                    a.1.min(text.len())
+                } else {
+                    0
+                };
+                let end = if i + 1 == last.no as usize {
+                    b.1.min(text.len())
+                } else {
+                    text.len()
+                };
+                text.get(start..end).unwrap_or("").to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 pub fn line(
@@ -32,7 +82,6 @@ pub fn line(
     let drag = layout.clone();
     let paint_selection = selection.clone();
     let click_selection = selection.clone();
-    let click_text = text.clone();
     let display: SharedString = text.into();
     let hit_offset = horizontal.clone();
     let drag_offset = horizontal.clone();
@@ -48,14 +97,13 @@ pub fn line(
                 let index =
                     line.closest_index_for_x(event.position.x - bounds.left() - hit_offset.get());
                 let mut s = click_selection.borrow_mut();
-                s.id = Some(id);
-                s.text = click_text.clone();
-                s.anchor = index;
-                s.end = index;
-                s.dragging = true;
+                s.id = Some((id.0, id.2));
+                s.anchor = (id.1, index);
+                s.end = (id.1, index);
+                s.dragging = event.click_count < 2;
                 if event.click_count >= 2 {
-                    s.anchor = 0;
-                    s.end = s.text.len();
+                    s.anchor = (id.1, 0);
+                    s.end = (id.1, line.text.len());
                 }
                 window.focus(&focus);
                 window.refresh();
@@ -64,13 +112,16 @@ pub fn line(
         })
         .on_mouse_move(move |event, window, _| {
             let mut s = selection.borrow_mut();
-            if s.id == Some(id)
+            if s.id == Some((id.0, id.2))
                 && s.dragging
                 && event.pressed_button == Some(MouseButton::Left)
                 && let Some((bounds, line)) = drag.borrow().as_ref()
+                && bounds.contains(&event.position)
             {
-                s.end =
-                    line.closest_index_for_x(event.position.x - bounds.left() - drag_offset.get());
+                s.end = (
+                    id.1,
+                    line.closest_index_for_x(event.position.x - bounds.left() - drag_offset.get()),
+                );
                 window.refresh();
             }
         })
@@ -116,14 +167,13 @@ pub fn line(
                         ));
                     }
                     let s = paint_selection.borrow();
-                    if s.id == Some(id) && s.text.as_str() == line.text.as_ref() {
+                    if s.id == Some((id.0, id.2))
+                        && let Some(range) = s.range(id.1, line.text.len())
+                    {
                         window.paint_quad(fill(
                             Bounds::from_corners(
-                                point(left + line.x_for_index(s.anchor.min(s.end)), bounds.top()),
-                                point(
-                                    left + line.x_for_index(s.anchor.max(s.end)),
-                                    bounds.bottom(),
-                                ),
+                                point(left + line.x_for_index(range.start), bounds.top()),
+                                point(left + line.x_for_index(range.end), bounds.bottom()),
                             ),
                             rgba(0x7dcfff66),
                         ));
@@ -139,13 +189,30 @@ pub fn line(
 mod tests {
     use super::Selection;
     #[test]
-    fn backwards_unicode_selection_uses_byte_boundaries() {
+    fn backwards_block_copy_includes_collapsed_context_and_unicode() {
+        let old = (1..30)
+            .map(|i| format!("old {i} aé界z\n"))
+            .collect::<String>();
+        let new = old
+            .replace("old 1 ", "new 1 ")
+            .replace("old 29 ", "new 29 ");
+        let diff = crate::diff::sidebyside::build(old.as_bytes(), new.as_bytes());
+        let last = diff
+            .rows
+            .iter()
+            .position(|r| matches!(r,crate::diff::Row::Line{right:Some(l),..} if l.no==29))
+            .unwrap();
         let s = Selection {
-            text: "aé界z".into(),
-            anchor: 6,
-            end: 1,
+            id: Some((1, true)),
+            anchor: (last, "new 29 aé界".len()),
+            end: (0, 4),
             ..Default::default()
         };
-        assert_eq!(s.selected(), "é界");
+        let copy = s.copy(&diff);
+        assert!(copy.starts_with("1 aé界z\nold 2"));
+        assert!(copy.contains("old 15 aé界z"));
+        assert!(copy.ends_with("new 29 aé界"));
+        assert_eq!(s.range(0, 12), Some(4..12));
+        assert_eq!(s.range(last + 1, 12), None);
     }
 }

@@ -26,17 +26,20 @@ opening it outside that repository.
   parents and hash. Drag to select details text and use Ctrl+C to copy.
 - Use **HEAD** to locate the checked-out commit. Dirty repositories initially
   select **Pending changes**; clean repositories initially select HEAD.
-- **Mark** selects up to two commit endpoints. **Compare** opens their diff;
-  **Diff** opens a selected commit against its first parent. **Clear** removes marks.
+- **Diff** (or double-click) opens a selected commit against its first parent.
+  Ctrl+click toggles additional commits; **Compare** is available with exactly
+  two selected commits. A normal click returns to a single selection.
 - Click folders to fold them and files to open their side-by-side diff. File and
   folder totals update as the background stats worker completes. **Expand** and
   **Collapse** operate on the whole tree. **Previous** and **Next** change files.
 - Scroll lists using the wheel or scrollbar. Pan wide diffs horizontally. Drag
-  the history/details divider to resize. Diff text supports drag selection within
-  a line, double-click to select a whole line, and Ctrl+C; copied text excludes
-  line numbers. Commit descriptions support selection across paragraphs.
+  the history/details divider to resize. Scrollbars appear when hovering a
+  scrollable region. Diff text supports dragging across lines on either side,
+  double-click to select a whole line, and Ctrl+C; copied text excludes line
+  numbers and includes collapsed context. Commit descriptions and the selected
+  file path also support selection and copying.
 - **Branches** opens the activity-sorted, filterable branch browser.
-  **Show in graph** locates a tip or loads a remote-only preview.
+  Double-click a branch to locate its tip or load a remote-only preview.
 - **Checkout…** opens an explicit choice dialog. Clicking a branch or detached
   commit choice performs that checkout. **Cancel** performs no Git operation.
 - **Refresh** reloads refs/status and revalidates remote data.
@@ -51,6 +54,9 @@ Type in the search field to filter history. Matching is case-insensitive and
 accepts contiguous fragments inside words. All space-separated terms must match
 one field, in any order. Default search covers hashes, full commit messages,
 authors, branch labels and tags. File paths require `f:`.
+Focus the search field to choose a search prefix from its dropdown. Matching
+text is highlighted in history, details and file names; branch filters highlight
+matching names too.
 
 | Query | Field |
 | --- | --- |
@@ -132,7 +138,9 @@ cargo clippy --all-targets -- -D warnings
 See [the benchmark workflow](docs/benchmarking.md) and
 [the GPUI migration report](docs/gpui-benchmarks.md), followed by
 [the visually verified usability fixes and measurements](docs/gpui-usability-benchmarks.md)
-and [scrollbar/diff fixes and measurements](docs/gpui-scroll-benchmarks.md). Historical terminal reports
+and [scrollbar/diff fixes and measurements](docs/gpui-scroll-benchmarks.md).
+The latest [selection, search and layout report](docs/gpui-design-benchmarks.md)
+covers the revised desktop workflow. Historical terminal reports
 remain in `docs/`; they do not measure the desktop implementation. Terminal
 render/input adapters are retained as regression references for existing tests,
 but the executable enters GPUI and never opens a console input loop.
@@ -143,7 +151,7 @@ but the executable enters GPUI and never opens a console input loop.
 - `GIT_RUSTLE_TRACE=1`: additionally emit those milestones as they happen.
 - `GIT_RUSTLE_AUTOQUIT=<ms>`: exit after the first history frame and loading settles.
 - `GIT_RUSTLE_DUMP=<path>`: save a final model summary, not a screenshot.
-- `GIT_RUSTLE_SCENARIO=scroll|files-scroll|diff-scroll|diff-pan|branches|diff|search|settings|pending|pending-diff`: run a non-mutating
+- `GIT_RUSTLE_SCENARIO=scroll|search-scroll|files-scroll|diff-scroll|diff-pan|branches|diff|compare|search|settings|pending|pending-diff`: run a non-mutating
   desktop benchmark action after loading.
 - `GIT_RUSTLE_FRAME_SAMPLES=<path>`: save 120 scroll frame intervals after discarding
   one warm-up frame. These include scheduling/layout/paint submission and exclude

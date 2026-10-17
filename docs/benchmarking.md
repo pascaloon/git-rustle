@@ -62,6 +62,14 @@ the diff vertically, or both diff text panes horizontally. They do not measure m
 input latency. The pre-scrollbar-fix executable lacks these scenarios: report them
 as candidate-only measurements unless both executables include the instrumentation.
 
+For search-decoration changes, also run `search-scroll` on a large history. It
+waits for `m: merge` results, then scrolls 120 measured frames with highlights.
+For selection changes, `compare` selects the first two graph rows using the same
+normal-click/Ctrl-click action handlers and opens their diff. Use a clean fixture
+with at least two commits so neither row is pending changes. This verifies action
+dispatch, not physical modifier-key input. These scenarios require the current
+instrumentation and must be reported as candidate-only against older baselines.
+
 For pending changes, create a disposable repository and use
 `-Scenarios pending,pending-diff`. The mutation component harness independently
 creates disposable repositories, commits a selected change to a new branch and

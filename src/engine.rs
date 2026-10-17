@@ -328,6 +328,12 @@ pub struct Engine {
     first_frame_at: Option<Instant>,
 }
 impl Engine {
+    pub fn repository_path(&self) -> String {
+        self.repo
+            .as_ref()
+            .map(|r| r.workdir().unwrap_or(r.path()).display().to_string())
+            .unwrap_or_default()
+    }
     pub fn new(path: PathBuf, no_cache: bool, start: Instant) -> Self {
         let (tx, rx) = async_channel::unbounded();
         let cache_path = if no_cache {

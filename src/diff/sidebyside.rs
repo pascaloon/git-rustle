@@ -45,6 +45,8 @@ pub enum Row {
 
 #[derive(Debug, Clone, Default)]
 pub struct FileDiff {
+    /// Source retained for copying through collapsed context, shared by clones.
+    pub source: [std::sync::Arc<[u8]>; 2],
     pub rows: Vec<Row>,
     pub added: u32,
     pub removed: u32,
@@ -63,7 +65,7 @@ impl FileDiff {
     }
 }
 
-fn decode(line: &[u8]) -> String {
+pub(crate) fn decode(line: &[u8]) -> String {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let s = String::from_utf8_lossy(line);
@@ -230,6 +232,7 @@ pub fn build(old: &[u8], new: &[u8]) -> FileDiff {
         }));
     }
     FileDiff {
+        source: [old.into(), new.into()],
         rows,
         added,
         removed,

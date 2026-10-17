@@ -579,12 +579,22 @@ impl App {
             }
             return;
         }
-        if self.marks.len() == MAX_MARKS {
-            let (a, b) = (self.marks[0], self.marks[1]);
+        let ids = if self.marks.is_empty() {
+            self.selected_id().into_iter().collect()
+        } else {
+            self.marks.clone()
+        };
+        self.open_selected_diff(&ids);
+    }
+
+    /// Compare one commit with its parent, or exactly two selected commits.
+    pub fn open_selected_diff(&mut self, ids: &[ObjectId]) {
+        if ids.len() == 2 {
+            let (a, b) = (ids[0], ids[1]);
             let time = |id: &ObjectId| {
                 self.history
                     .index_of(id)
-                    .map(|i| self.history.commits[i].commit_time)
+                    .map(|i| (self.history.commits[i].commit_time, std::cmp::Reverse(i)))
             };
             let (old, new) = match (time(&a), time(&b)) {
                 (Some(ta), Some(tb)) if tb < ta => (b, a),
@@ -592,8 +602,8 @@ impl App {
             };
             let key = self.new_key();
             self.show_view(ChangeSet::new(key, Some(old), new), None);
-        } else if let Some(id) = self.marks.first().copied().or_else(|| self.selected_id()) {
-            self.open_parent_diff(id);
+        } else if let [id] = ids {
+            self.open_parent_diff(*id);
         }
     }
 
@@ -2269,6 +2279,31 @@ mod tests {
         assert_eq!(app.right_width, 49);
         app.handle_mouse(ev(50, MouseKind::Up(Button::Left)), &a, 100, 12);
         assert!(!app.dragging_splitter);
+    }
+
+    #[test]
+    fn desktop_diff_uses_only_one_or_two_explicit_selections() {
+        let mut app = app_with(4);
+        let ids: Vec<_> = app.history.commits.iter().map(|c| c.id).collect();
+        app.open_selected_diff(&[]);
+        assert!(matches!(app.mode, Mode::Graph));
+        app.open_selected_diff(&ids[..3]);
+        assert!(matches!(app.mode, Mode::Graph));
+        app.open_selected_diff(&ids[1..2]);
+        assert!(matches!(&app.mode,Mode::Diff(v) if v.changes.new==ids[1]));
+        app.close_diff();
+        app.history.commits[0].commit_time = 20;
+        app.history.commits[2].commit_time = 10;
+        app.open_selected_diff(&[ids[0], ids[2]]);
+        assert!(
+            matches!(&app.mode,Mode::Diff(v) if v.changes.old==Some(ids[2]) && v.changes.new==ids[0])
+        );
+        app.close_diff();
+        app.history.commits[2].commit_time = 20;
+        app.open_selected_diff(&[ids[0], ids[2]]);
+        assert!(
+            matches!(&app.mode,Mode::Diff(v) if v.changes.old==Some(ids[2]) && v.changes.new==ids[0])
+        );
     }
 
     #[test]

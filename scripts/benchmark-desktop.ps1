@@ -33,6 +33,8 @@ function Run-One([string]$scenario,[int]$sample) {
         'files-scroll' { 'desktop scroll done' }
         'diff-scroll' { 'desktop scroll done' }
         'diff-pan' { 'desktop scroll done' }
+        'search-scroll' { 'desktop scroll done' }
+        'compare' { 'file diff (' }
         'branches' { 'branch activity ready' }
         'diff' { 'file diff (' }
         'search' { 'search ready' }
@@ -52,8 +54,9 @@ function Run-One([string]$scenario,[int]$sample) {
         'settings' { 'settings requested' }
         'pending' { 'pending status requested' }
         'pending-diff' { 'file diff requested' }
+        'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','files-scroll','diff-scroll','diff-pan')
+    $scrolling = $scenario -in @('scroll','files-scroll','diff-scroll','diff-pan','search-scroll')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     [pscustomobject]@{scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames}

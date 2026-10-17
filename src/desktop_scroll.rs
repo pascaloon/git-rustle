@@ -1,5 +1,5 @@
 //! Shared horizontal text offset with a fixed, equal-width diff split.
-use gpui::{Pixels, Point, Size, UniformListScrollHandle, point, px, size};
+use gpui::{Bounds, Pixels, Point, Size, UniformListScrollHandle, point, px, size};
 use gpui_component::scroll::ScrollbarHandle;
 use std::{cell::Cell, rc::Rc};
 
@@ -8,6 +8,7 @@ const BAR_SPACE: f32 = 12.;
 
 #[derive(Clone)]
 pub struct DiffScroll {
+    pub bounds: Rc<Cell<Bounds<Pixels>>>,
     vertical: UniformListScrollHandle,
     pub x: Rc<Cell<Pixels>>,
     width: Rc<Cell<Pixels>>,
@@ -17,6 +18,7 @@ pub struct DiffScroll {
 impl DiffScroll {
     pub fn new(vertical: UniformListScrollHandle) -> Self {
         Self {
+            bounds: Default::default(),
             vertical,
             x: Default::default(),
             width: Default::default(),
