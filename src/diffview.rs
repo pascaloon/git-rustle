@@ -161,6 +161,23 @@ impl DiffView {
         self.needs_redraw = true;
     }
 
+    pub fn set_syntax(
+        &mut self,
+        seq: u32,
+        file: usize,
+        syntax: std::sync::Arc<crate::diff::syntax::Syntax>,
+    ) -> bool {
+        if seq != self.req_seq || self.current != Some(file) || self.diff_for != Some(file) {
+            return false;
+        }
+        let Some(diff) = &mut self.diff else {
+            return false;
+        };
+        diff.syntax = Some(syntax);
+        self.needs_redraw = true;
+        true
+    }
+
     pub fn current_change(&self) -> Option<&FileChange> {
         self.current.and_then(|i| self.changes.files.get(i))
     }
@@ -469,6 +486,24 @@ mod tests {
         assert!(v.diff.is_none());
         v.set_file_diff(2, 1, Ok(FileDiff::message("new".into())));
         assert_eq!(v.diff_for, Some(1));
+    }
+
+    #[test]
+    fn late_syntax_cannot_color_another_file_or_reset_scroll() {
+        let mut v = view();
+        v.pending();
+        v.set_file_diff(1, 0, Ok(crate::diff::sidebyside::build(b"", b"fn a() {}")));
+        v.scroll = 4;
+        v.hscroll = 12;
+        assert!(!v.set_syntax(0, 0, Default::default()));
+        assert!(!v.set_syntax(1, 1, Default::default()));
+        assert!(v.diff.as_ref().unwrap().syntax.is_none());
+        assert!(v.set_syntax(1, 0, Default::default()));
+        assert_eq!((v.scroll, v.hscroll), (4, 12));
+        v.show(Some(1));
+        v.pending();
+        assert!(!v.set_syntax(1, 0, Default::default()));
+        assert!(v.diff.is_none());
     }
 
     #[test]

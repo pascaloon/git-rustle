@@ -45,6 +45,8 @@ pub enum Row {
 
 #[derive(Debug, Clone, Default)]
 pub struct FileDiff {
+    /// Installed asynchronously; None means coloring is still pending.
+    pub syntax: Option<std::sync::Arc<super::syntax::Syntax>>,
     /// Source retained for copying through collapsed context, shared by clones.
     pub source: [std::sync::Arc<[u8]>; 2],
     pub rows: Vec<Row>,
@@ -57,9 +59,16 @@ pub struct FileDiff {
 }
 
 impl FileDiff {
+    pub fn syntax_line(&self, right: bool, line: Option<&Line>) -> &[super::syntax::Span] {
+        match (&self.syntax, line) {
+            (Some(syntax), Some(line)) => syntax.sides[usize::from(right)].line(line.no),
+            _ => &[],
+        }
+    }
     pub fn message(text: String) -> Self {
         FileDiff {
             rows: vec![Row::Message(text)],
+            syntax: Some(Default::default()),
             ..Default::default()
         }
     }
@@ -233,6 +242,7 @@ pub fn build(old: &[u8], new: &[u8]) -> FileDiff {
     }
     FileDiff {
         source: [old.into(), new.into()],
+        syntax: None,
         rows,
         added,
         removed,

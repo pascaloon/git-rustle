@@ -7,6 +7,7 @@
 pub mod changes;
 pub mod filetree;
 pub mod sidebyside;
+pub mod syntax;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;

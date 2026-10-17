@@ -68,10 +68,15 @@ impl Selection {
             .join("\n")
     }
 }
+pub struct Decorations {
+    pub changes: Vec<Range<usize>>,
+    pub syntax: Vec<crate::diff::syntax::Span>,
+}
+
 pub fn line(
     id: (u32, usize, bool, usize),
     text: String,
-    highlights: Vec<Range<usize>>,
+    decorations: Decorations,
     selection: Rc<RefCell<Selection>>,
     focus: FocusHandle,
     horizontal: Rc<Cell<Pixels>>,
@@ -149,7 +154,7 @@ pub fn line(
                 },
                 move |bounds, line, window, cx| {
                     let left = bounds.left() + horizontal.get();
-                    for range in &highlights {
+                    for range in &decorations.changes {
                         let start = line
                             .text
                             .char_indices()
@@ -192,16 +197,97 @@ pub fn line(
                             rgba(crate::desktop_theme::SELECTION),
                         ));
                     }
-                    let _ = line.paint(point(left, bounds.top() + px(3.)), px(18.), window, cx);
+                    let origin = point(left, bounds.top() + px(3.));
+                    if decorations.syntax.is_empty() {
+                        let _ = line.paint(origin, px(18.), window, cx);
+                    } else {
+                        paint_syntax(&line, &decorations.syntax, origin, window, cx);
+                    }
                     *layout.borrow_mut() = Some((bounds, line));
                 },
             )
             .size_full(),
         )
 }
+// GPUI 0.2 splits platform shaping at color boundaries, even with identical
+// fonts. Shape once with the original font run and color its cached glyphs here.
+// This also keeps ligatures, hit testing and wrapping identical to plain text.
+fn paint_syntax(
+    line: &ShapedLine,
+    spans: &[crate::diff::syntax::Span],
+    origin: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let default_color = window.text_style().color;
+    let baseline = (px(18.) - line.ascent - line.descent) / 2. + line.ascent;
+    let text_system = cx.text_system().clone();
+    window.paint_layer(Bounds::new(origin, size(line.width, px(18.))), |window| {
+        let mask = window.content_mask().bounds;
+        for run in &line.runs {
+            let glyph_size = text_system.bounding_box(run.font_id, line.font_size).size;
+            for glyph in &run.glyphs {
+                let glyph_origin = origin + point(glyph.position.x, px(0.));
+                if !Bounds::new(glyph_origin, glyph_size).intersects(&mask) {
+                    continue;
+                }
+                let at = glyph_origin + point(px(0.), baseline);
+                if glyph.is_emoji {
+                    let _ = window.paint_emoji(at, run.font_id, glyph.id, line.font_size);
+                } else {
+                    let color = glyph_style(spans, glyph.index)
+                        .map(|style| {
+                            rgb(crate::desktop_theme::SYNTAX_COLORS[style as usize]).into()
+                        })
+                        .unwrap_or(default_color);
+                    let _ = window.paint_glyph(at, run.font_id, glyph.id, line.font_size, color);
+                }
+            }
+        }
+    });
+}
+
+fn glyph_style(spans: &[crate::diff::syntax::Span], index: usize) -> Option<u8> {
+    // Binary search also handles fallback fonts / bidi glyphs visited out of
+    // source order. A ligature takes the color of its first source byte.
+    let at = spans.partition_point(|span| span.range.end <= index);
+    spans
+        .get(at)
+        .filter(|span| span.range.contains(&index))
+        .map(|span| span.style)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Selection;
+    use super::{Selection, glyph_style};
+
+    #[test]
+    fn glyph_colors_use_utf8_ranges_and_default_gaps_in_any_order() {
+        use crate::diff::syntax::Span;
+        let spans = [
+            Span {
+                range: 3..7,
+                style: 1,
+            },
+            Span {
+                range: 9..12,
+                style: 2,
+            },
+        ];
+        for (index, expected) in [
+            (9, Some(2)),
+            (3, Some(1)),
+            (7, None),
+            (11, Some(2)),
+            (0, None),
+            (12, None),
+            (6, Some(1)),
+            (8, None),
+        ] {
+            assert_eq!(glyph_style(&spans, index), expected);
+        }
+        assert_eq!(glyph_style(&[], 0), None);
+    }
     #[test]
     fn wrapped_selection_copies_original_lines_without_visual_breaks() {
         let text = "a long café line with spaces\nnext line 世界\n";

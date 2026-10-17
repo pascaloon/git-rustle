@@ -2,6 +2,8 @@ param(
     [Parameter(Mandatory)][string]$Repository,
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [string]$Baseline,
+    [switch]$RequireSyntax,
+    [switch]$RejectCompetingBuilds,
     [int]$Samples = 15,
     [string[]]$Scenarios = @('scroll','branches','diff','search','settings'),
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\desktop"
@@ -16,6 +18,7 @@ $saved = @{}
 $names = @('GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES')
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
+    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     $log = Join-Path $OutputDirectory "$label-$scenario-$sample.txt"
     $env:GIT_RUSTLE_SCENARIO = $scenario
     $env:GIT_RUSTLE_FRAME_SAMPLES = Join-Path $OutputDirectory "$label-$scenario-$sample-frames.json"
@@ -25,11 +28,15 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $p = Start-Process -FilePath $exe -ArgumentList @('"' + $Repository + '"') -WindowStyle Normal -RedirectStandardError $log -PassThru
     if (-not $p.WaitForExit(60000)) { Stop-Process -Id $p.Id; throw "Timeout: $log" }
     $p.Refresh()
+    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
     if ($scenario -in @('scroll','search-scroll','graph-resize','tabs') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
+    if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
+        throw "Candidate did not install syntax colors: $log"
+    }
     $marks = @{}
     foreach ($m in [regex]::Matches($text,'([\d.]+) ms  ([^\r\n]+)')) {
         if (-not $marks.ContainsKey($m.Groups[2].Value)) { $marks[$m.Groups[2].Value] = [double]::Parse($m.Groups[1].Value,[cultureinfo]::InvariantCulture) }
@@ -70,7 +77,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
-    [pscustomobject]@{binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}
+    $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]
+    $syntaxMs = if ($syntax -and $marks.ContainsKey('file diff requested')) { $marks[$syntax] - $marks['file diff requested'] } else { $null }
+    $presentedMs = if ($marks.ContainsKey('file diff requested')) { $marks['desktop scenario frame'] - $marks['file diff requested'] } else { $null }
+    [pscustomobject]@{syntaxReadyMs=$syntaxMs;scenarioFrameAfterRequestMs=$presentedMs;binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}
 }
 try {
     $env:GIT_RUSTLE_TIMING='1'; $env:GIT_RUSTLE_AUTOQUIT='100'

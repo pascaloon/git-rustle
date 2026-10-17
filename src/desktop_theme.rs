@@ -26,6 +26,13 @@ pub const REMOVED_BG: u32 = 0x251211;
 pub const ADDED_HIGHLIGHT: u32 = 0x70b87844;
 pub const REMOVED_HIGHLIGHT: u32 = 0xed8c8644;
 
+// Matches diff::syntax's capture categories. Foregrounds stay readable on both
+// added/removed backgrounds; syntax never overrides selection or intraline fills.
+pub const SYNTAX_COLORS: [u32; 19] = [
+    0x929da8, 0xa8d59b, 0xc7a0e8, 0x89c9ee, 0xe8cc91, 0xeab38b, 0xeab38b, 0xa6c9ee, 0xc9c2bb,
+    0xb9b2ac, TEXT, 0xefad94, 0xe8cc91, 0xe8cc91, 0xeab38b, TEXT, 0x89c9ee, 0x89c9ee, 0xa8d59b,
+];
+
 // Orange anchors the UI; graph lanes use separated hues for branch tracking.
 pub const COLORS: [u32; 10] = [
     ACCENT, 0x66d9ef, 0xc792ff, 0xa6e36d, 0xff6f91, 0xffd866, 0x6c9fff, 0x5de0b5, 0xf184df,

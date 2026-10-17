@@ -38,6 +38,7 @@ pub(crate) enum Msg {
     Stats(u32, Vec<(usize, diff::Stat)>),
     /// File diff for diff view `id`: (view, seq, file index, result).
     FileDiff(u32, u32, usize, Result<diff::FileDiff, String>),
+    DiffSyntax(u32, u32, usize, Arc<diff::syntax::Syntax>),
 }
 
 /// Diff requests run on one worker thread. A burst of requests (holding an
@@ -52,6 +53,7 @@ fn spawn_diff_worker(
     thread::Builder::new()
         .name("diff".into())
         .spawn(move || {
+            let mut syntax: Option<diff::syntax::Worker> = None;
             while let Ok(first) = req_rx.recv() {
                 let mut tree: Option<DiffReq> = None;
                 let mut file: Option<DiffReq> = None;
@@ -100,11 +102,24 @@ fn spawn_diff_worker(
                 }) = file
                 {
                     let result = diff::file_diff(&repo, &change).map_err(|e| e.to_string());
+                    let source = result.as_ref().ok().map(|d| d.source.clone());
                     if tx
                         .send_blocking(Msg::FileDiff(view, seq, file, result))
                         .is_err()
                     {
                         return;
+                    }
+                    if let Some(source) = source {
+                        syntax
+                            .get_or_insert_with(|| diff::syntax::Worker::new(tx.clone()))
+                            .submit(
+                                (view, seq, file),
+                                source,
+                                [
+                                    change.old_path.unwrap_or_else(|| change.path.clone()),
+                                    change.path,
+                                ],
+                            );
                     }
                 }
             }
@@ -1154,6 +1169,17 @@ impl Engine {
                             timing.mark("stats done");
                         }
                         app.needs_redraw = true;
+                    }
+                }
+                Msg::DiffSyntax(view_id, seq, file, syntax) => {
+                    if let Some(view) = app.diff_view_mut()
+                        && view.id == view_id
+                    {
+                        let count = syntax.span_count();
+                        if view.set_syntax(seq, file, syntax) {
+                            timing.mark(format!("diff syntax ready ({count} spans)"));
+                            app.needs_redraw = true;
+                        }
                     }
                 }
                 Msg::FileDiff(view_id, seq, file, result) => {

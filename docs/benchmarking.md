@@ -69,6 +69,8 @@ the diff vertically, or both diff text panes horizontally. They do not measure m
 input latency. The pre-scrollbar-fix executable lacks these scenarios: report them
 as candidate-only measurements unless both executables include the instrumentation.
 
+For syntax-coloring changes, also follow the [source-code fixture and timing recipe](syntax-highlighting.md#performance-verification). Plain-text scrolling does not exercise token shaping.
+
 For search-decoration changes, also run `search-scroll` on a large history. It
 waits for `m: merge` results, then scrolls 120 measured frames with highlights.
 For selection changes, `compare` selects the first two graph rows using the same

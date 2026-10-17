@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Repository,
     [Parameter(Mandatory)][string]$Baseline,
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
+    [switch]$RejectCompetingBuilds,
     [int]$Samples = 15,
     [switch]$NativeCandidate,
     [switch]$NativeBaseline,
@@ -18,6 +19,7 @@ foreach ($name in @('GIT_RUSTLE_TIMING', 'GIT_RUSTLE_AUTOQUIT', 'GIT_RUSTLE_KEYS
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
+    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     $log = Join-Path $OutputDirectory "$label-$mode-$sample.txt"
     $runArgs = @('"' + $Repository + '"')
     if ($mode -eq 'uncached') { $runArgs += '--no-cache' }
@@ -28,6 +30,7 @@ function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
         throw "Benchmark exceeded two minutes: $log"
     }
     $process.Refresh()
+    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     if ($process.ExitCode -ne 0) { throw "Benchmark failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $frame = [regex]::Match($text, '([\d.]+) ms  first frame')

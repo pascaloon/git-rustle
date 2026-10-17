@@ -57,6 +57,11 @@ interior pixels. The icon generator retains the resulting alpha channel.
   double-click to select a displayed line, and Ctrl+C; copied text excludes line
   numbers and includes collapsed context. Commit descriptions and the selected
   file path also support selection and copying.
+- Source diffs gain syntax colors automatically while remaining immediately readable.
+  Coloring covers common languages including Rust, C/C++, C#, JavaScript/TypeScript,
+  Python, Go, Java, Ruby, shell, HTML/CSS, JSON, TOML, YAML, SQL and Markdown.
+  Large/generated files and unsupported formats keep plain text. See
+  [syntax highlighting](docs/syntax-highlighting.md) for coverage and limits.
 - **Branches** opens the activity-sorted, filterable branch browser.
   Double-click a branch to locate its tip or load a remote-only preview.
 - **Checkout…** opens an explicit choice dialog. Clicking a branch or detached

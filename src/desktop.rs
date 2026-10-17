@@ -506,7 +506,7 @@ impl Desktop {
                                     .is_some_and(|c| c.loaded && !c.tree.visible.is_empty()),
                                 Some("diff-scroll" | "diff-pan" | "wrap-scroll" | "tabs") => {
                                     matches!(&v.engine.app.mode,
-                                    Mode::Diff(d) if d.diff.is_some())
+                                    Mode::Diff(d) if d.diff.as_ref().is_some_and(|d| d.syntax.is_some()))
                                 }
                                 _ => false,
                             };
@@ -1764,6 +1764,7 @@ impl Desktop {
                                         left.as_ref().filter(|_| {
                                             wrapped.is_none_or(|r| r.sides[0].is_some())
                                         }),
+                                        diff.syntax_line(false, left.as_ref()),
                                         (view.id, i, false, visual),
                                         wrapped.and_then(|r| r.sides[0].clone()),
                                         v.selection.clone(),
@@ -1776,6 +1777,7 @@ impl Desktop {
                                         right.as_ref().filter(|_| {
                                             wrapped.is_none_or(|r| r.sides[1].is_some())
                                         }),
+                                        diff.syntax_line(true, right.as_ref()),
                                         (view.id, i, true, visual),
                                         wrapped.and_then(|r| r.sides[1].clone()),
                                         v.selection.clone(),
@@ -2153,7 +2155,7 @@ impl Desktop {
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
-                matches!(&app.mode,Mode::Diff(v) if v.diff.is_some())
+                matches!(&app.mode,Mode::Diff(v) if v.diff.as_ref().is_some_and(|d| d.syntax.is_some()))
             }
             Some("search") => app.search.result.as_ref().is_some_and(|r| r.done),
             Some("settings") => app.settings.open && !app.settings.busy,
@@ -2164,7 +2166,7 @@ impl Desktop {
     fn snapshot(&self) -> String {
         let app = &self.engine.app;
         format!(
-            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\n",
+            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\n",
             app.repo_name,
             app.history.len(),
             app.details
@@ -2173,7 +2175,15 @@ impl Desktop {
                 .unwrap_or_default(),
             app.ghost_status,
             app.pending.status,
-            self.viewport_rows
+            self.viewport_rows,
+            match &app.mode {
+                Mode::Diff(v) => v
+                    .diff
+                    .as_ref()
+                    .and_then(|d| d.syntax.as_ref())
+                    .map_or(0, |s| s.span_count()),
+                _ => 0,
+            }
         )
     }
 }
@@ -2502,6 +2512,7 @@ fn diff_stats(added: u32, removed: u32) -> Div {
 
 fn diff_line(
     line: Option<&diff::Line>,
+    syntax: &[diff::syntax::Span],
     id: (u32, usize, bool, usize),
     span: Option<std::ops::Range<usize>>,
     selection: std::rc::Rc<std::cell::RefCell<crate::selectable::Selection>>,
@@ -2558,8 +2569,18 @@ fn diff_line(
                 ),
         )
         .when(line.is_some(), |s| {
+            let decorations = crate::selectable::Decorations {
+                changes: hl,
+                syntax: diff::syntax::clipped(syntax, offset..offset + text.len()),
+            };
             s.child(crate::selectable::line(
-                id, text, hl, selection, focus, horizontal, offset,
+                id,
+                text,
+                decorations,
+                selection,
+                focus,
+                horizontal,
+                offset,
             ))
         })
 }
