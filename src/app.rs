@@ -89,6 +89,7 @@ pub struct App {
     /// Commits marked for diffing, in marking order (at most `MAX_MARKS`).
     pub marks: Vec<ObjectId>,
     pub mode: Mode,
+    pub parked_diff: Option<Box<DiffView>>,
     /// Sidebar width for the diff view, remembered between views.
     pub sidebar_width: u16,
     next_view_id: u32,
@@ -140,6 +141,7 @@ impl App {
             dragging_splitter: false,
             marks: Vec::new(),
             mode: Mode::Graph,
+            parked_diff: None,
             sidebar_width: 32,
             next_view_id: 1,
             details_changes: None,
@@ -525,10 +527,15 @@ impl App {
 
     /// Tree/file diff work to hand to the worker.
     pub fn pending_requests(&mut self) -> Vec<DiffReq> {
+        // A hidden Diff tab still accepts results and finishes its current request.
+        let mut requests = self
+            .parked_diff
+            .as_mut()
+            .map_or_else(Vec::new, |v| v.pending());
         if matches!(self.mode, Mode::Graph) && self.search.active() && self.graph_len() == 0 {
-            return Vec::new();
+            return requests;
         }
-        match &mut self.mode {
+        requests.extend(match &mut self.mode {
             Mode::Diff(view) => view.pending(),
             Mode::Graph => match self.details_changes.as_mut() {
                 Some(cs) if !cs.requested => {
@@ -544,7 +551,8 @@ impl App {
                 }
                 _ => Vec::new(),
             },
-        }
+        });
+        requests
     }
 
     /// The change set currently on screen (view or details panel).
@@ -561,6 +569,11 @@ impl App {
     /// Route a worker result to whichever change set has `key`.
     pub fn changes_by_key_mut(&mut self, key: u32) -> Option<&mut ChangeSet> {
         if let Mode::Diff(view) = &mut self.mode
+            && view.changes.key == key
+        {
+            return Some(&mut view.changes);
+        }
+        if let Some(view) = &mut self.parked_diff
             && view.changes.key == key
         {
             return Some(&mut view.changes);
@@ -622,6 +635,7 @@ impl App {
     }
 
     fn show_view(&mut self, changes: ChangeSet, cursor: Option<TreeCursor>) {
+        self.parked_diff = None;
         let id = self.next_view_id;
         self.next_view_id += 1;
         self.mode = Mode::Diff(Box::new(DiffView::new(
@@ -652,7 +666,22 @@ impl App {
     pub fn diff_view_mut(&mut self) -> Option<&mut DiffView> {
         match &mut self.mode {
             Mode::Diff(v) => Some(v),
-            Mode::Graph => None,
+            Mode::Graph => self.parked_diff.as_deref_mut(),
+        }
+    }
+
+    pub fn park_diff(&mut self) {
+        if matches!(self.mode, Mode::Diff(_)) {
+            let Mode::Diff(view) = std::mem::replace(&mut self.mode, Mode::Graph) else {
+                unreachable!()
+            };
+            self.parked_diff = Some(view);
+        }
+    }
+
+    pub fn resume_diff(&mut self) {
+        if let Some(view) = self.parked_diff.take() {
+            self.mode = Mode::Diff(view);
         }
     }
 
@@ -1040,10 +1069,15 @@ impl App {
     }
 
     pub fn confirm_graph_checkout(&mut self) {
+        if let Some(id) = self.selected_id() {
+            self.confirm_commit_checkout(id);
+        }
+    }
+
+    pub fn confirm_commit_checkout(&mut self, id: ObjectId) {
         if self.branches.busy || self.checkout_request.is_some() {
             return;
         }
-        let Some(id) = self.selected_id() else { return };
         let sha = id.to_string();
         // The browser is lazy and may never have been opened in this session.
         self.branches.rebuild(self.refs.as_ref());
@@ -2394,6 +2428,81 @@ mod tests {
             Mode::Diff(v) => assert_eq!(v.changes.new, app.history.commits[6].id),
             Mode::Graph => panic!("expected a parent diff"),
         }
+    }
+
+    #[test]
+    fn checkout_uses_selected_endpoint_even_when_details_focus_is_elsewhere() {
+        let mut app = app_with(10);
+        let selected = app.history.commits[0].id;
+        app.select(1);
+        app.confirm_commit_checkout(selected);
+        assert!(
+            matches!(app.checkout_confirmation.as_ref().unwrap().chosen(),
+            crate::checkout::Request::Commit { id, .. } if *id == selected)
+        );
+        assert!(
+            app.checkout_request.is_none(),
+            "opening the menu choice must not perform checkout"
+        );
+    }
+
+    #[test]
+    fn hidden_diff_finishes_loading_and_resumes_without_recomputation() {
+        use crate::diff::{ChangeKind, FileChange, TreeDiff};
+        let mut app = app_with(10);
+        app.open_parent_diff(app.history.commits[0].id);
+        let id = app.diff_view_mut().unwrap().id;
+        let key = app.diff_view_mut().unwrap().changes.key;
+        app.park_diff();
+        app.park_diff(); // Switching between other tabs must not drop it.
+        assert!(matches!(app.mode, Mode::Graph));
+        assert!(
+            matches!(app.pending_requests().as_slice(), [DiffReq::Tree { key: k, .. }] if *k == key)
+        );
+        assert!(app.changes_by_key_mut(key).is_some());
+        app.diff_view_mut().unwrap().set_tree(Ok(TreeDiff {
+            files: vec![FileChange {
+                worktree: false,
+                remote: None,
+                path: "a.rs".into(),
+                old_path: None,
+                kind: ChangeKind::Added,
+                old: None,
+                new: None,
+            }],
+        }));
+        let request = app.pending_requests();
+        let [
+            DiffReq::File {
+                view, seq, file, ..
+            },
+        ] = request.as_slice()
+        else {
+            panic!("hidden tab must request its file")
+        };
+        assert_eq!(*view, id);
+        app.diff_view_mut().unwrap().set_file_diff(
+            *seq,
+            *file,
+            Ok(crate::diff::sidebyside::build(b"", b"hello\n")),
+        );
+        app.diff_view_mut().unwrap().scroll = 17;
+        app.resume_diff();
+        let Mode::Diff(v) = &app.mode else {
+            panic!("expected resumed diff")
+        };
+        assert_eq!(v.id, id);
+        assert_eq!(v.scroll, 17);
+        assert!(v.diff.is_some());
+        assert!(app.pending_requests().is_empty());
+        app.park_diff();
+        app.open_parent_diff(app.history.commits[1].id);
+        assert!(app.parked_diff.is_none());
+        assert_ne!(app.diff_view_mut().unwrap().id, id);
+        assert!(
+            app.changes_by_key_mut(key).is_none(),
+            "discard superseded worker results"
+        );
     }
 
     #[test]

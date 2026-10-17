@@ -79,6 +79,17 @@ metrics include worker dispatch and delivery but exclude actual mouse input and
 GPU paint. The polling test harness has approximately 2 ms resolution. Never run
 mutation fixtures against the user's benchmark clone.
 
+For tab, context-menu or wrapping changes, `benchmark-desktop.ps1 -Baseline <exe>`
+alternates baseline/candidate launches after one warm-up each. Use `scroll`,
+`search-scroll` and `branches` on large history, and `files-scroll`, `diff-scroll`,
+`diff-pan`, `diff` and `compare` on the wide-file fixture. The harness rejects a
+zero-height graph viewport for graph scenarios. Candidate-only `wrap-scroll`
+records initial wrap-layout CPU time separately from its 120 cached scroll frames;
+`tabs` alternates Graph/Diff and `graph-resize` alternates the graph column width.
+`compare-menu` opens a two-commit context menu for visual inspection and asserts
+that its Checkout action cannot open a checkout dialog. It does not exercise
+physical Ctrl+click. Keep native clipboard and pointer checks separate.
+
 Retain all raw data, executable hashes, limitations and failed/rejected runs.
 For framework migrations, report the startup regression explicitly even when
 scrolling remains fast; moving to GPU rendering does not imply faster startup.

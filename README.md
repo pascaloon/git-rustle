@@ -26,16 +26,22 @@ opening it outside that repository.
   parents and hash. Drag to select details text and use Ctrl+C to copy.
 - Use **HEAD** to locate the checked-out commit. Dirty repositories initially
   select **Pending changes**; clean repositories initially select HEAD.
-- **Diff** (or double-click) opens a selected commit against its first parent.
-  Ctrl+click toggles additional commits; **Compare** is available with exactly
-  two selected commits. A normal click returns to a single selection.
+- Right-click a graph row for **Diff commit** and **Checkout…**. Ctrl+click
+  toggles additional commits; the context menu compares exactly two selected
+  commits and disables Checkout for multiple selections. Double-click opens a
+  commit against its first parent. A normal click returns to a single selection.
+- **Git Graph**, **Branches**, **Diff** and **Settings** are tabs. The Diff tab
+  appears after opening a diff and retains its file and scroll position when
+  switching tabs. A newly opened comparison replaces the previous diff.
 - Click folders to fold them and files to open their side-by-side diff. File and
   folder totals update as the background stats worker completes. **Expand** and
-  **Collapse** operate on the whole tree. **Previous** and **Next** change files.
+  **Collapse** icons operate on the whole tree. Choose files in the sidebar.
 - Scroll lists using the wheel or scrollbar. Pan wide diffs horizontally. Drag
-  the history/details divider to resize. Scrollbars appear when hovering a
+  the graph-column or history/details divider to resize. The icon above the diff
+  toggles word wrap; copying preserves source lines rather than visual wraps.
+  Scrollbars appear when hovering a
   scrollable region. Diff text supports dragging across lines on either side,
-  double-click to select a whole line, and Ctrl+C; copied text excludes line
+  double-click to select a displayed line, and Ctrl+C; copied text excludes line
   numbers and includes collapsed context. Commit descriptions and the selected
   file path also support selection and copying.
 - **Branches** opens the activity-sorted, filterable branch browser.
@@ -43,7 +49,9 @@ opening it outside that repository.
 - **Checkout…** opens an explicit choice dialog. Clicking a branch or detached
   commit choice performs that checkout. **Cancel** performs no Git operation.
 - **Refresh** reloads refs/status and revalidates remote data.
-- **Settings** configures provider API access; **Back** returns to the previous view.
+- **Settings** configures provider API access.
+- The shell's folder and terminal icons open the repository in Explorer or
+  Windows Terminal. Windows Terminal must be installed for its launcher.
 
 The former terminal navigation keys are not bound in the desktop. Normal text
 editing, selection, clipboard and input-method behavior remain available in fields.
@@ -68,7 +76,8 @@ matching names too.
 Message/path indexes are built lazily on workers and reused across launches.
 Results stream during indexing and retain ancestry through hidden commits.
 Unavailable objects and remote errors are reported as incomplete results.
-Clear the field or click **HEAD** to leave the filter.
+Click the field's **×** button or **HEAD** to leave the filter. The branch filter
+also has a clear button.
 
 ### Pending changes and commits
 
@@ -139,8 +148,9 @@ See [the benchmark workflow](docs/benchmarking.md) and
 [the GPUI migration report](docs/gpui-benchmarks.md), followed by
 [the visually verified usability fixes and measurements](docs/gpui-usability-benchmarks.md)
 and [scrollbar/diff fixes and measurements](docs/gpui-scroll-benchmarks.md).
-The latest [selection, search and layout report](docs/gpui-design-benchmarks.md)
-covers the revised desktop workflow. Historical terminal reports
+The [selection, search and layout report](docs/gpui-design-benchmarks.md) and
+latest [tabs, context menus and word-wrap report](docs/gpui-tabs-benchmarks.md)
+cover the revised desktop workflow. Historical terminal reports
 remain in `docs/`; they do not measure the desktop implementation. Terminal
 render/input adapters are retained as regression references for existing tests,
 but the executable enters GPUI and never opens a console input loop.
@@ -151,7 +161,7 @@ but the executable enters GPUI and never opens a console input loop.
 - `GIT_RUSTLE_TRACE=1`: additionally emit those milestones as they happen.
 - `GIT_RUSTLE_AUTOQUIT=<ms>`: exit after the first history frame and loading settles.
 - `GIT_RUSTLE_DUMP=<path>`: save a final model summary, not a screenshot.
-- `GIT_RUSTLE_SCENARIO=scroll|search-scroll|files-scroll|diff-scroll|diff-pan|branches|diff|compare|search|settings|pending|pending-diff`: run a non-mutating
+- `GIT_RUSTLE_SCENARIO=scroll|graph-resize|search-scroll|files-scroll|diff-scroll|diff-pan|wrap-scroll|tabs|branches|diff|compare|compare-menu|search|settings|pending|pending-diff`: run a non-mutating
   desktop benchmark action after loading.
 - `GIT_RUSTLE_FRAME_SAMPLES=<path>`: save 120 scroll frame intervals after discarding
   one warm-up frame. These include scheduling/layout/paint submission and exclude

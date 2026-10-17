@@ -90,13 +90,24 @@ pub fn run(mut engine: Engine) {
     });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Graph,
+    Branches,
+    Diff,
+    Settings,
+}
+
 #[derive(Clone)]
 enum Action {
+    Tab(Tab),
+    Wrap,
+    Explorer,
+    Terminal,
     Refresh,
     Head,
     Branches,
     Settings,
-    Back,
     Diff,
     Checkout,
     Commit,
@@ -108,7 +119,6 @@ enum Action {
     File(usize),
     Check(usize),
     Expand(bool),
-    NextFile(bool),
     Confirm(usize),
     CancelCheckout,
     SettingsTab(usize),
@@ -132,6 +142,15 @@ struct Desktop {
     project: Entity<InputState>,
     token: Entity<InputState>,
     graph_scroll: UniformListScrollHandle,
+    diff_files_scroll: UniformListScrollHandle,
+    context_menu: Option<Point<Pixels>>,
+    settings_loaded: bool,
+    branches_loaded: bool,
+    graph_width: f32,
+    resizing_graph: bool,
+    word_wrap: bool,
+    wrap_anchor: Option<usize>,
+    wrap_layout: crate::desktop_wrap::Layout,
     files_scroll: UniformListScrollHandle,
     branches_scroll: UniformListScrollHandle,
     diff_scroll: UniformListScrollHandle,
@@ -175,6 +194,136 @@ fn caption(s: impl Into<SharedString>) -> Div {
 }
 
 impl Desktop {
+    fn tabs(&self, cx: &Context<Self>) -> AnyElement {
+        let app = &self.engine.app;
+        let current = if app.settings.open {
+            Tab::Settings
+        } else if app.branches.open {
+            Tab::Branches
+        } else if matches!(app.mode, Mode::Diff(_)) {
+            Tab::Diff
+        } else {
+            Tab::Graph
+        };
+        let has_diff = app.parked_diff.is_some() || matches!(app.mode, Mode::Diff(_));
+        row()
+            .h(px(38.))
+            .flex_shrink_0()
+            .gap_0()
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .children(
+                [
+                    (Tab::Graph, "graph", "Git Graph"),
+                    (Tab::Branches, "branch", "Branches"),
+                    (Tab::Diff, "diff", "Diff"),
+                    (Tab::Settings, "settings", "Settings"),
+                ]
+                .into_iter()
+                .filter(|(t, _, _)| *t != Tab::Diff || has_diff)
+                .enumerate()
+                .map(|(i, (tab, name, label))| {
+                    row()
+                        .id(("tab", i))
+                        .h_full()
+                        .px_4()
+                        .cursor_pointer()
+                        .border_b_2()
+                        .border_color(rgb(if current == tab { ACCENT } else { BG }))
+                        .bg(rgb(if current == tab { PANEL } else { BG }))
+                        .hover(|s| s.bg(rgb(0x202c3f)))
+                        .child(icon(name))
+                        .child(label)
+                        .on_click(cx.listener(move |v, _, w, cx| v.action(Action::Tab(tab), w, cx)))
+                }),
+            )
+            .into_any_element()
+    }
+    fn commit_menu(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let app = &self.engine.app;
+        let count = self.selected_commits.ids(app.selected_id()).len();
+        let enabled_diff = app.pending.selected || matches!(count, 1 | 2);
+        let enabled_checkout = !app.pending.selected
+            && self
+                .selected_commits
+                .checkout_target(app.selected_id())
+                .is_some();
+        let p = point(
+            position
+                .x
+                .min(window.viewport_size().width - px(224.))
+                .max(px(0.)),
+            position
+                .y
+                .min(window.viewport_size().height - px(88.))
+                .max(px(0.)),
+        );
+        deferred(
+            column()
+                .id("commit-menu")
+                .absolute()
+                .left(p.x)
+                .top(p.y)
+                .w(px(224.))
+                .p_1()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(LINE))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                    v.context_menu = None;
+                    cx.notify();
+                }))
+                .children(
+                    [
+                        (
+                            Action::Diff,
+                            "diff",
+                            if app.pending.selected {
+                                "Diff pending changes"
+                            } else if count > 1 {
+                                "Compare selected commits"
+                            } else {
+                                "Diff commit"
+                            },
+                            enabled_diff,
+                        ),
+                        (Action::Checkout, "checkout", "Checkout…", enabled_checkout),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (action, name, label, enabled))| {
+                        row()
+                            .id(("commit-menu-item", i))
+                            .h(px(36.))
+                            .px_2()
+                            .rounded_sm()
+                            .text_color(rgb(if enabled { TEXT } else { MUTED }))
+                            .child(icon(name).text_color(rgb(if enabled { TEXT } else { MUTED })))
+                            .child(label)
+                            .when(enabled, |s| {
+                                s.cursor_pointer().hover(|s| s.bg(rgb(0x2a3b52))).on_click(
+                                    cx.listener(move |v, _, w, cx| {
+                                        cx.stop_propagation();
+                                        v.action(action.clone(), w, cx);
+                                    }),
+                                )
+                            })
+                    }),
+                ),
+        )
+        .with_priority(3)
+        .into_any_element()
+    }
+
     fn new(mut engine: Engine, window: &mut Window, cx: &mut Context<Self>) -> Self {
         engine.mark("GPUI window ready");
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search commits…"));
@@ -270,7 +419,7 @@ impl Desktop {
                         {
                             v.scenario_started = true;
                             match v.scenario.as_deref() {
-                                Some("scroll") => {
+                                Some("scroll" | "graph-resize") => {
                                     v.scroll_step = 1;
                                     v.frame_start = Some(Instant::now());
                                     v.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -278,7 +427,9 @@ impl Desktop {
                                 }
                                 Some("pending-diff") => v.action(Action::Diff, window, cx),
                                 Some("branches") => v.action(Action::Branches, window, cx),
-                                Some("diff" | "diff-scroll" | "diff-pan") => {
+                                Some(
+                                    "diff" | "diff-scroll" | "diff-pan" | "wrap-scroll" | "tabs",
+                                ) => {
                                     v.action(Action::Head, window, cx);
                                     v.action(Action::Diff, window, cx);
                                 }
@@ -291,6 +442,14 @@ impl Desktop {
                                     v.action(Action::Select(0, false), window, cx);
                                     v.action(Action::Select(1, true), window, cx);
                                     v.action(Action::Diff, window, cx);
+                                }
+                                Some("compare-menu") => {
+                                    v.action(Action::Select(0, false), window, cx);
+                                    v.action(Action::Select(1, true), window, cx);
+                                    v.action(Action::Checkout, window, cx);
+                                    assert!(v.engine.app.checkout_confirmation.is_none());
+                                    v.context_menu = Some(point(px(220.), px(210.)));
+                                    cx.notify();
                                 }
                                 _ => {}
                             }
@@ -310,11 +469,16 @@ impl Desktop {
                                     .details_changes
                                     .as_ref()
                                     .is_some_and(|c| c.loaded && !c.tree.visible.is_empty()),
-                                Some("diff-scroll" | "diff-pan") => matches!(&v.engine.app.mode,
-                                    Mode::Diff(d) if d.diff.is_some()),
+                                Some("diff-scroll" | "diff-pan" | "wrap-scroll" | "tabs") => {
+                                    matches!(&v.engine.app.mode,
+                                    Mode::Diff(d) if d.diff.is_some())
+                                }
                                 _ => false,
                             };
                             if ready {
+                                if v.scenario.as_deref() == Some("wrap-scroll") {
+                                    v.action(Action::Wrap, window, cx);
+                                }
                                 v.scroll_step = 1;
                                 v.frame_start = Some(Instant::now());
                                 cx.notify();
@@ -362,6 +526,15 @@ impl Desktop {
             project,
             token,
             graph_scroll: UniformListScrollHandle::new(),
+            diff_files_scroll: UniformListScrollHandle::new(),
+            context_menu: None,
+            settings_loaded: false,
+            branches_loaded: false,
+            graph_width: 84.,
+            resizing_graph: false,
+            word_wrap: false,
+            wrap_anchor: None,
+            wrap_layout: Default::default(),
             files_scroll: UniformListScrollHandle::new(),
             branches_scroll: UniformListScrollHandle::new(),
             diff_horizontal: crate::desktop_scroll::DiffScroll::new(diff_scroll.clone()),
@@ -472,6 +645,11 @@ impl Desktop {
         if id != view.id || diff.rows.is_empty() {
             return;
         }
+        let total = if self.word_wrap {
+            self.wrap_layout.rows.len()
+        } else {
+            diff.rows.len()
+        };
         let top =
             (-f32::from(self.diff_scroll.0.borrow().base_handle.offset().y) / 24.).max(0.) as usize;
         let top = if down {
@@ -479,18 +657,28 @@ impl Desktop {
         } else {
             top.saturating_sub(3)
         }
-        .min(diff.rows.len() - 1);
+        .min(total.saturating_sub(1));
         self.diff_scroll.scroll_to_item(top, ScrollStrategy::Top);
         let end = if down {
             top + (f32::from(bounds.size.height) / 24.).floor().max(1.) as usize - 1
         } else {
             top
         }
-        .min(diff.rows.len() - 1);
-        if let diff::Row::Line { left, right: r } = &diff.rows[end]
+        .min(total.saturating_sub(1));
+        let wrapped = self.word_wrap.then(|| &self.wrap_layout.rows[end]);
+        let source = wrapped.map_or(end, |r| r.source);
+        if let diff::Row::Line { left, right: r } = &diff.rows[source]
             && let Some(line) = if right { r.as_ref() } else { left.as_ref() }
         {
-            s.end = (end, if down { line.text.len() } else { 0 });
+            let span = wrapped.and_then(|r| r.sides[usize::from(right)].as_ref());
+            s.end = (
+                source,
+                if down {
+                    span.map_or(line.text.len(), |r| r.end)
+                } else {
+                    span.map_or(0, |r| r.start)
+                },
+            );
         }
         cx.notify();
     }
@@ -505,17 +693,11 @@ impl Desktop {
                 d.token = self.token.read(cx).value().to_string();
             }
         }
-        if matches!(
-            action,
-            Action::File(_)
-                | Action::NextFile(_)
-                | Action::Diff
-                | Action::Back
-                | Action::Select(_, _)
-        ) {
+        if matches!(action, Action::File(_) | Action::Diff) {
             *self.selection.borrow_mut() = Default::default();
             self.diff_horizontal.set_x(px(0.));
         }
+        self.context_menu = None;
         let app = &mut self.engine.app;
         if matches!(
             action,
@@ -536,7 +718,7 @@ impl Desktop {
                 }
                 app.settings.open = false;
                 app.branches.open = false;
-                app.close_diff();
+                app.park_diff();
                 app.clear_search();
                 if let Some(id) = app.head_id()
                     && let Some(i) = app.history.index_of(&id)
@@ -545,20 +727,65 @@ impl Desktop {
                 }
                 self.search.update(cx, |s, cx| s.set_value("", window, cx));
             }
-            Action::Branches => app.branches.show(app.refs.as_ref()),
-            Action::Settings => app.settings.show(),
-            Action::Back => {
-                if app.settings.saving {
-                    return;
-                }
-                if app.settings.open {
-                    app.settings.open = false;
-                } else if app.branches.open {
-                    app.branches.open = false;
-                    app.branches.pending_jump = None;
+            Action::Branches | Action::Tab(Tab::Branches) => {
+                app.park_diff();
+                app.settings.open = false;
+                if !self.branches_loaded {
+                    app.branches.show(app.refs.as_ref());
+                    self.branches_loaded = true;
                 } else {
-                    app.close_diff();
+                    app.branches.open = true;
                 }
+            }
+            Action::Settings | Action::Tab(Tab::Settings) => {
+                app.park_diff();
+                app.branches.open = false;
+                if !self.settings_loaded {
+                    app.settings.show();
+                    self.settings_loaded = true;
+                } else {
+                    app.settings.open = true;
+                }
+            }
+            Action::Tab(tab) => {
+                app.settings.open = false;
+                app.branches.open = false;
+                app.branches.pending_jump = None;
+                if tab == Tab::Diff {
+                    app.resume_diff();
+                } else {
+                    app.park_diff();
+                }
+            }
+            Action::Wrap => {
+                let top = (-f32::from(self.diff_scroll.0.borrow().base_handle.offset().y) / 24.)
+                    .max(0.) as usize;
+                self.wrap_anchor = Some(if self.word_wrap {
+                    self.wrap_layout.source(top)
+                } else {
+                    top
+                });
+                self.word_wrap = !self.word_wrap;
+                self.diff_horizontal.set_x(px(0.));
+            }
+            Action::Explorer | Action::Terminal => {
+                let terminal = matches!(action, Action::Terminal);
+                let path = self.engine.repository_path();
+                let weak = cx.entity().downgrade();
+                cx.spawn(async move |_, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { crate::desktop_shell::open(&path, terminal) })
+                        .await;
+                    if let Err(error) = result {
+                        let _ = weak.update(cx, |v, cx| {
+                            v.notice = error;
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+                return;
             }
             Action::Select(i, control) => {
                 let id = app.history_index(i).map(|i| app.history.commits[i].id);
@@ -587,7 +814,13 @@ impl Desktop {
                 }
                 self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
-            Action::Checkout => app.confirm_graph_checkout(),
+            Action::Checkout => {
+                if !app.pending.selected
+                    && let Some(id) = self.selected_commits.checkout_target(app.selected_id())
+                {
+                    app.confirm_commit_checkout(id);
+                }
+            }
             Action::Commit => app.request_commit(),
             Action::CheckAll(value) => {
                 if !app.pending.busy
@@ -606,21 +839,6 @@ impl Desktop {
             Action::Expand(value) => {
                 if let Some(cs) = app.active_changes_mut() {
                     cs.tree.set_all_expanded(value);
-                }
-            }
-            Action::NextFile(forward) => {
-                if let Some(v) = app.diff_view_mut()
-                    && let Some(current) = v.current
-                {
-                    let next = if forward {
-                        current
-                            .saturating_add(1)
-                            .min(v.changes.files.len().saturating_sub(1))
-                    } else {
-                        current.saturating_sub(1)
-                    };
-                    v.show(Some(next));
-                    self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 }
             }
             Action::File(node) => {
@@ -699,8 +917,10 @@ impl Desktop {
                 }
             }
         }
-        self.graph_scroll
-            .scroll_to_item(app.graph_selected(), ScrollStrategy::Center);
+        if matches!(action, Action::Head | Action::JumpBranch) {
+            self.graph_scroll
+                .scroll_to_item(app.graph_selected(), ScrollStrategy::Center);
+        }
         self.changed(cx);
         self.sync_inputs(window, cx);
     }
@@ -714,15 +934,16 @@ impl Desktop {
         let icon_name = match action {
             Action::Refresh => Some("refresh"),
             Action::Settings => Some("settings"),
-            Action::Back => Some("back"),
+            Action::Wrap => Some("wrap"),
+            Action::Explorer => Some("folder"),
+            Action::Terminal => Some("terminal"),
             Action::Head => Some("head"),
             Action::Branches => Some("branch"),
             Action::Diff => Some("diff"),
             Action::Checkout => Some("checkout"),
             Action::Expand(true) => Some("expand"),
             Action::Expand(false) => Some("collapse"),
-            Action::NextFile(true) => Some("next"),
-            Action::NextFile(false) => Some("back"),
+
             _ => None,
         };
         let text: SharedString = text.into();
@@ -744,7 +965,11 @@ impl Desktop {
             .px_2()
             .h(px(30.))
             .rounded_md()
-            .bg(rgb(0x253246))
+            .bg(rgb(if matches!(action, Action::Wrap) && self.word_wrap {
+                0x355378
+            } else {
+                0x253246
+            }))
             .text_color(rgb(if enabled { TEXT } else { MUTED }))
             .when(enabled, |s| {
                 s.cursor_pointer().hover(|s| s.bg(rgb(0x354764)))
@@ -755,7 +980,9 @@ impl Desktop {
                     gpui_component::tooltip::Tooltip::new(match n {
                         "settings" => "Settings",
                         "refresh" => "Refresh",
-                        "back" => "Back",
+                        "wrap" => "Toggle word wrap",
+                        "folder" => "Open in Explorer",
+                        "terminal" => "Open in Windows Terminal",
                         "expand" => "Expand folders",
                         "collapse" => "Collapse folders",
                         "diff" => "Diff selected commits (one or two)",
@@ -784,16 +1011,7 @@ impl Desktop {
                 v.engine.app.list_rows = range.len().max(1);
                 v.engine.app.scroll = range.start;
                 let app = &v.engine.app;
-                let graph_width = range
-                    .clone()
-                    .filter_map(|row| {
-                        app.history_index(row)
-                            .map(|i| app.history.row_cells(i).len())
-                    })
-                    .max()
-                    .unwrap_or(1)
-                    .clamp(1, 18) as f32
-                    * 14.;
+                let graph_width = v.graph_width;
                 range
                     .map(|row_index| {
                         let selected =
@@ -811,6 +1029,25 @@ impl Desktop {
                             .bg(rgb(if selected { 0x26354c } else { BG }))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(0x202c3f)))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |v, e: &MouseDownEvent, w, cx| {
+                                    let id = v
+                                        .engine
+                                        .app
+                                        .history_index(row_index)
+                                        .map(|i| v.engine.app.history.commits[i].id);
+                                    let selected = id.map_or(v.engine.app.pending.selected, |id| {
+                                        v.selected_commits.contains(id, v.engine.app.selected_id())
+                                    });
+                                    if !selected {
+                                        v.action(Action::Select(row_index, false), w, cx);
+                                    }
+                                    v.context_menu = Some(e.position);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
                             .on_click(cx.listener(move |v, e: &ClickEvent, window, cx| {
                                 v.action(
                                     Action::Select(row_index, e.modifiers().control),
@@ -960,26 +1197,35 @@ impl Desktop {
                     )
                     .child(self.search_box(cx))
                     .child(self.button("head", "HEAD", Action::Head, cx))
-                    .child(self.button("refresh", "", Action::Refresh, cx))
+                    .child(self.button("refresh", "", Action::Refresh, cx)),
+            )
+            .child(
+                column()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.scroll_region(0, list, Scrollbar::vertical(&self.graph_scroll), cx))
                     .child(
-                        self.button(
-                            "graph-diff",
-                            if self
-                                .selected_commits
-                                .ids(self.engine.app.selected_id())
-                                .len()
-                                == 2
-                            {
-                                "Compare"
-                            } else {
-                                "Diff"
-                            },
-                            Action::Diff,
-                            cx,
-                        ),
+                        div()
+                            .id("graph-column-divider")
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(self.graph_width + 8.))
+                            .w(px(5.))
+                            .cursor_col_resize()
+                            .bg(rgb(LINE))
+                            .hover(|s| s.bg(rgb(ACCENT)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|v, _, _, cx| {
+                                    v.resizing_graph = true;
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_click(|_, _, cx| cx.stop_propagation()),
                     ),
             )
-            .child(self.scroll_region(0, list, Scrollbar::vertical(&self.graph_scroll), cx))
             .into_any_element()
     }
     fn search_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -999,7 +1245,11 @@ impl Desktop {
                 row()
                     .gap_1()
                     .child(icon("search").text_color(rgb(MUTED)))
-                    .child(div().flex_1().child(Input::new(&self.search))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.search).cleanable(true)),
+                    ),
             )
             .when(self.search_help, |s| {
                 s.child(
@@ -1142,7 +1392,7 @@ impl Desktop {
                     .collect()
             }),
         )
-        .track_scroll(self.files_scroll.clone())
+        .track_scroll(if matches!(self.engine.app.mode,Mode::Diff(_)) {self.diff_files_scroll.clone()} else {self.files_scroll.clone()})
         .size_full();
         column()
             .flex_1()
@@ -1152,13 +1402,22 @@ impl Desktop {
                     .p_2()
                     .border_b_1()
                     .border_color(rgb(LINE))
-                    .child(caption("FILES"))
-                    .child(self.button("expand", "Expand", Action::Expand(true), cx))
-                    .child(self.button("collapse", "Collapse", Action::Expand(false), cx)),
+                    .child(div().flex_1().child(caption("FILES")))
+                    .child(self.button("expand", "", Action::Expand(true), cx))
+                    .child(self.button("collapse", "", Action::Expand(false), cx)),
             )
             .when(loading, |s| s.child(caption("Loading files…")))
             .when_some(error, |s, e| s.child(caption(e)))
-            .child(self.scroll_region(1, list, Scrollbar::vertical(&self.files_scroll), cx))
+            .child(self.scroll_region(
+                1,
+                list,
+                Scrollbar::vertical(if matches!(self.engine.app.mode, Mode::Diff(_)) {
+                    &self.diff_files_scroll
+                } else {
+                    &self.files_scroll
+                }),
+                cx,
+            ))
             .into_any_element()
     }
     fn details(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1203,33 +1462,69 @@ impl Desktop {
                     }),
             );
         } else {
-            panel = panel
-                .child(
-                    div()
-                        .h(px(360.))
-                        .flex_shrink_0()
-                        .p_3()
-                        .child(self.detail_text.clone()),
-                )
-                .child(
-                    row()
-                        .px_3()
-                        .pb_3()
-                        .child(self.button("diff", "Diff", Action::Diff, cx))
-                        .child(self.button("checkout", "Checkout…", Action::Checkout, cx)),
-                );
+            panel = panel.child(
+                div()
+                    .h(px(360.))
+                    .flex_shrink_0()
+                    .p_3()
+                    .child(self.detail_text.clone()),
+            );
         }
         panel.child(self.files(cx)).into_any_element()
     }
-    fn diff(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn diff(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Mode::Diff(view) = &self.engine.app.mode else {
             return div().into_any_element();
         };
-        let n = view.diff.as_ref().map_or(0, |d| d.rows.len());
+        let top =
+            (-f32::from(self.diff_scroll.0.borrow().base_handle.offset().y) / 24.).max(0.) as usize;
+        let source_top = self.wrap_layout.source(top);
+        let mut reflow = false;
+        if self.word_wrap
+            && let Some(diff) = &view.diff
+        {
+            let single = view.current_change().is_some_and(|c| {
+                matches!(c.kind, diff::ChangeKind::Added | diff::ChangeKind::Deleted)
+            });
+            let width = (f32::from(window.viewport_size().width) - self.diff_sidebar - 6.)
+                / if single { 1. } else { 2. }
+                - 68.;
+            let started = Instant::now();
+            reflow =
+                self.wrap_layout
+                    .update(view.id, view.current.unwrap_or(0), diff, width, window);
+            if reflow && self.scenario.as_deref() == Some("wrap-scroll") {
+                let elapsed = started.elapsed().as_secs_f64() * 1000.;
+                eprintln!("wrap layout {elapsed:.3} ms");
+            }
+        }
+        if let Some(source) = self
+            .wrap_anchor
+            .take()
+            .or_else(|| reflow.then_some(source_top))
+        {
+            self.diff_scroll.scroll_to_item(
+                if self.word_wrap {
+                    self.wrap_layout.visual(source)
+                } else {
+                    source
+                },
+                ScrollStrategy::Top,
+            );
+        }
+        let n = if self.word_wrap && view.diff.is_some() {
+            self.wrap_layout.rows.len()
+        } else {
+            view.diff.as_ref().map_or(0, |d| d.rows.len())
+        };
         let single_sided = view
             .current_change()
             .is_some_and(|c| matches!(c.kind, diff::ChangeKind::Added | diff::ChangeKind::Deleted));
-        let line_width = view.diff.as_ref().map_or(0., |d| d.max_width as f32 * 7.4);
+        let line_width = if self.word_wrap {
+            0.
+        } else {
+            view.diff.as_ref().map_or(0., |d| d.max_width as f32 * 7.4)
+        };
         let geometry = self.diff_horizontal.clone();
         let horizontal = self.diff_horizontal.clone();
         let list = uniform_list(
@@ -1245,39 +1540,45 @@ impl Desktop {
                 };
                 let kind = view.current_change().map(|c| c.kind);
                 range
-                    .map(|i| match &diff.rows[i] {
-                        diff::Row::Line { left, right } => row()
-                            .w_full()
-                            .h(px(24.))
-                            .gap_0()
-                            .when(kind != Some(diff::ChangeKind::Added), |r| {
-                                r.child(diff_line(
-                                    left.as_ref(),
-                                    false,
-                                    view.id,
-                                    i,
-                                    v.selection.clone(),
-                                    v.select_focus.clone(),
-                                    v.diff_horizontal.x.clone(),
-                                ))
-                            })
-                            .when(kind != Some(diff::ChangeKind::Deleted), |r| {
-                                r.child(diff_line(
-                                    right.as_ref(),
-                                    true,
-                                    view.id,
-                                    i,
-                                    v.selection.clone(),
-                                    v.select_focus.clone(),
-                                    v.diff_horizontal.x.clone(),
-                                ))
-                            }),
-                        diff::Row::Separator { skipped } => row()
-                            .w_full()
-                            .h(px(24.))
-                            .child(caption(format!("··· {skipped} unchanged lines ···"))),
-                        diff::Row::Message(s) => {
-                            row().w_full().h(px(24.)).child(caption(s.clone()))
+                    .map(|visual| {
+                        let wrapped = v.word_wrap.then(|| &v.wrap_layout.rows[visual]);
+                        let i = wrapped.map_or(visual, |r| r.source);
+                        match &diff.rows[i] {
+                            diff::Row::Line { left, right } => row()
+                                .w_full()
+                                .h(px(24.))
+                                .gap_0()
+                                .when(kind != Some(diff::ChangeKind::Added), |r| {
+                                    r.child(diff_line(
+                                        left.as_ref().filter(|_| {
+                                            wrapped.is_none_or(|r| r.sides[0].is_some())
+                                        }),
+                                        (view.id, i, false, visual),
+                                        wrapped.and_then(|r| r.sides[0].clone()),
+                                        v.selection.clone(),
+                                        v.select_focus.clone(),
+                                        v.diff_horizontal.x.clone(),
+                                    ))
+                                })
+                                .when(kind != Some(diff::ChangeKind::Deleted), |r| {
+                                    r.child(diff_line(
+                                        right.as_ref().filter(|_| {
+                                            wrapped.is_none_or(|r| r.sides[1].is_some())
+                                        }),
+                                        (view.id, i, true, visual),
+                                        wrapped.and_then(|r| r.sides[1].clone()),
+                                        v.selection.clone(),
+                                        v.select_focus.clone(),
+                                        v.diff_horizontal.x.clone(),
+                                    ))
+                                }),
+                            diff::Row::Separator { skipped } => row()
+                                .w_full()
+                                .h(px(24.))
+                                .child(caption(format!("··· {skipped} unchanged lines ···"))),
+                            diff::Row::Message(s) => {
+                                row().w_full().h(px(24.)).child(caption(s.clone()))
+                            }
                         }
                     })
                     .collect()
@@ -1327,13 +1628,7 @@ impl Desktop {
                                     .child(self.diff_path.clone()),
                             )
                             .when_some(view.diff.as_ref(), |s,d|s.child(diff_stats(d.added,d.removed)))
-                            .child(self.button(
-                                "previous-file",
-                                "Previous",
-                                Action::NextFile(false),
-                                cx,
-                            ))
-                            .child(self.button("next-file", "Next", Action::NextFile(true), cx)),
+                            .child(self.button("word-wrap", "", Action::Wrap, cx)),
                     )
                     .when(n == 0, |s| {
                         s.child(caption(if !view.changes.loaded {
@@ -1493,7 +1788,11 @@ impl Desktop {
                 row()
                     .p_3()
                     .child(icon("search"))
-                    .child(div().w(px(340.)).child(Input::new(&self.branch_filter)))
+                    .child(
+                        div()
+                            .w(px(340.))
+                            .child(Input::new(&self.branch_filter).cleanable(true)),
+                    )
                     .child(caption(format!("{} branches", browser.visible.len()))),
             )
             .when(browser.loading, |s| {
@@ -1570,9 +1869,10 @@ impl Desktop {
     fn scenario_ready(&self) -> bool {
         let app = &self.engine.app;
         match self.scenario.as_deref() {
-            Some("scroll" | "files-scroll" | "diff-scroll" | "diff-pan" | "search-scroll") => {
-                self.scroll_step > 121
-            }
+            Some(
+                "scroll" | "graph-resize" | "files-scroll" | "diff-scroll" | "diff-pan"
+                | "search-scroll" | "wrap-scroll" | "tabs",
+            ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
                 matches!(&app.mode,Mode::Diff(v) if v.diff.is_some())
@@ -1607,7 +1907,7 @@ impl Render for Desktop {
         } else if self.engine.app.branches.open {
             self.branches(cx)
         } else if matches!(self.engine.app.mode, Mode::Diff(_)) {
-            self.diff(cx)
+            self.diff(window, cx)
         } else {
             row()
                 .flex_1()
@@ -1721,6 +2021,26 @@ impl Render for Desktop {
                                     ScrollStrategy::Top,
                                 );
                             }
+                            Some("graph-resize") => {
+                                v.graph_width = if v.scroll_step.is_multiple_of(2) {
+                                    84.
+                                } else {
+                                    420.
+                                };
+                            }
+                            Some("tabs") => {
+                                if v.scroll_step.is_multiple_of(2) {
+                                    v.engine.app.park_diff();
+                                } else {
+                                    v.engine.app.resume_diff();
+                                }
+                            }
+                            Some("wrap-scroll") => {
+                                v.diff_scroll.scroll_to_item(
+                                    (v.scroll_step * 37) % v.wrap_layout.rows.len().max(1),
+                                    ScrollStrategy::Top,
+                                );
+                            }
                             Some("diff-scroll") => {
                                 let n = match &v.engine.app.mode {
                                     Mode::Diff(d) => d.diff.as_ref().map_or(0, |d| d.rows.len()),
@@ -1789,6 +2109,11 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && v.context_menu.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if v.select_focus.is_focused(window)
                     && e.keystroke.modifiers.control
                     && e.keystroke.key == "c"
@@ -1806,6 +2131,13 @@ impl Render for Desktop {
                 }
             }))
             .on_mouse_move(cx.listener(|v, e: &MouseMoveEvent, window, cx| {
+                if v.resizing_graph && e.pressed_button == Some(MouseButton::Left) {
+                    v.graph_width = (f32::from(e.position.x) - 8.).clamp(
+                        28.,
+                        (f32::from(window.viewport_size().width) - v.pane_width - 250.).max(28.),
+                    );
+                    cx.notify();
+                }
                 if v.resizing_diff && e.pressed_button == Some(MouseButton::Left) {
                     v.diff_sidebar = f32::from(e.position.x).clamp(200., 600.);
                     cx.notify();
@@ -1819,6 +2151,7 @@ impl Render for Desktop {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|v, _, _, _| {
+                    v.resizing_graph = false;
                     v.resizing = false;
                     v.resizing_diff = false;
                     v.selection.borrow_mut().dragging = false;
@@ -1828,6 +2161,7 @@ impl Render for Desktop {
                 MouseButton::Left,
                 cx.listener(|v, _, _, _| {
                     v.selection.borrow_mut().dragging = false;
+                    v.resizing_graph = false;
                     v.resizing = false;
                     v.resizing_diff = false;
                 }),
@@ -1843,10 +2177,6 @@ impl Render for Desktop {
                     .px_4()
                     .border_b_1()
                     .border_color(rgb(LINE))
-                    .when(
-                        app.settings.open || app.branches.open || matches!(app.mode, Mode::Diff(_)),
-                        |s| s.child(self.button("shell-back", "", Action::Back, cx)),
-                    )
                     .child(
                         column()
                             .flex_1()
@@ -1854,9 +2184,10 @@ impl Render for Desktop {
                             .child(div().text_size(px(18.)).child(app.repo_name.clone()))
                             .child(caption(self.engine.repository_path()).whitespace_nowrap()),
                     )
-                    .child(self.button("branches", "Branches", Action::Branches, cx))
-                    .child(self.button("settings", "", Action::Settings, cx)),
+                    .child(self.button("explorer", "", Action::Explorer, cx))
+                    .child(self.button("terminal", "", Action::Terminal, cx)),
             )
+            .child(self.tabs(cx))
             .child(content)
             .when(!status.is_empty(), |s| {
                 s.child(
@@ -1875,6 +2206,7 @@ impl Render for Desktop {
                 s.child(caption(self.notice.clone()))
             })
             .children(dialog)
+            .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
     }
 }
 
@@ -1888,16 +2220,37 @@ fn diff_stats(added: u32, removed: u32) -> Div {
 
 fn diff_line(
     line: Option<&diff::Line>,
-    added: bool,
-    view: u32,
-    index: usize,
+    id: (u32, usize, bool, usize),
+    span: Option<std::ops::Range<usize>>,
     selection: std::rc::Rc<std::cell::RefCell<crate::selectable::Selection>>,
     focus: FocusHandle,
     horizontal: std::rc::Rc<std::cell::Cell<Pixels>>,
 ) -> Div {
+    let added = id.2;
     let changed = line.is_some_and(|l| l.kind != diff::LineKind::Context);
-    let text = line.map(|l| l.text.clone()).unwrap_or_default();
-    let hl = line.map(|l| l.hl.clone()).unwrap_or_default();
+    let offset = span.as_ref().map_or(0, |r| r.start);
+    let text = line
+        .map(|l| {
+            span.as_ref()
+                .map_or_else(|| l.text.clone(), |r| l.text[r.clone()].to_string())
+        })
+        .unwrap_or_default();
+    let hl = line
+        .map(|l| {
+            if span.is_none() {
+                return l.hl.clone();
+            }
+            let start = l.text[..offset].chars().count();
+            let end = start + text.chars().count();
+            l.hl.iter()
+                .filter_map(|r| {
+                    let a = r.start.max(start);
+                    let b = r.end.min(end);
+                    (a < b).then_some(a.saturating_sub(start)..b.saturating_sub(start))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     row()
         .flex_1()
         .min_w_0()
@@ -1916,16 +2269,15 @@ fn diff_line(
                 .w(px(48.))
                 .flex_shrink_0()
                 .text_color(rgb(MUTED))
-                .child(line.map(|l| format!("{:>5}", l.no)).unwrap_or_default()),
+                .child(
+                    line.filter(|_| offset == 0)
+                        .map(|l| format!("{:>5}", l.no))
+                        .unwrap_or_default(),
+                ),
         )
         .when(line.is_some(), |s| {
             s.child(crate::selectable::line(
-                (view, index, added),
-                text,
-                hl,
-                selection,
-                focus,
-                horizontal,
+                id, text, hl, selection, focus, horizontal, offset,
             ))
         })
 }

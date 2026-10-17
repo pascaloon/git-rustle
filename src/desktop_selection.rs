@@ -4,6 +4,13 @@ pub struct Commits {
     explicit: Option<Vec<gix::ObjectId>>,
 }
 impl Commits {
+    pub fn checkout_target(&self, focused: Option<gix::ObjectId>) -> Option<gix::ObjectId> {
+        match self.explicit.as_deref() {
+            Some([id]) => Some(*id),
+            Some(_) => None,
+            None => focused,
+        }
+    }
     pub fn ids(&self, focused: Option<gix::ObjectId>) -> Vec<gix::ObjectId> {
         self.explicit
             .clone()
@@ -49,13 +56,16 @@ mod tests {
         let mut s = Commits::default();
         s.click(Some(id(2)), Some(id(1)), true);
         assert_eq!(s.ids(Some(id(2))), vec![id(1), id(2)]);
+        assert_eq!(s.checkout_target(Some(id(2))), None);
         s.click(Some(id(3)), Some(id(2)), true);
         assert_eq!(s.ids(None).len(), 3);
         s.click(Some(id(2)), Some(id(3)), true);
         assert_eq!(s.ids(None), vec![id(1), id(3)]);
         s.click(Some(id(4)), None, false);
         assert_eq!(s.ids(None), vec![id(4)]);
+        assert_eq!(s.checkout_target(Some(id(3))), Some(id(4)));
         s.click(Some(id(4)), None, true);
         assert!(s.ids(Some(id(4))).is_empty());
+        assert_eq!(s.checkout_target(Some(id(4))), None);
     }
 }

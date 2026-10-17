@@ -69,12 +69,13 @@ impl Selection {
     }
 }
 pub fn line(
-    id: (u32, usize, bool),
+    id: (u32, usize, bool, usize),
     text: String,
     highlights: Vec<Range<usize>>,
     selection: Rc<RefCell<Selection>>,
     focus: FocusHandle,
     horizontal: Rc<Cell<Pixels>>,
+    offset: usize,
 ) -> impl IntoElement {
     type LineLayout = Rc<RefCell<Option<(Bounds<Pixels>, ShapedLine)>>>;
     let layout: LineLayout = Rc::new(RefCell::new(None));
@@ -86,7 +87,7 @@ pub fn line(
     let hit_offset = horizontal.clone();
     let drag_offset = horizontal.clone();
     div()
-        .id((if id.2 { "right-text" } else { "left-text" }, id.1))
+        .id((if id.2 { "right-text" } else { "left-text" }, id.3))
         .flex_1()
         .min_w_0()
         .h_full()
@@ -98,12 +99,12 @@ pub fn line(
                     line.closest_index_for_x(event.position.x - bounds.left() - hit_offset.get());
                 let mut s = click_selection.borrow_mut();
                 s.id = Some((id.0, id.2));
-                s.anchor = (id.1, index);
-                s.end = (id.1, index);
+                s.anchor = (id.1, index + offset);
+                s.end = (id.1, index + offset);
                 s.dragging = event.click_count < 2;
                 if event.click_count >= 2 {
-                    s.anchor = (id.1, 0);
-                    s.end = (id.1, line.text.len());
+                    s.anchor = (id.1, offset);
+                    s.end = (id.1, offset + line.text.len());
                 }
                 window.focus(&focus);
                 window.refresh();
@@ -120,7 +121,10 @@ pub fn line(
             {
                 s.end = (
                     id.1,
-                    line.closest_index_for_x(event.position.x - bounds.left() - drag_offset.get()),
+                    offset
+                        + line.closest_index_for_x(
+                            event.position.x - bounds.left() - drag_offset.get(),
+                        ),
                 );
                 window.refresh();
             }
@@ -168,12 +172,18 @@ pub fn line(
                     }
                     let s = paint_selection.borrow();
                     if s.id == Some((id.0, id.2))
-                        && let Some(range) = s.range(id.1, line.text.len())
+                        && let Some(range) = s.range(id.1, offset + line.text.len())
                     {
                         window.paint_quad(fill(
                             Bounds::from_corners(
-                                point(left + line.x_for_index(range.start), bounds.top()),
-                                point(left + line.x_for_index(range.end), bounds.bottom()),
+                                point(
+                                    left + line.x_for_index(range.start.saturating_sub(offset)),
+                                    bounds.top(),
+                                ),
+                                point(
+                                    left + line.x_for_index(range.end.saturating_sub(offset)),
+                                    bounds.bottom(),
+                                ),
                             ),
                             rgba(0x7dcfff66),
                         ));
@@ -188,6 +198,24 @@ pub fn line(
 #[cfg(test)]
 mod tests {
     use super::Selection;
+    #[test]
+    fn wrapped_selection_copies_original_lines_without_visual_breaks() {
+        let text = "a long café line with spaces\nnext line 世界\n";
+        let diff = crate::diff::sidebyside::build(b"", text.as_bytes());
+        let s = Selection {
+            id: Some((1, true)),
+            anchor: (0, 7),
+            end: (1, "next line 世".len()),
+            ..Default::default()
+        };
+        assert_eq!(s.copy(&diff), "café line with spaces\nnext line 世");
+        // Each wrapped chunk clamps source offsets to its own byte range.
+        let range = s.range(0, 16).unwrap();
+        assert_eq!(
+            range.start.saturating_sub(7)..range.end.saturating_sub(7),
+            0..9
+        );
+    }
     #[test]
     fn backwards_block_copy_includes_collapsed_context_and_unicode() {
         let old = (1..30)
