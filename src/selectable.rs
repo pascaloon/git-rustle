@@ -1,6 +1,10 @@
 //! Single-line selection without a retained editor or parser per visible row.
 use gpui::{prelude::*, *};
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+};
 #[derive(Default)]
 pub struct Selection {
     pub id: Option<(u32, usize, bool)>,
@@ -20,6 +24,7 @@ pub fn line(
     highlights: Vec<Range<usize>>,
     selection: Rc<RefCell<Selection>>,
     focus: FocusHandle,
+    horizontal: Rc<Cell<Pixels>>,
 ) -> impl IntoElement {
     type LineLayout = Rc<RefCell<Option<(Bounds<Pixels>, ShapedLine)>>>;
     let layout: LineLayout = Rc::new(RefCell::new(None));
@@ -29,15 +34,19 @@ pub fn line(
     let click_selection = selection.clone();
     let click_text = text.clone();
     let display: SharedString = text.into();
+    let hit_offset = horizontal.clone();
+    let drag_offset = horizontal.clone();
     div()
         .id((if id.2 { "right-text" } else { "left-text" }, id.1))
         .flex_1()
+        .min_w_0()
         .h_full()
         .overflow_hidden()
         .cursor_text()
         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
             if let Some((bounds, line)) = hit.borrow().as_ref() {
-                let index = line.closest_index_for_x(event.position.x - bounds.left());
+                let index =
+                    line.closest_index_for_x(event.position.x - bounds.left() - hit_offset.get());
                 let mut s = click_selection.borrow_mut();
                 s.id = Some(id);
                 s.text = click_text.clone();
@@ -60,7 +69,8 @@ pub fn line(
                 && event.pressed_button == Some(MouseButton::Left)
                 && let Some((bounds, line)) = drag.borrow().as_ref()
             {
-                s.end = line.closest_index_for_x(event.position.x - bounds.left());
+                s.end =
+                    line.closest_index_for_x(event.position.x - bounds.left() - drag_offset.get());
                 window.refresh();
             }
         })
@@ -83,6 +93,7 @@ pub fn line(
                     )
                 },
                 move |bounds, line, window, cx| {
+                    let left = bounds.left() + horizontal.get();
                     for range in &highlights {
                         let start = line
                             .text
@@ -98,8 +109,8 @@ pub fn line(
                             .unwrap_or(line.text.len());
                         window.paint_quad(fill(
                             Bounds::from_corners(
-                                point(bounds.left() + line.x_for_index(start), bounds.top()),
-                                point(bounds.left() + line.x_for_index(end), bounds.bottom()),
+                                point(left + line.x_for_index(start), bounds.top()),
+                                point(left + line.x_for_index(end), bounds.bottom()),
                             ),
                             rgba(if id.2 { 0x4cba6644 } else { 0xf06c8444 }),
                         ));
@@ -108,24 +119,16 @@ pub fn line(
                     if s.id == Some(id) && s.text.as_str() == line.text.as_ref() {
                         window.paint_quad(fill(
                             Bounds::from_corners(
+                                point(left + line.x_for_index(s.anchor.min(s.end)), bounds.top()),
                                 point(
-                                    bounds.left() + line.x_for_index(s.anchor.min(s.end)),
-                                    bounds.top(),
-                                ),
-                                point(
-                                    bounds.left() + line.x_for_index(s.anchor.max(s.end)),
+                                    left + line.x_for_index(s.anchor.max(s.end)),
                                     bounds.bottom(),
                                 ),
                             ),
                             rgba(0x7dcfff66),
                         ));
                     }
-                    let _ = line.paint(
-                        point(bounds.left(), bounds.top() + px(3.)),
-                        px(18.),
-                        window,
-                        cx,
-                    );
+                    let _ = line.paint(point(left, bounds.top() + px(3.)), px(18.), window, cx);
                     *layout.borrow_mut() = Some((bounds, line));
                 },
             )

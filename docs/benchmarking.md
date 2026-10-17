@@ -55,6 +55,13 @@ The other intervals are worker request to result delivery. State summaries inclu
 maximum visible list-row counts to detect a zero-height viewport. They are not a
 substitute for visual or mouse/clipboard verification.
 
+For scrollbar or diff rendering changes, also run `-Scenarios files-scroll,diff-scroll,diff-pan`
+against a fixture with hundreds of changed files and a long, wide modified text file.
+These scenarios collect the same 120 frame intervals while moving the file list,
+the diff vertically, or both diff text panes horizontally. They do not measure mouse
+input latency. The pre-scrollbar-fix executable lacks these scenarios: report them
+as candidate-only measurements unless both executables include the instrumentation.
+
 For pending changes, create a disposable repository and use
 `-Scenarios pending,pending-diff`. The mutation component harness independently
 creates disposable repositories, commits a selected change to a new branch and

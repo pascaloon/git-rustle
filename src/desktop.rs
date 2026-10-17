@@ -4,7 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Root, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
-    scroll::Scrollbar,
+    scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
 
@@ -130,7 +130,8 @@ struct Desktop {
     files_scroll: UniformListScrollHandle,
     branches_scroll: UniformListScrollHandle,
     diff_scroll: UniformListScrollHandle,
-    diff_horizontal: ScrollHandle,
+    diff_horizontal: crate::desktop_scroll::DiffScroll,
+    hovered_scroll: [bool; 4],
     notice: String,
     close_requested: bool,
     settings_identity: Option<(u32, usize, usize)>,
@@ -257,7 +258,7 @@ impl Desktop {
                                 }
                                 Some("pending-diff") => v.action(Action::Diff, window, cx),
                                 Some("branches") => v.action(Action::Branches, window, cx),
-                                Some("diff") => {
+                                Some("diff" | "diff-scroll" | "diff-pan") => {
                                     v.action(Action::Head, window, cx);
                                     v.action(Action::Diff, window, cx);
                                 }
@@ -267,6 +268,24 @@ impl Desktop {
                                 }
                                 Some("settings") => v.action(Action::Settings, window, cx),
                                 _ => {}
+                            }
+                        }
+                        if v.scenario_started && v.scroll_step == 0 {
+                            let ready = match v.scenario.as_deref() {
+                                Some("files-scroll") => v
+                                    .engine
+                                    .app
+                                    .details_changes
+                                    .as_ref()
+                                    .is_some_and(|c| c.loaded && !c.tree.visible.is_empty()),
+                                Some("diff-scroll" | "diff-pan") => matches!(&v.engine.app.mode,
+                                    Mode::Diff(d) if d.diff.is_some()),
+                                _ => false,
+                            };
+                            if ready {
+                                v.scroll_step = 1;
+                                v.frame_start = Some(Instant::now());
+                                cx.notify();
                             }
                         }
                         if v.engine.app.needs_redraw {
@@ -296,6 +315,7 @@ impl Desktop {
                 }
             }
         });
+        let diff_scroll = UniformListScrollHandle::new();
         Self {
             engine,
             search,
@@ -308,8 +328,9 @@ impl Desktop {
             graph_scroll: UniformListScrollHandle::new(),
             files_scroll: UniformListScrollHandle::new(),
             branches_scroll: UniformListScrollHandle::new(),
-            diff_scroll: UniformListScrollHandle::new(),
-            diff_horizontal: ScrollHandle::new(),
+            diff_horizontal: crate::desktop_scroll::DiffScroll::new(diff_scroll.clone()),
+            diff_scroll,
+            hovered_scroll: [false; 4],
             notice: String::new(),
             close_requested: false,
             settings_identity: None,
@@ -401,7 +422,7 @@ impl Desktop {
             Action::File(_) | Action::NextFile(_) | Action::Diff | Action::Back | Action::Select(_)
         ) {
             *self.selection.borrow_mut() = Default::default();
-            self.diff_horizontal.set_offset(point(px(0.), px(0.)));
+            self.diff_horizontal.set_x(px(0.));
         }
         let app = &mut self.engine.app;
         if matches!(
@@ -738,15 +759,40 @@ impl Desktop {
                         self.engine.app.history.len()
                     ))),
             )
+            .child(self.scroll_region(0, list, Scrollbar::vertical(&self.graph_scroll), cx))
+            .into_any_element()
+    }
+    fn scroll_region(
+        &self,
+        slot: usize,
+        content: impl IntoElement,
+        scrollbar: Scrollbar,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(("scroll-region", slot))
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .on_hover(cx.listener(move |v, hovered, _, cx| {
+                v.hovered_scroll[slot] = *hovered;
+                cx.notify();
+            }))
+            .child(content)
             .child(
                 div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(list)
-                    .child(Scrollbar::vertical(&self.graph_scroll)),
+                    .absolute()
+                    .inset_0()
+                    .child(scrollbar.id(("scrollbar", slot)).scrollbar_show(
+                        if self.hovered_scroll[slot] {
+                            ScrollbarShow::Always
+                        } else {
+                            ScrollbarShow::Scrolling
+                        },
+                    )),
             )
-            .into_any_element()
     }
     fn files(&self, cx: &mut Context<Self>) -> AnyElement {
         let cs = match &self.engine.app.mode {
@@ -834,14 +880,7 @@ impl Desktop {
             )
             .when(loading, |s| s.child(caption("Loading files…")))
             .when_some(error, |s, e| s.child(caption(e)))
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(list)
-                    .child(Scrollbar::vertical(&self.files_scroll)),
-            )
+            .child(self.scroll_region(1, list, Scrollbar::vertical(&self.files_scroll), cx))
             .into_any_element()
     }
     fn details(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -915,9 +954,9 @@ impl Desktop {
         let single_sided = view
             .current_change()
             .is_some_and(|c| matches!(c.kind, diff::ChangeKind::Added | diff::ChangeKind::Deleted));
-        let diff_width = view.diff.as_ref().map_or(800., |d| {
-            (d.max_width as f32 * 7.4 + 60.) * if single_sided { 1. } else { 2. }
-        });
+        let line_width = view.diff.as_ref().map_or(0., |d| d.max_width as f32 * 7.4);
+        let geometry = self.diff_horizontal.clone();
+        let horizontal = self.diff_horizontal.clone();
         let path = view
             .current_change()
             .map(|c| c.path.clone())
@@ -948,6 +987,7 @@ impl Desktop {
                                     i,
                                     v.selection.clone(),
                                     v.select_focus.clone(),
+                                    v.diff_horizontal.x.clone(),
                                 ))
                             })
                             .when(kind != Some(diff::ChangeKind::Deleted), |r| {
@@ -958,6 +998,7 @@ impl Desktop {
                                     i,
                                     v.selection.clone(),
                                     v.select_focus.clone(),
+                                    v.diff_horizontal.x.clone(),
                                 ))
                             }),
                         diff::Row::Separator { skipped } => row()
@@ -972,9 +1013,7 @@ impl Desktop {
             }),
         )
         .track_scroll(self.diff_scroll.clone())
-        .w(px(diff_width.max(800.)))
-        .min_w_full()
-        .h_full();
+        .size_full();
         row()
             .flex_1()
             .min_h_0()
@@ -1008,8 +1047,16 @@ impl Desktop {
                     .child(
                         row()
                             .p_2()
+                            .flex_shrink_0()
                             .child(self.button("diff-back", "Back", Action::Back, cx))
-                            .child(path)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(path),
+                            )
                             .child(self.button(
                                 "previous-file",
                                 "Previous",
@@ -1018,23 +1065,62 @@ impl Desktop {
                             ))
                             .child(self.button("next-file", "Next", Action::NextFile(true), cx)),
                     )
-                    .when(n == 0, |s| s.child(caption("Loading diff…")))
+                    .when(n == 0, |s| {
+                        s.child(caption(if !view.changes.loaded {
+                            "Loading files…"
+                        } else if view.changes.error.is_some() {
+                            "Unable to load files"
+                        } else if view.current.is_none() {
+                            "No changed files"
+                        } else if view.diff.is_none() {
+                            "Loading diff…"
+                        } else {
+                            "No text changes"
+                        }))
+                    })
                     .child(
-                        div()
-                            .id("diff-horizontal")
-                            .flex_1()
-                            .min_h_0()
-                            .relative()
-                            .child(
-                                div()
-                                    .id("diff-horizontal-content")
-                                    .size_full()
-                                    .overflow_x_scroll()
-                                    .track_scroll(&self.diff_horizontal)
-                                    .child(list),
-                            )
-                            .child(Scrollbar::vertical(&self.diff_scroll))
-                            .child(Scrollbar::horizontal(&self.diff_horizontal)),
+                        self.scroll_region(
+                            2,
+                            div()
+                                .size_full()
+                                .relative()
+                                .child(
+                                    canvas(
+                                        move |bounds, _, _| {
+                                            geometry.configure(
+                                                bounds.size.width,
+                                                px(line_width),
+                                                single_sided,
+                                            );
+                                        },
+                                        move |bounds, _, window, _| {
+                                            // Capture before the vertical list can reinterpret an
+                                            // X-only (or Shift+wheel) gesture as vertical scrolling.
+                                            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                                                if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                                                    return;
+                                                }
+                                                let delta = event.delta.pixel_delta(px(24.));
+                                                let dx = if event.modifiers.shift && delta.x == px(0.) {
+                                                    delta.y
+                                                } else {
+                                                    delta.x
+                                                };
+                                                if dx != px(0.) {
+                                                    horizontal.set_x(horizontal.x.get() + dx);
+                                                    window.refresh();
+                                                    cx.stop_propagation();
+                                                }
+                                            });
+                                        },
+                                    )
+                                    .absolute()
+                                    .size_full(),
+                                )
+                                .child(list),
+                            Scrollbar::new(&self.diff_horizontal),
+                            cx,
+                        ),
                     ),
             )
             .into_any_element()
@@ -1105,14 +1191,7 @@ impl Desktop {
                 s.child(caption(browser.status.clone()))
             })
             .children(browser.errors.iter().cloned().map(caption))
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(list)
-                    .child(Scrollbar::vertical(&self.branches_scroll)),
-            )
+            .child(self.scroll_region(3, list, Scrollbar::vertical(&self.branches_scroll), cx))
             .into_any_element()
     }
     fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1183,7 +1262,7 @@ impl Desktop {
     fn scenario_ready(&self) -> bool {
         let app = &self.engine.app;
         match self.scenario.as_deref() {
-            Some("scroll") => self.scroll_step > 121,
+            Some("scroll" | "files-scroll" | "diff-scroll" | "diff-pan") => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff") => matches!(&app.mode,Mode::Diff(v) if v.diff.is_some()),
             Some("search") => app.search.result.as_ref().is_some_and(|r| r.done),
@@ -1313,8 +1392,37 @@ impl Render for Desktop {
                     }
                     v.scroll_step += 1;
                     if v.scroll_step <= 121 {
-                        let row = (v.scroll_step * 37) % v.engine.app.graph_len().max(1);
-                        v.graph_scroll.scroll_to_item(row, ScrollStrategy::Top);
+                        match v.scenario.as_deref() {
+                            Some("files-scroll") => {
+                                let n = v
+                                    .engine
+                                    .app
+                                    .details_changes
+                                    .as_ref()
+                                    .map_or(0, |c| c.tree.visible.len());
+                                v.files_scroll.scroll_to_item(
+                                    (v.scroll_step * 7) % n.max(1),
+                                    ScrollStrategy::Top,
+                                );
+                            }
+                            Some("diff-scroll") => {
+                                let n = match &v.engine.app.mode {
+                                    Mode::Diff(d) => d.diff.as_ref().map_or(0, |d| d.rows.len()),
+                                    _ => 0,
+                                };
+                                v.diff_scroll.scroll_to_item(
+                                    (v.scroll_step * 37) % n.max(1),
+                                    ScrollStrategy::Top,
+                                );
+                            }
+                            Some("diff-pan") => v
+                                .diff_horizontal
+                                .set_x(-px(((v.scroll_step * 37) % 1600) as f32)),
+                            _ => {
+                                let row = (v.scroll_step * 37) % v.engine.app.graph_len().max(1);
+                                v.graph_scroll.scroll_to_item(row, ScrollStrategy::Top);
+                            }
+                        }
                         v.frame_start = Some(Instant::now());
                         cx.notify();
                     } else {
@@ -1452,6 +1560,7 @@ fn diff_line(
     index: usize,
     selection: std::rc::Rc<std::cell::RefCell<crate::selectable::Selection>>,
     focus: FocusHandle,
+    horizontal: std::rc::Rc<std::cell::Cell<Pixels>>,
 ) -> Div {
     let changed = line.is_some_and(|l| l.kind != diff::LineKind::Context);
     let text = line.map(|l| l.text.clone()).unwrap_or_default();
@@ -1472,6 +1581,7 @@ fn diff_line(
         .child(
             div()
                 .w(px(48.))
+                .flex_shrink_0()
                 .text_color(rgb(MUTED))
                 .child(line.map(|l| format!("{:>5}", l.no)).unwrap_or_default()),
         )
@@ -1481,6 +1591,7 @@ fn diff_line(
             hl,
             selection,
             focus,
+            horizontal,
         ))
 }
 fn graph_canvas(

@@ -30,6 +30,9 @@ function Run-One([string]$scenario,[int]$sample) {
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
         'scroll' { 'desktop scroll done' }
+        'files-scroll' { 'desktop scroll done' }
+        'diff-scroll' { 'desktop scroll done' }
+        'diff-pan' { 'desktop scroll done' }
         'branches' { 'branch activity ready' }
         'diff' { 'file diff (' }
         'search' { 'search ready' }
@@ -50,8 +53,9 @@ function Run-One([string]$scenario,[int]$sample) {
         'pending' { 'pending status requested' }
         'pending-diff' { 'file diff requested' }
     }
-    $frames = if ($scenario -eq 'scroll') { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
-    if ($scenario -eq 'scroll' -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
+    $scrolling = $scenario -in @('scroll','files-scroll','diff-scroll','diff-pan')
+    $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
+    if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     [pscustomobject]@{scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames}
 }
 try {

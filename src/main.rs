@@ -20,6 +20,7 @@ mod term;
 mod ui;
 
 mod desktop;
+mod desktop_scroll;
 mod engine;
 mod selectable;
 use std::path::PathBuf;

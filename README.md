@@ -131,7 +131,8 @@ cargo clippy --all-targets -- -D warnings
 
 See [the benchmark workflow](docs/benchmarking.md) and
 [the GPUI migration report](docs/gpui-benchmarks.md), followed by
-[the visually verified usability fixes and measurements](docs/gpui-usability-benchmarks.md). Historical terminal reports
+[the visually verified usability fixes and measurements](docs/gpui-usability-benchmarks.md)
+and [scrollbar/diff fixes and measurements](docs/gpui-scroll-benchmarks.md). Historical terminal reports
 remain in `docs/`; they do not measure the desktop implementation. Terminal
 render/input adapters are retained as regression references for existing tests,
 but the executable enters GPUI and never opens a console input loop.
@@ -142,7 +143,7 @@ but the executable enters GPUI and never opens a console input loop.
 - `GIT_RUSTLE_TRACE=1`: additionally emit those milestones as they happen.
 - `GIT_RUSTLE_AUTOQUIT=<ms>`: exit after the first history frame and loading settles.
 - `GIT_RUSTLE_DUMP=<path>`: save a final model summary, not a screenshot.
-- `GIT_RUSTLE_SCENARIO=scroll|branches|diff|search|settings|pending|pending-diff`: run a non-mutating
+- `GIT_RUSTLE_SCENARIO=scroll|files-scroll|diff-scroll|diff-pan|branches|diff|search|settings|pending|pending-diff`: run a non-mutating
   desktop benchmark action after loading.
 - `GIT_RUSTLE_FRAME_SAMPLES=<path>`: save 120 scroll frame intervals after discarding
   one warm-up frame. These include scheduling/layout/paint submission and exclude
