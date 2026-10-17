@@ -8,8 +8,11 @@ pub mod changes;
 pub mod filetree;
 pub mod sidebyside;
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use gix::ObjectId;
 use gix::bstr::ByteSlice;
@@ -369,7 +372,70 @@ pub fn file_diff(repo: &gix::Repository, change: &FileChange) -> Result<FileDiff
             return Ok(FileDiff::message("File too large to diff".to_string()));
         }
     };
-    Ok(sidebyside::build(old, new))
+    let new = worktree_for_diff(repo, change, new)?;
+    Ok(sidebyside::build(old, &new))
+}
+
+/// Compare working files in the same representation Git stores in the index.
+/// Git's filter pipeline respects core.autocrlf and path-specific attributes;
+/// stripping CR ourselves would hide real changes for paths marked `-text`.
+fn worktree_for_diff<'a>(
+    repo: &gix::Repository,
+    change: &FileChange,
+    data: &'a [u8],
+) -> Result<std::borrow::Cow<'a, [u8]>> {
+    if !change.worktree
+        || !change
+            .old
+            .is_some_and(|side| matches!(side.kind, EntryKind::Blob | EntryKind::BlobExecutable))
+        || !data.windows(2).any(|pair| pair == b"\r\n")
+    {
+        return Ok(std::borrow::Cow::Borrowed(data));
+    }
+    // The main repository is opened with isolated configuration for fast startup.
+    // Working-file conversion needs Git's installation, system and user config as
+    // well: core.autocrlf is commonly set by Git for Windows, outside .git/config.
+    // Keep that repository on the worker thread so file stats don't reopen it for
+    // every path in a large pending change set.
+    thread_local! {
+        static FILTER_REPO: RefCell<Option<(PathBuf, gix::Repository)>> = const { RefCell::new(None) };
+    }
+    FILTER_REPO.with(|slot| {
+        let mut cached = slot.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|(path, _)| path != repo.git_dir())
+        {
+            let mut options = gix::open::Options::default();
+            options.permissions.config.git_binary = true;
+            options.permissions.attributes.git_binary = true;
+            let path = repo.workdir().unwrap_or_else(|| repo.git_dir());
+            let trust = gix::sec::trust::Mapping {
+                full: options.clone(),
+                reduced: options,
+            };
+            let full = gix::ThreadSafeRepository::discover_opts(path, Default::default(), trust)?
+                .to_thread_local();
+            *cached = Some((repo.git_dir().to_path_buf(), full));
+        }
+        let filter_repo = &cached.as_ref().expect("filter repo initialized").1;
+        let (mut pipeline, index) = filter_repo.filter_pipeline(None)?;
+        let result = pipeline.convert_to_git(data, Path::new(&change.path), &index)?;
+        if matches!(
+            result,
+            gix::filter::plumbing::pipeline::convert::ToGitOutcome::Unchanged(_)
+        ) {
+            return Ok(std::borrow::Cow::Borrowed(data));
+        }
+        let mut converted = Vec::with_capacity(data.len());
+        result
+            .take(MAX_BLOB as u64 + 1)
+            .read_to_end(&mut converted)?;
+        if converted.len() > MAX_BLOB {
+            return Err("Filtered file too large to diff".into());
+        }
+        Ok(std::borrow::Cow::Owned(converted))
+    })
 }
 
 /// Line counts for one changed file.
@@ -411,7 +477,8 @@ pub fn file_stats(repo: &gix::Repository, change: &FileChange) -> Result<Stat> {
             removed: 0,
         },
         (Loaded::Text(o), Loaded::Text(n)) => {
-            let (added, removed) = sidebyside::counts(o, n);
+            let n = worktree_for_diff(repo, change, n)?;
+            let (added, removed) = sidebyside::counts(o, &n);
             Stat::Lines { added, removed }
         }
     })

@@ -10,7 +10,7 @@ gpui = { version = "=0.2.2", default-features = false, features = ["windows-mani
 gpui-component = "=0.5.1"
 async-channel = "2"
 futures-lite = "2"
-gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "sha1"] }
+gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "sha1", "attributes"] }
 unicode-width = "0.2"
 imara-diff = "0.2"
 serde = { version = "1", features = ["derive"] }

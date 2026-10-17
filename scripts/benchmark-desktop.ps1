@@ -44,6 +44,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'search-scroll' { 'desktop scroll done' }
         'wrap-scroll' { 'desktop scroll done' }
         'tabs' { 'desktop scroll done' }
+        'settings-tabs' { 'desktop scroll done' }
         'compare' { 'file diff (' }
         'branches' { 'branch activity ready' }
         'diff' { 'file diff (' }
@@ -66,7 +67,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     [pscustomobject]@{binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}

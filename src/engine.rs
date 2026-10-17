@@ -350,7 +350,14 @@ impl Engine {
         thread::spawn(move || {
             let result =
                 git::open(&path).and_then(|repo| Ok((repo.clone(), git::snapshot_refs(&repo)?)));
+            let opened = result.is_ok();
             let _ = repo_tx.send_blocking(Msg::Repo(Box::new(result)));
+            if opened {
+                // Git for Windows config-path discovery may launch Git once.
+                // Warm its shared cache on this worker before a pending file
+                // diff needs the full Git filter configuration.
+                let _ = gix::path::env::installation_config();
+            }
         });
         let mut app = App::new();
         app.pending.known = false;
@@ -911,7 +918,10 @@ impl Engine {
                     }
                 }
                 Msg::Settings(session, outcome) => {
-                    if matches!(&outcome, settings::Outcome::Saved(Ok(_))) {
+                    if matches!(
+                        &outcome,
+                        settings::Outcome::Saved(Ok(_)) | settings::Outcome::SavedPage(Ok(_))
+                    ) {
                         self.preview_epoch = self.preview_epoch.wrapping_add(1);
                         self.preview_cancel.store(true, Ordering::Relaxed);
                         self.preview_wanted = false;

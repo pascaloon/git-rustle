@@ -31,7 +31,8 @@ cargo test --release engine::tests::benchmark_desktop_mutations -- `
 
 `-NativeCandidate` launches the GPUI window normally; the baseline console stays
 hidden. For comparisons between two GPUI builds, also pass `-NativeBaseline`
-to `benchmark.ps1`. Hiding the native window prevents a meaningful GPU frame measurement.
+to `benchmark.ps1` and `benchmark-remote-preview.ps1`. Hiding the native window
+prevents a meaningful GPU frame measurement.
 Keep the desktop unlocked and the app visible. Native windows appear briefly for
 each sample. Do not compare a minimized/occluded GPU window with a visible one.
 The standard startup script retains one warm-up and 15 alternating measured
@@ -49,6 +50,10 @@ and worktree polling still wait until the first native frame.
 
 The desktop suite runs scroll, branch activity, selected-file diff, metadata
 search and settings-load scenarios through the same action methods as the UI.
+For Settings changes, compare `-Scenarios settings` against the preserved baseline.
+Also run candidate-only `-Scenarios settings-tabs` to cycle Project/GitLab/GitHub
+through the UI action handlers for 120 measured next-frame intervals. This includes
+input synchronization and rendering, but excludes physical pointer/keyboard latency.
 Each scenario gets one discarded launch and 15 measured launches. Scroll collects
 121 next-frame intervals and discards the first, saving 120 raw intervals per
 launch. This includes event-loop scheduling, layout and paint submission; it

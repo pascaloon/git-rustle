@@ -13,6 +13,7 @@ mod git;
 mod graph;
 mod model;
 mod pending;
+mod provider_settings;
 mod remote;
 mod search;
 mod settings;

@@ -83,15 +83,28 @@ pub enum Request {
     Load,
     Test(Draft),
     Save(Draft),
+    SaveProject(Configuration),
+    SaveProvider(Provider, crate::provider_settings::Draft),
 }
 pub enum Outcome {
     Loaded(Result<Vec<Configuration>, String>),
     Tested(Result<String, String>),
     Saved(Result<String, String>),
+    LoadedAll(Result<Loaded, String>),
+    SavedPage(Result<String, String>),
+}
+
+pub struct Loaded {
+    configs: Vec<Configuration>,
+    providers: [crate::provider_settings::Draft; 2],
 }
 
 #[derive(Default)]
 pub struct Settings {
+    pub page: usize,
+    pub project_selected: usize,
+    pub projects: Vec<Configuration>,
+    pub providers: [crate::provider_settings::Draft; 2],
     pub open: bool,
     pub session: u32,
     pub tab: usize,
@@ -113,6 +126,8 @@ impl Settings {
         self.saving = false;
         self.field = 0;
         self.drafts = Default::default();
+        self.projects.clear();
+        self.providers = Default::default();
         self.status = "Loading repository remotes…".into();
         self.error = false;
         self.request = Some(Request::Load);
@@ -129,6 +144,36 @@ impl Settings {
         self.busy = false;
         self.saving = false;
         match outcome {
+            Outcome::LoadedAll(Ok(loaded)) => {
+                self.projects = loaded.configs.clone();
+                self.project_selected = self
+                    .project_selected
+                    .min(self.projects.len().saturating_sub(1));
+                self.providers = loaded.providers;
+                self.finish(Outcome::Loaded(Ok(loaded.configs)));
+                self.status = "Project settings apply here. GitLab and GitHub settings apply to all projects.".into();
+            }
+            Outcome::SavedPage(Ok(message)) => {
+                if self.page > 0 {
+                    let draft = &mut self.providers[self.page - 1];
+                    draft.has_token = !draft.forget && (!draft.token.is_empty() || draft.has_token);
+                    draft.saved_url = draft
+                        .validated_url(if self.page == 1 {
+                            Provider::Gitlab
+                        } else {
+                            Provider::Github
+                        })
+                        .unwrap_or_else(|_| draft.url.clone());
+                    draft.token.clear();
+                    draft.forget = false;
+                }
+                self.status = message;
+                self.error = false;
+            }
+            Outcome::LoadedAll(Err(error)) | Outcome::SavedPage(Err(error)) => {
+                self.status = error;
+                self.error = true;
+            }
             Outcome::Loaded(Ok(configs)) => {
                 for (tab, provider) in [Provider::Gitlab, Provider::Github].into_iter().enumerate()
                 {
@@ -182,6 +227,37 @@ impl Settings {
                 self.status = message;
                 self.error = false;
             }
+        }
+    }
+
+    pub fn save_page(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.request = if self.page == 0 {
+            self.projects
+                .get(self.project_selected)
+                .cloned()
+                .map(Request::SaveProject)
+        } else {
+            let provider = if self.page == 1 {
+                Provider::Gitlab
+            } else {
+                Provider::Github
+            };
+            let draft = self.providers[self.page - 1].clone();
+            if let Err(error) = draft.validated_url(provider) {
+                self.status = error;
+                self.error = true;
+                return;
+            }
+            Some(Request::SaveProvider(provider, draft))
+        };
+        if self.request.is_some() {
+            self.busy = true;
+            self.saving = true;
+            self.error = false;
+            self.status = "Saving settings…".into();
         }
     }
 
@@ -339,7 +415,30 @@ impl Settings {
 
 pub fn execute(path: &Path, request: Request) -> Outcome {
     match request {
-        Request::Load => Outcome::Loaded(remote::configurations(path)),
+        Request::Load => Outcome::LoadedAll((|| {
+            let settings = crate::provider_settings::load()?;
+            Ok(Loaded {
+                configs: remote::configurations(path)?,
+                providers: [
+                    crate::provider_settings::Draft::load(&settings, Provider::Gitlab)?,
+                    crate::provider_settings::Draft::load(&settings, Provider::Github)?,
+                ],
+            })
+        })()),
+        Request::SaveProvider(provider, draft) => {
+            Outcome::SavedPage(crate::provider_settings::save(provider, &draft))
+        }
+        Request::SaveProject(mut config) => Outcome::SavedPage((|| {
+            config.project = config
+                .project
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| p.trim().to_string());
+            let mut resolved = config.clone();
+            crate::provider_settings::load()?.apply(&mut resolved);
+            resolved.remote()?;
+            save_config(path, &config, || Ok(()))?;
+            Ok("Saved for this project. Remote branches will refresh automatically.".into())
+        })()),
         Request::Test(draft) => Outcome::Tested(draft.validated().and_then(|config| {
             let remote = config.remote()?;
             remote::test_connection(
@@ -582,5 +681,47 @@ mod tests {
                 .as_deref(),
             Some("team/subgroup/project")
         );
+    }
+
+    #[test]
+    fn project_save_keeps_transport_and_existing_api_override() {
+        let dir = fixture();
+        let mut config = config();
+        config.provider = Some("gitlab".into());
+        config.project = Some("team/renamed".into());
+        match execute(dir.path(), Request::SaveProject(config)) {
+            Outcome::SavedPage(Ok(_)) => {}
+            _ => panic!("project save failed"),
+        }
+        let configs = remote::configurations(dir.path()).unwrap();
+        assert_eq!(configs[0].url, self::config().url);
+        assert_eq!(configs[0].api_url, self::config().api_url);
+        assert_eq!(configs[0].project.as_deref(), Some("team/renamed"));
+        assert!(configs[0].remote().is_ok());
+    }
+
+    #[test]
+    fn global_drafts_can_save_without_project_remotes_and_remain_independent() {
+        let mut settings = Settings {
+            page: 1,
+            ..Default::default()
+        };
+        settings.providers[0].url = "https://gitlab.com".into();
+        settings.providers[1].url = "https://github.com".into();
+        settings.providers[0].token = "new-token".into();
+        settings.save_page();
+        assert!(matches!(
+            settings.request,
+            Some(Request::SaveProvider(Provider::Gitlab, _))
+        ));
+        settings.finish(Outcome::SavedPage(Ok("saved".into())));
+        assert!(settings.providers[0].has_token);
+        assert!(settings.providers[0].token.is_empty());
+        assert_eq!(
+            settings.providers[0].token_text(),
+            crate::provider_settings::MASK
+        );
+        assert!(!settings.providers[1].has_token);
+        assert_eq!(settings.providers[1].url, "https://github.com");
     }
 }

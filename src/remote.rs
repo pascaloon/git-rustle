@@ -286,9 +286,9 @@ fn configuration_data(path: &Path) -> Result<(Vec<Configuration>, Upstreams), St
         item.name = name.to_string();
         match field {
             "url" if item.url.is_empty() => item.url = value.to_string(),
-            "rustle-provider" => item.provider = Some(value.to_string()),
-            "rustle-api-url" => item.api_url = Some(value.to_string()),
-            "rustle-project" => item.project = Some(value.to_string()),
+            "rustle-provider" => item.provider = (!value.is_empty()).then(|| value.to_string()),
+            "rustle-api-url" => item.api_url = (!value.is_empty()).then(|| value.to_string()),
+            "rustle-project" => item.project = (!value.is_empty()).then(|| value.to_string()),
             _ => {}
         }
     }
@@ -303,9 +303,11 @@ fn configuration_data(path: &Path) -> Result<(Vec<Configuration>, Upstreams), St
 
 fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>, Upstreams), String> {
     let (configurations, upstreams) = configuration_data(path)?;
+    let providers = crate::provider_settings::load()?;
     let mut remotes = Vec::new();
     let mut unsupported = Vec::new();
-    for config in configurations {
+    for mut config in configurations {
+        providers.apply(&mut config);
         match config.remote() {
             Ok(remote) => remotes.push(remote),
             Err(_) => unsupported.push(command::clean(&config.name)),
@@ -391,7 +393,10 @@ fn helper_token(path: &Path, remote: &Remote) -> Option<String> {
 }
 
 fn cached_token(path: &Path, git_dir: &Path, remote: &Remote) -> Result<Option<String>, String> {
-    if let Some(token) = crate::credentials::read(&remote.endpoint)?.or_else(|| env_token(remote)) {
+    if let Some(token) = crate::provider_settings::token(remote)?
+        .or(crate::credentials::read(&remote.endpoint)?)
+        .or_else(|| env_token(remote))
+    {
         return Ok(Some(token));
     }
     let key = (path.to_path_buf(), remote.endpoint.clone());
@@ -764,7 +769,7 @@ pub fn test_connection(
     let saved = if forget || replacement.is_some() {
         None
     } else {
-        crate::credentials::read(&remote.endpoint)?
+        crate::provider_settings::token(remote)?.or(crate::credentials::read(&remote.endpoint)?)
     };
     let mut token = replacement
         .map(str::to_string)

@@ -5,9 +5,11 @@ use crate::desktop_theme::*;
 use crate::{app::Mode, diff, engine::Engine, graph::layout::CellKind};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable, Root,
+    Disableable, Root, Sizable,
+    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
@@ -115,7 +117,7 @@ enum Action {
     CancelCheckout,
     SettingsTab(usize),
     SettingsRemote(usize),
-    TestSettings,
+    SettingsProvider(Option<&'static str>),
     SaveSettings,
     ForgetToken,
 }
@@ -123,7 +125,7 @@ enum Action {
 struct Desktop {
     engine: Engine,
     search: Entity<InputState>,
-    search_help: bool,
+    search_field: &'static str,
     matches: Matches,
     branch_matches: Matches,
     selected_commits: crate::desktop_selection::Commits,
@@ -185,6 +187,51 @@ fn caption(s: impl Into<SharedString>) -> Div {
         .child(s.into())
 }
 
+// Keep typed field prefixes working while the inset selector supplies the default.
+// An empty input must clear the filter even when a field remains selected.
+fn search_query(field: &str, text: &str) -> String {
+    if text.trim().is_empty() {
+        String::new()
+    } else if matches!(text.trim_start().get(..2), Some("m:" | "a:" | "s:" | "f:")) {
+        text.to_string()
+    } else {
+        format!("{field}{text}")
+    }
+}
+
+fn toolbar_filter(input: &Entity<InputState>, cx: &App) -> Input {
+    Input::new(input)
+        .small()
+        .min_h(px(30.))
+        .py_0()
+        .cleanable(true)
+        .when(input.read(cx).value().is_empty(), |s| {
+            s.prefix(icon("search").text_color(rgb(MUTED)))
+        })
+}
+
+fn tab_bar() -> Div {
+    row()
+        .h(px(38.))
+        .flex_shrink_0()
+        .gap_0()
+        .px_3()
+        .border_b_1()
+        .border_color(rgb(LINE))
+}
+
+fn tab_item(id: impl Into<ElementId>, active: bool, enabled: bool) -> Stateful<Div> {
+    row()
+        .id(id)
+        .h_full()
+        .px_4()
+        .border_b_2()
+        .border_color(rgb(if active { ACCENT } else { BG }))
+        .bg(rgb(if active { PANEL } else { BG }))
+        .text_color(rgb(if enabled { TEXT } else { MUTED }))
+        .when(enabled, |s| s.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
+}
+
 impl Desktop {
     fn tabs(&self, cx: &Context<Self>) -> AnyElement {
         let app = &self.engine.app;
@@ -198,13 +245,7 @@ impl Desktop {
             Tab::Graph
         };
         let has_diff = app.parked_diff.is_some() || matches!(app.mode, Mode::Diff(_));
-        row()
-            .h(px(38.))
-            .flex_shrink_0()
-            .gap_0()
-            .px_3()
-            .border_b_1()
-            .border_color(rgb(LINE))
+        tab_bar()
             .children(
                 [
                     (Tab::Graph, "graph", "Git Graph"),
@@ -216,15 +257,7 @@ impl Desktop {
                 .filter(|(t, _, _)| *t != Tab::Diff || has_diff)
                 .enumerate()
                 .map(|(i, (tab, name, label))| {
-                    row()
-                        .id(("tab", i))
-                        .h_full()
-                        .px_4()
-                        .cursor_pointer()
-                        .border_b_2()
-                        .border_color(rgb(if current == tab { ACCENT } else { BG }))
-                        .bg(rgb(if current == tab { PANEL } else { BG }))
-                        .hover(|s| s.bg(rgb(HOVER)))
+                    tab_item(("tab", i), current == tab, true)
                         .child(icon(name))
                         .child(label)
                         .on_click(cx.listener(move |v, _, w, cx| v.action(Action::Tab(tab), w, cx)))
@@ -338,24 +371,24 @@ impl Desktop {
                 .placeholder("Access token")
         });
         let subscriptions = vec![
+            cx.subscribe_in(&token, window, |v, state, event, window, cx| {
+                if matches!(event, InputEvent::Focus)
+                    && v.engine.app.settings.page > 0
+                    && state.read(cx).value() == crate::provider_settings::MASK
+                {
+                    window.defer(cx, |window, cx| {
+                        window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+                    });
+                }
+            }),
             cx.subscribe(&search, |v, state, event, cx| {
                 if matches!(event, InputEvent::Change) {
-                    v.engine.app.search.text.value = state.read(cx).value().to_string();
+                    v.engine.app.search.text.value =
+                        search_query(v.search_field, &state.read(cx).value());
                     v.matches = Matches::new(&v.engine.app.search.text.value);
                     v.selected_commits.clear();
                     v.engine.app.search.changed();
                     v.changed(cx);
-                }
-                match event {
-                    InputEvent::Focus => {
-                        v.search_help = true;
-                        cx.notify();
-                    }
-                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
-                        v.search_help = false;
-                        cx.notify();
-                    }
-                    _ => {}
                 }
             }),
             cx.subscribe(&branch_filter, |v, state, event, cx| {
@@ -429,7 +462,9 @@ impl Desktop {
                                     v.search
                                         .update(cx, |s, cx| s.set_value("m: merge", window, cx));
                                 }
-                                Some("settings") => v.action(Action::Settings, window, cx),
+                                Some("settings" | "settings-tabs") => {
+                                    v.action(Action::Settings, window, cx)
+                                }
                                 Some("compare") => {
                                     v.action(Action::Select(0, false), window, cx);
                                     v.action(Action::Select(1, true), window, cx);
@@ -448,6 +483,9 @@ impl Desktop {
                         }
                         if v.scenario_started && v.scroll_step == 0 {
                             let ready = match v.scenario.as_deref() {
+                                Some("settings-tabs") => {
+                                    v.engine.app.settings.open && !v.engine.app.settings.busy
+                                }
                                 Some("search-scroll") => v
                                     .engine
                                     .app
@@ -507,7 +545,7 @@ impl Desktop {
         Self {
             engine,
             search,
-            search_help: false,
+            search_field: "",
             matches: Matches::default(),
             branch_matches: Matches::default(),
             selected_commits: Default::default(),
@@ -569,20 +607,30 @@ impl Desktop {
         if app.settings.open && !app.settings.busy {
             let key = (
                 app.settings.session,
-                app.settings.tab,
-                app.settings.selected[app.settings.tab],
+                app.settings.page,
+                app.settings.project_selected,
             );
             if self.settings_identity != Some(key) {
                 self.settings_identity = Some(key);
-                if let Some(d) = app.settings.current() {
-                    self.api.update(cx, |s, cx| {
-                        s.set_value(d.config.api_url.clone().unwrap_or_default(), window, cx)
-                    });
-                    self.project.update(cx, |s, cx| {
-                        s.set_value(d.config.project.clone().unwrap_or_default(), window, cx)
-                    });
+                if app.settings.page == 0 {
+                    let project = app
+                        .settings
+                        .projects
+                        .get(app.settings.project_selected)
+                        .and_then(|d| {
+                            d.project
+                                .clone()
+                                .or_else(|| d.remote().ok().map(|r| r.project))
+                        })
+                        .unwrap_or_default();
+                    self.project
+                        .update(cx, |s, cx| s.set_value(project, window, cx));
+                } else {
+                    let d = &app.settings.providers[app.settings.page - 1];
+                    self.api
+                        .update(cx, |s, cx| s.set_value(d.url.clone(), window, cx));
                     self.token
-                        .update(cx, |s, cx| s.set_value(d.token.clone(), window, cx));
+                        .update(cx, |s, cx| s.set_value(d.token_text(), window, cx));
                 }
             }
         }
@@ -673,14 +721,24 @@ impl Desktop {
         cx.notify();
     }
     fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(action, Action::SettingsTab(_) | Action::SettingsRemote(_))
-            && self.settings_identity.is_some()
+        if matches!(
+            action,
+            Action::SettingsTab(_)
+                | Action::SettingsRemote(_)
+                | Action::SaveSettings
+                | Action::ForgetToken
+        ) && self.settings_identity.is_some()
+            && !self.engine.app.settings.busy
         {
             let s = &mut self.engine.app.settings;
-            if let Some(d) = s.drafts[s.tab].get_mut(s.selected[s.tab]) {
-                d.config.api_url = Some(self.api.read(cx).value().to_string());
-                d.config.project = Some(self.project.read(cx).value().to_string());
-                d.token = self.token.read(cx).value().to_string();
+            if s.page == 0 {
+                if let Some(d) = s.projects.get_mut(s.project_selected) {
+                    d.project = Some(self.project.read(cx).value().to_string());
+                }
+            } else {
+                let d = &mut s.providers[s.page - 1];
+                d.url = self.api.read(cx).value().to_string();
+                d.set_token_text(self.token.read(cx).value().to_string());
             }
         }
         if matches!(action, Action::File(_) | Action::Diff) {
@@ -783,6 +841,7 @@ impl Desktop {
                 app.select_graph(i);
             }
             Action::SearchField(prefix) => {
+                self.search_field = prefix;
                 let text = self.search.read(cx).value().to_string();
                 let text = text.trim();
                 let value = if matches!(text.get(..2), Some("m:" | "a:" | "s:" | "f:")) {
@@ -791,10 +850,9 @@ impl Desktop {
                     text
                 };
                 self.search.update(cx, |s, cx| {
-                    s.set_value(format!("{prefix}{value}"), window, cx);
+                    s.set_value(value.to_string(), window, cx);
                     s.focus(window, cx);
                 });
-                self.search_help = false;
             }
             Action::Diff => {
                 if app.pending.selected {
@@ -888,27 +946,28 @@ impl Desktop {
             }
             Action::SettingsTab(i) => {
                 if !app.settings.busy {
-                    app.settings.tab = i;
+                    app.settings.page = i;
                 }
             }
             Action::SettingsRemote(i) => {
                 if !app.settings.busy {
-                    app.settings.selected[app.settings.tab] = i;
+                    app.settings.project_selected = i;
                 }
             }
-            Action::TestSettings | Action::SaveSettings => {
-                let tab = app.settings.tab;
-                if let Some(d) = app.settings.drafts[tab].get_mut(app.settings.selected[tab]) {
-                    d.config.api_url = Some(self.api.read(cx).value().to_string());
-                    d.config.project = Some(self.project.read(cx).value().to_string());
-                    d.token = self.token.read(cx).value().to_string();
+            Action::SettingsProvider(provider) => {
+                if !app.settings.busy
+                    && let Some(d) = app.settings.projects.get_mut(app.settings.project_selected)
+                {
+                    d.provider = provider.map(str::to_string);
                 }
-                app.settings.action(matches!(action, Action::SaveSettings));
             }
+            Action::SaveSettings => app.settings.save_page(),
             Action::ForgetToken => {
-                let t = app.settings.tab;
-                if let Some(d) = app.settings.drafts[t].get_mut(app.settings.selected[t]) {
+                if !app.settings.busy && app.settings.page > 0 {
+                    let d = &mut app.settings.providers[app.settings.page - 1];
                     d.forget = !d.forget;
+                    d.token.clear();
+                    self.settings_identity = None;
                 }
             }
         }
@@ -943,14 +1002,38 @@ impl Desktop {
             _ => None,
         };
         let text: SharedString = text.into();
-        let enabled = !matches!(action, Action::Diff)
+        let enabled = (!matches!(action, Action::Diff)
             || self.engine.app.pending.selected
             || matches!(
                 self.selected_commits
                     .ids(self.engine.app.selected_id())
                     .len(),
                 1 | 2
-            );
+            ))
+            && (!matches!(
+                action,
+                Action::SettingsTab(_)
+                    | Action::SettingsRemote(_)
+                    | Action::SettingsProvider(_)
+                    | Action::SaveSettings
+                    | Action::ForgetToken
+            ) || !self.engine.app.settings.busy)
+            && (!matches!(action, Action::SaveSettings)
+                || self.engine.app.settings.page > 0
+                || !self.engine.app.settings.projects.is_empty());
+        let active = match action {
+            Action::SettingsTab(i) => self.engine.app.settings.page == i,
+            Action::SettingsProvider(provider) => self
+                .engine
+                .app
+                .settings
+                .projects
+                .get(self.engine.app.settings.project_selected)
+                .is_some_and(|d| d.provider.as_deref() == provider),
+            Action::Wrap => self.word_wrap,
+            _ => false,
+        };
+        let save = matches!(action, Action::SaveSettings);
         div()
             .id(id)
             .flex()
@@ -961,14 +1044,25 @@ impl Desktop {
             .px_2()
             .h(px(30.))
             .rounded_md()
-            .bg(rgb(if matches!(action, Action::Wrap) && self.word_wrap {
+            .bg(rgb(if save && enabled {
+                ACCENT
+            } else if active {
                 SELECTED
             } else {
                 CONTROL
             }))
-            .text_color(rgb(if enabled { TEXT } else { MUTED }))
+            .text_color(rgb(if save && enabled {
+                BG
+            } else if active {
+                ACCENT
+            } else if enabled {
+                TEXT
+            } else {
+                MUTED
+            }))
             .when(enabled, |s| {
-                s.cursor_pointer().hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                s.cursor_pointer()
+                    .hover(move |s| s.bg(rgb(if save { ACCENT_HOVER } else { SELECTED_HOVER })))
             })
             .when_some(icon_name, |s, n| s.child(icon(n)))
             .when_some(icon_name, |s, n| {
@@ -1171,6 +1265,8 @@ impl Desktop {
                     .px_3()
                     .border_b_1()
                     .border_color(rgb(LINE))
+                    .child(self.button("head", "HEAD", Action::Head, cx))
+                    .child(self.button("refresh", "", Action::Refresh, cx))
                     .child(caption(format!(
                         "{} commits",
                         self.engine
@@ -1194,9 +1290,8 @@ impl Desktop {
                             )))
                         },
                     )
-                    .child(self.search_box(cx))
-                    .child(self.button("head", "HEAD", Action::Head, cx))
-                    .child(self.button("refresh", "", Action::Refresh, cx)),
+                    .child(div().flex_1())
+                    .child(self.search_box(cx)),
             )
             .child(
                 column()
@@ -1229,69 +1324,65 @@ impl Desktop {
     }
     fn search_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let choices = [
-            ("", "All fields", "message, author, SHA, branches"),
-            ("m: ", "Message", "full commit description"),
-            ("a: ", "Author", "name or email"),
-            ("s: ", "Commit SHA", "full or partial hash"),
-            ("f: ", "Changed file", "path or filename"),
+            ("", "All fields"),
+            ("m: ", "Message"),
+            ("a: ", "Author"),
+            ("s: ", "Commit SHA"),
+            ("f: ", "Changed file"),
         ];
-        div()
-            .relative()
-            .flex_1()
-            .min_w(px(100.))
-            .max_w(px(420.))
-            .child(
+        let query = self.search.read(cx).value();
+        let selected = choices
+            .iter()
+            .find(|(prefix, _)| !prefix.is_empty() && query.trim_start().starts_with(prefix.trim()))
+            .or_else(|| {
+                choices
+                    .iter()
+                    .find(|(prefix, _)| *prefix == self.search_field)
+            })
+            .copied()
+            .unwrap_or(choices[0]);
+        let view = cx.entity().downgrade();
+        let selector = Button::new("search-field")
+            .xsmall()
+            .ghost()
+            .label(match selected.0 {
+                "s: " => "SHA",
+                "f: " => "File",
+                _ => selected.1,
+            })
+            .child(div().text_color(rgb(MUTED)).child("▾"))
+            .tooltip("Search field")
+            .dropdown_menu(move |mut menu, _, _| {
+                for (prefix, title) in choices {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(title)
+                            .checked(prefix == selected.0)
+                            .on_click(move |_, window, cx| {
+                                _ = view.update(cx, |v, cx| {
+                                    v.action(Action::SearchField(prefix), window, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
+        div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
+            toolbar_filter(&self.search, cx).prefix(
                 row()
-                    .gap_1()
-                    .child(icon("search").text_color(rgb(MUTED)))
+                    .gap_2()
                     .child(
                         div()
-                            .flex_1()
-                            .child(Input::new(&self.search).cleanable(true)),
-                    ),
-            )
-            .when(self.search_help, |s| {
-                s.child(
-                    deferred(
-                        column()
-                            .absolute()
-                            .top(px(36.))
-                            .left_0()
-                            .w(px(340.))
-                            .p_1()
-                            .rounded_md()
-                            .bg(rgb(PANEL))
-                            .border_1()
+                            .pr_1()
+                            .border_r_1()
                             .border_color(rgb(LINE))
-                            .shadow_lg()
-                            .occlude()
-                            .children(choices.into_iter().enumerate().map(
-                                |(i, (prefix, title, hint))| {
-                                    row()
-                                        .id(("search-choice", i))
-                                        .p_2()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(SELECTED)))
-                                        .child(
-                                            div()
-                                                .w(px(26.))
-                                                .text_color(rgb(ACCENT))
-                                                .child(prefix.trim().to_string()),
-                                        )
-                                        .child(column().child(title).child(caption(hint)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |v, _, w, cx| {
-                                                cx.stop_propagation();
-                                                v.action(Action::SearchField(prefix), w, cx);
-                                            }),
-                                        )
-                                },
-                            )),
+                            .child(selector),
                     )
-                    .with_priority(2),
-                )
-            })
+                    .when(query.is_empty(), |s| {
+                        s.child(icon("search").text_color(rgb(MUTED)))
+                    }),
+            ),
+        )
     }
     fn scroll_region(
         &self,
@@ -1890,14 +1981,20 @@ impl Desktop {
             .flex_1()
             .child(
                 row()
-                    .p_3()
-                    .child(icon("search"))
+                    .h(px(48.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(caption(format!("{} branches", browser.visible.len())))
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .w(px(340.))
-                            .child(Input::new(&self.branch_filter).cleanable(true)),
-                    )
-                    .child(caption(format!("{} branches", browser.visible.len()))),
+                            .flex_1()
+                            .min_w(px(180.))
+                            .max_w(px(420.))
+                            .child(toolbar_filter(&self.branch_filter, cx)),
+                    ),
             )
             .when(browser.loading, |s| {
                 s.child(caption("Refreshing branches…"))
@@ -1911,63 +2008,124 @@ impl Desktop {
     }
     fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = &self.engine.app.settings;
+        let mut form = column().max_w(px(700.)).gap_3();
+        if settings.page == 0 {
+            form = form
+                .child(caption("Settings for this project"))
+                .child(caption("Repository path"))
+                .child(
+                    div()
+                        .text_color(rgb(TEXT))
+                        .child(self.engine.repository_path()),
+                )
+                .child(caption("Remote"))
+                .child(
+                    row()
+                        .flex_wrap()
+                        .children(settings.projects.iter().enumerate().map(|(i, d)| {
+                            div()
+                                .id(("remote", i))
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(if settings.project_selected == i {
+                                    SELECTED
+                                } else {
+                                    CONTROL
+                                }))
+                                .text_color(rgb(if settings.project_selected == i {
+                                    ACCENT
+                                } else {
+                                    TEXT
+                                }))
+                                .child(d.name.clone())
+                                .when(!settings.busy, |s| {
+                                    s.cursor_pointer().on_click(cx.listener(
+                                        move |v, _, window, cx| {
+                                            v.action(Action::SettingsRemote(i), window, cx)
+                                        },
+                                    ))
+                                })
+                        })),
+                );
+            if let Some(d) = settings.projects.get(settings.project_selected) {
+                form = form
+                    .child(div().text_color(rgb(TEXT)).child(d.url.clone()))
+                    .child(caption("Provider"))
+                    .child(
+                        row()
+                            .child(self.button(
+                                "provider-auto",
+                                "Auto",
+                                Action::SettingsProvider(None),
+                                cx,
+                            ))
+                            .child(self.button(
+                                "provider-gitlab",
+                                "GitLab",
+                                Action::SettingsProvider(Some("gitlab")),
+                                cx,
+                            ))
+                            .child(self.button(
+                                "provider-github",
+                                "GitHub",
+                                Action::SettingsProvider(Some("github")),
+                                cx,
+                            )),
+                    )
+                    .child(caption("Project path · group/project or owner/repository"))
+                    .child(Input::new(&self.project).disabled(settings.busy));
+            } else if !settings.busy {
+                form = form.child(caption(
+                    "No remotes configured. Add one with git remote add, then reopen the app.",
+                ));
+            }
+        } else {
+            let draft = &settings.providers[settings.page - 1];
+            form = form.child(caption("Global settings · shared by all your projects"))
+                .child(caption("Custom server or API URL"))
+                .child(Input::new(&self.api).disabled(settings.busy))
+                .child(caption("Access token · stored in Windows Credential Manager"))
+                .child(Input::new(&self.token).disabled(settings.busy))
+                .child(caption(if draft.forget { "The saved token will be removed when you save." }
+                    else if draft.has_token { "A custom token is saved. Leave it masked to keep it, or replace it." }
+                    else { "No custom token saved. Environment tokens and Git credentials can still be used." }))
+                .child(self.button("forget", if draft.forget { "✓ Forget saved token" } else { "Forget saved token" }, Action::ForgetToken, cx));
+        }
         column()
             .flex_1()
             .p_6()
             .gap_4()
-            .child(row().child(div().text_size(px(20.)).child("Remote settings")))
+            .child(div().text_size(px(20.)).child("Settings"))
             .child(
-                row()
-                    .child(self.button("gitlab", "GitLab", Action::SettingsTab(0), cx))
-                    .child(self.button("github", "GitHub", Action::SettingsTab(1), cx)),
-            )
-            .children(
-                settings.drafts[settings.tab]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| {
-                        div()
-                            .id(("remote", i))
-                            .p_2()
-                            .cursor_pointer()
-                            .bg(rgb(if settings.selected[settings.tab] == i {
-                                SELECTED
-                            } else {
-                                PANEL
+                tab_bar().children(["Project", "GitLab", "GitHub"].into_iter().enumerate().map(
+                    |(page, label)| {
+                        tab_item(
+                            ("settings-tab", page),
+                            settings.page == page,
+                            !settings.busy,
+                        )
+                        .child(label)
+                        .when(!settings.busy, |s| {
+                            s.on_click(cx.listener(move |v, _, window, cx| {
+                                v.action(Action::SettingsTab(page), window, cx)
                             }))
-                            .child(d.config.name.clone())
-                            .on_click(cx.listener(move |v, _, window, cx| {
-                                v.action(Action::SettingsRemote(i), window, cx)
-                            }))
-                    }),
+                        })
+                    },
+                )),
             )
+            .child(form)
+            .child(row().child(self.button(
+                "save",
+                if settings.saving { "Saving…" } else { "Save" },
+                Action::SaveSettings,
+                cx,
+            )))
             .child(
-                column()
-                    .max_w(px(650.))
-                    .gap_3()
-                    .child(caption("API URL"))
-                    .child(Input::new(&self.api))
-                    .child(caption("Project path"))
-                    .child(Input::new(&self.project))
-                    .child(caption("Access token · Windows Credential Manager"))
-                    .child(Input::new(&self.token))
-                    .child(
-                        row()
-                            .child(self.button(
-                                "forget",
-                                if settings.current().is_some_and(|d| d.forget) {
-                                    "✓ Forget saved token"
-                                } else {
-                                    "Forget saved token"
-                                },
-                                Action::ForgetToken,
-                                cx,
-                            ))
-                            .child(self.button("test", "Test", Action::TestSettings, cx))
-                            .child(self.button("save", "Save", Action::SaveSettings, cx)),
-                    ),
+                div()
+                    .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
+                    .child(settings.status.clone()),
             )
-            .child(caption(settings.status.clone()))
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
@@ -1975,7 +2133,7 @@ impl Desktop {
         match self.scenario.as_deref() {
             Some(
                 "scroll" | "graph-resize" | "files-scroll" | "diff-scroll" | "diff-pan"
-                | "search-scroll" | "wrap-scroll" | "tabs",
+                | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2106,7 +2264,7 @@ impl Render for Desktop {
         });
         if self.scroll_step > 0 && self.scroll_step <= 121 {
             let weak = cx.entity().downgrade();
-            window.on_next_frame(move |_, cx| {
+            window.on_next_frame(move |window, cx| {
                 let _ = weak.update(cx, |v, cx| {
                     if let Some(start) = v.frame_start.take() {
                         v.frame_samples.push(start.elapsed().as_secs_f64() * 1000.);
@@ -2114,6 +2272,9 @@ impl Render for Desktop {
                     v.scroll_step += 1;
                     if v.scroll_step <= 121 {
                         match v.scenario.as_deref() {
+                            Some("settings-tabs") => {
+                                v.action(Action::SettingsTab(v.scroll_step % 3), window, cx)
+                            }
                             Some("files-scroll") => {
                                 let n = v
                                     .engine

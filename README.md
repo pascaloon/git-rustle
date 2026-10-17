@@ -126,11 +126,16 @@ have 12-second request timeouts; Git operations have a five-minute timeout.
 ### Provider configuration
 
 Public GitHub/GitLab HTTPS, SSH and SCP-style URLs are recognized. For on-premise
-hosts, use Settings to choose GitLab/GitHub, select a configured Git remote, enter
-the API base and project path, and **Test** or **Save**. Provider tabs retain
-independent drafts. Tokens are masked and saved in Windows Credential Manager;
-they are not written into application caches. **Forget saved token** removes the
-saved credential on Save. Git transport URLs remain unchanged.
+hosts, use **Settings → Project** to select the Git remote, provider and project
+path. **GitLab** and **GitHub** each have a custom server/API URL and access token.
+These two tabs apply globally to the Windows user across projects; their URLs are
+stored in `%LOCALAPPDATA%\git-rustle\providers.json`. A global provider URL takes
+precedence over older repository API URL overrides. Tokens are saved per API
+installation in Windows Credential Manager, shared across its projects, and shown
+as a mask when present. Leave the mask unchanged to keep a token, or type to replace
+it. **Forget saved token** removes the saved credential on Save. Changing the URL
+requires a new token or explicitly forgetting the old one when a token is saved.
+Each subtab keeps an independent draft. Git transport URLs remain unchanged.
 
 ## Performance and validation
 
@@ -159,7 +164,7 @@ tests, but the executable enters GPUI and never opens a console input loop.
 - `GIT_RUSTLE_TRACE=1`: additionally emit those milestones as they happen.
 - `GIT_RUSTLE_AUTOQUIT=<ms>`: exit after the first history frame and loading settles.
 - `GIT_RUSTLE_DUMP=<path>`: save a final model summary, not a screenshot.
-- `GIT_RUSTLE_SCENARIO=scroll|graph-resize|search-scroll|files-scroll|diff-scroll|diff-pan|wrap-scroll|tabs|branches|diff|compare|compare-menu|search|settings|pending|pending-diff`: run a non-mutating
+- `GIT_RUSTLE_SCENARIO=scroll|graph-resize|search-scroll|files-scroll|diff-scroll|diff-pan|wrap-scroll|tabs|branches|diff|compare|compare-menu|search|settings|settings-tabs|pending|pending-diff`: run a non-mutating
   desktop benchmark action after loading.
 - `GIT_RUSTLE_FRAME_SAMPLES=<path>`: save 120 scroll frame intervals after discarding
   one warm-up frame. These include scheduling/layout/paint submission and exclude

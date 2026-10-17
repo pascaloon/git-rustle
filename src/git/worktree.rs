@@ -715,6 +715,108 @@ mod tests {
         );
     }
     #[test]
+    fn worktree_diff_uses_git_line_ending_conversion() {
+        let f = Fixture::new(false);
+        f.write("a.txt", "first\noriginal\nthird\n");
+        f.git(&["add", "a.txt"]);
+        f.git(&["commit", "-qm", "Initial"]);
+        f.git(&["config", "core.autocrlf", "true"]);
+        f.write("a.txt", "first\r\nupdated\r\nthird\r\n");
+
+        assert_eq!(f.git(&["diff", "--numstat", "--", "a.txt"]), "1\t1\ta.txt");
+        let repo = super::super::open(f.root()).unwrap();
+        let change = f
+            .snapshot()
+            .files
+            .into_iter()
+            .find(|c| c.path == "a.txt")
+            .unwrap();
+        let diff = crate::diff::file_diff(&repo, &change).unwrap();
+        assert_eq!((diff.added, diff.removed), (1, 1));
+        assert_eq!(
+            crate::diff::file_stats(&repo, &change).unwrap(),
+            crate::diff::Stat::Lines {
+                added: 1,
+                removed: 1
+            }
+        );
+    }
+    #[test]
+    fn worktree_diff_honors_external_git_config() {
+        if let Some(root) = std::env::var_os("GIT_RUSTLE_EOL_CHILD_REPO") {
+            let repo = super::super::open(Path::new(&root)).unwrap();
+            let change = snapshot(&repo)
+                .unwrap()
+                .files
+                .into_iter()
+                .find(|change| change.path == "a.txt")
+                .unwrap();
+            let diff = crate::diff::file_diff(&repo, &change).unwrap();
+            assert_eq!((diff.added, diff.removed), (1, 1));
+            assert_eq!(
+                crate::diff::file_stats(&repo, &change).unwrap(),
+                crate::diff::Stat::Lines {
+                    added: 1,
+                    removed: 1
+                }
+            );
+            return;
+        }
+
+        let f = Fixture::new(false);
+        f.write("a.txt", "first\noriginal\nthird\n");
+        f.git(&["add", "a.txt"]);
+        f.git(&["commit", "-qm", "Initial"]);
+        f.git(&["config", "--unset", "core.autocrlf"]);
+        f.write("a.txt", "first\r\nupdated\r\nthird\n");
+        f.write("global.gitconfig", "[core]\n\tautocrlf = true\n");
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git::worktree::tests::worktree_diff_honors_external_git_config",
+                "--nocapture",
+            ])
+            .env("GIT_RUSTLE_EOL_CHILD_REPO", f.root())
+            .env("GIT_CONFIG_GLOBAL", f.root().join("global.gitconfig"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn worktree_diff_preserves_crlf_when_attributes_disable_conversion() {
+        let f = Fixture::new(false);
+        f.write(".gitattributes", "*.txt -text\n");
+        f.write("a.txt", "first\noriginal\nthird\n");
+        f.git(&["add", ".gitattributes", "a.txt"]);
+        f.git(&["commit", "-qm", "Initial"]);
+        f.git(&["config", "core.autocrlf", "true"]);
+        f.write("a.txt", "first\r\nupdated\r\nthird\r\n");
+
+        assert_eq!(f.git(&["diff", "--numstat", "--", "a.txt"]), "3\t3\ta.txt");
+        let repo = super::super::open(f.root()).unwrap();
+        let change = f
+            .snapshot()
+            .files
+            .into_iter()
+            .find(|c| c.path == "a.txt")
+            .unwrap();
+        let diff = crate::diff::file_diff(&repo, &change).unwrap();
+        assert_eq!((diff.added, diff.removed), (3, 3));
+        assert_eq!(
+            crate::diff::file_stats(&repo, &change).unwrap(),
+            crate::diff::Stat::Lines {
+                added: 3,
+                removed: 3
+            }
+        );
+    }
+    #[test]
     fn selected_commit_preserves_unchecked_index_and_worktree() {
         let f = Fixture::new(true);
         f.write("a.txt", "partial a\n");
