@@ -141,7 +141,13 @@ impl Layout {
         } else {
             let color = self.pick_color();
             let slot = free_iter.next();
-            self.alloc(slot, Lane { expected: *id, color })
+            self.alloc(
+                slot,
+                Lane {
+                    expected: *id,
+                    color,
+                },
+            )
         };
         let node_color = self.lanes[node_lane].expect("node lane set").color;
         // Lanes other than the first one that expected this commit end here.
@@ -160,9 +166,11 @@ impl Layout {
                 continue;
             }
             // Existing lane already waiting for this parent?
-            if let Some(k) = self.lanes.iter().position(|l| {
-                matches!(l, Some(l) if &l.expected == p)
-            }) && k != node_lane
+            if let Some(k) = self
+                .lanes
+                .iter()
+                .position(|l| matches!(l, Some(l) if &l.expected == p))
+                && k != node_lane
             {
                 let color = self.lanes[k].expect("checked").color;
                 if !targets.iter().any(|t| t.0 == k) {
@@ -172,7 +180,13 @@ impl Layout {
             }
             let color = self.pick_color();
             let slot = free_iter.next();
-            let k = self.alloc(slot, Lane { expected: *p, color });
+            let k = self.alloc(
+                slot,
+                Lane {
+                    expected: *p,
+                    color,
+                },
+            );
             targets.push((k, true, color));
         }
         if parents.is_empty() {
@@ -343,7 +357,10 @@ mod tests {
         let _ = l.push(&id(3), &[id(2)]); // lane0 expects 2
         let r = l.push(&id(4), &[id(1), id(2)]); // new lane1 for node 4; second parent 2 already in lane0
         assert_eq!(r.node_lane, 1);
-        assert_eq!(kinds(&r), vec![CellKind::JoinFromRight, CellKind::MergeNode]);
+        assert_eq!(
+            kinds(&r),
+            vec![CellKind::JoinFromRight, CellKind::MergeNode]
+        );
     }
 
     #[test]

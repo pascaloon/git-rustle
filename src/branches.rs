@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Legacy adapters remain as regression-test references.
 //! Branch browser state and bounded worker-only local activity scoring.
 use crate::git::{RefKind, RefSnapshot};
 use crate::remote;
@@ -246,7 +247,7 @@ impl Browser {
         self.ensure_visible();
     }
 
-    fn filter(&mut self) {
+    pub fn filter(&mut self) {
         let q = self.query.to_lowercase();
         self.visible = self
             .entries

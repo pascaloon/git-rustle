@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory)][string]$Baseline,
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [int]$Samples = 15,
+    [switch]$NativeCandidate,
+    [switch]$NativeBaseline,
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\comparison"
 )
 $ErrorActionPreference = 'Stop'
@@ -19,7 +21,8 @@ function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
     $log = Join-Path $OutputDirectory "$label-$mode-$sample.txt"
     $runArgs = @('"' + $Repository + '"')
     if ($mode -eq 'uncached') { $runArgs += '--no-cache' }
-    $process = Start-Process -FilePath $exe -ArgumentList $runArgs -WindowStyle Hidden -RedirectStandardError $log -PassThru
+    $windowStyle = if (($NativeCandidate -and $label -eq 'candidate') -or ($NativeBaseline -and $label -eq 'baseline')) { 'Normal' } else { 'Hidden' }
+    $process = Start-Process -FilePath $exe -ArgumentList $runArgs -WindowStyle $windowStyle -RedirectStandardError $log -PassThru
     if (-not $process.WaitForExit(120000)) {
         Stop-Process -Id $process.Id
         throw "Benchmark exceeded two minutes: $log"

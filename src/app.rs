@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Legacy adapters remain as regression-test references.
 //! Application state and input handling (no drawing here; see `ui`).
 
 use std::collections::HashMap;
@@ -254,6 +255,11 @@ impl App {
         } else {
             Some(row - usize::from(row > self.pending.row()))
         }
+    }
+    /// User navigation cancels deferred startup focus, including late status results.
+    pub fn begin_navigation(&mut self) {
+        self.startup_head_search = None;
+        self.pending.autofocus = false;
     }
     pub fn select_graph(&mut self, row: usize) {
         if self.graph_len() == 0 {
@@ -1009,7 +1015,7 @@ impl App {
         self.needs_redraw = true;
     }
 
-    fn confirm_checkout(&mut self, choices: Vec<crate::checkout::Request>) {
+    pub fn confirm_checkout(&mut self, choices: Vec<crate::checkout::Request>) {
         if self.pending.busy || self.pending.request.is_some() {
             return;
         }

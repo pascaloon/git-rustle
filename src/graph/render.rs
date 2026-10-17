@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Legacy adapters remain as regression-test references.
 //! Turn [`GraphCell`]s into glyphs and colours on the screen.
 
 use super::dimming::{CONNECTOR, GLYPH};

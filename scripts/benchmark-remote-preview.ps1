@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$Baseline,
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [int]$Samples = 15,
+    [switch]$NativeCandidate,
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\remote-preview"
 )
 # Use the fresh fixture from remote::history::tests::prepare_native_fixture.
@@ -19,7 +20,8 @@ foreach ($name in @('GIT_RUSTLE_TIMING', 'GIT_RUSTLE_AUTOQUIT', 'GIT_RUSTLE_KEYS
 }
 function Run-One([string]$exe, [string]$label, [int]$sample) {
     $log = Join-Path $OutputDirectory "$label-$sample.txt"
-    $process = Start-Process -FilePath $exe -ArgumentList @('"' + $Repository + '"') -WindowStyle Hidden -RedirectStandardError $log -PassThru
+    $windowStyle = if ($NativeCandidate -and $label -eq 'candidate') { 'Normal' } else { 'Hidden' }
+    $process = Start-Process -FilePath $exe -ArgumentList @('"' + $Repository + '"') -WindowStyle $windowStyle -RedirectStandardError $log -PassThru
     if (-not $process.WaitForExit(30000)) { Stop-Process -Id $process.Id; throw "Timed out: $log" }
     $process.Refresh()
     if ($process.ExitCode -ne 0) { throw "Failed: $log" }

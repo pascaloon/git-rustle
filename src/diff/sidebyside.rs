@@ -95,7 +95,10 @@ fn split_lines(data: &[u8]) -> Vec<&[u8]> {
 
 /// Added and removed line counts only.
 pub fn counts(old: &[u8], new: &[u8]) -> (u32, u32) {
-    let input = InternedInput::new(imara_diff::sources::byte_lines(old), imara_diff::sources::byte_lines(new));
+    let input = InternedInput::new(
+        imara_diff::sources::byte_lines(old),
+        imara_diff::sources::byte_lines(new),
+    );
     let diff = Diff::compute(Algorithm::Histogram, &input);
     (diff.count_additions(), diff.count_removals())
 }
@@ -104,7 +107,10 @@ pub fn counts(old: &[u8], new: &[u8]) -> (u32, u32) {
 pub fn build(old: &[u8], new: &[u8]) -> FileDiff {
     let old_lines = split_lines(old);
     let new_lines = split_lines(new);
-    let input = InternedInput::new(imara_diff::sources::byte_lines(old), imara_diff::sources::byte_lines(new));
+    let input = InternedInput::new(
+        imara_diff::sources::byte_lines(old),
+        imara_diff::sources::byte_lines(new),
+    );
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
 
@@ -169,7 +175,11 @@ pub fn build(old: &[u8], new: &[u8]) -> FileDiff {
                 line(
                     o,
                     old_lines[o],
-                    if k < paired { LineKind::Changed } else { LineKind::Removed },
+                    if k < paired {
+                        LineKind::Changed
+                    } else {
+                        LineKind::Removed
+                    },
                 )
             });
             let mut right = (k < after.len()).then(|| {
@@ -177,7 +187,11 @@ pub fn build(old: &[u8], new: &[u8]) -> FileDiff {
                 line(
                     n,
                     new_lines[n],
-                    if k < paired { LineKind::Changed } else { LineKind::Added },
+                    if k < paired {
+                        LineKind::Changed
+                    } else {
+                        LineKind::Added
+                    },
                 )
             });
             if let (Some(l), Some(r)) = (left.as_mut(), right.as_mut()) {
@@ -251,7 +265,13 @@ fn intraline(a: &str, b: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
         .count();
     let ra = prefix..ac.len() - suffix;
     let rb = prefix..bc.len() - suffix;
-    let frac = |r: &Range<usize>, n: usize| if n == 0 { 0.0 } else { r.len() as f64 / n as f64 };
+    let frac = |r: &Range<usize>, n: usize| {
+        if n == 0 {
+            0.0
+        } else {
+            r.len() as f64 / n as f64
+        }
+    };
     if frac(&ra, ac.len()) > 0.7 && frac(&rb, bc.len()) > 0.7 {
         return (Vec::new(), Vec::new());
     }
@@ -283,7 +303,9 @@ mod tests {
     #[test]
     fn hunks_get_context_and_separators() {
         let old: String = (1..=20).map(|i| format!("line {i}\n")).collect();
-        let new = old.replace("line 10\n", "line ten\n").replace("line 3\n", "");
+        let new = old
+            .replace("line 10\n", "line ten\n")
+            .replace("line 3\n", "");
         let d = build(old.as_bytes(), new.as_bytes());
         assert_eq!(d.removed, 2);
         assert_eq!(d.added, 1);

@@ -51,7 +51,7 @@ jobs:
             "- Clean release build (including dependency downloads): $($timer.Elapsed.TotalSeconds.ToString('F3')) s",
             "- Executable size: $($exe.Length) bytes",
             "- SHA-256: $hash",
-            '- Build timing measures CI throughput, not TUI runtime performance.'
+            '- Build timing measures CI throughput, not application runtime performance.'
           ) | Add-Content $env:GITHUB_STEP_SUMMARY
 
       - name: Run release-mode tests

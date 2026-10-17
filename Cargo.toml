@@ -2,10 +2,14 @@
 name = "git-rustle"
 version = "0.1.0"
 edition = "2024"
-description = "Windows Terminal-native, fast and colorful Git graph viewer"
+description = "Fast Windows-native GPU-accelerated Git client"
 license = "MIT"
 
 [dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+gpui-component = "=0.5.1"
+async-channel = "2"
+futures-lite = "2"
 gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "sha1"] }
 unicode-width = "0.2"
 imara-diff = "0.2"

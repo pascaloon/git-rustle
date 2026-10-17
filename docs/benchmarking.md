@@ -5,6 +5,69 @@ delivering notable changes. Commands below run in PowerShell from the repository
 root. This documents the workflow used for the remote UX and connection-dimming
 changes on October 15, 2026; measurements are examples, not universal budgets.
 
+
+## GPUI desktop (current implementation)
+
+The sections below this one describe the historical terminal harnesses. The
+GPUI executable no longer consumes `GIT_RUSTLE_KEYS`, and its model dump is not
+a screen capture. Do not use keyboard-script success as evidence for GPUI.
+
+Preserve the baseline and finish release tests, Clippy and builds as described
+below. For a terminal baseline and GPUI candidate use:
+
+```powershell
+.\scripts\benchmark.ps1 -Repository $benchRepo -Baseline $baselineExe `
+  -NativeCandidate -Samples 15 -OutputDirectory (Join-Path $benchRun 'startup')
+.\scripts\benchmark-remote-preview.ps1 -Repository $fixturePath `
+  -Baseline $baselineExe -NativeCandidate -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'preview')
+.\scripts\benchmark-desktop.ps1 -Repository $benchRepo -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'desktop')
+cargo test --release engine::tests::benchmark_desktop_mutations -- `
+  --ignored --exact --nocapture
+```
+
+`-NativeCandidate` launches the GPUI window normally; the baseline console stays
+hidden. For comparisons between two GPUI builds, also pass `-NativeBaseline`
+to `benchmark.ps1`. Hiding the native window prevents a meaningful GPU frame measurement.
+Keep the desktop unlocked and the app visible. Native windows appear briefly for
+each sample. Do not compare a minimized/occluded GPU window with a visible one.
+The standard startup script retains one warm-up and 15 alternating measured
+launches per binary/cache mode. The preview fixture must be fresh enough for its
+five-minute branch/tag caches; generate it only after builds finish.
+
+The GPUI `first frame` mark is the next-frame callback following the first
+qualifying history render. The old mark follows a console flush. These are
+user-interface readiness proxies with different rendering pipelines, not equal
+GPU/display presentation timestamps. Both exclude OS process-loader time.
+GPUI platform, component and window setup have separate timing marks. The complete
+walk remains a timestamp since main. A bootstrap worker drives local loading
+while DirectX initializes; after handoff GPUI owns the engine. Network discovery
+and worktree polling still wait until the first native frame.
+
+The desktop suite runs scroll, branch activity, selected-file diff, metadata
+search and settings-load scenarios through the same action methods as the UI.
+Each scenario gets one discarded launch and 15 measured launches. Scroll collects
+121 next-frame intervals and discards the first, saving 120 raw intervals per
+launch. This includes event-loop scheduling, layout and paint submission; it
+excludes input-device latency and does not measure scanout or claim display FPS.
+The other intervals are worker request to result delivery. State summaries include
+maximum visible list-row counts to detect a zero-height viewport. They are not a
+substitute for visual or mouse/clipboard verification.
+
+For pending changes, create a disposable repository and use
+`-Scenarios pending,pending-diff`. The mutation component harness independently
+creates disposable repositories, commits a selected change to a new branch and
+checks out the original branch. It discards one warm-up, records 15 samples and
+asserts success. Its status metric includes history startup; commit/checkout
+metrics include worker dispatch and delivery but exclude actual mouse input and
+GPU paint. The polling test harness has approximately 2 ms resolution. Never run
+mutation fixtures against the user's benchmark clone.
+
+Retain all raw data, executable hashes, limitations and failed/rejected runs.
+For framework migrations, report the startup regression explicitly even when
+scrolling remains fast; moving to GPU rendering does not imply faster startup.
+
 ## 1. Preserve a trustworthy baseline
 
 Before editing code, build the current implementation and copy its release
@@ -57,7 +120,8 @@ Git Rustle's own caches; the overlay harness uses a dedicated cache identity.
 | Drawing, scrolling, popup or input behavior | Native interaction and screen checks; add repeatable action/frame timing if claiming interaction performance |
 | Remote file lists or file diffs | Controlled provider fixture, request-to-ready interval, repeated/offline cache reuse |
 
-There is no general scrolling/FPS or remote-file benchmark script yet. Add a
+The desktop suite measures scroll callback intervals, not display FPS. Remote-file
+component fixtures are separate from native interaction measurements. Add a
 focused measurement when needed; do not infer those speeds from startup results.
 Use local HTTP fixtures for reproducible network behavior. Record live provider
 latency separately, including host type and cache state, without logging tokens.

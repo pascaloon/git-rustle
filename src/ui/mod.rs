@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Legacy adapters remain as regression-test references.
 //! Drawing: header, commit list with graph, details panel, status bar.
 
 pub mod branches;

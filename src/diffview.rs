@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Legacy adapters remain as regression-test references.
 //! State and input handling for the full-screen diff view. Drawing lives in
 //! `ui::diff`; diff computation runs on worker threads and results arrive
 //! through `set_tree` / `set_file_diff` (stats go straight to the `ChangeSet`).
@@ -164,7 +165,7 @@ impl DiffView {
         self.current.and_then(|i| self.changes.files.get(i))
     }
 
-    fn show(&mut self, file: Option<usize>) {
+    pub fn show(&mut self, file: Option<usize>) {
         if let Some(file) = file
             && self.current != Some(file)
         {

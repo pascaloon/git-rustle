@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Legacy adapters remain as regression-test references.
 //! Lazy modal settings state and worker-side persistence.
 use crate::remote::{self, Configuration, Provider};
 use crate::term::{KeyCode, KeyEvent};

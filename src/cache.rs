@@ -145,7 +145,11 @@ fn encode_rows(h: &History) -> Vec<u8> {
 }
 
 /// Decode rows back into a cells arena, rewriting each record's `row` span.
-fn decode_rows(data: &[u8], commits: &mut [CommitRec], total_cells: usize) -> Option<Vec<GraphCell>> {
+fn decode_rows(
+    data: &[u8],
+    commits: &mut [CommitRec],
+    total_cells: usize,
+) -> Option<Vec<GraphCell>> {
     let mut cells: Vec<GraphCell> = Vec::with_capacity(total_cells);
     let mut prev: Vec<GraphCell> = Vec::new();
     let mut r = Reader { data, pos: 0 };
