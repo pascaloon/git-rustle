@@ -1,4 +1,5 @@
 //! Unicode-safe search decoration and selectable, read-only prose.
+use crate::desktop_theme;
 use gpui::{prelude::*, *};
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use std::ops::Range;
@@ -79,8 +80,8 @@ impl Matches {
 }
 fn search_style() -> HighlightStyle {
     HighlightStyle {
-        color: Some(rgb(0xffda85).into()),
-        background_color: Some(rgba(0xd6a53c33).into()),
+        color: Some(rgb(desktop_theme::SEARCH_TEXT).into()),
+        background_color: Some(rgba(desktop_theme::SEARCH_BG).into()),
         ..Default::default()
     }
 }
@@ -139,7 +140,7 @@ impl Render for TextBlock {
             (
                 self.anchor.min(self.end)..self.anchor.max(self.end),
                 HighlightStyle {
-                    background_color: Some(rgba(0x7dcfff66).into()),
+                    background_color: Some(rgba(desktop_theme::SELECTION).into()),
                     ..Default::default()
                 },
             )

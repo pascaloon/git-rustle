@@ -25,6 +25,7 @@ mod desktop_scroll;
 mod desktop_selection;
 mod desktop_shell;
 mod desktop_text;
+mod desktop_theme;
 mod desktop_wrap;
 mod engine;
 mod selectable;

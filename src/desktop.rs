@@ -1,25 +1,15 @@
 //! Native desktop presentation. Lists construct only visible rows.
 use crate::desktop_icons::icon;
 use crate::desktop_text::{Matches, TextBlock};
+use crate::desktop_theme::*;
 use crate::{app::Mode, diff, engine::Engine, graph::layout::CellKind};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Root, Theme, ThemeMode,
+    Root,
     input::{Input, InputEvent, InputState},
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
-
-const BG: u32 = 0x10141c;
-const PANEL: u32 = 0x171d28;
-const LINE: u32 = 0x2a3444;
-const TEXT: u32 = 0xdce5f4;
-const MUTED: u32 = 0x8c9ab1;
-const ACCENT: u32 = 0x7dcfff;
-const COLORS: [u32; 10] = [
-    0xffb86c, 0x7dcfff, 0xb5f27a, 0xff7bb4, 0xc7a8ff, 0x5ee6c7, 0xffe06b, 0xff8a80, 0x8fb8ff,
-    0xa0e8a0,
-];
 
 pub fn run(mut engine: Engine) {
     engine.mark("GPUI initialization requested");
@@ -45,7 +35,7 @@ pub fn run(mut engine: Engine) {
         gpui_component::init(cx);
         crate::desktop_text::init(cx);
         engine.mark("GPUI components ready");
-        Theme::change(ThemeMode::Dark, None, cx);
+        crate::desktop_theme::apply(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         cx.open_window(
             WindowOptions {
@@ -232,7 +222,7 @@ impl Desktop {
                         .border_b_2()
                         .border_color(rgb(if current == tab { ACCENT } else { BG }))
                         .bg(rgb(if current == tab { PANEL } else { BG }))
-                        .hover(|s| s.bg(rgb(0x202c3f)))
+                        .hover(|s| s.bg(rgb(HOVER)))
                         .child(icon(name))
                         .child(label)
                         .on_click(cx.listener(move |v, _, w, cx| v.action(Action::Tab(tab), w, cx)))
@@ -310,12 +300,12 @@ impl Desktop {
                             .child(icon(name).text_color(rgb(if enabled { TEXT } else { MUTED })))
                             .child(label)
                             .when(enabled, |s| {
-                                s.cursor_pointer().hover(|s| s.bg(rgb(0x2a3b52))).on_click(
-                                    cx.listener(move |v, _, w, cx| {
+                                s.cursor_pointer()
+                                    .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                                    .on_click(cx.listener(move |v, _, w, cx| {
                                         cx.stop_propagation();
                                         v.action(action.clone(), w, cx);
-                                    }),
-                                )
+                                    }))
                             })
                     }),
                 ),
@@ -966,13 +956,13 @@ impl Desktop {
             .h(px(30.))
             .rounded_md()
             .bg(rgb(if matches!(action, Action::Wrap) && self.word_wrap {
-                0x355378
+                SELECTED
             } else {
-                0x253246
+                CONTROL
             }))
             .text_color(rgb(if enabled { TEXT } else { MUTED }))
             .when(enabled, |s| {
-                s.cursor_pointer().hover(|s| s.bg(rgb(0x354764)))
+                s.cursor_pointer().hover(|s| s.bg(rgb(SELECTED_HOVER)))
             })
             .when_some(icon_name, |s, n| s.child(icon(n)))
             .when_some(icon_name, |s, n| {
@@ -1026,9 +1016,9 @@ impl Desktop {
                             .h(px(32.))
                             .px_2()
                             .gap_2()
-                            .bg(rgb(if selected { 0x26354c } else { BG }))
+                            .bg(rgb(if selected { SELECTED } else { BG }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x202c3f)))
+                            .hover(|s| s.bg(rgb(HOVER)))
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
@@ -1093,7 +1083,7 @@ impl Desktop {
                                     .child(v.matches.styled(rec.id.to_hex_with_len(8).to_string())),
                             );
                             if app.head_id() == Some(rec.id) {
-                                r = r.child(div().text_color(rgb(0xb5f27a)).child("HEAD"));
+                                r = r.child(div().text_color(rgb(ACCENT)).child("HEAD"));
                             }
                             if let Some(labels) = app.labels.get(&rec.id) {
                                 for label in
@@ -1103,8 +1093,8 @@ impl Desktop {
                                         div()
                                             .rounded_sm()
                                             .px_1()
-                                            .bg(rgb(0x30304a))
-                                            .text_color(rgb(0xc7a8ff))
+                                            .bg(rgb(SELECTED))
+                                            .text_color(rgb(SEARCH_TEXT))
                                             .max_w(px(170.))
                                             .overflow_hidden()
                                             .whitespace_nowrap()
@@ -1144,12 +1134,7 @@ impl Desktop {
                                 );
                         } else {
                             r = r
-                                .child(
-                                    div()
-                                        .w(px(graph_width))
-                                        .text_color(rgb(0xb5f27a))
-                                        .child("●"),
-                                )
+                                .child(div().w(px(graph_width)).text_color(rgb(ACCENT)).child("●"))
                                 .child(format!(
                                     "Pending changes  ·  {} files",
                                     app.pending.snapshot.files.len()
@@ -1272,7 +1257,7 @@ impl Desktop {
                                         .id(("search-choice", i))
                                         .p_2()
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(0x26354c)))
+                                        .hover(|s| s.bg(rgb(SELECTED)))
                                         .child(
                                             div()
                                                 .w(px(26.))
@@ -1356,9 +1341,9 @@ impl Desktop {
                             .pr_3()
                             .h(px(30.))
                             .pl(px(8. + visible.depth as f32 * 14.))
-                            .bg(rgb(if selected { 0x26354c } else { PANEL }))
+                            .bg(rgb(if selected { SELECTED } else { PANEL }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x253246)));
+                            .hover(|s| s.bg(rgb(CONTROL)));
                         if let Some(check) = cs.checkbox(node) {
                             r = r.child(div().id(("check", node)).child(check).on_click(
                                 cx.listener(move |v, _, window, cx| {
@@ -1709,9 +1694,9 @@ impl Desktop {
                             .w_full()
                             .h(px(40.))
                             .px_4()
-                            .bg(rgb(if b.selected == i { 0x26354c } else { BG }))
+                            .bg(rgb(if b.selected == i { SELECTED } else { BG }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x202c3f)))
+                            .hover(|s| s.bg(rgb(HOVER)))
                             .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(
                                 v.branch_matches.styled(format!(
                                     "{}{}",
@@ -1827,7 +1812,7 @@ impl Desktop {
                             .p_2()
                             .cursor_pointer()
                             .bg(rgb(if settings.selected[settings.tab] == i {
-                                0x26354c
+                                SELECTED
                             } else {
                                 PANEL
                             }))
@@ -1984,7 +1969,7 @@ impl Render for Desktop {
                                 .id(("choice", i))
                                 .p_3()
                                 .rounded_md()
-                                .bg(rgb(0x253246))
+                                .bg(rgb(CONTROL))
                                 .cursor_pointer()
                                 .child(c.label())
                                 .on_click(cx.listener(move |v, _, window, cx| {
@@ -2214,8 +2199,8 @@ fn diff_stats(added: u32, removed: u32) -> Div {
     row()
         .flex_shrink_0()
         .text_size(px(12.))
-        .child(div().text_color(rgb(0x85dba2)).child(format!("+{added}")))
-        .child(div().text_color(rgb(0xf28c9d)).child(format!("−{removed}")))
+        .child(div().text_color(rgb(ADDED)).child(format!("+{added}")))
+        .child(div().text_color(rgb(REMOVED)).child(format!("−{removed}")))
 }
 
 fn diff_line(
@@ -2260,7 +2245,7 @@ fn diff_line(
         .font_family("Cascadia Mono")
         .text_size(px(12.))
         .bg(rgb(if changed {
-            if added { 0x173a2c } else { 0x40232d }
+            if added { ADDED_BG } else { REMOVED_BG }
         } else {
             BG
         }))

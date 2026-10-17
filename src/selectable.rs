@@ -167,7 +167,11 @@ pub fn line(
                                 point(left + line.x_for_index(start), bounds.top()),
                                 point(left + line.x_for_index(end), bounds.bottom()),
                             ),
-                            rgba(if id.2 { 0x4cba6644 } else { 0xf06c8444 }),
+                            rgba(if id.2 {
+                                crate::desktop_theme::ADDED_HIGHLIGHT
+                            } else {
+                                crate::desktop_theme::REMOVED_HIGHLIGHT
+                            }),
                         ));
                     }
                     let s = paint_selection.borrow();
@@ -185,7 +189,7 @@ pub fn line(
                                     bounds.bottom(),
                                 ),
                             ),
-                            rgba(0x7dcfff66),
+                            rgba(crate::desktop_theme::SELECTION),
                         ));
                     }
                     let _ = line.paint(point(left, bounds.top() + px(3.)), px(18.), window, cx);

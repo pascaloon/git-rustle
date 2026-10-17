@@ -49,5 +49,5 @@ pub fn icon(name: &str) -> gpui::Svg {
         .path(format!("rustle/{name}"))
         .size(px(16.))
         .flex_shrink_0()
-        .text_color(rgb(0xdce5f4))
+        .text_color(rgb(crate::desktop_theme::TEXT))
 }

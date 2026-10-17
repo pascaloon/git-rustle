@@ -3,6 +3,8 @@
 Fast, Windows-native, GPU-accelerated Git client, written in Rust with GPUI.
 The desktop renderer uses DirectX on Windows. Git history, diffs, search, remote
 previews, checkout and commits keep the existing Gitoxide/Git worker implementations.
+The native UI uses an OLED-black canvas, charcoal panels and Rust-orange accents,
+with separate green/red diff status colors.
 
 ## Build and launch
 
@@ -149,8 +151,10 @@ See [the benchmark workflow](docs/benchmarking.md) and
 [the visually verified usability fixes and measurements](docs/gpui-usability-benchmarks.md)
 and [scrollbar/diff fixes and measurements](docs/gpui-scroll-benchmarks.md).
 The [selection, search and layout report](docs/gpui-design-benchmarks.md) and
-latest [tabs, context menus and word-wrap report](docs/gpui-tabs-benchmarks.md)
-cover the revised desktop workflow. Historical terminal reports
+[tabs, context menus and word-wrap report](docs/gpui-tabs-benchmarks.md)
+cover the revised desktop workflow. The [OLED theme report](docs/oled-theme-benchmarks.md)
+records native visual checks and before/after startup and scrolling measurements.
+Historical terminal reports
 remain in `docs/`; they do not measure the desktop implementation. Terminal
 render/input adapters are retained as regression references for existing tests,
 but the executable enters GPUI and never opens a console input loop.
