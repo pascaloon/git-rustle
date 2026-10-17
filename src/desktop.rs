@@ -5,7 +5,8 @@ use crate::desktop_theme::*;
 use crate::{app::Mode, diff, engine::Engine, graph::layout::CellKind};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Root,
+    Disableable, Root,
+    checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
     scroll::{Scrollbar, ScrollbarShow},
 };
@@ -1357,13 +1358,8 @@ impl Desktop {
                             .bg(rgb(if selected { SELECTED } else { BG }))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(CONTROL)));
-                        if let Some(check) = cs.checkbox(node) {
-                            r = r.child(div().id(("check", node)).child(check).on_click(
-                                cx.listener(move |v, _, window, cx| {
-                                    cx.stop_propagation();
-                                    v.action(Action::Check(node), window, cx);
-                                }),
-                            ));
+                        if let Some(check) = cs.check_state(node) {
+                            r = r.child(v.file_checkbox(node, check, cx));
                         }
                         let prefix = if item.is_folder() {
                             if item.expanded { "▾" } else { "▸" }
@@ -1417,6 +1413,76 @@ impl Desktop {
                 cx,
             ))
             .into_any_element()
+    }
+    fn file_checkbox(
+        &self,
+        node: usize,
+        state: diff::changes::CheckState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use diff::changes::CheckState;
+        let disabled = self.engine.app.pending.busy;
+        div()
+            .id(("file-check-hitbox", node))
+            .relative()
+            .size(px(16.))
+            .flex_shrink_0()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                Checkbox::new(("file-check", node))
+                    .checked(state != CheckState::Unchecked)
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |v, _, window, cx| {
+                        cx.stop_propagation();
+                        v.action(Action::Check(node), window, cx);
+                    })),
+            )
+            .when(state == CheckState::Mixed, |s| {
+                // The component supplies focus, input and the box; paint a dash
+                // over its checkmark for a partially selected folder.
+                s.child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let opacity = if disabled { 0.5 } else { 1. };
+                            let color: Hsla = rgb(ACCENT).into();
+                            if disabled {
+                                window.paint_quad(quad(
+                                    Bounds::new(
+                                        bounds.origin + point(px(1.), px(1.)),
+                                        size(px(14.), px(14.)),
+                                    ),
+                                    px(3.),
+                                    rgb(BG),
+                                    px(0.),
+                                    rgb(BG),
+                                    BorderStyle::Solid,
+                                ));
+                            }
+                            window.paint_quad(quad(
+                                Bounds::new(
+                                    bounds.origin + point(px(1.), px(1.)),
+                                    size(px(14.), px(14.)),
+                                ),
+                                px(3.),
+                                color.opacity(opacity),
+                                px(0.),
+                                color,
+                                BorderStyle::Solid,
+                            ));
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    bounds.origin + point(px(4.), px(7.)),
+                                    size(px(8.), px(2.)),
+                                ),
+                                rgb(BG),
+                            ));
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
     }
     fn details(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let app = &self.engine.app;

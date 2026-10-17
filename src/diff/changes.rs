@@ -9,6 +9,13 @@ use gix::ObjectId;
 use super::filetree::FileTree;
 use super::{FileChange, Stat, TreeDiff};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Unchecked,
+    Checked,
+    Mixed,
+}
+
 #[derive(Debug)]
 pub struct ChangeSet {
     /// Identifies this set in worker messages.
@@ -113,15 +120,23 @@ impl ChangeSet {
         }
     }
 
-    pub fn checkbox(&self, node: usize) -> Option<&'static str> {
+    pub fn check_state(&self, node: usize) -> Option<CheckState> {
         self.checked.as_ref()?;
         let (yes, total) = self.check_totals.get(node).copied().unwrap_or_default();
         Some(if yes == 0 {
-            "[ ] "
+            CheckState::Unchecked
         } else if yes == total {
-            "[x] "
+            CheckState::Checked
         } else {
-            "[-] "
+            CheckState::Mixed
+        })
+    }
+
+    pub fn checkbox(&self, node: usize) -> Option<&'static str> {
+        self.check_state(node).map(|state| match state {
+            CheckState::Unchecked => "[ ] ",
+            CheckState::Checked => "[x] ",
+            CheckState::Mixed => "[-] ",
         })
     }
 
@@ -195,6 +210,43 @@ impl ChangeSet {
 mod tests {
     use super::*;
     use crate::diff::ChangeKind;
+
+    #[test]
+    fn folder_checks_follow_descendants_and_mixed_click_selects_all() {
+        let mut cs = ChangeSet::new(1, None, ObjectId::null(gix::hash::Kind::Sha1));
+        cs.set_tree(Ok(TreeDiff {
+            files: ["src/a.rs", "src/b.rs", "other.txt"]
+                .map(|path| FileChange {
+                    worktree: true,
+                    remote: None,
+                    path: path.into(),
+                    old_path: None,
+                    kind: ChangeKind::Modified,
+                    old: None,
+                    new: None,
+                })
+                .into(),
+        }));
+        let folder = cs.tree.nodes.iter().position(|n| n.name == "src").unwrap();
+        let first = cs.tree.nodes.iter().position(|n| n.name == "a.rs").unwrap();
+        assert_eq!(cs.check_state(folder), None);
+        cs.enable_checks();
+        assert_eq!(cs.check_state(folder), Some(CheckState::Checked));
+        cs.toggle_checked(first);
+        assert_eq!(cs.check_state(first), Some(CheckState::Unchecked));
+        assert_eq!(cs.check_state(folder), Some(CheckState::Mixed));
+        assert_eq!(cs.checked_count(), 2);
+        cs.toggle_checked(folder);
+        assert_eq!(cs.check_state(folder), Some(CheckState::Checked));
+        assert_eq!(cs.checked_count(), 3);
+        cs.toggle_checked(folder);
+        assert_eq!(cs.check_state(folder), Some(CheckState::Unchecked));
+        assert_eq!(cs.checked_count(), 1, "unrelated file stays selected");
+        cs.set_all_checked(true);
+        assert_eq!(cs.checked_count(), 3);
+        cs.set_all_checked(false);
+        assert_eq!(cs.checked_count(), 0);
+    }
 
     #[test]
     fn totals_roll_up_to_folders() {
