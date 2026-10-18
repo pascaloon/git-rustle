@@ -128,6 +128,7 @@ pub struct Outcome {
     pub view: View,
     pub result: Result<String>,
     pub refresh_repository: bool,
+    pub refresh_remotes: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Snapshot {
@@ -1330,6 +1331,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
     })();
     Outcome {
         view,
+        refresh_remotes: result.is_ok() && matches!(request, Request::PushReviewed(_)),
         result,
         refresh_repository: !request.is_read_only(),
     }

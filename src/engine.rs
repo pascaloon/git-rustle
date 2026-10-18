@@ -981,6 +981,11 @@ impl Engine {
                         app.pending.want_refresh = true;
                         app.want_refresh = true;
                     }
+                    if outcome.refresh_remotes {
+                        // API branch tips override local tracking labels. Bypass their
+                        // cache after publishing, just as a manual remote refresh does.
+                        app.branches.want_refresh = Some(true);
+                    }
                     app.needs_redraw = true;
                     timing.mark("git operation done");
                 }
@@ -1664,6 +1669,121 @@ mod tests {
             e.app.details.as_ref().is_some_and(|d| d.id == head)
         });
     }
+    #[test]
+    fn push_refreshes_graph_labels_over_stale_remote_metadata() {
+        push_graph_refresh();
+    }
+
+    /// Exercise the real push worker and result delivery with API metadata that
+    /// still points at the previous commit. All Git writes stay in these fixtures.
+    fn push_graph_refresh() -> (f64, f64) {
+        let dir = fixture();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote_path = remote_dir.path().to_str().unwrap();
+        let git = |args: &[&str]| {
+            String::from_utf8(crate::git::command::checked(dir.path(), args).unwrap()).unwrap()
+        };
+        git(&["init", "--bare", "-q", remote_path]);
+        git(&["remote", "add", "origin", remote_path]);
+        git(&["push", "origin", "HEAD~1:refs/heads/main"]);
+        git(&["branch", "--set-upstream-to=origin/main", "main"]);
+        let mut e = Engine::new(dir.path().into(), true, Instant::now());
+        until(&mut e, |e| {
+            e.app.history.complete
+                && e.app.pending.known
+                && e.auto_remote
+                && !e.app.branches.loading
+                && e.operations_initialized
+                && !e.operation_busy
+        });
+        let head = e.app.head_id().unwrap();
+        let old = e.app.history.commits[1].id;
+        let remote = remote::Remote {
+            name: "origin".into(),
+            url: remote_path.into(),
+            provider: remote::Provider::Github,
+            endpoint: "http://127.0.0.1:9/branches".into(),
+            project: "test/repository".into(),
+        };
+        e.app.branches.update(
+            remote::Update {
+                remote,
+                branches: vec![remote::Branch {
+                    name: "main".into(),
+                    sha: old.to_string(),
+                }],
+                scoped: true,
+                cached: true,
+                stale: false,
+            },
+            e.app.refs.as_ref(),
+        );
+        e.app.remote_labels();
+        assert!(e.app.labels[&old].iter().any(|l| l.name == "origin/main"));
+        let epoch = e.operation_epoch;
+        e.request_operation(git::operations::Request::PreviewPush);
+        until(&mut e, |e| e.operation_epoch != epoch);
+        assert!(!e.operation_error, "{}", e.operation_status);
+        assert!(e.app.branches.want_refresh.is_none());
+        let review = e.operations.push.clone().unwrap();
+        let epoch = e.operation_epoch;
+        let generation = e.remote_generation;
+        let start = Instant::now();
+        e.request_operation(git::operations::Request::PushReviewed(review));
+        until(&mut e, |e| e.operation_epoch != epoch);
+        let push_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert!(!e.operation_error, "{}", e.operation_status);
+        // A normal local ref refresh alone leaves the old API label authoritative.
+        // tick() advances twice, so discovery may already have consumed the flag.
+        assert!(
+            e.app.branches.want_refresh == Some(true)
+                || (e.remote_generation != generation && e.preview_force)
+        );
+        until(&mut e, |e| {
+            e.remote_generation != generation
+                && !e.app.branches.loading
+                && e.app.branches.want_refresh.is_none()
+                && !e.refreshing
+                && !e.app.want_refresh
+                && !e.app.is_walking()
+                && e.app
+                    .labels
+                    .get(&head)
+                    .is_some_and(|labels| labels.iter().any(|l| l.name == "origin/main"))
+        });
+        let graph_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert!(
+            !e.app
+                .labels
+                .get(&old)
+                .is_some_and(|labels| { labels.iter().any(|l| l.name == "origin/main") })
+        );
+        assert_eq!(git(&["rev-parse", "origin/main"]).trim(), head.to_string());
+        assert_eq!(
+            String::from_utf8(
+                crate::git::command::checked(remote_dir.path(), &["rev-parse", "main"]).unwrap()
+            )
+            .unwrap()
+            .trim(),
+            head.to_string()
+        );
+        (push_ms, graph_ms)
+    }
+
+    #[test]
+    #[ignore = "15 local push-to-graph samples with one discarded warm-up"]
+    fn benchmark_desktop_push_refresh() {
+        for sample in -1..15 {
+            let (push_ms, graph_ms) = push_graph_refresh();
+            if sample >= 0 {
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"pushMs":push_ms,"pushToGraphMs":graph_ms})
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "benchmarks commits and checkout in disposable repositories"]
     fn benchmark_desktop_mutations() {

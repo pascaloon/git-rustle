@@ -891,6 +891,7 @@ fn push_review_normal_and_new_branch_only_publish_current_branch() {
     output(&clone, &["config", "remote.origin.mirror", "true"]).unwrap();
     let result = execute(&clone, Request::PushReviewed(review));
     assert!(result.result.is_ok(), "{:?}", result.result);
+    assert!(result.refresh_remotes);
     assert_eq!(source.git(&["rev-parse", "published"]), head);
     assert_eq!(
         output(&clone, &["rev-parse", "origin/published"]).unwrap(),
@@ -946,6 +947,7 @@ fn push_review_red_never_overwrites_remote_or_seals_history() {
     source.write("other", "unseen work");
     source.commit("unseen remote work");
     let outcome = execute(&clone, Request::PreviewPush);
+    assert!(!outcome.refresh_remotes);
     assert!(!outcome.refresh_repository);
     assert_eq!(outcome.view.cursor, 1);
     let review = outcome.view.push.unwrap();
@@ -958,6 +960,7 @@ fn push_review_red_never_overwrites_remote_or_seals_history() {
     let result = execute(&clone, Request::PushReviewed(review));
     assert!(result.result.is_err());
     assert_eq!(result.view.cursor, 1);
+    assert!(!result.refresh_remotes);
     assert_eq!(source.git(&["rev-parse", "HEAD"]), remote_head);
 }
 

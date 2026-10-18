@@ -122,6 +122,7 @@ then measure mutation workers and UI delivery separately:
 cargo test --release git::operations::tests::benchmark_operations -- --ignored --exact --nocapture
 cargo test --release git::operations::tests::benchmark_large_worktree_operations -- --ignored --exact --nocapture
 cargo test --release engine::tests::benchmark_desktop_mutations -- --ignored --exact --nocapture
+cargo test --release engine::tests::benchmark_desktop_push_refresh -- --ignored --exact --nocapture
 ./scripts/benchmark-operations.ps1 -Samples 15 -OutputDirectory target/bench/<run>/operations-native
 ```
 
@@ -130,6 +131,11 @@ cost. The native suite measures action dispatch through the next rendered frame
 for the new-branch dialog, branch creation, rebase plan and history popup. Both have
 one discarded warm-up and 15 retained samples. They do not establish live remote
 latency, large binary-file snapshot latency or physical input/display latency.
+The push-to-graph harness publishes to a disposable local bare remote after
+installing stale API branch metadata. It asserts a forced discovery request and
+the updated graph label, and records push result delivery and time through graph
+model refresh separately. Its provider is unconfigured, so discovery falls back
+to local tracking refs; it does not measure live provider API latency or painting.
 The large-worktree harness separately measures branch creation and history
 navigation with 1,001 tracked files, both clean and with 100 staged/unstaged files
 plus an untracked file, checking that staging and working contents survive.
