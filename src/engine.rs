@@ -371,10 +371,12 @@ impl Engine {
         }
     }
     pub fn repository_path(&self) -> String {
-        self.repo
-            .as_ref()
-            .map(|r| r.workdir().unwrap_or(r.path()).display().to_string())
+        self.repository_root()
+            .map(|p| p.display().to_string())
             .unwrap_or_default()
+    }
+    pub fn repository_root(&self) -> Option<&Path> {
+        self.repo.as_ref().map(|r| r.workdir().unwrap_or(r.path()))
     }
     pub fn landing(&self) -> bool {
         self.repo_seen && self.repo.is_none()

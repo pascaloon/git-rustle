@@ -210,6 +210,30 @@ the child process environment. Never log the token. It only reads project/member
 the latest commit and its image; request creation remains a local fixture test.
 Keep native cached remote-preview comparison in the run as a regression check.
 
+For shared binary-photo cache changes, preserve both the baseline application and
+test executables. Compare the existing `benchmark_author_cache` harness in each
+preserved test executable after builds finish: it records 15 samples after one
+warm-up, with 100 warm reads per sample. The candidate seeds equivalent 4 KiB image
+bytes directly in its binary cache; the old harness seeds a JSON byte array. These
+measure cached identity/image I/O and parsing, excluding image decoding and real
+network downloads. Also run candidate-only
+`remote::requests::tests::benchmark_shared_author_cache` to resolve different commit
+IDs through the same persisted email binding with the API unavailable. It reports
+binary versus JSON storage sizes for the same payload.
+
+Set `GIT_RUSTLE_AUTHOR_REPO` to the large read-only clone and run the ignored
+`desktop::requests::tests::benchmark_local_author_reuse` harness. It reads 40 local
+author headers per sample and measures shared-image lookup separately. It excludes
+worker scheduling and GPU paint. Compare native startup, `scroll` and `avatar-scroll`
+with the baseline; `avatar-scroll` uses a preloaded shared photo. Then run candidate-only
+`avatar-reuse-scroll` with `GIT_RUSTLE_AVATAR_FIXTURE` set to that photo. This scenario
+uses the real background local-author worker and profile lookup while scrolling,
+seeding positive profiles with the fixture image after each lookup and issuing no
+photo API requests. Logs record worker dispatch-to-delivery milliseconds, snapshots
+require visible reused profiles, and frame JSON retains 120 intervals per launch.
+One photo is shared by all seeded identities: this measures reuse/scheduling/rendering,
+not mixed-image decoding, cold provider responses or physical input latency.
+
 For landing-page changes, compare native repository startup with the baseline,
 then run `scripts/benchmark-landing.ps1 -Candidate <exe> -Repository <repo>
 -OutputDirectory <new-directory>`. The candidate-only suite discards one warm-up

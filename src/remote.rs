@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::git::command;
 use serde::{Deserialize, Serialize};
 
+mod avatars;
 pub mod files;
 pub mod history;
 pub mod requests;

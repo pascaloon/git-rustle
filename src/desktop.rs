@@ -710,12 +710,16 @@ impl Desktop {
                                     v.frame_start = Some(Instant::now());
                                     cx.notify();
                                 }
-                                Some("scroll" | "graph-resize" | "avatar-scroll") => {
-                                    if v.scenario.as_deref() == Some("avatar-scroll") {
+                                Some("scroll" | "graph-resize" | "avatar-scroll" | "avatar-reuse-scroll") => {
+                                    if matches!(v.scenario.as_deref(), Some("avatar-scroll" | "avatar-reuse-scroll")) {
                                         let path = std::env::var_os("GIT_RUSTLE_AVATAR_FIXTURE").expect("avatar image fixture required");
                                         let bytes = std::fs::read(path).expect("read avatar fixture");
                                         let format = crate::remote::requests::image_format(&bytes).expect("PNG, JPEG or WebP avatar fixture");
-                                        v.avatars.scenario_image = Some(std::sync::Arc::new(Image::from_bytes(format, bytes)));
+                                        let image = std::sync::Arc::new(Image::from_bytes(format, bytes));
+                                        if v.scenario.as_deref() == Some("avatar-reuse-scroll") {
+                                            v.avatars.reuse_scenario_image = Some(image);
+                                            v.avatars.seed_reuse_scenario();
+                                        } else { v.avatars.scenario_image = Some(image); }
                                     }
                                     v.scroll_step = 1;
                                     v.frame_start = Some(Instant::now());
@@ -1632,11 +1636,15 @@ impl Desktop {
             n,
             cx.processor(|v, range: std::ops::Range<usize>, _, cx| {
                 v.viewport_rows[0] = v.viewport_rows[0].max(range.len());
+                v.reset_avatar_repository();
                 let app = &v.engine.app;
-                v.avatars.observe(range.clone().filter_map(|row| {
+                let changed = v.avatars.observe(range.clone().filter_map(|row| {
                     app.history_index(row)
                         .map(|i| v.engine.app.history.commits[i].id)
                 }));
+                if changed {
+                    v.resolve_avatar_authors(cx);
+                }
                 v.engine.app.list_rows = range.len().max(1);
                 v.engine.app.scroll = range.start;
                 let app = &v.engine.app;
@@ -1761,8 +1769,7 @@ impl Desktop {
                                         .text_color(rgb(MUTED))
                                         .child(requests::avatar(
                                             v.avatars
-                                                .images
-                                                .get(&rec.id)
+                                                .image(&rec.id)
                                                 .or(v.avatars.scenario_image.as_ref()),
                                             app.history.author(i),
                                             22.,
@@ -2159,7 +2166,7 @@ impl Desktop {
                                 ))
                                 .when_some(self.detail_id, |s, id| {
                                     s.child(requests::avatar(
-                                        self.avatars.images.get(&id),
+                                        self.avatars.image(&id),
                                         app.details
                                             .as_ref()
                                             .map(|d| d.author_name.as_str())
@@ -2703,10 +2710,24 @@ impl Desktop {
             }
             Some("request-compose") => self.composer.is_some(),
             Some(
-                "history-scroll" | "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize"
-                | "files-scroll" | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll"
-                | "tabs" | "settings-tabs" | "checkout-dialog" | "status-panels" | "request-edit"
-                | "request-tabs" | "avatar-scroll",
+                "history-scroll"
+                | "rebase-scroll"
+                | "rebase-edit"
+                | "scroll"
+                | "graph-resize"
+                | "files-scroll"
+                | "diff-scroll"
+                | "diff-pan"
+                | "search-scroll"
+                | "wrap-scroll"
+                | "tabs"
+                | "settings-tabs"
+                | "checkout-dialog"
+                | "status-panels"
+                | "request-edit"
+                | "request-tabs"
+                | "avatar-scroll"
+                | "avatar-reuse-scroll",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2763,11 +2784,12 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\n{}\n{}\n{}",
+                "footer_panel={:?}\n{}\n{}\n{}\n{}",
                 self.status_panel,
                 self.engine.operation_status,
                 self.operations.summary(),
-                self.request_summary()
+                self.request_summary(),
+                self.avatars.summary()
             ),
         )
     }

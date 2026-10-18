@@ -43,7 +43,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -eq 'status-panels' -and $state -notmatch 'footer_panel=Some\(Details\)') {
         throw "Expected the final toggle to leave Details open: $log"
     }
-    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll') -and
+    if ($scenario -eq 'avatar-reuse-scroll' -and $state -notmatch 'avatar_visible_ready=[1-9]') {
+        throw "Expected visible rows to reuse known author profiles: $log"
+    }
+    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
         throw "Candidate did not install syntax colors: $log"
@@ -58,6 +61,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'request-edit' { 'desktop scroll done' }
         'request-tabs' { 'desktop scroll done' }
         'avatar-scroll' { 'desktop scroll done' }
+        'avatar-reuse-scroll' { 'desktop scroll done' }
         'scroll' { 'desktop scroll done' }
         'graph-resize' { 'desktop scroll done' }
         'checkout-dialog' { 'desktop scroll done' }
@@ -92,7 +96,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll','avatar-reuse-scroll')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

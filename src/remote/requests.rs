@@ -1,4 +1,5 @@
 //! PR/MR composition. Blocking I/O belongs on a worker; typing never hits the API.
+pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};
 
@@ -72,6 +73,7 @@ pub struct Client<'a> {
     http: Http,
     token: Option<String>,
     no_cache: bool,
+    photos: Option<super::avatars::Cache>,
 }
 
 impl<'a> Client<'a> {
@@ -81,6 +83,7 @@ impl<'a> Client<'a> {
         Ok(Self {
             path,
             token: cached_token(path, &git_dir, remote)?,
+            photos: super::avatars::Cache::new(&git_dir),
             git_dir,
             remote,
             http: Http::new(),
@@ -403,9 +406,28 @@ impl<'a> Client<'a> {
         Some(avatar)
     }
 
+    #[cfg(test)]
     pub fn author(&mut self, sha: &str) -> Option<Vec<u8>> {
+        self.author_for_email(sha, "")
+    }
+
+    fn photo_cache(&self) -> Option<&super::avatars::Cache> {
+        self.photos.as_ref().filter(|_| !self.no_cache)
+    }
+
+    pub fn author_for_email(&mut self, sha: &str, email: &str) -> Option<Vec<u8>> {
+        if let Some(url) = self
+            .photo_cache()
+            .and_then(|c| c.identity(self.remote, email))
+        {
+            return self.avatar(&url);
+        }
         let url = self.author_url(sha)?;
-        self.avatar(&url)
+        let bytes = self.avatar(&url)?;
+        if let Some(cache) = self.photo_cache() {
+            cache.store_identity(self.remote, email, &url);
+        }
+        Some(bytes)
     }
 
     pub fn avatar(&self, url: &str) -> Option<Vec<u8>> {
@@ -413,7 +435,21 @@ impl<'a> Client<'a> {
             return None;
         }
         let key = format!("image-{url}");
-        if let Some(bytes) = self.read::<Vec<u8>>(&key, 86400) {
+        if let Some(bytes) = self.photo_cache().and_then(|c| c.image(url)) {
+            return Some(bytes);
+        }
+        // Upgrade existing fresh JSON entries without another download.
+        if let Some(bytes) = self.read::<Vec<u8>>(&key, 86400)
+            && bytes.len() <= super::avatars::MAX_IMAGE as usize
+            && image_format(&bytes).is_some()
+        {
+            if self
+                .photo_cache()
+                .is_some_and(|c| c.store_image(url, &bytes))
+                && let Some(path) = self.location(&key)
+            {
+                let _ = std::fs::remove_file(path);
+            }
             return Some(bytes);
         }
         // Image hosts receive no provider token, cookies or redirect credentials.
@@ -430,11 +466,13 @@ impl<'a> Client<'a> {
         let bytes = response
             .body_mut()
             .with_config()
-            .limit(256 * 1024)
+            .limit(super::avatars::MAX_IMAGE)
             .read_to_vec()
             .ok()?;
         image_format(&bytes)?;
-        self.write(&key, &bytes);
+        if let Some(cache) = self.photo_cache() {
+            cache.store_image(url, &bytes);
+        }
         Some(bytes)
     }
 }
@@ -447,20 +485,8 @@ pub fn safe_web_url(value: &str) -> bool {
             && u.password().is_none()
     })
 }
-fn safe_image_url(value: &str) -> bool {
+pub(super) fn safe_image_url(value: &str) -> bool {
     safe_web_url(value)
-}
-
-pub fn image_format(bytes: &[u8]) -> Option<gpui::ImageFormat> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some(gpui::ImageFormat::Png)
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some(gpui::ImageFormat::Jpeg)
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some(gpui::ImageFormat::Webp)
-    } else {
-        None
-    }
 }
 
 fn status_error(status: u16) -> String {
@@ -579,6 +605,7 @@ mod tests {
             http: Http::new(),
             token: Some("fixture-only".into()),
             no_cache: true,
+            photos: Some(super::super::avatars::Cache::at(path.join("photos"))),
         }
     }
 
@@ -758,10 +785,69 @@ mod tests {
             } else {
                 assert!(avatar.ends_with("?s=64"));
             }
-            assert_eq!(client.author(&sha), Some(bytes)); // API server stopped
+            let legacy = client.location(&format!("image-{avatar}")).unwrap();
+            assert!(legacy.exists());
+            assert_eq!(client.author(&sha), Some(bytes.clone())); // API server stopped
+            assert!(!legacy.exists()); // migrated to shared binary, without downloading
+            assert_eq!(client.photo_cache().unwrap().image(&avatar), Some(bytes));
             let location = client.location(&format!("author-{sha}")).unwrap();
             let _ = std::fs::remove_dir_all(location.parent().unwrap());
         }
+    }
+
+    #[test]
+    fn known_author_reuses_binary_across_repositories_commits_and_credentials() {
+        let (url, server) = server(vec![(
+            200,
+            "",
+            json!({"author":{
+                "avatar_url":"https://avatars.example/u/shared-cache-test"
+            }}),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let remote = fixture(Provider::Github, &url, &first);
+        let mut other = fixture(Provider::Github, &url, &second);
+        other.endpoint = other
+            .endpoint
+            .replace("/team/project/", "/different/repository/");
+        let photos = dir.path().join("shared");
+        let mut client1 = client(&first, &remote);
+        let mut client2 = client(&second, &other);
+        for client in [&mut client1, &mut client2] {
+            client.no_cache = false;
+            client.photos = Some(super::super::avatars::Cache::at(photos.clone()));
+        }
+        client2.token = Some("a-different-credential".into());
+        let bytes = b"\x89PNG\r\n\x1a\nshared".to_vec();
+        let image_url = "https://avatars.example/u/shared-cache-test?s=64";
+        assert!(
+            client1
+                .photo_cache()
+                .unwrap()
+                .store_image(image_url, &bytes)
+        );
+        assert_eq!(
+            client1.author_for_email(&"a".repeat(40), "alice@example.com"),
+            Some(bytes.clone())
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        // No commit/author API or image host is available now, and this SHA is new.
+        assert_eq!(
+            client2.author_for_email(&"b".repeat(40), "alice@example.com"),
+            Some(bytes)
+        );
+        assert_eq!(std::fs::read_dir(photos).unwrap().count(), 2); // one image + one binding
+        client2.no_cache = true;
+        assert!(
+            client2
+                .author_for_email("invalid", "alice@example.com")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(client1.location("unused").unwrap().parent().unwrap());
     }
 
     #[test]
@@ -779,11 +865,12 @@ mod tests {
             let remote = fixture(Provider::Github, &url, dir.path());
             let mut client = client(dir.path(), &remote);
             client.no_cache = false;
-            let bytes = vec![137u8; 4096];
-            client.write(
-                "image-https://avatars.githubusercontent.com/u/42?s=64",
-                &bytes,
-            );
+            let mut bytes = vec![137u8; 4096];
+            bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            client
+                .photo_cache()
+                .unwrap()
+                .store_image("https://avatars.githubusercontent.com/u/42?s=64", &bytes);
             let sha = "a".repeat(40);
             let start = std::time::Instant::now();
             assert_eq!(client.author(&sha).unwrap().len(), 4096);
@@ -804,6 +891,41 @@ mod tests {
         println!(
             "author_loopback_identity_cached_image_ms={cold:?}\nauthor_disk_cache_ms={warm:?}"
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_shared_author_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(Provider::Github, "http://127.0.0.1:1", dir.path());
+        let mut client = client(dir.path(), &remote);
+        client.no_cache = false;
+        let image_url = "https://avatars.example/u/benchmark?s=64";
+        let mut bytes = vec![137u8; 4096];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let cache = client.photo_cache().unwrap();
+        assert!(cache.store_image(image_url, &bytes));
+        cache.store_identity(&remote, "alice@example.com", image_url);
+        let legacy = serde_json::to_vec(&bytes).unwrap();
+        println!(
+            "image_binary_bytes={} image_json_bytes={}",
+            bytes.len(),
+            legacy.len()
+        );
+        let mut samples = Vec::new();
+        for sample in 0..16 {
+            let start = std::time::Instant::now();
+            for i in 0..100 {
+                assert_eq!(
+                    client.author_for_email(&format!("{i:040x}"), "alice@example.com"),
+                    Some(bytes.clone())
+                );
+            }
+            if sample > 0 {
+                samples.push(start.elapsed().as_secs_f64() * 1000. / 100.);
+            }
+        }
+        println!("shared_author_different_commits_disk_ms={samples:?}");
     }
 
     #[test]
