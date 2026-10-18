@@ -2,7 +2,12 @@
 use crate::desktop_icons::icon;
 use crate::desktop_text::{Matches, TextBlock};
 use crate::desktop_theme::*;
-use crate::{app::Mode, diff, engine::Engine, graph::layout::CellKind};
+use crate::{
+    app::Mode,
+    diff,
+    engine::Engine,
+    graph::layout::{CellKind, GraphCell},
+};
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Root, Sizable,
@@ -1236,13 +1241,24 @@ impl Desktop {
                                         )),
                                 );
                         } else {
-                            let lane = app
+                            let head = app
                                 .pending
                                 .head_index
-                                .and_then(|i| app.history.commits.get(i))
-                                .map_or(0, |rec| rec.node_lane as usize);
+                                .and_then(|i| app.history.commits.get(i).map(|rec| (i, rec)));
+                            let lane = head.map_or(0, |(_, rec)| rec.node_lane as usize);
+                            let cells = pending_graph_cells(
+                                head.map_or(&[], |(i, _)| app.history.row_cells(i)),
+                                lane,
+                            );
+                            let flags = head.map_or_else(Vec::new, |(_, rec)| {
+                                app.history
+                                    .remote_cells
+                                    .get(rec.row.range())
+                                    .unwrap_or_default()
+                                    .to_vec()
+                            });
                             r = r
-                                .child(pending_graph_canvas(graph_width, lane))
+                                .child(pending_graph_canvas(graph_width, lane, cells, flags))
                                 .child(format!(
                                     "Pending changes  ·  {} files",
                                     app.pending.snapshot.files.len()
@@ -2554,8 +2570,10 @@ fn graph_node_center(bounds: Bounds<Pixels>, lane: usize) -> Point<Pixels> {
     )
 }
 
+const GRAPH_NODE_RADIUS: f32 = 5.;
+
 fn paint_graph_node(center: Point<Pixels>, color: Hsla, hollow: bool, window: &mut Window) {
-    let radius = px(5.);
+    let radius = px(GRAPH_NODE_RADIUS);
     window.paint_quad(quad(
         Bounds::new(
             center - point(radius, radius),
@@ -2569,17 +2587,85 @@ fn paint_graph_node(center: Point<Pixels>, color: Hsla, hollow: bool, window: &m
     ));
 }
 
-fn pending_graph_canvas(width: f32, lane: usize) -> impl IntoElement {
+fn graph_connects_top(kind: CellKind) -> bool {
+    matches!(
+        kind,
+        CellKind::Vertical
+            | CellKind::Node
+            | CellKind::MergeNode
+            | CellKind::Cross
+            | CellKind::EndFromRight
+            | CellKind::EndFromLeft
+            | CellKind::JoinFromLeft
+            | CellKind::JoinFromRight
+    )
+}
+
+fn graph_color(cell: GraphCell, flag: u8) -> Hsla {
+    let color: Hsla = rgb(COLORS[cell.color() as usize % COLORS.len()]).into();
+    if flag & 1 != 0 {
+        color.opacity(0.42)
+    } else {
+        color
+    }
+}
+
+/// The synthetic row sits immediately above HEAD: only its incoming lanes
+/// cross this row. Merge-parent starts and horizontal connectors belong below it.
+fn pending_graph_cells(head: &[GraphCell], lane: usize) -> Vec<GraphCell> {
+    let mut cells: Vec<_> = head
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            if i == lane {
+                GraphCell::new(CellKind::Node, cell.color())
+            } else if graph_connects_top(cell.kind()) {
+                GraphCell::new(CellKind::Vertical, cell.color())
+            } else {
+                GraphCell::EMPTY
+            }
+        })
+        .collect();
+    // Unborn repositories and history still loading have no HEAD row yet.
+    if cells.len() <= lane {
+        cells.resize(lane + 1, GraphCell::EMPTY);
+        cells[lane] = GraphCell::new(CellKind::Node, 0);
+    }
+    cells
+}
+
+fn pending_graph_canvas(
+    width: f32,
+    lane: usize,
+    cells: Vec<GraphCell>,
+    flags: Vec<u8>,
+) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            if lane < (width / 14.) as usize {
-                paint_graph_node(
-                    graph_node_center(bounds, lane),
-                    rgb(ACCENT).into(),
-                    true,
-                    window,
-                );
+            for (i, cell) in cells.iter().enumerate().take((width / 14.) as usize) {
+                let center = graph_node_center(bounds, i);
+                let color = graph_color(*cell, flags.get(i).copied().unwrap_or(0));
+                if i == lane {
+                    // Stop at the rim so the pending marker stays hollow on every background.
+                    let start = center.y + px(GRAPH_NODE_RADIUS);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(center.x - px(1.), start),
+                            size(px(2.), bounds.bottom() - start),
+                        ),
+                        color,
+                    ));
+                    paint_graph_node(center, color, true, window);
+                } else if cell.kind() == CellKind::Vertical {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(center.x - px(1.), bounds.top()),
+                            size(px(2.), bounds.size.height),
+                        ),
+                        color,
+                    ));
+                }
             }
         },
     )
@@ -2588,11 +2674,7 @@ fn pending_graph_canvas(width: f32, lane: usize) -> impl IntoElement {
     .flex_shrink_0()
 }
 
-fn graph_canvas(
-    cells: Vec<crate::graph::layout::GraphCell>,
-    flags: Vec<u8>,
-    width: f32,
-) -> impl IntoElement {
+fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -2600,24 +2682,9 @@ fn graph_canvas(
                 let center = graph_node_center(bounds, i);
                 let x = center.x;
                 let middle = center.y;
-                let color: Hsla = rgb(COLORS[c.color() as usize % 10]).into();
-                let color: Hsla = if flags.get(i).is_some_and(|f| f & 1 != 0) {
-                    color.opacity(0.42)
-                } else {
-                    color
-                };
+                let color = graph_color(*c, flags.get(i).copied().unwrap_or(0));
                 let k = c.kind();
-                let top = matches!(
-                    k,
-                    CellKind::Vertical
-                        | CellKind::Node
-                        | CellKind::MergeNode
-                        | CellKind::Cross
-                        | CellKind::EndFromRight
-                        | CellKind::EndFromLeft
-                        | CellKind::JoinFromLeft
-                        | CellKind::JoinFromRight
-                );
+                let top = graph_connects_top(k);
                 let bottom = matches!(
                     k,
                     CellKind::Vertical
@@ -2683,4 +2750,57 @@ fn graph_canvas(
     // Fill the commit row so adjacent canvases meet without a vertical gap.
     .h_full()
     .flex_shrink_0()
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::{CellKind, GraphCell, pending_graph_cells};
+    use crate::graph::layout::Layout;
+
+    fn id(n: u8) -> gix::ObjectId {
+        gix::ObjectId::from_bytes_or_panic(&[n; 20])
+    }
+
+    #[test]
+    fn pending_inherits_head_color_and_preserves_parallel_branch() {
+        let mut layout = Layout::new();
+        let other = layout.push(&id(3), &[id(1)]);
+        let head = layout.push(&id(2), &[id(1)]);
+        let lane = head.node_lane as usize;
+        assert_ne!(lane, other.node_lane as usize);
+        let pending = pending_graph_cells(&head.cells, lane);
+        assert_eq!(pending[lane].color(), head.cells[lane].color());
+        assert_ne!(pending[lane].color(), other.cells[0].color());
+        assert_eq!(
+            pending[0],
+            GraphCell::new(CellKind::Vertical, other.cells[0].color())
+        );
+    }
+
+    #[test]
+    fn pending_preserves_incoming_merge_lanes_but_does_not_start_merge_parents() {
+        let mut layout = Layout::new();
+        layout.push(&id(4), &[id(2)]);
+        layout.push(&id(3), &[id(2)]);
+        let head = layout.push(&id(2), &[id(1)]);
+        assert_eq!(head.cells[1].kind(), CellKind::EndFromRight);
+        let pending = pending_graph_cells(&head.cells, head.node_lane as usize);
+        assert_eq!(
+            pending[1],
+            GraphCell::new(CellKind::Vertical, head.cells[1].color())
+        );
+
+        let merge = Layout::new().push(&id(4), &[id(3), id(2)]);
+        assert_eq!(merge.cells[1].kind(), CellKind::StartToRight);
+        let pending = pending_graph_cells(&merge.cells, merge.node_lane as usize);
+        assert_eq!(pending[1], GraphCell::EMPTY);
+    }
+
+    #[test]
+    fn pending_without_head_has_a_fallback_node() {
+        assert_eq!(
+            pending_graph_cells(&[], 0),
+            vec![GraphCell::new(CellKind::Node, 0)]
+        );
+    }
 }
