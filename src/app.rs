@@ -49,6 +49,8 @@ pub enum LoadState {
 pub struct Label {
     pub name: String,
     pub kind: RefKind,
+    /// Provider tip that differs from the locally stored remote-tracking ref.
+    pub remote_only: bool,
 }
 
 pub struct App {
@@ -761,6 +763,7 @@ impl App {
                     .map(|r| Label {
                         name: r.name.clone(),
                         kind: r.kind,
+                        remote_only: false,
                     })
                     .collect(),
             );
@@ -778,6 +781,7 @@ impl App {
                     Label {
                         name: "HEAD".into(),
                         kind: RefKind::Head,
+                        remote_only: false,
                     },
                 );
             }
@@ -795,24 +799,36 @@ impl App {
 
     pub fn remote_labels(&mut self) {
         self.search.invalidate();
-        // API metadata adds labels only. It never changes the local walk tips or cache.
+        // Replace only API overlays. Fetched remote-tracking labels stay on their
+        // actual local objects, even when a provider reports a different tip.
+        self.labels.retain(|_, labels| {
+            labels.retain(|label| !label.remote_only);
+            !labels.is_empty()
+        });
         for (name, update) in &self.branches.remotes {
-            let prefix = format!("{name}/");
-            for labels in self.labels.values_mut() {
-                labels.retain(|l| !(l.kind == RefKind::Remote && l.name.starts_with(&prefix)));
-            }
             for branch in &update.branches {
                 if let Ok(id) = ObjectId::from_hex(branch.sha.as_bytes()) {
+                    let label_name = format!("{name}/{}", branch.name);
                     if self.ghosts.contains_key(&id)
-                        && !self.ghost_branches.iter().any(|(tip, name)| {
-                            *tip == id && *name == format!("{}/{}", update.remote.name, branch.name)
-                        })
+                        && !self
+                            .ghost_branches
+                            .iter()
+                            .any(|(tip, name)| *tip == id && *name == label_name)
                     {
                         continue;
                     }
-                    self.labels.entry(id).or_default().push(Label {
-                        name: format!("{name}/{}", branch.name),
+                    let labels = self.labels.entry(id).or_default();
+                    // When fetched and live tips agree, the real ref badge suffices.
+                    if labels
+                        .iter()
+                        .any(|label| label.kind == RefKind::Remote && label.name == label_name)
+                    {
+                        continue;
+                    }
+                    labels.push(Label {
+                        name: label_name,
                         kind: RefKind::Remote,
+                        remote_only: true,
                     });
                 }
             }
@@ -826,6 +842,7 @@ impl App {
                 labels.push(Label {
                     name: name.clone(),
                     kind: RefKind::Tag,
+                    remote_only: false,
                 });
             }
         }
@@ -2039,6 +2056,84 @@ mod tests {
         assert_eq!(text.matches("HEAD").count(), 1);
         app.set_refs(RefSnapshot::default());
         assert!(app.labels.is_empty()); // Unborn HEAD has no commit to label.
+    }
+
+    #[test]
+    fn provider_labels_preserve_fetched_refs_and_mark_only_different_live_tips() {
+        use crate::git::RefEntry;
+        for url in [
+            "https://github.com/test/repo",
+            "https://gitlab.com/test/repo",
+        ] {
+            let mut app = app_with(3);
+            let live = app.history.commits[0].id;
+            let fetched = app.history.commits[1].id;
+            let refs = RefSnapshot {
+                refs: vec![
+                    RefEntry {
+                        name: "origin/main".into(),
+                        id: fetched,
+                        kind: RefKind::Remote,
+                    },
+                    RefEntry {
+                        name: "origin/unlisted".into(),
+                        id: fetched,
+                        kind: RefKind::Remote,
+                    },
+                ],
+                ..Default::default()
+            };
+            app.set_refs(refs.clone());
+            let mut update = crate::remote::Update {
+                remote: crate::remote::Remote::parse("origin", url, None).unwrap(),
+                branches: vec![crate::remote::Branch {
+                    name: "main".into(),
+                    sha: live.to_string(),
+                }],
+                scoped: false,
+                cached: false,
+                stale: false,
+            };
+            app.branches.update(update.clone(), app.refs.as_ref());
+            // The live tip is already a local object: cloud state must describe
+            // the branch's provider origin, not whether the commit is a ghost.
+            for _ in 0..2 {
+                app.remote_labels();
+                let labels = &app.labels[&fetched];
+                assert_eq!(labels.len(), 2);
+                assert!(labels.iter().all(|l| !l.remote_only));
+                let cloud = &app.labels[&live];
+                assert_eq!(cloud.len(), 1);
+                assert_eq!(cloud[0].name, "origin/main");
+                assert_eq!(cloud[0].kind, RefKind::Remote);
+                assert!(cloud[0].remote_only);
+                assert_eq!(app.refs.as_ref().unwrap().refs[0].id, fetched);
+            }
+            // A local fetch converges with the live tip: leave just the real ref.
+            let mut refreshed = refs.clone();
+            refreshed.refs[0].id = live;
+            app.set_refs(refreshed);
+            assert_eq!(app.labels[&live].len(), 1);
+            assert!(!app.labels[&live][0].remote_only);
+            assert_eq!(app.labels[&fetched][0].name, "origin/unlisted");
+            // A provider can also move back to an already fetched object.
+            update.branches[0].sha = fetched.to_string();
+            app.branches.update(update.clone(), app.refs.as_ref());
+            app.remote_labels();
+            assert!(app.labels[&fetched].iter().any(|l| l.remote_only));
+            assert!(!app.labels[&live][0].remote_only);
+            // Removing an API branch removes only its overlay, even for a full
+            // provider listing. Fetched refs stay until Git itself removes them.
+            update.branches.clear();
+            app.branches.update(update, app.refs.as_ref());
+            app.remote_labels();
+            assert!(app.labels.values().flatten().all(|l| !l.remote_only));
+            assert_eq!(app.labels[&live][0].name, "origin/main");
+            assert_eq!(app.labels[&fetched][0].name, "origin/unlisted");
+            app.branches.remotes.clear();
+            app.set_refs(refs);
+            assert!(!app.labels.contains_key(&live));
+        }
     }
 
     #[test]

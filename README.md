@@ -148,6 +148,10 @@ branch browser requests the full listing. Remote enrichment prioritizes selected
 branches and bounds background work. Activity uses the latest 100 first-parent
 commits and counts commits from the past seven days.
 
+Blue `origin/branch` graph badges stay on the locally fetched tracking refs.
+When the provider reports a different tip, a separate blue badge with the same
+name and a cloud icon marks that tip. Matching tips share one badge.
+
 Ghost previews preserve merge ancestry and selection. Immutable metadata, trees,
 file contents and assembled previews are cached separately; branch/tag caches
 have a five-minute TTL. Refresh revalidates them. Cached results remain usable

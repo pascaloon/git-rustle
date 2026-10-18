@@ -1752,15 +1752,26 @@ impl Desktop {
                                 for label in
                                     labels.iter().filter(|label| label.name != "HEAD").take(3)
                                 {
+                                    let remote = label.kind == crate::git::RefKind::Remote;
+                                    let color = if remote { REMOTE_TEXT } else { SEARCH_TEXT };
                                     r = r.child(
-                                        div()
+                                        row()
+                                            .gap_1()
                                             .rounded_sm()
                                             .px_1()
-                                            .bg(rgb(SELECTED))
-                                            .text_color(rgb(SEARCH_TEXT))
+                                            .flex_shrink_0()
+                                            .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
+                                            .text_color(rgb(color))
                                             .max_w(px(170.))
                                             .overflow_hidden()
                                             .whitespace_nowrap()
+                                            .when(label.remote_only, |badge| {
+                                                badge.child(
+                                                    icon("cloud")
+                                                        .size(px(14.))
+                                                        .text_color(rgb(color)),
+                                                )
+                                            })
                                             .child(v.matches.styled(label.name.clone())),
                                     );
                                 }
