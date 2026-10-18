@@ -16,6 +16,7 @@ use crate::model::History;
 
 pub mod checkout;
 pub mod command;
+pub mod operations;
 pub mod worktree;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -135,7 +136,10 @@ pub fn snapshot_refs(repo: &gix::Repository) -> Result<RefSnapshot> {
             RefKind::Remote
         } else if full.starts_with(b"refs/tags/") {
             RefKind::Tag
-        } else if full == b"refs/stash".as_bstr() || full.starts_with(b"refs/notes/") {
+        } else if full == b"refs/stash".as_bstr()
+            || full.starts_with(b"refs/notes/")
+            || full.starts_with(b"refs/rustle/")
+        {
             continue;
         } else {
             RefKind::Other

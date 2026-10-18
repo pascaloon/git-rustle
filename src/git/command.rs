@@ -62,15 +62,17 @@ pub fn run_env(
         let tx = tx.clone();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
+            let mut truncated = false;
             let mut buf = [0u8; 8192];
             while let Ok(n) = pipe.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
                 let keep = n.min((16 * 1024 * 1024usize).saturating_sub(bytes.len()));
+                truncated |= keep != n;
                 bytes.extend_from_slice(&buf[..keep]);
             }
-            let _ = tx.send((is_out, bytes));
+            let _ = tx.send((is_out, bytes, truncated));
         });
     }
     drop(tx);
@@ -92,9 +94,12 @@ pub fn run_env(
         stderr: Vec::new(),
     };
     for _ in 0..2 {
-        let (is_out, data) = rx
+        let (is_out, data, truncated) = rx
             .recv_timeout(timeout.saturating_sub(start.elapsed()))
             .map_err(|_| "Git helper timed out".to_string())?;
+        if truncated {
+            return Err("Git output exceeded 16 MiB; the incomplete result was rejected.".into());
+        }
         if is_out {
             output.stdout = data;
         } else {

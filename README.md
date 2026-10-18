@@ -10,7 +10,7 @@ with separate green/red diff status colors.
 
 Requires Windows 10/11, a DirectX-capable graphics driver, a current stable Rust
 MSVC toolchain, and Visual Studio C++ Build Tools. Git for Windows on PATH is
-required for checkout and commit creation. No terminal host is needed.
+required for Git mutations and recovery. No terminal host is needed.
 
 ```powershell
 cargo build --release --locked
@@ -67,6 +67,18 @@ interior pixels. The icon generator retains the resulting alpha channel.
 - **Checkout…** opens an explicit choice dialog. Clicking a branch or detached
   commit choice performs that checkout. **Cancel** performs no Git operation.
 - **Refresh** reloads refs/status and revalidates remote data.
+- **Pull**, **Push**, and **New branch** live in the graph toolbar. Push reviews
+  the current branch with a green, orange or red safety shield. Right-click a
+  commit to merge, rebase, or rename/delete its local branches.
+- **Interactive rebase from here…** prepares an editable commit plan from the
+  graph menu. Its tab appears only for an open plan or active interactive rebase.
+  Reorder, reword, squash, fixup, edit and drop are supported. **Conflicts** guides paused operations with
+  version comparison, text editing, staging, Continue, Skip and Abort.
+- **Undo / redo history** in the bottom-right status bar lists recoverable states.
+  Double-click a state to move backward or forward. Commit and checkout share
+  this history; pushes and outside repository changes invalidate earlier states.
+  See [Git operations and recovery](docs/git-operations.md) for safety boundaries,
+  supported repository types and benchmark commands.
 - **Settings** configures provider API access.
 - The shell's folder and terminal icons open the repository in Explorer or
   Windows Terminal. Windows Terminal must be installed for its launcher.

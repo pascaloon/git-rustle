@@ -18,6 +18,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod operations;
 
 pub fn run(mut engine: Engine) {
     engine.mark("GPUI initialization requested");
@@ -60,7 +61,8 @@ pub fn run(mut engine: Engine) {
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
                     weak.update(cx, |v, cx| {
-                        if v.engine.app.pending.busy
+                        if v.engine.operation_busy
+                            || v.engine.app.pending.busy
                             || v.engine.app.branches.busy
                             || v.engine.app.settings.saving
                         {
@@ -90,6 +92,8 @@ pub fn run(mut engine: Engine) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Rebase,
+    Conflicts,
     Graph,
     Branches,
     Diff,
@@ -98,6 +102,7 @@ enum Tab {
 
 #[derive(Clone)]
 enum Action {
+    Operation(Box<operations::Action>),
     Tab(Tab),
     Wrap,
     Explorer,
@@ -129,6 +134,7 @@ enum Action {
 
 struct Desktop {
     engine: Engine,
+    operations: operations::Panel,
     search: Entity<InputState>,
     search_field: &'static str,
     matches: Matches,
@@ -240,7 +246,9 @@ fn tab_item(id: impl Into<ElementId>, active: bool, enabled: bool) -> Stateful<D
 impl Desktop {
     fn tabs(&self, cx: &Context<Self>) -> AnyElement {
         let app = &self.engine.app;
-        let current = if app.settings.open {
+        let current = if let Some(tab) = self.operations.tab {
+            tab
+        } else if app.settings.open {
             Tab::Settings
         } else if app.branches.open {
             Tab::Branches
@@ -255,11 +263,21 @@ impl Desktop {
                 [
                     (Tab::Graph, "graph", "Git Graph"),
                     (Tab::Branches, "branch", "Branches"),
+                    (Tab::Rebase, "graph", "Interactive rebase"),
+                    (Tab::Conflicts, "diff", "Conflicts"),
                     (Tab::Diff, "diff", "Diff"),
                     (Tab::Settings, "settings", "Settings"),
                 ]
                 .into_iter()
                 .filter(|(t, _, _)| *t != Tab::Diff || has_diff)
+                .filter(|(t, _, _)| {
+                    *t != Tab::Rebase
+                        || self.operations.rebase_open
+                        || self.engine.operations.interactive_rebase
+                })
+                .filter(|(t, _, _)| {
+                    *t != Tab::Conflicts || self.engine.operations.conflict.is_some()
+                })
                 .enumerate()
                 .map(|(i, (tab, name, label))| {
                     tab_item(("tab", i), current == tab, true)
@@ -284,14 +302,119 @@ impl Desktop {
                 .selected_commits
                 .checkout_target(app.selected_id())
                 .is_some();
+        let mut items = vec![
+            (
+                Action::Diff,
+                "diff",
+                if app.pending.selected {
+                    "Diff pending changes"
+                } else if count > 1 {
+                    "Compare selected commits"
+                } else {
+                    "Diff commit"
+                }
+                .to_string(),
+                enabled_diff,
+            ),
+            (
+                Action::Checkout,
+                "checkout",
+                "Checkout…".into(),
+                enabled_checkout,
+            ),
+        ];
+        if enabled_checkout && let Some(id) = app.selected_id() {
+            let target = id.to_string();
+            let labels = app
+                .refs
+                .as_ref()
+                .map(|r| {
+                    r.refs
+                        .iter()
+                        .filter(|r| r.id == id && r.kind != crate::git::RefKind::Head)
+                        .map(|r| r.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let label = if labels.is_empty() {
+                id.to_hex_with_len(12).to_string()
+            } else {
+                format!("{} · {}", labels.join(", "), id.to_hex_with_len(12))
+            };
+            let idle = !self.engine.operation_busy
+                && !app.pending.busy
+                && !app.branches.busy
+                && !app.settings.saving
+                && self.engine.operations.conflict.is_none()
+                && !app.ghosts.contains_key(&id);
+            let attached = app.refs.as_ref().is_some_and(|r| r.head_branch.is_some());
+            if app.head_id() != Some(id) {
+                for (dialog, title) in [
+                    (operations::Dialog::Merge, "Merge into current branch…"),
+                    (
+                        operations::Dialog::Rebase,
+                        "Rebase current branch onto this…",
+                    ),
+                ] {
+                    items.push((
+                        Action::Operation(Box::new(operations::Action::Open(
+                            dialog,
+                            target.clone(),
+                            label.clone(),
+                        ))),
+                        "graph",
+                        title.into(),
+                        idle && attached,
+                    ));
+                }
+            }
+            items.push((
+                Action::Operation(Box::new(operations::Action::Open(
+                    operations::Dialog::Plan,
+                    target,
+                    label,
+                ))),
+                "graph",
+                "Interactive rebase from here…".into(),
+                idle && attached && !self.operations.rebase_open,
+            ));
+            if let Some(refs) = &app.refs {
+                for branch in refs
+                    .refs
+                    .iter()
+                    .filter(|r| r.id == id && r.kind == crate::git::RefKind::Branch)
+                {
+                    for (dialog, verb) in [
+                        (operations::Dialog::Rename, "Rename"),
+                        (operations::Dialog::Delete, "Delete"),
+                    ] {
+                        let enabled = idle
+                            && (dialog != operations::Dialog::Delete
+                                || refs.head_branch.as_ref() != Some(&branch.name));
+                        items.push((
+                            Action::Operation(Box::new(operations::Action::Open(
+                                dialog,
+                                branch.name.clone(),
+                                branch.name.clone(),
+                            ))),
+                            "branch",
+                            format!("{verb} {}…", branch.name),
+                            enabled,
+                        ));
+                    }
+                }
+            }
+        }
+        let menu_height =
+            ((items.len() * 36 + 10) as f32).min(f32::from(window.viewport_size().height) - 16.);
         let p = point(
             position
                 .x
-                .min(window.viewport_size().width - px(224.))
+                .min(window.viewport_size().width - px(320.))
                 .max(px(0.)),
             position
                 .y
-                .min(window.viewport_size().height - px(88.))
+                .min(window.viewport_size().height - px(menu_height))
                 .max(px(0.)),
         );
         deferred(
@@ -300,7 +423,9 @@ impl Desktop {
                 .absolute()
                 .left(p.x)
                 .top(p.y)
-                .w(px(224.))
+                .w(px(320.))
+                .max_h(px(menu_height))
+                .overflow_y_scroll()
                 .p_1()
                 .bg(rgb(PANEL))
                 .border_1()
@@ -312,25 +437,8 @@ impl Desktop {
                     v.context_menu = None;
                     cx.notify();
                 }))
-                .children(
-                    [
-                        (
-                            Action::Diff,
-                            "diff",
-                            if app.pending.selected {
-                                "Diff pending changes"
-                            } else if count > 1 {
-                                "Compare selected commits"
-                            } else {
-                                "Diff commit"
-                            },
-                            enabled_diff,
-                        ),
-                        (Action::Checkout, "checkout", "Checkout…", enabled_checkout),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (action, name, label, enabled))| {
+                .children(items.into_iter().enumerate().map(
+                    |(i, (action, name, label, enabled))| {
                         row()
                             .id(("commit-menu-item", i))
                             .h(px(36.))
@@ -347,14 +455,15 @@ impl Desktop {
                                         v.action(action.clone(), w, cx);
                                     }))
                             })
-                    }),
-                ),
+                    },
+                )),
         )
         .with_priority(3)
         .into_any_element()
     }
 
     fn new(mut engine: Engine, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let operations = operations::Panel::new(window, cx);
         engine.mark("GPUI window ready");
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search commits…"));
         let branch_filter =
@@ -431,6 +540,7 @@ impl Desktop {
                         let old = v.engine.app.graph_selected();
                         let saving = v.engine.app.settings.saving;
                         v.engine.tick(message);
+                        v.sync_operations(window, cx);
                         if saving && !v.engine.app.settings.saving {
                             v.settings_identity = None;
                         }
@@ -449,6 +559,74 @@ impl Desktop {
                         {
                             v.scenario_started = true;
                             match v.scenario.as_deref() {
+                                Some("operations" | "operations-create") => {
+                                    v.operation_action(
+                                        operations::Action::Open(
+                                            operations::Dialog::Create,
+                                            "HEAD".into(),
+                                            "HEAD".into(),
+                                        ),
+                                        window,
+                                        cx,
+                                    );
+                                    v.engine.mark("desktop operation requested");
+                                    if v.scenario.as_deref() == Some("operations-create") {
+                                        v.engine.request_operation(
+                                            crate::git::operations::Request::Create {
+                                                name: "bench-topic".into(),
+                                                target: "HEAD".into(),
+                                            },
+                                        );
+                                        v.engine.tick(None);
+                                    }
+                                }
+                                Some("push-review" | "push-review-orange" | "push-review-red") => {
+                                    v.engine.mark("desktop operation requested");
+                                    v.operation_action(
+                                        operations::Action::Open(
+                                            operations::Dialog::Push,
+                                            String::new(),
+                                            String::new(),
+                                        ),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                Some("integrate-review" | "graph-menu") => {
+                                    v.engine.mark("desktop operation requested");
+                                    if let Some(id) = v.engine.app.selected_id() {
+                                        if v.scenario.as_deref() == Some("graph-menu") {
+                                            v.context_menu = Some(point(px(220.), px(210.)));
+                                        } else {
+                                            v.operation_action(
+                                                operations::Action::Open(
+                                                    operations::Dialog::Merge,
+                                                    id.to_string(),
+                                                    id.to_hex_with_len(12).to_string(),
+                                                ),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                }
+                                Some("rebase-plan") => {
+                                    v.engine.mark("desktop operation requested");
+                                    v.operation_action(
+                                        operations::Action::Open(
+                                            operations::Dialog::Plan,
+                                            "HEAD~3".into(),
+                                            "HEAD~3".into(),
+                                        ),
+                                        window,
+                                        cx,
+                                    );
+                                    v.operation_action(operations::Action::Submit, window, cx);
+                                }
+                                Some("history") => {
+                                    v.engine.mark("desktop operation requested");
+                                    v.operation_action(operations::Action::History, window, cx);
+                                }
                                 Some("scroll" | "graph-resize") => {
                                     v.scroll_step = 1;
                                     v.frame_start = Some(Instant::now());
@@ -530,6 +708,7 @@ impl Desktop {
                             v.engine.autoquit_ready(Duration::from_millis(ms))
                                 && (v.scenario.is_none() || v.scenario_presented)
                         }) || (v.close_requested
+                            && !v.engine.operation_busy
                             && !v.engine.app.pending.busy
                             && !v.engine.app.branches.busy
                             && !v.engine.app.settings.saving)
@@ -549,6 +728,7 @@ impl Desktop {
         let diff_scroll = UniformListScrollHandle::new();
         Self {
             engine,
+            operations,
             search,
             search_field: "",
             matches: Matches::default(),
@@ -751,6 +931,32 @@ impl Desktop {
             self.diff_horizontal.set_x(px(0.));
         }
         self.context_menu = None;
+        if let Action::Operation(action) = action {
+            self.operation_action(*action, window, cx);
+            return;
+        }
+        if matches!(
+            action,
+            Action::Tab(_)
+                | Action::Head
+                | Action::Branches
+                | Action::Settings
+                | Action::Diff
+                | Action::JumpBranch
+        ) {
+            self.operations.tab = match action {
+                Action::Tab(tab @ (Tab::Rebase | Tab::Conflicts)) => Some(tab),
+                _ => None,
+            };
+        }
+        if self.engine.operation_busy
+            && matches!(
+                action,
+                Action::Commit | Action::Checkout | Action::Confirm(_) | Action::SaveSettings
+            )
+        {
+            return;
+        }
         let app = &mut self.engine.app;
         if matches!(
             action,
@@ -759,6 +965,7 @@ impl Desktop {
             app.begin_navigation();
         }
         match action {
+            Action::Operation(_) => unreachable!(),
             Action::Refresh => {
                 app.want_refresh = true;
                 app.pending.want_refresh = true;
@@ -992,6 +1199,12 @@ impl Desktop {
     ) -> impl IntoElement {
         let icon_name = match action {
             Action::Refresh => Some("refresh"),
+            Action::Operation(ref a) => match a.as_ref() {
+                operations::Action::Pull => Some("pull"),
+                operations::Action::Open(operations::Dialog::Push, ..) => Some("push"),
+                operations::Action::Open(operations::Dialog::Create, ..) => Some("branch"),
+                _ => None,
+            },
             Action::Settings => Some("settings"),
             Action::Wrap => Some("wrap"),
             Action::Explorer => Some("folder"),
@@ -1023,6 +1236,12 @@ impl Desktop {
                     | Action::SaveSettings
                     | Action::ForgetToken
             ) || !self.engine.app.settings.busy)
+            && (!matches!(action, Action::Operation(_))
+                || (!self.engine.operation_busy
+                    && !self.engine.app.pending.busy
+                    && !self.engine.app.branches.busy
+                    && !self.engine.app.settings.saving)
+                || matches!(&action, Action::Operation(a) if matches!(a.as_ref(), operations::Action::Cancel | operations::Action::CloseHistory)))
             && (!matches!(action, Action::SaveSettings)
                 || self.engine.app.settings.page > 0
                 || !self.engine.app.settings.projects.is_empty());
@@ -1075,6 +1294,8 @@ impl Desktop {
                     gpui_component::tooltip::Tooltip::new(match n {
                         "settings" => "Settings",
                         "refresh" => "Refresh",
+                        "pull" => "Pull current upstream",
+                        "push" => "Review push for the current branch",
                         "wrap" => "Toggle word wrap",
                         "folder" => "Open in Explorer",
                         "terminal" => "Open in Windows Terminal",
@@ -1096,6 +1317,74 @@ impl Desktop {
                     cx.listener(move |v, _, window, cx| v.action(action.clone(), window, cx)),
                 )
             })
+    }
+    fn graph_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        row()
+            .h(px(48.))
+            .flex_shrink_0()
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(self.button("head", "HEAD", Action::Head, cx))
+            .child(self.button("refresh", "", Action::Refresh, cx))
+            .child(self.button(
+                "pull",
+                "Pull",
+                Action::Operation(Box::new(operations::Action::Pull)),
+                cx,
+            ))
+            .child(self.button(
+                "push",
+                "Push",
+                Action::Operation(Box::new(operations::Action::Open(
+                    operations::Dialog::Push,
+                    String::new(),
+                    String::new(),
+                ))),
+                cx,
+            ))
+            .child(
+                self.button(
+                    "create-branch",
+                    "New branch",
+                    Action::Operation(Box::new(operations::Action::Open(
+                        operations::Dialog::Create,
+                        self.engine
+                            .app
+                            .head_id()
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "HEAD".into()),
+                        format!("{} (HEAD)", self.current_branch()),
+                    ))),
+                    cx,
+                ),
+            )
+            .child(caption(format!(
+                "{} commits",
+                self.engine
+                    .app
+                    .search
+                    .result
+                    .as_ref()
+                    .map_or(self.engine.app.history.len(), |r| r.rows.len())
+            )))
+            .when(
+                self.selected_commits
+                    .ids(self.engine.app.selected_id())
+                    .len()
+                    > 1,
+                |s| {
+                    s.child(caption(format!(
+                        "{} selected",
+                        self.selected_commits
+                            .ids(self.engine.app.selected_id())
+                            .len()
+                    )))
+                },
+            )
+            .child(div().flex_1())
+            .child(self.search_box(cx))
+            .into_any_element()
     }
     fn graph(&self, cx: &mut Context<Self>) -> AnyElement {
         let n = self.engine.app.graph_len();
@@ -1274,41 +1563,6 @@ impl Desktop {
         column()
             .flex_1()
             .h_full()
-            .child(
-                row()
-                    .h(px(48.))
-                    .flex_shrink_0()
-                    .px_3()
-                    .border_b_1()
-                    .border_color(rgb(LINE))
-                    .child(self.button("head", "HEAD", Action::Head, cx))
-                    .child(self.button("refresh", "", Action::Refresh, cx))
-                    .child(caption(format!(
-                        "{} commits",
-                        self.engine
-                            .app
-                            .search
-                            .result
-                            .as_ref()
-                            .map_or(self.engine.app.history.len(), |r| r.rows.len())
-                    )))
-                    .when(
-                        self.selected_commits
-                            .ids(self.engine.app.selected_id())
-                            .len()
-                            > 1,
-                        |s| {
-                            s.child(caption(format!(
-                                "{} selected",
-                                self.selected_commits
-                                    .ids(self.engine.app.selected_id())
-                                    .len()
-                            )))
-                        },
-                    )
-                    .child(div().flex_1())
-                    .child(self.search_box(cx)),
-            )
             .child(
                 column()
                     .relative()
@@ -2152,6 +2406,24 @@ impl Desktop {
         let app = &self.engine.app;
         match self.scenario.as_deref() {
             Some(
+                "operations" | "history" | "push-review" | "push-review-orange" | "push-review-red"
+                | "integrate-review" | "graph-menu",
+            ) => !self.engine.operation_busy,
+            Some("operations-create") => {
+                !self.engine.operation_busy
+                    && self
+                        .engine
+                        .operations
+                        .labels
+                        .iter()
+                        .any(|l| l == "Create branch bench-topic")
+            }
+            Some("rebase-plan") => {
+                self.engine.operations.plan.is_some()
+                    && self.operations.rebase_open
+                    && !self.engine.operation_busy
+            }
+            Some(
                 "scroll" | "graph-resize" | "files-scroll" | "diff-scroll" | "diff-pan"
                 | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs",
             ) => self.scroll_step > 121,
@@ -2168,7 +2440,7 @@ impl Desktop {
     fn snapshot(&self) -> String {
         let app = &self.engine.app;
         format!(
-            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\n",
+            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\noperations={} cursor={} conflicts={}\n{}\n",
             app.repo_name,
             app.history.len(),
             app.details
@@ -2185,40 +2457,59 @@ impl Desktop {
                     .and_then(|d| d.syntax.as_ref())
                     .map_or(0, |s| s.span_count()),
                 _ => 0,
-            }
+            },
+            self.engine.operations.labels.len(),
+            self.engine.operations.cursor,
+            self.engine
+                .operations
+                .conflict
+                .as_ref()
+                .map_or(0, |c| c.files.len()),
+            format_args!(
+                "{}\n{}",
+                self.engine.operation_status,
+                self.operations.summary()
+            ),
         )
     }
 }
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs(window, cx);
-        let content = if self.engine.app.settings.open {
+        let content = if self.operations.tab.is_some() {
+            self.operations_content(cx)
+        } else if self.engine.app.settings.open {
             self.settings(cx)
         } else if self.engine.app.branches.open {
             self.branches(cx)
         } else if matches!(self.engine.app.mode, Mode::Diff(_)) {
             self.diff(window, cx)
         } else {
-            row()
+            column()
                 .flex_1()
-                .min_h_0()
-                .items_start()
-                .gap_0()
-                .child(self.graph(cx))
+                .child(self.graph_toolbar(cx))
                 .child(
-                    div()
-                        .id("pane-divider")
-                        .w(px(5.))
-                        .h_full()
-                        .cursor_col_resize()
-                        .bg(rgb(BG))
-                        .hover(|s| s.bg(rgb(CONTROL)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|v, _, _, _| v.resizing = true),
-                        ),
+                    row()
+                        .flex_1()
+                        .min_h_0()
+                        .items_start()
+                        .gap_0()
+                        .child(self.graph(cx))
+                        .child(
+                            div()
+                                .id("pane-divider")
+                                .w(px(5.))
+                                .h_full()
+                                .cursor_col_resize()
+                                .bg(rgb(BG))
+                                .hover(|s| s.bg(rgb(CONTROL)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|v, _, _, _| v.resizing = true),
+                                ),
+                        )
+                        .child(self.details(window, cx)),
                 )
-                .child(self.details(window, cx))
                 .into_any_element()
         };
         let app = &self.engine.app;
@@ -2403,6 +2694,11 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && v.operations.dismiss() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if e.keystroke.key == "escape" && v.context_menu.take().is_some() {
                     cx.notify();
                     cx.stop_propagation();
@@ -2483,6 +2779,7 @@ impl Render for Desktop {
             )
             .child(self.tabs(cx))
             .child(content)
+            .child(self.operations_status(cx))
             .when(!status.is_empty(), |s| {
                 s.child(
                     div()
@@ -2500,6 +2797,7 @@ impl Render for Desktop {
                 s.child(caption(self.notice.clone()))
             })
             .children(dialog)
+            .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
     }
 }

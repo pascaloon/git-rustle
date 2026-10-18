@@ -10,6 +10,15 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+For Git mutation and recovery changes, also follow the operation-specific
+[worker and native measurements](git-operations.md#performance-validation).
+Compare the existing desktop mutation harness against a preserved baseline test
+executable; branch/merge/rebase/history actions also need their own measurements.
+When building archived source with the same Cargo target directory, Cargo can
+reuse the wrong package artifact afterward. Preserve the baseline harness, then
+run `cargo clean -p git-rustle --release` before rebuilding the candidate, and
+verify that the expected new test names appear in its test listing.
+
 The sections below this one describe the historical terminal harnesses. The
 GPUI executable no longer consumes `GIT_RUSTLE_KEYS`, and its model dump is not
 a screen capture. Do not use keyboard-script success as evidence for GPUI.

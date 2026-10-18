@@ -10,6 +10,14 @@ impl AssetSource for Assets {
             _ => path.strip_prefix("rustle/").unwrap_or(""),
         };
         let body = match name {
+            "shield-check" => {
+                "<path d='M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z'/><path d='m8 12 3 3 5-6'/>"
+            }
+            "shield-alert" => {
+                "<path d='M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z'/><path d='M12 8v5m0 3h.01'/>"
+            }
+            "pull" => "<path d='M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4'/>",
+            "push" => "<path d='M12 16V4m-5 5 5-5 5 5M4 17v4h16v-4'/>",
             "check" => "<path d='m5 12 4 4L19 6'/>",
             "copy" => "<rect x='8' y='8' width='12' height='13' rx='2'/><path d='M16 8V3H3v13h5'/>",
             "clear" => "<circle cx='12' cy='12' r='9'/><path d='m9 9 6 6m0-6-6 6'/>",

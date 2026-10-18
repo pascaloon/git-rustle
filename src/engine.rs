@@ -12,6 +12,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 pub(crate) enum Msg {
+    Operation(Box<git::operations::Outcome>),
+    OperationsView(Box<git::operations::View>),
     Search(search::Matches),
     Pending(u32, Result<pending::Snapshot, String>),
     Committed(Result<String, String>),
@@ -305,6 +307,13 @@ fn refresh_repo(path: PathBuf, tx: Sender<Msg>) {
 
 pub struct Engine {
     pub app: App,
+    pub operations: git::operations::View,
+    pub operation_status: String,
+    pub operation_error: bool,
+    pub operation_busy: bool,
+    pub operation_epoch: u64,
+    operation_request: Option<git::operations::Request>,
+    operations_initialized: bool,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     timing: Timing,
@@ -343,6 +352,16 @@ pub struct Engine {
     first_frame_at: Option<Instant>,
 }
 impl Engine {
+    pub fn request_operation(&mut self, request: git::operations::Request) {
+        if !self.operation_busy
+            && self.operation_request.is_none()
+            && !self.app.pending.busy
+            && !self.app.branches.busy
+            && !self.app.settings.saving
+        {
+            self.operation_request = Some(request);
+        }
+    }
     pub fn repository_path(&self) -> String {
         self.repo
             .as_ref()
@@ -368,10 +387,11 @@ impl Engine {
             let opened = result.is_ok();
             let _ = repo_tx.send_blocking(Msg::Repo(Box::new(result)));
             if opened {
-                // Git for Windows config-path discovery may launch Git once.
-                // Warm its shared cache on this worker before a pending file
-                // diff needs the full Git filter configuration.
+                // Git for Windows config and attributes path discovery may
+                // launch Git. Warm both shared caches on this worker before a
+                // pending file diff needs the full Git filter configuration.
                 let _ = gix::path::env::installation_config();
+                let _ = gix::path::env::system_prefix();
             }
         });
         let mut app = App::new();
@@ -379,6 +399,13 @@ impl Engine {
         app.pending.autofocus = true;
         app.pending.want_refresh = true;
         Self {
+            operations: Default::default(),
+            operation_status: String::new(),
+            operation_error: false,
+            operation_busy: false,
+            operation_epoch: 0,
+            operation_request: None,
+            operations_initialized: false,
             app,
             tx,
             rx,
@@ -426,6 +453,35 @@ impl Engine {
         self.advance(None);
     }
     fn advance(&mut self, message: Option<Msg>) {
+        if self.first_frame && self.repo.is_some() && !self.operations_initialized {
+            self.operations_initialized = true;
+            self.operation_request
+                .get_or_insert(git::operations::Request::Inspect);
+        }
+        if !self.operation_busy
+            && !self.app.pending.busy
+            && !self.app.branches.busy
+            && !self.app.settings.saving
+            && let Some(repo) = &self.repo
+            && let Some(request) = self.operation_request.take()
+        {
+            self.operation_busy = true;
+            self.operation_status = "Working… You can keep browsing while Git finishes.".into();
+            self.operation_error = false;
+            if !request.is_read_only() {
+                self.app.pending.loading = false;
+                self.pending_generation = self.pending_generation.wrapping_add(1);
+            }
+            self.app.needs_redraw = true;
+            let path = repo.workdir().unwrap_or(repo.git_dir()).to_path_buf();
+            let tx = self.tx.clone();
+            self.timing.mark("git operation requested");
+            thread::spawn(move || {
+                let _ = tx.send_blocking(Msg::Operation(Box::new(git::operations::execute(
+                    &path, request,
+                ))));
+            });
+        }
         let app = &mut self.app;
         let tx = &self.tx;
         let timing = &mut self.timing;
@@ -437,7 +493,9 @@ impl Engine {
             app.branches.want_refresh.get_or_insert(false);
         }
         if let Some(r) = self.repo.as_ref() {
-            if !app.pending.busy
+            if !self.operation_busy
+                && !app.settings.saving
+                && !app.pending.busy
                 && !app.branches.busy
                 && let Some(request) = app.pending.request.take()
             {
@@ -451,11 +509,14 @@ impl Engine {
                 let tx = tx.clone();
                 timing.mark("commit requested");
                 thread::spawn(move || {
-                    let _ =
-                        tx.send_blocking(Msg::Committed(git::worktree::commit(&path, &request)));
+                    let outcome =
+                        git::operations::execute(&path, git::operations::Request::Commit(request));
+                    let _ = tx.send_blocking(Msg::OperationsView(Box::new(outcome.view)));
+                    let _ = tx.send_blocking(Msg::Committed(outcome.result));
                 });
             }
             if self.first_frame
+                && !self.operation_busy
                 && !app.pending.busy
                 && !app.branches.busy
                 && !app.pending.loading
@@ -526,7 +587,9 @@ impl Engine {
                 });
             }
         }
-        if !app.branches.busy
+        if !self.operation_busy
+            && !app.pending.busy
+            && !app.branches.busy
             && let Some(r) = self.repo.as_ref()
             && let Some(request) = app.settings.request.take()
         {
@@ -584,7 +647,8 @@ impl Engine {
                     app.want_refresh = true;
                 }
             }
-            if !app.branches.busy
+            if !self.operation_busy
+                && !app.branches.busy
                 && !app.pending.busy
                 && let Some(target) = app.checkout_request.take()
             {
@@ -597,8 +661,11 @@ impl Engine {
                 let tx = tx.clone();
                 timing.mark("checkout requested");
                 thread::spawn(move || {
-                    let result = git::checkout::execute(&path, &target);
-                    let _ = tx.send_blocking(Msg::Checkout(result, target.is_remote()));
+                    let remote = target.is_remote();
+                    let outcome =
+                        git::operations::execute(&path, git::operations::Request::Checkout(target));
+                    let _ = tx.send_blocking(Msg::OperationsView(Box::new(outcome.view)));
+                    let _ = tx.send_blocking(Msg::Checkout(outcome.result, remote));
                 });
             }
         }
@@ -842,6 +909,40 @@ impl Engine {
         }
         for msg in pending {
             match msg {
+                Msg::Operation(outcome) => {
+                    self.operation_busy = false;
+                    self.operation_error = outcome.result.is_err();
+                    self.operation_status = outcome.result.unwrap_or_else(|e| e);
+                    let plan = self.operations.plan.take();
+                    let preview = self.operations.preview.take();
+                    self.operations = outcome.view;
+                    if self.operations.plan.is_none() {
+                        self.operations.plan = plan;
+                    }
+                    if self.operations.preview.is_none() {
+                        self.operations.preview = preview;
+                    }
+                    if self.operations.preview.as_ref().is_some_and(|p| {
+                        !self
+                            .operations
+                            .conflict
+                            .as_ref()
+                            .is_some_and(|c| c.files.contains(&p.path))
+                    }) {
+                        self.operations.preview = None;
+                    }
+                    self.operation_epoch = self.operation_epoch.wrapping_add(1);
+                    if outcome.refresh_repository {
+                        app.pending.want_refresh = true;
+                        app.want_refresh = true;
+                    }
+                    app.needs_redraw = true;
+                    timing.mark("git operation done");
+                }
+                Msg::OperationsView(view) => {
+                    self.operations = *view;
+                    self.operation_epoch = self.operation_epoch.wrapping_add(1);
+                }
                 Msg::Search(result) => {
                     let done = result.done;
                     let generation = result.generation;
@@ -867,6 +968,12 @@ impl Engine {
                             }
                         } else {
                             timing.mark("pending status failed");
+                        }
+                        if result.as_ref().is_ok_and(|s| s.conflicts)
+                            && self.operations.conflict.is_none()
+                        {
+                            self.operation_request
+                                .get_or_insert(git::operations::Request::Inspect);
                         }
                         app.install_pending(result);
                     }
@@ -1222,6 +1329,7 @@ impl Engine {
         }
         self.first_frame
             && self.first_frame_at.is_some_and(|t| t.elapsed() >= delay)
+            && !self.operation_busy
             && self.walker.is_none()
             && self.app.pending.known
             && !self.app.pending.loading
