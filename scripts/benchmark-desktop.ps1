@@ -32,9 +32,13 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
-    if ($scenario -in @('request-compose','request-edit','request-tabs') -and
+    if ($scenario -in @('request-compose','request-edit','request-tabs','request-clear') -and
         ($state -notmatch 'request_open=true request_members=10000 request_sending=false' -or $text -match 'POST ')) {
         throw "Expected a retained composer with 10,000 members and no submission: $log"
+    }
+    if ($scenario -in @('request-open','request-clear') -and
+        ($state -notmatch 'request_open=true .*request_sending=false request_body_bytes=0' -or $text -match 'POST ')) {
+        throw "Expected an open composer with an empty description and no submission: $log"
     }
     if ($scenario -eq 'checkout-dialog' -and
         ($state -notmatch 'checkout_choices=[1-9]' -or $text -match 'checkout requested')) {
@@ -58,6 +62,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
         'request-compose' { 'request composer ready' }
+        'request-open' { 'desktop scenario frame' }
+        'request-clear' { 'desktop scroll done' }
         'request-edit' { 'desktop scroll done' }
         'request-tabs' { 'desktop scroll done' }
         'avatar-scroll' { 'desktop scroll done' }
@@ -85,6 +91,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
         'request-compose' { 'request composer requested' }
+        'request-open' { 'request composer requested' }
         'branches' { 'branch activity requested' }
         'diff' { 'file diff requested' }
         'search' {
@@ -96,7 +103,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll','avatar-reuse-scroll')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

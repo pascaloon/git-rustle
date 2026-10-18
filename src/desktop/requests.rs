@@ -144,7 +144,9 @@ impl Composer {
             InputState::new(window, cx)
                 .code_editor("markdown")
                 .line_number(false)
-                .placeholder("## Summary\nDescribe your changes…\n\n## Testing\n- [ ] Tests pass")
+                // gpui-component 0.5.1 applies the full placeholder run to each
+                // line of an empty editor. Multiple lines panic in DirectWrite.
+                .placeholder("Describe your changes in Markdown…")
         });
         let assignees =
             cx.new(|cx| SelectState::new(People::default(), None, window, cx).searchable(true));
@@ -358,7 +360,23 @@ impl Desktop {
     }
 
     pub(super) fn request_scenario_step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.scenario.as_deref() == Some("request-tabs") {
+        if self.scenario.as_deref() == Some("request-clear") {
+            if let Some(c) = &mut self.composer {
+                c.preview = false;
+                c.body.update(cx, |s, cx| {
+                    s.set_value(
+                        if self.scroll_step.is_multiple_of(2) {
+                            "## Summary\nA **Markdown** description.\n\n- [ ] Test"
+                        } else {
+                            ""
+                        },
+                        window,
+                        cx,
+                    )
+                });
+            }
+            cx.notify();
+        } else if self.scenario.as_deref() == Some("request-tabs") {
             self.action(
                 Action::Tab(if self.scroll_step.is_multiple_of(2) {
                     Tab::Request
@@ -379,13 +397,15 @@ impl Desktop {
         }
     }
 
-    pub(super) fn request_summary(&self) -> String {
+    pub(super) fn request_summary(&self, cx: &gpui::App) -> String {
         self.composer
             .as_ref()
             .map(|c| {
                 format!(
-                    "request_open=true request_members={} request_sending={}",
-                    c.member_count, c.sending
+                    "request_open=true request_members={} request_sending={} request_body_bytes={}",
+                    c.member_count,
+                    c.sending,
+                    c.body.read(cx).value().len()
                 )
             })
             .unwrap_or_else(|| "request_open=false".into())

@@ -746,7 +746,12 @@ impl Desktop {
                                     v.action(Action::Select(1, true), window, cx);
                                     v.action(Action::Diff, window, cx);
                                 }
-                                Some("request-compose" | "request-edit" | "request-tabs") => {
+                                Some("request-open") => {
+                                    let source = v.engine.app.refs.as_ref()
+                                        .and_then(|r| r.head_branch.clone()).unwrap_or_default();
+                                    v.action(Action::NewRequest(source), window, cx);
+                                }
+                                Some("request-compose" | "request-edit" | "request-tabs" | "request-clear") => {
                                     v.request_scenario(window, cx);
                                 }
                                 Some("compare-menu") => {
@@ -770,7 +775,7 @@ impl Desktop {
                         if v.scenario_started && v.scroll_step == 0 {
                             let ready = match v.scenario.as_deref() {
                                 Some("history-scroll") => v.history_scenario_ready(),
-                                Some("request-edit" | "request-tabs") => v.composer.is_some(),
+                                Some("request-edit" | "request-tabs" | "request-clear") => v.composer.is_some(),
                                 Some("rebase-scroll" | "rebase-edit") => v.rebase_scenario_ready(),
                                 Some("settings-tabs") => {
                                     v.engine.app.settings.open && !v.engine.app.settings.busy
@@ -822,7 +827,7 @@ impl Desktop {
                             && !v.engine.app.settings.saving)
                         {
                             if let Some(path) = std::env::var_os("GIT_RUSTLE_DUMP") {
-                                let _ = std::fs::write(path, v.snapshot());
+                                let _ = std::fs::write(path, v.snapshot(cx));
                             }
                             cx.quit();
                         }
@@ -2708,7 +2713,7 @@ impl Desktop {
                     && self.operations.rebase_open
                     && !self.engine.operation_busy
             }
-            Some("request-compose") => self.composer.is_some(),
+            Some("request-compose" | "request-open") => self.composer.is_some(),
             Some(
                 "history-scroll"
                 | "rebase-scroll"
@@ -2726,6 +2731,7 @@ impl Desktop {
                 | "status-panels"
                 | "request-edit"
                 | "request-tabs"
+                | "request-clear"
                 | "avatar-scroll"
                 | "avatar-reuse-scroll",
             ) => self.scroll_step > 121,
@@ -2739,7 +2745,7 @@ impl Desktop {
             _ => true,
         }
     }
-    fn snapshot(&self) -> String {
+    fn snapshot(&self, cx: &gpui::App) -> String {
         if self.engine.landing() {
             return format!(
                 "Git Rustle\nlanding page\nOpen Directory\nrecent_count={}\n{}\n{}\n",
@@ -2788,7 +2794,7 @@ impl Desktop {
                 self.status_panel,
                 self.engine.operation_status,
                 self.operations.summary(),
-                self.request_summary(),
+                self.request_summary(cx),
                 self.avatars.summary()
             ),
         )
@@ -2878,7 +2884,7 @@ impl Render for Desktop {
                         let handler_start = Instant::now();
                         match v.scenario.as_deref() {
                             Some("history-scroll") => v.history_scenario_scroll(v.scroll_step),
-                            Some("request-edit" | "request-tabs") => {
+                            Some("request-edit" | "request-tabs" | "request-clear") => {
                                 v.request_scenario_step(window, cx)
                             }
                             Some("rebase-scroll" | "rebase-edit") => {

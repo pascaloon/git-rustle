@@ -168,6 +168,18 @@ scrolling remains fast; moving to GPU rendering does not imply faster startup.
 
 ### Provider composition and photos
 
+For empty-description regressions, also run candidate-only
+`benchmark-desktop.ps1 -Scenarios request-open,request-clear` on a disposable local
+repository with one commit and no provider remote. `request-open` uses the actual
+NewRequest action from the toolbar/context menu and leaves the description empty;
+it measures action-to-rendered-frame time. `request-clear` alternates Markdown text
+and an empty description for 120 measured frame callbacks, ending empty. Both
+require an empty editor in the final snapshot and perform no submission. Compare
+the existing `request-compose,request-edit` scenarios with the preserved baseline
+for construction/editing regressions. A prefilled composer alone cannot validate
+empty-placeholder rendering: native pointer opening from both entry points and
+typing/clearing the description must also work.
+
 After preserving the baseline and finishing release validation/builds, compare
 startup and `benchmark-desktop.ps1 -Scenarios scroll,branches -Baseline <exe>` on
 the large history. Run candidate-only

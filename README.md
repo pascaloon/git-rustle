@@ -17,6 +17,17 @@ cargo build --release --locked
 .\target\release\git-rustle.exe [PATH]
 ```
 
+For faster optimized builds during development, use the `fast` profile:
+
+```powershell
+cargo build --profile fast --locked
+.\target\fast\git-rustle.exe [PATH]
+```
+
+It inherits the release settings with LTO disabled and 16 code-generation units.
+The first build creates a separate dependency cache. Use the release profile for
+shipping and runtime performance validation.
+
 `PATH` can be a repository or a directory inside it; the default is the working
 directory. `--no-cache` disables persistent application caches. `--help` and
 `--version` are also available. When the directory is outside a repository, the
