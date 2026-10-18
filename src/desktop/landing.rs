@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 impl Desktop {
     pub(super) fn open_repository(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.composer.as_ref().is_some_and(|c| c.busy()) {
+            self.notice = "Waiting for the request to finish…".into();
+            cx.notify();
+            return;
+        }
         self.engine = self.engine.open_directory(path);
         self.opening_directory = true;
         self.notice.clear();

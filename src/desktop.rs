@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 mod landing;
 mod operations;
 mod rebase;
+mod requests;
 mod status;
 
 pub fn run(mut engine: Engine) {
@@ -64,7 +65,8 @@ pub fn run(mut engine: Engine) {
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
                     weak.update(cx, |v, cx| {
-                        if v.engine.operation_busy
+                        if v.composer.as_ref().is_some_and(|c| c.busy())
+                            || v.engine.operation_busy
                             || v.engine.recents_loading
                             || v.engine.app.pending.busy
                             || v.engine.app.branches.busy
@@ -96,6 +98,7 @@ pub fn run(mut engine: Engine) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Request,
     Rebase,
     Conflicts,
     Graph,
@@ -106,6 +109,7 @@ enum Tab {
 
 #[derive(Clone)]
 enum Action {
+    NewRequest(String),
     Operation(Box<operations::Action>),
     Tab(Tab),
     Wrap,
@@ -137,6 +141,8 @@ enum Action {
 }
 
 struct Desktop {
+    composer: Option<requests::Composer>,
+    avatars: requests::Avatars,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
@@ -284,7 +290,9 @@ fn tab_item(id: impl Into<ElementId>, active: bool, enabled: bool) -> Stateful<D
 impl Desktop {
     fn tabs(&self, cx: &Context<Self>) -> AnyElement {
         let app = &self.engine.app;
-        let current = if let Some(tab) = self.operations.tab {
+        let current = if self.composer.as_ref().is_some_and(|c| c.active) {
+            Tab::Request
+        } else if let Some(tab) = self.operations.tab {
             tab
         } else if app.settings.open {
             Tab::Settings
@@ -301,6 +309,7 @@ impl Desktop {
                 [
                     (Tab::Graph, "graph", "Git Graph"),
                     (Tab::Branches, "branch", "Branches"),
+                    (Tab::Request, "branch", "New PR / MR"),
                     (Tab::Rebase, "graph", "Interactive rebase"),
                     (Tab::Conflicts, "diff", "Conflicts"),
                     (Tab::Diff, "diff", "Diff"),
@@ -308,6 +317,7 @@ impl Desktop {
                 ]
                 .into_iter()
                 .filter(|(t, _, _)| *t != Tab::Diff || has_diff)
+                .filter(|(t, _, _)| *t != Tab::Request || self.composer.is_some())
                 .filter(|(t, _, _)| {
                     *t != Tab::Rebase
                         || self.operations.rebase_open
@@ -422,6 +432,12 @@ impl Desktop {
                     .iter()
                     .filter(|r| r.id == id && r.kind == crate::git::RefKind::Branch)
                 {
+                    items.push((
+                        Action::NewRequest(branch.name.clone()),
+                        "branch",
+                        format!("Create PR / MR from {}…", branch.name),
+                        true,
+                    ));
                     for (dialog, verb) in [
                         (operations::Dialog::Rename, "Rename"),
                         (operations::Dialog::Delete, "Delete"),
@@ -581,8 +597,10 @@ impl Desktop {
                         let saving = v.engine.app.settings.saving;
                         v.engine.tick(message);
                         v.sync_operations(window, cx);
+                        v.sync_avatars(cx);
                         if saving && !v.engine.app.settings.saving {
                             v.settings_identity = None;
+                            v.avatars = Default::default();
                         }
                         if old != v.engine.app.graph_selected() {
                             v.graph_scroll.scroll_to_item(
@@ -692,7 +710,13 @@ impl Desktop {
                                     v.frame_start = Some(Instant::now());
                                     cx.notify();
                                 }
-                                Some("scroll" | "graph-resize") => {
+                                Some("scroll" | "graph-resize" | "avatar-scroll") => {
+                                    if v.scenario.as_deref() == Some("avatar-scroll") {
+                                        let path = std::env::var_os("GIT_RUSTLE_AVATAR_FIXTURE").expect("avatar image fixture required");
+                                        let bytes = std::fs::read(path).expect("read avatar fixture");
+                                        let format = crate::remote::requests::image_format(&bytes).expect("PNG, JPEG or WebP avatar fixture");
+                                        v.avatars.scenario_image = Some(std::sync::Arc::new(Image::from_bytes(format, bytes)));
+                                    }
                                     v.scroll_step = 1;
                                     v.frame_start = Some(Instant::now());
                                     v.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -718,6 +742,9 @@ impl Desktop {
                                     v.action(Action::Select(1, true), window, cx);
                                     v.action(Action::Diff, window, cx);
                                 }
+                                Some("request-compose" | "request-edit" | "request-tabs") => {
+                                    v.request_scenario(window, cx);
+                                }
                                 Some("compare-menu") => {
                                     v.action(Action::Select(0, false), window, cx);
                                     v.action(Action::Select(1, true), window, cx);
@@ -739,6 +766,7 @@ impl Desktop {
                         if v.scenario_started && v.scroll_step == 0 {
                             let ready = match v.scenario.as_deref() {
                                 Some("history-scroll") => v.history_scenario_ready(),
+                                Some("request-edit" | "request-tabs") => v.composer.is_some(),
                                 Some("rebase-scroll" | "rebase-edit") => v.rebase_scenario_ready(),
                                 Some("settings-tabs") => {
                                     v.engine.app.settings.open && !v.engine.app.settings.busy
@@ -782,6 +810,7 @@ impl Desktop {
                             v.engine.autoquit_ready(Duration::from_millis(ms))
                                 && (v.scenario.is_none() || v.scenario_presented)
                         }) || (v.close_requested
+                            && !v.composer.as_ref().is_some_and(|c| c.busy())
                             && !v.engine.operation_busy
                             && !v.engine.recents_loading
                             && !v.engine.app.pending.busy
@@ -802,6 +831,8 @@ impl Desktop {
         });
         let diff_scroll = UniformListScrollHandle::new();
         Self {
+            composer: None,
+            avatars: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
@@ -858,6 +889,7 @@ impl Desktop {
         }
     }
     fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_request_repository();
         let app = &self.engine.app;
         if app.pending.description.value != self.draft_text {
             self.draft_text = app.pending.description.value.clone();
@@ -1012,6 +1044,24 @@ impl Desktop {
             self.diff_horizontal.set_x(px(0.));
         }
         self.context_menu = None;
+        if let Action::NewRequest(source) = action {
+            self.open_request(source, window, cx);
+            return;
+        }
+        if let Some(c) = &mut self.composer {
+            if let Action::Tab(tab) = action {
+                c.active = tab == Tab::Request;
+            } else if matches!(
+                action,
+                Action::Head
+                    | Action::Branches
+                    | Action::Settings
+                    | Action::Diff
+                    | Action::JumpBranch
+            ) {
+                c.active = false;
+            }
+        }
         if let Action::Operation(action) = action {
             self.operation_action(*action, window, cx);
             return;
@@ -1046,6 +1096,7 @@ impl Desktop {
             app.begin_navigation();
         }
         match action {
+            Action::NewRequest(_) => unreachable!(),
             Action::Operation(_) => unreachable!(),
             Action::Refresh => {
                 app.want_refresh = true;
@@ -1541,6 +1592,21 @@ impl Desktop {
                     .as_ref()
                     .map_or(self.engine.app.history.len(), |r| r.rows.len())
             )))
+            .child(
+                self.button(
+                    "new-request",
+                    "PR / MR",
+                    Action::NewRequest(
+                        self.engine
+                            .app
+                            .refs
+                            .as_ref()
+                            .and_then(|r| r.head_branch.clone())
+                            .unwrap_or_default(),
+                    ),
+                    cx,
+                ),
+            )
             .when(
                 self.selected_commits
                     .ids(self.engine.app.selected_id())
@@ -1566,6 +1632,11 @@ impl Desktop {
             n,
             cx.processor(|v, range: std::ops::Range<usize>, _, cx| {
                 v.viewport_rows[0] = v.viewport_rows[0].max(range.len());
+                let app = &v.engine.app;
+                v.avatars.observe(range.clone().filter_map(|row| {
+                    app.history_index(row)
+                        .map(|i| v.engine.app.history.commits[i].id)
+                }));
                 v.engine.app.list_rows = range.len().max(1);
                 v.engine.app.scroll = range.start;
                 let app = &v.engine.app;
@@ -1682,12 +1753,20 @@ impl Desktop {
                                         .child(v.matches.styled(app.history.subject(i).to_owned())),
                                 )
                                 .child(
-                                    div()
+                                    row()
                                         .w(px(150.))
                                         .flex_shrink_0()
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_color(rgb(MUTED))
+                                        .child(requests::avatar(
+                                            v.avatars
+                                                .images
+                                                .get(&rec.id)
+                                                .or(v.avatars.scenario_image.as_ref()),
+                                            app.history.author(i),
+                                            22.,
+                                        ))
                                         .child(v.matches.styled(app.history.author(i).to_owned())),
                                 )
                                 .child(
@@ -2079,7 +2158,15 @@ impl Desktop {
                                     caption("COMMIT DETAILS").text_color(rgb(INSPECTOR_MUTED)),
                                 ))
                                 .when_some(self.detail_id, |s, id| {
-                                    s.child(
+                                    s.child(requests::avatar(
+                                        self.avatars.images.get(&id),
+                                        app.details
+                                            .as_ref()
+                                            .map(|d| d.author_name.as_str())
+                                            .unwrap_or("?"),
+                                        28.,
+                                    ))
+                                    .child(
                                         div()
                                             .font_family("Cascadia Mono")
                                             .text_size(px(11.))
@@ -2434,6 +2521,19 @@ impl Desktop {
                     .border_b_1()
                     .border_color(rgb(LINE))
                     .child(caption(format!("{} branches", browser.visible.len())))
+                    .child(
+                        self.button(
+                            "branch-request",
+                            "Create PR / MR",
+                            Action::NewRequest(
+                                browser
+                                    .chosen()
+                                    .map(|e| e.target.name.clone())
+                                    .unwrap_or_default(),
+                            ),
+                            cx,
+                        ),
+                    )
                     .child(div().flex_1())
                     .child(
                         div()
@@ -2601,10 +2701,12 @@ impl Desktop {
                     && self.operations.rebase_open
                     && !self.engine.operation_busy
             }
+            Some("request-compose") => self.composer.is_some(),
             Some(
                 "history-scroll" | "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize"
                 | "files-scroll" | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll"
-                | "tabs" | "settings-tabs" | "checkout-dialog" | "status-panels",
+                | "tabs" | "settings-tabs" | "checkout-dialog" | "status-panels" | "request-edit"
+                | "request-tabs" | "avatar-scroll",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2661,10 +2763,11 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\n{}\n{}",
+                "footer_panel={:?}\n{}\n{}\n{}",
                 self.status_panel,
                 self.engine.operation_status,
-                self.operations.summary()
+                self.operations.summary(),
+                self.request_summary()
             ),
         )
     }
@@ -2677,7 +2780,9 @@ impl Render for Desktop {
             return self.landing_page(window, cx).into_any_element();
         }
         self.sync_inputs(window, cx);
-        let content = if self.operations.tab.is_some() {
+        let content = if self.composer.as_ref().is_some_and(|c| c.active) {
+            self.request_content(window, cx)
+        } else if self.operations.tab.is_some() {
             self.operations_content(cx)
         } else if self.engine.app.settings.open {
             self.settings(cx)
@@ -2751,6 +2856,9 @@ impl Render for Desktop {
                         let handler_start = Instant::now();
                         match v.scenario.as_deref() {
                             Some("history-scroll") => v.history_scenario_scroll(v.scroll_step),
+                            Some("request-edit" | "request-tabs") => {
+                                v.request_scenario_step(window, cx)
+                            }
                             Some("rebase-scroll" | "rebase-edit") => {
                                 v.rebase_scenario_step(v.scroll_step, window, cx);
                             }

@@ -1,5 +1,6 @@
 /target
 *.pdb
+/tmp_token_dont_submit.txt
 
 # Benchmark results stay local; retain instructions and runnable helpers.
 /docs/*-benchmarks.md

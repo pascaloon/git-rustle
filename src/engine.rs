@@ -357,6 +357,9 @@ pub struct Engine {
     first_frame_at: Option<Instant>,
 }
 impl Engine {
+    pub fn no_cache(&self) -> bool {
+        self.no_cache
+    }
     pub fn request_operation(&mut self, request: git::operations::Request) {
         if !self.operation_busy
             && self.operation_request.is_none()

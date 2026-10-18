@@ -32,6 +32,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -in @('request-compose','request-edit','request-tabs') -and
+        ($state -notmatch 'request_open=true request_members=10000 request_sending=false' -or $text -match 'POST ')) {
+        throw "Expected a retained composer with 10,000 members and no submission: $log"
+    }
     if ($scenario -eq 'checkout-dialog' -and
         ($state -notmatch 'checkout_choices=[1-9]' -or $text -match 'checkout requested')) {
         throw "Expected an open checkout dialog without a checkout: $log"
@@ -39,7 +43,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -eq 'status-panels' -and $state -notmatch 'footer_panel=Some\(Details\)') {
         throw "Expected the final toggle to leave Details open: $log"
     }
-    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs') -and
+    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
         throw "Candidate did not install syntax colors: $log"
@@ -50,6 +54,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        'request-compose' { 'request composer ready' }
+        'request-edit' { 'desktop scroll done' }
+        'request-tabs' { 'desktop scroll done' }
+        'avatar-scroll' { 'desktop scroll done' }
         'scroll' { 'desktop scroll done' }
         'graph-resize' { 'desktop scroll done' }
         'checkout-dialog' { 'desktop scroll done' }
@@ -72,6 +80,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        'request-compose' { 'request composer requested' }
         'branches' { 'branch activity requested' }
         'diff' { 'file diff requested' }
         'search' {
@@ -83,7 +92,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

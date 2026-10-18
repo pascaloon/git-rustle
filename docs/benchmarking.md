@@ -166,6 +166,50 @@ scrolling remains fast; moving to GPU rendering does not imply faster startup.
 
 ## 1. Preserve a trustworthy baseline
 
+### Provider composition and photos
+
+After preserving the baseline and finishing release validation/builds, compare
+startup and `benchmark-desktop.ps1 -Scenarios scroll,branches -Baseline <exe>` on
+the large history. Run candidate-only
+`benchmark-desktop.ps1 -Scenarios request-compose,request-edit,request-tabs` on a
+small disposable repository. These use 10,000 synthetic project members, the real
+composer input states, and the normal tab handlers without submitting requests.
+`request-compose` records composer construction/member-index installation to ready
+and its next frame; edit alternates Markdown Write/Preview and changes the title;
+tabs alternates Graph/composer. Each interaction launch retains 120 next-frame
+intervals after discarding the first. The runner verifies the retained composer,
+member count and idle submission state. This is candidate-only UI instrumentation,
+excluding provider latency, physical typing and scanout. Verify actual member
+search, keyboard selection, chip removal, tab retention and preview with the native
+UI separately. The autocomplete component measurement includes query filtering CPU:
+
+```powershell
+cargo test --release desktop::requests::tests::benchmark_member_search -- --ignored --exact --nocapture
+cargo test --release remote::requests::tests::benchmark_roster -- --ignored --exact --nocapture
+cargo test --release remote::requests::tests::benchmark_author_cache -- --ignored --exact --nocapture
+```
+
+Discard any invocation that compiled first, then save repeated harness stdout to
+the ignored run folder. Each harness discards one warm-up and records 15 samples.
+Member search uses 10,000 records and 600 queries per sample; the roster harness
+compares a 100-member loopback project/member load with fresh disk-cache reuse
+after its HTTP server has stopped. Neither establishes real provider latency.
+The author cache harness measures a loopback commit identity lookup with seeded
+image bytes, then both identity and image reuse with the API server offline. It
+excludes actual image download/decoding. For image paint/scrolling, set
+`GIT_RUSTLE_AVATAR_FIXTURE` to a small PNG/JPEG/WebP and run candidate-only
+`benchmark-desktop.ps1 -Scenarios avatar-scroll` on the large history. This uses
+one shared cached image for all visible rows and records 120 next-frame intervals
+per launch; it does not characterize mixed-image cache misses or network latency.
+Normal provider fixture tests cover creation payloads for both providers, GitHub
+partial success, pagination, token cache partitioning, failed rosters and redirects.
+Record authenticated live checks separately using the ignored
+`remote::requests::tests::live_github_readonly` test, with `GITHUB_TOKEN`,
+`GIT_RUSTLE_LIVE_PATH` and optionally `GIT_RUSTLE_LIVE_PROJECT=owner/repository` in
+the child process environment. Never log the token. It only reads project/members,
+the latest commit and its image; request creation remains a local fixture test.
+Keep native cached remote-preview comparison in the run as a regression check.
+
 For landing-page changes, compare native repository startup with the baseline,
 then run `scripts/benchmark-landing.ps1 -Candidate <exe> -Repository <repo>
 -OutputDirectory <new-directory>`. The candidate-only suite discards one warm-up

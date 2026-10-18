@@ -1,4 +1,4 @@
-//! Read-only provider APIs. Loaded lazily, independently of the local graph.
+//! Provider APIs. Loaded lazily, independently of the local graph.
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod files;
 pub mod history;
+pub mod requests;
 
 const TTL: u64 = 300;
 const MAX_PAGES: usize = 1000;
@@ -301,7 +302,7 @@ fn configuration_data(path: &Path) -> Result<(Vec<Configuration>, Upstreams), St
     ))
 }
 
-fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>, Upstreams), String> {
+pub(crate) fn configured(path: &Path) -> Result<(Vec<Remote>, Vec<String>, Upstreams), String> {
     let (configurations, upstreams) = configuration_data(path)?;
     let providers = crate::provider_settings::load()?;
     let mut remotes = Vec::new();
