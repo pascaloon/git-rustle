@@ -612,9 +612,7 @@ impl Desktop {
                     },
                 ),
             };
-            let mut body = column()
-                .gap_4()
-                .child(div().text_size(px(22.)).child(title));
+            let mut body = dialog_body(title);
             if dialog == Dialog::Push {
                 if op.push_pending {
                     body = body.child(caption("Checking the remote branch… You can close this dialog while the check runs."));
@@ -685,8 +683,7 @@ impl Desktop {
                     _ => true,
                 };
             body = body.child(
-                row()
-                    .justify_end()
+                dialog_actions()
                     .child(self.op_button("dialog-cancel", "Cancel", Action::Cancel, cx))
                     .child(
                         div()
@@ -714,25 +711,7 @@ impl Desktop {
                             }),
                     ),
             );
-            return Some(
-                column()
-                    .absolute()
-                    .inset_0()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgba(0x00000099))
-                    .occlude()
-                    .child(
-                        body.w(px(560.))
-                            .p_6()
-                            .bg(rgb(PANEL))
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .shadow_lg(),
-                    )
-                    .into_any_element(),
-            );
+            return Some(dialog_overlay(body).into_any_element());
         }
         if let Some((_, text)) = &self.operations.confirmation {
             return Some(

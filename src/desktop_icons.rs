@@ -46,6 +46,7 @@ impl AssetSource for Assets {
             }
             "wrap" => "<path d='M3 5h18M3 10h13a4 4 0 0 1 0 8h-5m3-3-3 3 3 3M3 15h4'/>",
             "checkout" => "<path d='M4 4h9v16H4m5-8h12m-4-4 4 4-4 4'/>",
+            "commit" => "<path d='M3 12h5m8 0h5'/><circle cx='12' cy='12' r='4'/>",
             _ => return Ok(None),
         };
         Ok(Some(Cow::Owned(format!("<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>{body}</svg>").into_bytes())))

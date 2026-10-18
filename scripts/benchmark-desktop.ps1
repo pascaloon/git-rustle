@@ -32,6 +32,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -eq 'checkout-dialog' -and
+        ($state -notmatch 'checkout_choices=[1-9]' -or $text -match 'checkout requested')) {
+        throw "Expected an open checkout dialog without a checkout: $log"
+    }
     if ($scenario -in @('scroll','search-scroll','graph-resize','tabs') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
@@ -45,6 +49,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $metric = switch ($scenario) {
         'scroll' { 'desktop scroll done' }
         'graph-resize' { 'desktop scroll done' }
+        'checkout-dialog' { 'desktop scroll done' }
         'files-scroll' { 'desktop scroll done' }
         'diff-scroll' { 'desktop scroll done' }
         'diff-pan' { 'desktop scroll done' }
@@ -74,7 +79,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

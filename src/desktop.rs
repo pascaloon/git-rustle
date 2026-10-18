@@ -198,6 +198,37 @@ fn caption(s: impl Into<SharedString>) -> Div {
         .child(s.into())
 }
 
+// Checkout and Git operation dialogs share one shell and action alignment.
+fn dialog_body(title: &'static str) -> Div {
+    column()
+        .gap_4()
+        .child(div().flex_shrink_0().text_size(px(22.)).child(title))
+}
+fn dialog_actions() -> Div {
+    row().flex_shrink_0().justify_end()
+}
+fn dialog_overlay(body: Div) -> Div {
+    column()
+        .absolute()
+        .inset_0()
+        .p_6()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000099))
+        .occlude()
+        .child(
+            body.w(px(560.))
+                .max_w_full()
+                .max_h_full()
+                .p_6()
+                .bg(rgb(PANEL))
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(LINE))
+                .shadow_lg(),
+        )
+}
+
 // Keep typed field prefixes working while the inset selector supplies the default.
 // An empty input must clear the filter even when a field remains selected.
 fn search_query(field: &str, text: &str) -> String {
@@ -626,6 +657,14 @@ impl Desktop {
                                 Some("history") => {
                                     v.engine.mark("desktop operation requested");
                                     v.operation_action(operations::Action::History, window, cx);
+                                }
+                                Some("checkout-dialog") => {
+                                    v.action(Action::Select(1, false), window, cx);
+                                    v.action(Action::Checkout, window, cx);
+                                    assert!(v.engine.app.checkout_confirmation.is_some());
+                                    v.scroll_step = 1;
+                                    v.frame_start = Some(Instant::now());
+                                    cx.notify();
                                 }
                                 Some("scroll" | "graph-resize") => {
                                     v.scroll_step = 1;
@@ -1190,6 +1229,95 @@ impl Desktop {
         self.changed(cx);
         self.sync_inputs(window, cx);
     }
+    fn checkout_choice(
+        &self,
+        index: usize,
+        choice: &crate::checkout::Request,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        use crate::checkout::Request;
+        let (symbol, action, target, description, branch) = match choice {
+            Request::Branch(t) => (
+                "branch",
+                "SWITCH BRANCH",
+                t.label(),
+                if t.remote.is_some() {
+                    "Use a local branch that tracks this remote."
+                } else {
+                    "Continue working on this branch."
+                },
+                true,
+            ),
+            Request::Commit { id, remote } => (
+                "commit",
+                "DETACHED HEAD",
+                id.to_hex_with_len(12).to_string(),
+                if remote.is_some() {
+                    "Inspect this commit; download missing objects if needed."
+                } else {
+                    "Inspect this commit in detached HEAD mode."
+                },
+                false,
+            ),
+        };
+        let full_target = match choice {
+            Request::Commit { id, .. } => id.to_string(),
+            _ => target.clone(),
+        };
+        row()
+            .id(("choice", index))
+            .w_full()
+            .flex_shrink_0()
+            .p_3()
+            .gap_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CONTROL))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(HOVER)).border_color(rgb(ACCENT)))
+            .tooltip(move |w, cx| {
+                gpui_component::tooltip::Tooltip::new(full_target.clone()).build(w, cx)
+            })
+            .child(
+                row()
+                    .size(px(36.))
+                    .flex_shrink_0()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(rgb(if branch { SELECTED } else { PANEL }))
+                    .child(icon(symbol).size(px(20.)).text_color(rgb(if branch {
+                        ACCENT
+                    } else {
+                        MUTED
+                    }))),
+            )
+            .child(
+                column()
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if branch { ACCENT } else { MUTED }))
+                            .child(action),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_ellipsis()
+                            .child(target),
+                    )
+                    .child(caption(description)),
+            )
+            .child(icon("next").text_color(rgb(MUTED)))
+            .on_click(
+                cx.listener(move |v, _, window, cx| v.action(Action::Confirm(index), window, cx)),
+            )
+    }
+
     fn button(
         &self,
         id: &'static str,
@@ -2425,7 +2553,7 @@ impl Desktop {
             }
             Some(
                 "scroll" | "graph-resize" | "files-scroll" | "diff-scroll" | "diff-pan"
-                | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs",
+                | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs" | "checkout-dialog",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2440,7 +2568,7 @@ impl Desktop {
     fn snapshot(&self) -> String {
         let app = &self.engine.app;
         format!(
-            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\noperations={} cursor={} conflicts={}\n{}\n",
+            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\ncheckout_choices={}\noperations={} cursor={} conflicts={}\n{}\n",
             app.repo_name,
             app.history.len(),
             app.details
@@ -2458,6 +2586,9 @@ impl Desktop {
                     .map_or(0, |s| s.span_count()),
                 _ => 0,
             },
+            app.checkout_confirmation
+                .as_ref()
+                .map_or(0, |d| d.choices.len()),
             self.engine.operations.labels.len(),
             self.engine.operations.cursor,
             self.engine
@@ -2545,41 +2676,29 @@ impl Render for Desktop {
             _ => String::new(),
         };
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
-            column()
-                .absolute()
-                .inset_0()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                .child(
-                    column()
-                        .w(px(620.))
-                        .p_6()
-                        .gap_4()
-                        .rounded_lg()
-                        .bg(rgb(PANEL))
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .child(div().text_size(px(20.)).child("Confirm checkout"))
-                        .children(d.choices.iter().enumerate().map(|(i, c)| {
-                            div()
-                                .id(("choice", i))
-                                .p_3()
-                                .rounded_md()
-                                .bg(rgb(CONTROL))
-                                .cursor_pointer()
-                                .child(c.label())
-                                .on_click(cx.listener(move |v, _, window, cx| {
-                                    v.action(Action::Confirm(i), window, cx)
-                                }))
-                        }))
-                        .child(self.button(
-                            "cancel-checkout",
-                            "Cancel",
-                            Action::CancelCheckout,
-                            cx,
-                        )),
-                )
+            dialog_overlay(
+                dialog_body("Confirm checkout")
+                    .child(caption("Choose how to open this revision."))
+                    .child(
+                        column()
+                            .id("checkout-options")
+                            .gap_2()
+                            .max_h(px(360.))
+                            .overflow_y_scroll()
+                            .children(
+                                d.choices
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, c)| self.checkout_choice(i, c, cx)),
+                            ),
+                    )
+                    .child(dialog_actions().child(self.button(
+                        "cancel-checkout",
+                        "Cancel",
+                        Action::CancelCheckout,
+                        cx,
+                    ))),
+            )
         });
         if self.scroll_step > 0 && self.scroll_step <= 121 {
             let weak = cx.entity().downgrade();

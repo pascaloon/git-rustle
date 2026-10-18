@@ -109,6 +109,14 @@ that its Checkout action cannot open a checkout dialog. It does not exercise
 physical Ctrl+click. Keep native clipboard and pointer checks separate.
 
 Retain all raw data, executable hashes, limitations and failed/rejected runs.
+For native checkout-dialog styling, run `benchmark-desktop.ps1 -Scenarios checkout-dialog`
+on the disposable three-commit checkout fixture. It selects the second graph row,
+opens the confirmation without checking out, and records 120 modal redraw intervals.
+The runner requires an open dialog in the final state and rejects any checkout request.
+Both comparison executables must include this scenario; preserve an instrumented
+baseline before changing the design. This measures redraw scheduling/layout/paint,
+not physical input latency; verify pointer interactions separately in the fixture.
+
 For framework migrations, report the startup regression explicitly even when
 scrolling remains fast; moving to GPU rendering does not imply faster startup.
 
