@@ -24,7 +24,6 @@ pub(super) enum Action {
     Confirm,
     Cancel,
     History,
-    CloseHistory,
     SaveConflict,
 }
 pub(super) struct Panel {
@@ -45,7 +44,6 @@ pub(super) struct Panel {
     dialog_error: Option<String>,
     epoch: u64,
     conflict_open: bool,
-    history: bool,
     confirmation: Option<(Request, String)>,
     resolution: Entity<InputState>,
     resolution_source: Option<(String, String)>,
@@ -88,7 +86,6 @@ impl Panel {
             dialog_error: None,
             epoch: 0,
             conflict_open: false,
-            history: false,
             confirmation: None,
             resolution: cx.new(|cx| InputState::new(window, cx).multi_line(true)),
             resolution_source: None,
@@ -241,14 +238,9 @@ impl Desktop {
                 }
                 request
             }
-            Action::History => {
-                self.operations.history = true;
-                Some(Request::Inspect)
-            }
-            Action::CloseHistory => {
-                self.operations.history = false;
-                None
-            }
+            Action::History => self
+                .toggle_status_panel(status::Panel::History)
+                .then_some(Request::Inspect),
             Action::Cancel => {
                 self.operations.confirmation = None;
                 self.operations.dialog = None;
@@ -327,6 +319,15 @@ impl Desktop {
             Action::Run(request) => Some(request),
         };
         if let Some(request) = request {
+            if self
+                .engine
+                .app
+                .checkout_notice
+                .as_ref()
+                .is_some_and(Result::is_ok)
+            {
+                self.engine.app.checkout_notice = None;
+            }
             self.engine.request_operation(request);
             self.engine.tick(None);
         }
@@ -518,33 +519,6 @@ impl Desktop {
         .h(px((count.min(4) * 88) as f32))
         .w_full()
         .into_any_element()
-    }
-    pub(super) fn operations_status(&self, cx: &Context<Self>) -> AnyElement {
-        row()
-            .h(px(36.))
-            .flex_shrink_0()
-            .px_3()
-            .border_t_1()
-            .border_color(rgb(LINE))
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .text_size(px(12.))
-                    .text_color(rgb(if self.engine.operation_error {
-                        REMOVED
-                    } else {
-                        MUTED
-                    }))
-                    .child(self.engine.operation_status.clone()),
-            )
-            .child(self.op_button(
-                "operation-history",
-                "Undo / redo history",
-                Action::History,
-                cx,
-            ))
-            .into_any_element()
     }
     pub(super) fn operations_overlay(&self, cx: &Context<Self>) -> Option<AnyElement> {
         if let Some(dialog) = self.operations.dialog {
@@ -752,7 +726,7 @@ impl Desktop {
                     .into_any_element(),
             );
         }
-        if !self.operations.history {
+        if self.status_panel != Some(status::Panel::History) {
             return None;
         }
         let view = &self.engine.operations;
@@ -786,6 +760,7 @@ impl Desktop {
         }
         Some(
             column()
+                .id("operation-history-panel")
                 .absolute()
                 .right(px(12.))
                 .bottom(px(42.))
@@ -798,16 +773,8 @@ impl Desktop {
                 .rounded_lg()
                 .shadow_lg()
                 .occlude()
-                .child(
-                    row()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(18.))
-                                .child("Undo / redo history"),
-                        )
-                        .child(self.op_button("close-history", "Close", Action::CloseHistory, cx)),
-                )
+                .on_mouse_down_out(cx.listener(Self::dismiss_status_panel_outside))
+                .child(div().text_size(px(18.)).child("Undo / redo history"))
                 .child(caption(
                     "Double-click a state to undo or redo all operations up to it.",
                 ))

@@ -71,6 +71,13 @@ The other intervals are worker request to result delivery. State summaries inclu
 maximum visible list-row counts to detect a zero-height viewport. They are not a
 substitute for visual or mouse/clipboard verification.
 
+For footer panel changes, also run `-Scenarios status-panels` on a small disposable
+repository. It cycles Details open/closed and History open/closed through the UI
+handlers for 120 measured next-frame intervals. History inspection runs only when
+opening its panel. The runner checks that the final Details panel is open. This
+is candidate-only for binaries without the scenario; verify real pointer toggles,
+selected button styling and dismissal separately in the native app.
+
 For scrollbar or diff rendering changes, also run `-Scenarios files-scroll,diff-scroll,diff-pan`
 against a fixture with hundreds of changed files and a long, wide modified text file.
 These scenarios collect the same 120 frame intervals while moving the file list,

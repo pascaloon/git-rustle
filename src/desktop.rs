@@ -10,7 +10,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable, Root, Sizable,
+    Disableable, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
@@ -20,6 +20,7 @@ use gpui_component::{
 use std::time::{Duration, Instant};
 mod landing;
 mod operations;
+mod status;
 
 pub fn run(mut engine: Engine) {
     engine.mark("GPUI initialization requested");
@@ -166,6 +167,7 @@ struct Desktop {
     diff_horizontal: crate::desktop_scroll::DiffScroll,
     hovered_scroll: [bool; 4],
     notice: String,
+    status_panel: Option<status::Panel>,
     close_requested: bool,
     settings_identity: Option<(u32, usize, usize)>,
     draft_text: String,
@@ -675,6 +677,12 @@ impl Desktop {
                                     v.engine.mark("desktop operation requested");
                                     v.operation_action(operations::Action::History, window, cx);
                                 }
+                                Some("status-panels") => {
+                                    v.toggle_status_panel(status::Panel::Details);
+                                    v.scroll_step = 1;
+                                    v.frame_start = Some(Instant::now());
+                                    cx.notify();
+                                }
                                 Some("checkout-dialog") => {
                                     v.action(Action::Select(1, false), window, cx);
                                     v.action(Action::Checkout, window, cx);
@@ -815,6 +823,7 @@ impl Desktop {
             diff_scroll,
             hovered_scroll: [false; 4],
             notice: String::new(),
+            status_panel: None,
             close_requested: false,
             settings_identity: None,
             draft_text: String::new(),
@@ -965,6 +974,9 @@ impl Desktop {
         cx.notify();
     }
     fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if self.status_panel == Some(status::Panel::Details) {
+            self.status_panel = None;
+        }
         if matches!(
             action,
             Action::SettingsTab(_)
@@ -1213,6 +1225,9 @@ impl Desktop {
                     && let Some(dialog) = app.checkout_confirmation.take()
                 {
                     app.checkout_request = dialog.choices.get(i).cloned();
+                    if app.checkout_request.is_some() && !self.engine.operation_error {
+                        self.engine.operation_status.clear();
+                    }
                 }
             }
             Action::SettingsTab(i) => {
@@ -1389,7 +1404,7 @@ impl Desktop {
                     && !self.engine.app.pending.busy
                     && !self.engine.app.branches.busy
                     && !self.engine.app.settings.saving)
-                || matches!(&action, Action::Operation(a) if matches!(a.as_ref(), operations::Action::Cancel | operations::Action::CloseHistory)))
+                || matches!(&action, Action::Operation(a) if matches!(a.as_ref(), operations::Action::Cancel)))
             && (!matches!(action, Action::SaveSettings)
                 || self.engine.app.settings.page > 0
                 || !self.engine.app.settings.projects.is_empty());
@@ -2573,7 +2588,8 @@ impl Desktop {
             }
             Some(
                 "scroll" | "graph-resize" | "files-scroll" | "diff-scroll" | "diff-pan"
-                | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs" | "checkout-dialog",
+                | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs" | "checkout-dialog"
+                | "status-panels",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2630,7 +2646,8 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "{}\n{}",
+                "footer_panel={:?}\n{}\n{}",
+                self.status_panel,
                 self.engine.operation_status,
                 self.operations.summary()
             ),
@@ -2682,37 +2699,6 @@ impl Render for Desktop {
                 .into_any_element()
         };
         let app = &self.engine.app;
-        let status = match &app.load {
-            crate::app::LoadState::Empty | crate::app::LoadState::Loading => {
-                "Loading history…".to_string()
-            }
-            crate::app::LoadState::Refreshing => "Refreshing history…".to_string(),
-            crate::app::LoadState::Error(e) => e.clone(),
-            _ if app.search.busy => app
-                .search
-                .result
-                .as_ref()
-                .map(|r| format!("Searching… {}/{}", r.examined, r.total))
-                .unwrap_or_else(|| "Searching…".into()),
-            _ if app
-                .search
-                .result
-                .as_ref()
-                .is_some_and(|r| r.unavailable > 0) =>
-            {
-                app.search
-                    .result
-                    .as_ref()
-                    .and_then(|r| r.error.clone())
-                    .unwrap_or_else(|| "Search incomplete: objects unavailable".into())
-            }
-            _ if app.branches.loading => "Refreshing remote branches…".into(),
-            // Hide the idle count, while retaining remote progress and errors.
-            _ if !app.ghost_status.ends_with(" ghost commits (remote only)") => {
-                app.ghost_status.clone()
-            }
-            _ => String::new(),
-        };
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
                 dialog_body("Confirm checkout")
@@ -2748,6 +2734,13 @@ impl Render for Desktop {
                     v.scroll_step += 1;
                     if v.scroll_step <= 121 {
                         match v.scenario.as_deref() {
+                            Some("status-panels") => {
+                                if matches!(v.scroll_step % 4, 1 | 2) {
+                                    v.toggle_status_panel(status::Panel::Details);
+                                } else {
+                                    v.operation_action(operations::Action::History, window, cx);
+                                }
+                            }
                             Some("settings-tabs") => {
                                 v.action(Action::SettingsTab(v.scroll_step % 3), window, cx)
                             }
@@ -2851,6 +2844,11 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && v.status_panel.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if e.keystroke.key == "escape" && v.operations.dismiss() {
                     cx.notify();
                     cx.stop_propagation();
@@ -2936,23 +2934,8 @@ impl Render for Desktop {
             )
             .child(self.tabs(cx))
             .child(content)
-            .child(self.operations_status(cx))
-            .when(!status.is_empty(), |s| {
-                s.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(rgb(LINE))
-                        .child(caption(status)),
-                )
-            })
-            .when_some(app.checkout_notice.as_ref(), |s, n| {
-                s.child(caption(n.as_ref().unwrap_or_else(|e| e).clone()))
-            })
-            .when(!self.notice.is_empty(), |s| {
-                s.child(caption(self.notice.clone()))
-            })
+            .child(self.status_bar(cx))
+            .children(self.status_details(cx))
             .children(dialog)
             .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
