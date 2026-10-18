@@ -1,6 +1,9 @@
 //! Contextual graph actions and focused recovery views.
+use super::rebase::{CommitAction, Draft};
 use super::*;
 use crate::git::operations::{PushPreview, PushRisk, Request, Resolution};
+use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Dialog {
@@ -19,6 +22,9 @@ pub(super) enum Action {
     Pull,
     StartPlan,
     ClosePlan,
+    ResetPlan,
+    SetPlan(usize, CommitAction),
+    MovePlan(usize, isize),
     ShowConflicts,
     Run(Request),
     Confirm,
@@ -40,7 +46,10 @@ pub(super) struct Panel {
     pub rebase_open: bool,
     pub plan_pending: bool,
     rebase_submitted: bool,
-    plan_text: Entity<InputState>,
+    draft: Draft,
+    controls: HashMap<usize, PlanControls>,
+    plan_scroll: UniformListScrollHandle,
+    plan_visible: usize,
     dialog_error: Option<String>,
     epoch: u64,
     conflict_open: bool,
@@ -48,13 +57,37 @@ pub(super) struct Panel {
     resolution: Entity<InputState>,
     resolution_source: Option<(String, String)>,
 }
+struct PlanControls {
+    select: Entity<SelectState<Vec<CommitAction>>>,
+    message: Option<Entity<InputState>>,
+    _subscriptions: Vec<Subscription>,
+}
+impl SelectItem for CommitAction {
+    type Value = Self;
+    fn title(&self) -> SharedString {
+        self.name().into()
+    }
+    fn value(&self) -> &Self {
+        self
+    }
+    fn render(&self, _: &mut Window, _: &mut gpui::App) -> impl IntoElement {
+        column()
+            .py_1()
+            .gap_1()
+            .child(self.name())
+            .child(caption(self.description()))
+    }
+}
 impl Panel {
     pub fn summary(&self) -> String {
         format!(
-            "dialog={:?} rebase_open={} push={:?}",
+            "dialog={:?} rebase_open={} push={:?} plan_rows={} plan_visible={} plan_errors={}",
             self.dialog,
             self.rebase_open,
-            self.push.as_ref().map(|p| &p.risk)
+            self.push.as_ref().map(|p| &p.risk),
+            self.draft.entries.len(),
+            self.plan_visible,
+            self.draft.errors
         )
     }
     pub fn dismiss(&mut self) -> bool {
@@ -82,7 +115,10 @@ impl Panel {
             rebase_open: false,
             plan_pending: false,
             rebase_submitted: false,
-            plan_text: cx.new(|cx| InputState::new(window, cx).multi_line(true)),
+            draft: Draft::default(),
+            controls: HashMap::new(),
+            plan_scroll: UniformListScrollHandle::new(),
+            plan_visible: 0,
             dialog_error: None,
             epoch: 0,
             conflict_open: false,
@@ -126,10 +162,10 @@ impl Desktop {
             if !self.engine.operation_error
                 && let Some(plan) = &self.engine.operations.plan
             {
-                self.operations
-                    .plan_text
-                    .update(cx, |s, cx| s.set_value(plan.text.clone(), window, cx));
-
+                self.operations.draft = Draft::new(plan);
+                self.operations.controls.clear();
+                self.operations.plan_scroll = UniformListScrollHandle::new();
+                self.operations.plan_visible = 0;
                 self.operations.rebase_open = true;
                 self.operations.tab = Some(Tab::Rebase);
                 self.operations.dialog = None;
@@ -139,6 +175,8 @@ impl Desktop {
             self.operations.rebase_submitted = false;
             if !self.engine.operation_error || conflict {
                 self.operations.rebase_open = false;
+                self.operations.controls.clear();
+                self.operations.draft = Draft::default();
             }
         }
         if self.operations.tab == Some(Tab::Rebase)
@@ -272,19 +310,70 @@ impl Desktop {
                 self.operations.rebase_open = false;
                 self.operations.tab = None;
                 self.engine.operations.plan = None;
+                self.operations.draft = Draft::default();
+                self.operations.controls.clear();
+                None
+            }
+            Action::ResetPlan => {
+                if let Some(plan) = &self.engine.operations.plan {
+                    self.operations.draft = Draft::new(plan);
+                    self.operations.controls.clear();
+                    self.operations.plan_visible = 0;
+                    self.operations
+                        .plan_scroll
+                        .scroll_to_item(0, ScrollStrategy::Top);
+                }
+                None
+            }
+            Action::SetPlan(key, action) => {
+                if self.engine.operation_busy || self.operations.rebase_submitted {
+                    return;
+                }
+                self.operations.draft.set_action(key, action);
+                if let Some(controls) = self.operations.controls.get(&key) {
+                    controls
+                        .select
+                        .update(cx, |s, cx| s.set_selected_value(&action, window, cx));
+                }
+                if action == CommitAction::Reword {
+                    self.ensure_plan_controls(key, window, cx);
+                    if let Some(input) = self
+                        .operations
+                        .controls
+                        .get(&key)
+                        .and_then(|c| c.message.as_ref())
+                    {
+                        input.update(cx, |s, cx| s.focus(window, cx));
+                    }
+                }
+                None
+            }
+            Action::MovePlan(key, direction) => {
+                if self.engine.operation_busy || self.operations.rebase_submitted {
+                    return;
+                }
+                if let Some(to) = self.operations.draft.move_entry(key, direction) {
+                    self.operations
+                        .plan_scroll
+                        .scroll_to_item(to, ScrollStrategy::Center);
+                }
                 None
             }
             Action::StartPlan => {
+                if self.operations.draft.errors > 0 || self.operations.draft.entries.is_empty() {
+                    return;
+                }
                 if let Some(plan) = &self.engine.operations.plan {
                     self.operations.confirmation = Some((
                         Request::Interactive {
                             plan: plan.clone(),
-                            text: self.operations.plan_text.read(cx).value().to_string(),
+                            text: self.operations.draft.text(),
                         },
                         format!(
-                            "Rewrite {} using this plan, based on {}? Dropped commits remain in local recovery checkpoints.",
+                            "Rewrite {} using this plan, based on {}? {}. Dropped commits remain in local recovery checkpoints.",
                             plan.branch,
-                            &plan.base[..12.min(plan.base.len())]
+                            &plan.base[..12.min(plan.base.len())],
+                            self.operations.draft.summary
                         ),
                     ));
                 }
@@ -344,6 +433,9 @@ impl Desktop {
             .into_any_element()
     }
     pub(super) fn operations_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.operations.tab == Some(Tab::Rebase) && !self.engine.operations.interactive_rebase {
+            return self.rebase_content(cx);
+        }
         let mut content = column()
             .id("git-workflows")
             .flex_1()
@@ -361,11 +453,7 @@ impl Desktop {
                     content = content.child(caption("Rebase is in progress. Resolve or amend the current commit, then continue."))
                         .child(self.op_button("rebase-progress", "Open rebase progress", Action::ShowConflicts, cx));
                 } else {
-                    content = content.child(caption("Oldest commit first. Move lines to reorder; change pick to reword, squash, fixup, drop or edit."))
-                        .child(caption("For reword, replace the message after the commit ID. Keep every full ID once. Edit pauses for an external amend."))
-                        .child(div().min_h(px(300.)).child(Input::new(&self.operations.plan_text).h(px(360.))))
-                        .child(row().child(self.op_button("start-plan", "Review and start rebase…", Action::StartPlan, cx))
-                            .child(self.op_button("close-plan", "Discard plan", Action::ClosePlan, cx)));
+                    unreachable!("draft rebase uses its own virtualized layout");
                 }
             }
             Some(Tab::Conflicts) => {
@@ -435,6 +523,299 @@ impl Desktop {
             _ => {}
         }
         content.into_any_element()
+    }
+    // Allocate component state only as rows become visible. Reword inputs are
+    // created on demand; ordinary commits never carry an editor or text layout.
+    fn ensure_plan_controls(&mut self, key: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(i) = self.operations.draft.index(key) else {
+            return;
+        };
+        let action = self.operations.draft.entries[i].action;
+        self.operations.controls.entry(key).or_insert_with(|| {
+            let select = cx.new(|cx| {
+                SelectState::new(
+                    CommitAction::ALL.to_vec(),
+                    Some(
+                        gpui_component::IndexPath::default()
+                            .row(CommitAction::ALL.iter().position(|a| *a == action).unwrap()),
+                    ),
+                    window,
+                    cx,
+                )
+            });
+            let subscription = cx.subscribe_in(&select, window, move |v, _, event, window, cx| {
+                if let SelectEvent::Confirm(Some(action)) = event {
+                    v.operation_action(Action::SetPlan(key, *action), window, cx);
+                }
+            });
+            PlanControls {
+                select,
+                message: None,
+                _subscriptions: vec![subscription],
+            }
+        });
+        if action == CommitAction::Reword && self.operations.controls[&key].message.is_none() {
+            let message = self.operations.draft.entries[i].message.clone();
+            let input = cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder("New commit message");
+                input.set_value(message, window, cx);
+                input
+            });
+            let subscription = cx.subscribe(&input, move |v, input, event, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(i) = v.operations.draft.index(key)
+                {
+                    v.operations.draft.entries[i].message = input.read(cx).value().to_string();
+                    v.operations.draft.refresh();
+                    cx.notify();
+                }
+            });
+            let controls = self.operations.controls.get_mut(&key).unwrap();
+            controls.message = Some(input);
+            controls._subscriptions.push(subscription);
+        }
+    }
+    fn rebase_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let plan = self.engine.operations.plan.as_ref();
+        let enabled = !self.engine.operation_busy && !self.operations.rebase_submitted;
+        let valid = self.operations.draft.errors == 0 && !self.operations.draft.entries.is_empty();
+        let count = self.operations.draft.entries.len();
+        let list = uniform_list(
+            "rebase-commits",
+            count,
+            cx.processor(|v, range: std::ops::Range<usize>, window, cx| {
+                v.operations.plan_visible = v.operations.plan_visible.max(range.len());
+                if v.operations.controls.len() > 64 {
+                    let visible = &v.operations.draft.entries[range.clone()];
+                    v.operations
+                        .controls
+                        .retain(|key, _| visible.iter().any(|e| e.key == *key));
+                }
+                range
+                    .map(|i| {
+                        let key = v.operations.draft.entries[i].key;
+                        v.ensure_plan_controls(key, window, cx);
+                        v.rebase_row(i, cx)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .h_full()
+        .track_scroll(self.operations.plan_scroll.clone());
+        column().flex_1().size_full().p_6().gap_4().overflow_hidden()
+            .child(column().flex_shrink_0().gap_2()
+                .child(row().gap_3().child(icon("graph").text_color(rgb(ACCENT)))
+                    .child(div().text_size(px(22.)).child("Interactive rebase"))
+                    .child(div().flex_1())
+                    .child(caption(plan.map(|p| format!("{}  /  onto {}", p.branch, &p.base[..12.min(p.base.len())])).unwrap_or_default()).truncate()))
+                .child(caption("Shape your history. Choose an action for each commit and use the arrows to change replay order.")))
+            .child(column().flex_1().border_1().border_color(rgb(LINE)).rounded_lg().overflow_hidden()
+                .child(row().flex_shrink_0().h(px(38.)).px_4().bg(rgb(CONTROL))
+                    .child(caption("REPLAY ORDER · OLDEST FIRST"))
+                    .child(div().flex_1())
+                    .child(caption(format!("{count} commits"))))
+                .child(row().flex_1().min_h_0().gap_0().child(list)
+                    .child(Scrollbar::vertical(&self.operations.plan_scroll).scrollbar_show(ScrollbarShow::Always))))
+            .child(column().flex_shrink_0().gap_3()
+                .child(row().child(div().text_size(px(13.)).child(self.operations.draft.summary.clone()))
+                    .child(div().flex_1())
+                    .when(!valid, |r| r.child(div().text_size(px(12.)).text_color(rgb(REMOVED)).child(format!("Fix {} plan issue(s) before continuing", self.operations.draft.errors)))))
+                .child(row()
+                    .child(Button::new("reset-rebase").small().ghost().label("Reset plan").disabled(!enabled)
+                        .on_click(cx.listener(|v, _, window, cx| v.operation_action(Action::ResetPlan, window, cx))))
+                    .child(caption("History changes only after review and confirmation.").flex_1())
+                    .child(self.op_button("close-plan", "Discard plan", Action::ClosePlan, cx))
+                    .child(Button::new("start-plan").small().primary().label("Review rebase…").disabled(!enabled || !valid)
+                        .on_click(cx.listener(|v, _, window, cx| v.operation_action(Action::StartPlan, window, cx))))))
+            .into_any_element()
+    }
+    fn rebase_row(&self, i: usize, cx: &Context<Self>) -> AnyElement {
+        let entry = &self.operations.draft.entries[i];
+        let key = entry.key;
+        let controls = &self.operations.controls[&key];
+        let enabled = !self.engine.operation_busy && !self.operations.rebase_submitted;
+        let color = if entry.error.is_some() || entry.action == CommitAction::Drop {
+            REMOVED
+        } else if entry.action == CommitAction::Pick {
+            MUTED
+        } else {
+            ACCENT
+        };
+        let detail = if let Some(error) = entry.error {
+            error.to_string()
+        } else if entry.action.combines() {
+            let target = &self.operations.draft.entries[entry.target.unwrap()];
+            format!(
+                "↳ {} {} · {}",
+                if entry.action == CommitAction::Fixup {
+                    "Fold into"
+                } else {
+                    "Combine with"
+                },
+                &target.id[..8.min(target.id.len())],
+                if target.action == CommitAction::Reword {
+                    target.message.trim()
+                } else {
+                    &target.subject
+                }
+            )
+        } else {
+            entry.action.description().into()
+        };
+        let mut body = column().flex_1().gap_2().child(
+            row()
+                .gap_3()
+                .child(
+                    div()
+                        .font_family("Cascadia Mono")
+                        .text_size(px(12.))
+                        .text_color(rgb(MUTED))
+                        .child(entry.id[..8.min(entry.id.len())].to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_color(rgb(if entry.action == CommitAction::Drop {
+                            MUTED
+                        } else {
+                            TEXT
+                        }))
+                        .when(entry.action == CommitAction::Drop, |s| s.line_through())
+                        .child(entry.subject.clone()),
+                ),
+        );
+        if entry.action == CommitAction::Reword {
+            body = body.child(
+                row()
+                    .child(caption("Message"))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(controls.message.as_ref().unwrap())
+                                .small()
+                                .disabled(!enabled)
+                                .w_full(),
+                        ),
+                    )
+                    .when(entry.error.is_some(), |r| {
+                        r.child(div().text_color(rgb(REMOVED)).child("Required"))
+                    }),
+            );
+        } else {
+            body = body.child(caption(detail).truncate().text_color(rgb(
+                if entry.error.is_some() {
+                    REMOVED
+                } else {
+                    MUTED
+                },
+            )));
+        }
+        row()
+            .id(("rebase-row", key))
+            .relative()
+            .w_full()
+            .h(px(92.))
+            .px_4()
+            .gap_4()
+            .border_b_1()
+            .border_color(rgb(INSPECTOR_LINE))
+            .bg(rgb(if entry.error.is_some() {
+                REMOVED_BG
+            } else {
+                PANEL
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(rgb(color)),
+            )
+            .child(
+                div()
+                    .w(px(24.))
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("{:02}", i + 1)),
+            )
+            .child(
+                div().w(px(126.)).flex_shrink_0().child(
+                    Select::new(&controls.select)
+                        .small()
+                        .w_full()
+                        .menu_width(px(420.))
+                        .disabled(!enabled),
+                ),
+            )
+            .child(body)
+            .child(
+                row()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(
+                        Button::new(("rebase-up", key))
+                            .small()
+                            .ghost()
+                            .label("↑")
+                            .tooltip("Move earlier in replay order")
+                            .disabled(!enabled || i == 0)
+                            .on_click(cx.listener(move |v, _, window, cx| {
+                                v.operation_action(Action::MovePlan(key, -1), window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(("rebase-down", key))
+                            .small()
+                            .ghost()
+                            .label("↓")
+                            .tooltip("Move later in replay order")
+                            .disabled(!enabled || i + 1 == self.operations.draft.entries.len())
+                            .on_click(cx.listener(move |v, _, window, cx| {
+                                v.operation_action(Action::MovePlan(key, 1), window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+    pub(super) fn rebase_scenario_ready(&self) -> bool {
+        self.operations.rebase_open
+            && !self.engine.operation_busy
+            && self.operations.draft.entries.len() >= 3
+    }
+    pub(super) fn rebase_scenario_step(
+        &mut self,
+        step: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.scenario.as_deref() == Some("rebase-scroll") {
+            self.operations.plan_scroll.scroll_to_item(
+                (step * 37) % self.operations.draft.entries.len(),
+                ScrollStrategy::Top,
+            );
+        } else {
+            self.operation_action(Action::SetPlan(1, CommitAction::ALL[step % 6]), window, cx);
+            self.operation_action(
+                Action::MovePlan(1, if step.is_multiple_of(2) { 1 } else { -1 }),
+                window,
+                cx,
+            );
+            if let Some(input) = self
+                .operations
+                .controls
+                .get(&1)
+                .and_then(|c| c.message.clone())
+            {
+                input.update(cx, |s, cx| {
+                    s.set_value(format!("Reworded commit {step}"), window, cx)
+                });
+            }
+        }
     }
     fn conflict_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let count = self

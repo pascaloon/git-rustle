@@ -20,6 +20,7 @@ use gpui_component::{
 use std::time::{Duration, Instant};
 mod landing;
 mod operations;
+mod rebase;
 mod status;
 
 pub fn run(mut engine: Engine) {
@@ -660,12 +661,12 @@ impl Desktop {
                                         }
                                     }
                                 }
-                                Some("rebase-plan") => {
+                                Some("rebase-plan" | "rebase-scroll" | "rebase-edit") => {
                                     v.engine.mark("desktop operation requested");
                                     v.operation_action(
                                         operations::Action::Open(
                                             operations::Dialog::Plan,
-                                            "HEAD~3".into(),
+                                            std::env::var("GIT_RUSTLE_REBASE_BASE").unwrap_or_else(|_| "HEAD~3".into()),
                                             "HEAD~3".into(),
                                         ),
                                         window,
@@ -730,6 +731,7 @@ impl Desktop {
                         }
                         if v.scenario_started && v.scroll_step == 0 {
                             let ready = match v.scenario.as_deref() {
+                                Some("rebase-scroll" | "rebase-edit") => v.rebase_scenario_ready(),
                                 Some("settings-tabs") => {
                                     v.engine.app.settings.open && !v.engine.app.settings.busy
                                 }
@@ -2587,9 +2589,9 @@ impl Desktop {
                     && !self.engine.operation_busy
             }
             Some(
-                "scroll" | "graph-resize" | "files-scroll" | "diff-scroll" | "diff-pan"
-                | "search-scroll" | "wrap-scroll" | "tabs" | "settings-tabs" | "checkout-dialog"
-                | "status-panels",
+                "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize" | "files-scroll"
+                | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll" | "tabs"
+                | "settings-tabs" | "checkout-dialog" | "status-panels",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2734,6 +2736,9 @@ impl Render for Desktop {
                     v.scroll_step += 1;
                     if v.scroll_step <= 121 {
                         match v.scenario.as_deref() {
+                            Some("rebase-scroll" | "rebase-edit") => {
+                                v.rebase_scenario_step(v.scroll_step, window, cx);
+                            }
                             Some("status-panels") => {
                                 if matches!(v.scroll_step % 4, 1 | 2) {
                                     v.toggle_status_panel(status::Panel::Details);

@@ -116,6 +116,27 @@ that its Checkout action cannot open a checkout dialog. It does not exercise
 physical Ctrl+click. Keep native clipboard and pointer checks separate.
 
 Retain all raw data, executable hashes, limitations and failed/rejected runs.
+For the interactive rebase editor, run `scripts/benchmark-rebase.ps1 -Baseline <exe>
+-OutputDirectory <new-directory>` after release validation/builds. It creates a
+disposable linear 1,001-commit repository, alternates baseline/candidate openings
+of the same three-commit plan, then measures candidate-only scrolling and editing
+of 1,000 rows (one warm-up and 15 launches; 120 measured next-frame intervals per
+interaction launch). Editing cycles all six actions, moves a commit in both
+directions and updates a reword message through the UI handlers. The runner checks
+visible rows, validation state, unchanged HEAD/worktree and absence of executed
+operations. Intervals include event-loop scheduling, layout and paint submission;
+they exclude action-handler CPU time, physical input and display scanout. To
+measure the model work too, compile `scripts/benchmark-rebase-model.rs` with
+`rustc -O --edition=2024 -C lto=fat -C codegen-units=1 -C panic=abort -o
+target/bench/<run>/model-bench.exe`, then run it after builds finish and save stdout
+as `model-samples.json`. It imports the production draft module, using only the
+Plan text field, and records a discarded warm-up plus 15 samples of loading 1,000
+entries and 200 action changes, moves, message validations and serializations per
+sample. These component times exclude GPUI, Git and input delivery; do not add
+their percentiles to native frame percentiles. The baseline lacks the structured
+interaction scenarios. Verify actual combobox, keyboard, move and message-editing
+behavior separately in the native app; run startup comparisons on the large clone.
+
 For native checkout-dialog styling, run `benchmark-desktop.ps1 -Scenarios checkout-dialog`
 on the disposable three-commit checkout fixture. It selects the second graph row,
 opens the confirmation without checking out, and records 120 modal redraw intervals.
