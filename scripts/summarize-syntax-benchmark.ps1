@@ -1,4 +1,7 @@
-param([Parameter(Mandatory)][string]$Run)
+param(
+    [Parameter(Mandatory)][string]$Run,
+    [string[]]$Suites = @('source','small','plain')
+)
 $ErrorActionPreference = 'Stop'
 $Run = (Resolve-Path -LiteralPath $Run).Path
 function Percentile($values, [double]$p) {
@@ -26,7 +29,7 @@ foreach ($mode in 'warm','uncached') {
     $summary += Metric "startup-$mode-ms" $b.firstFrameMs $c.firstFrameMs
     if ($mode -eq 'uncached') { $summary += Metric 'walk-uncached-ms' $b.walkDoneMs $c.walkDoneMs }
 }
-foreach ($suite in 'source','small','plain') {
+foreach ($suite in $Suites) {
     $samples = Get-Content (Join-Path $Run "$suite/samples.json") -Raw | ConvertFrom-Json
     foreach ($scenario in @($samples.scenario | Select-Object -Unique)) {
         $b = @($samples | Where-Object {$_.binary -eq 'baseline' -and $_.scenario -eq $scenario})

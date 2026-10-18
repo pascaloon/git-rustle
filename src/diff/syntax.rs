@@ -200,6 +200,8 @@ fn language(path: &str) -> Option<&'static str> {
             "toml" => "toml",
             "yaml" | "yml" => "yaml",
             "sh" | "bash" => "bash",
+            "bat" | "cmd" => "batch",
+            "ps1" | "psm1" | "psd1" => "powershell",
             "go" => "go",
             "rb" => "ruby",
             "java" => "java",
@@ -221,6 +223,24 @@ fn language(path: &str) -> Option<&'static str> {
 }
 // Some grammar crates publish extension queries rather than a complete language.
 fn configuration(lang: &str) -> Option<HighlightConfiguration> {
+    // These grammars are not bundled by gpui-component. Reuse the same bounded
+    // worker and map their additional capture names onto our existing palette.
+    let standalone = match lang {
+        "batch" => Some((
+            tree_sitter_batch::LANGUAGE.into(),
+            tree_sitter_batch::HIGHLIGHTS_QUERY.replace("@label", "@title"),
+        )),
+        "powershell" => Some((
+            tree_sitter_powershell::LANGUAGE.into(),
+            tree_sitter_powershell::HIGHLIGHTS_QUERY.replace("@delimiter", "@punctuation"),
+        )),
+        _ => None,
+    };
+    if let Some((language, query)) = standalone {
+        let mut result = HighlightConfiguration::new(language, lang, &query, "", "").ok()?;
+        result.configure(NAMES);
+        return Some(result);
+    }
     let registry = LanguageRegistry::singleton();
     let config = registry.language(lang)?;
     let query = match lang {
@@ -447,6 +467,83 @@ mod tests {
     }
 
     #[test]
+    fn windows_shell_extensions_are_case_insensitive() {
+        for path in ["build.bat", "build.cmd", "BUILD.BAT", "dir/Build.CmD"] {
+            assert_eq!(language(path), Some("batch"));
+        }
+        for path in [
+            "build.ps1",
+            "module.psm1",
+            "module.psd1",
+            "BUILD.PS1",
+            "dir/Test.PsM1",
+        ] {
+            assert_eq!(language(path), Some("powershell"));
+        }
+    }
+
+    #[test]
+    fn batch_commands_comments_labels_and_expansions() {
+        let source = "@echo off\r\nREM build café\r\n:: another comment\r\n:build\r\nset NAME=world\r\nif defined NAME echo %NAME% \"hello\"\r\nfor %%I in (1 2) do echo %%I\r\necho !NAME!\r\n";
+        let side = paint("build.BAT", source);
+        for (no, token, category) in [
+            (1, "@echo off", "keyword"),
+            (2, "REM build café", "comment"),
+            (3, ":: another comment", "comment"),
+            (4, ":build", "title"),
+            (5, "set", "keyword"),
+            (5, "NAME", "variable"),
+            (6, "if", "keyword"),
+            (6, "%NAME%", "variable"),
+            (6, "hello", "string"),
+            (7, "%%I", "variable"),
+            (8, "!NAME!", "variable"),
+        ] {
+            let line = source.lines().nth(no as usize - 1).unwrap();
+            assert!(
+                has(&side, no, line, token, category),
+                "{no}: {token} {category}: {:?}",
+                side.line(no)
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_commands_types_comments_and_multiline_strings() {
+        let source = "function Get-Greeting {\r\nparam([string]$Name)\r\n<# hidden context\r\nstill a comment café #>\r\n$Count = 42\r\nWrite-Output \"Hello $Name\"\r\n$Text = @\"\r\nhello 世界\r\n\"@\r\nreturn $Text\r\n}\r\n";
+        let side = paint("build.PS1", source);
+        for (no, token, category) in [
+            (1, "function", "keyword"),
+            (1, "Get-Greeting", "function"),
+            (2, "param", "keyword"),
+            (2, "string", "type"),
+            (2, "$Name", "variable"),
+            (4, "still a comment café", "comment"),
+            (5, "42", "number"),
+            (6, "Write-Output", "function"),
+            (6, "Hello ", "string"),
+            (8, "hello 世界", "string"),
+            (10, "return", "keyword"),
+        ] {
+            let line = source.lines().nth(no as usize - 1).unwrap();
+            assert!(
+                has(&side, no, line, token, category),
+                "{no}: {token} {category}: {:?}",
+                side.line(no)
+            );
+        }
+        let line = source.lines().nth(7).unwrap();
+        let start = line.find('世').unwrap();
+        assert_eq!(
+            clipped(side.line(8), start..line.len()),
+            vec![Span {
+                range: 0..6,
+                style: 1
+            }]
+        );
+    }
+
+    #[test]
     fn all_mapped_languages_compile_their_queries() {
         for path in [
             "a.rs",
@@ -461,6 +558,8 @@ mod tests {
             "a.toml",
             "a.yaml",
             "a.sh",
+            "a.bat",
+            "a.ps1",
             "a.go",
             "a.rb",
             "a.java",
@@ -561,10 +660,22 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",\n")
         );
+        let powershell = (0..600).map(|i| format!(
+            "function Get-Item{i} {{ param([string]$Name) $Count = {i}; Write-Output \"Hello $Name\" }}\n"
+        )).collect::<String>();
+        let batch = (0..600)
+            .map(|i| {
+                format!(
+                    "REM build step {i}\nset NAME=world{i}\nif defined NAME echo \"Hello %NAME%\"\n"
+                )
+            })
+            .collect::<String>();
         for (path, text) in [
             ("wide.rs", rust),
             ("a.py", python),
             ("a.json", json),
+            ("build.ps1", powershell),
+            ("build.bat", batch),
             ("large.rs", "let x = 1;\n".repeat(60_000)),
         ] {
             let mut painter = Painter::default();

@@ -21,8 +21,12 @@ not restart at hunk boundaries. Each renamed side uses its own filename.
 The bundled gpui-component Tree-sitter grammars cover Rust, C/C++, C#, JavaScript
 (including JSX), TypeScript/TSX, Python, JSON/JSONC, TOML, YAML, Bash, Go, Ruby,
 Java, HTML, CSS, SQL, Markdown, Swift, Scala, Zig, Elixir, GraphQL, Protocol
-Buffers, CMake, Make and patch files. Detection uses known extensions plus
-Makefile/GNUmakefile, CMakeLists.txt, Gemfile/Rakefile and Bash dotfiles.
+Buffers, CMake, Make and patch files.
+Two standalone grammars add Windows Batch (.bat, .cmd) and PowerShell
+(.ps1, .psm1, .psd1), with case-insensitive extension detection.
+Detection also recognizes Makefile/GNUmakefile, CMakeLists.txt, Gemfile/Rakefile
+and Bash dotfiles. Batch expansions inside quoted strings currently share the
+string color.
 
 This is syntax coloring, not semantic highlighting or language-server analysis.
 Only the primary language is parsed: embedded JavaScript in HTML, Markdown fenced
@@ -71,7 +75,7 @@ RequireSyntax rejects an accidentally uncolored source fixture.
 Each scrolling launch saves 120 measured next-frame intervals. They include
 scheduling, layout and paint submission, not physical input latency or scanout.
 The component harness prints one first-use sample (sample -1, retained separately)
-and 15 warm samples for Rust, Python, JSON and large-file fallback. It separately
+and 15 warm samples for Rust, Python, JSON, Batch, PowerShell and large-file fallback. It separately
 times cached range lookup/clipping for 50 rows; this excludes shaping and paint.
 Component timings are candidate-only. Native baseline/candidate comparisons
 establish the end-to-end regression budget.
@@ -85,3 +89,12 @@ Use scripts/summarize-syntax-benchmark.ps1 -Run $benchRun to summarize the stand
 startup/source/small/plain output directories. RejectCompetingBuilds aborts a native
 run if Rust/C/C++ compiler or Cargo processes appear at its launch boundaries;
 retain those logs as rejected data and repeat after other work finishes.
+
+For Windows shell coverage, pass -Language Batch or -Language PowerShell
+to new-syntax-fixture.ps1 (optionally -Lines 600). Run the same native diff,
+diff-scroll, diff-pan and wrap-scroll scenarios on each generated repository.
+These fixtures are source data only; benchmark scripts never execute their
+Batch or PowerShell contents. Existing UTF-8 and file/work limits still apply.
+
+Summarize these suites with scripts/summarize-syntax-benchmark.ps1 -Run $benchRun
+-Suites batch,powershell.
