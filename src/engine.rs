@@ -513,7 +513,7 @@ impl Engine {
             self.operation_busy = true;
             self.operation_status = "Working… You can keep browsing while Git finishes.".into();
             self.operation_error = false;
-            if !request.is_read_only() {
+            if request.changes_repository() {
                 self.app.pending.loading = false;
                 self.pending_generation = self.pending_generation.wrapping_add(1);
             }

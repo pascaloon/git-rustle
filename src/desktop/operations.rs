@@ -4,6 +4,7 @@ use super::*;
 use crate::git::operations::{PushPreview, PushRisk, Request, Resolution};
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use std::collections::HashMap;
+mod history;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Dialog {
@@ -30,6 +31,10 @@ pub(super) enum Action {
     Confirm,
     Cancel,
     History,
+    CloseHistory,
+    ReviewClear,
+    CancelClear,
+    ClearHistory,
     SaveConflict,
 }
 pub(super) struct Panel {
@@ -50,6 +55,9 @@ pub(super) struct Panel {
     controls: HashMap<usize, PlanControls>,
     plan_scroll: UniformListScrollHandle,
     plan_visible: usize,
+    history_clear: bool,
+    history_scroll: UniformListScrollHandle,
+    history_visible: usize,
     dialog_error: Option<String>,
     epoch: u64,
     conflict_open: bool,
@@ -81,13 +89,15 @@ impl SelectItem for CommitAction {
 impl Panel {
     pub fn summary(&self) -> String {
         format!(
-            "dialog={:?} rebase_open={} push={:?} plan_rows={} plan_visible={} plan_errors={}",
+            "dialog={:?} rebase_open={} push={:?} plan_rows={} plan_visible={} plan_errors={} history_visible={} history_clear={}",
             self.dialog,
             self.rebase_open,
             self.push.as_ref().map(|p| &p.risk),
             self.draft.entries.len(),
             self.plan_visible,
-            self.draft.errors
+            self.draft.errors,
+            self.history_visible,
+            self.history_clear
         )
     }
     pub fn dismiss(&mut self) -> bool {
@@ -119,6 +129,9 @@ impl Panel {
             controls: HashMap::new(),
             plan_scroll: UniformListScrollHandle::new(),
             plan_visible: 0,
+            history_clear: false,
+            history_scroll: UniformListScrollHandle::new(),
+            history_visible: 0,
             dialog_error: None,
             epoch: 0,
             conflict_open: false,
@@ -142,6 +155,16 @@ impl Desktop {
             return;
         }
         self.operations.epoch = self.engine.operation_epoch;
+        if self.status_panel == Some(status::Panel::History) {
+            self.operations.history_scroll.scroll_to_item(
+                self.engine
+                    .operations
+                    .labels
+                    .len()
+                    .saturating_sub(self.engine.operations.cursor),
+                ScrollStrategy::Center,
+            );
+        }
         let conflict = self.engine.operations.conflict.is_some();
         if conflict && !self.operations.conflict_open {
             self.operations.tab = Some(Tab::Conflicts);
@@ -276,9 +299,33 @@ impl Desktop {
                 }
                 request
             }
-            Action::History => self
-                .toggle_status_panel(status::Panel::History)
-                .then_some(Request::Inspect),
+            Action::History => {
+                self.operations.history_clear = false;
+                self.toggle_status_panel(status::Panel::History)
+                    .then_some(Request::Inspect)
+            }
+            Action::CloseHistory => {
+                self.status_panel = None;
+                self.operations.history_clear = false;
+                None
+            }
+            Action::ReviewClear => {
+                if !self.engine.operation_busy && !self.engine.operations.labels.is_empty() {
+                    self.operations.history_clear = true;
+                }
+                None
+            }
+            Action::CancelClear => {
+                self.operations.history_clear = false;
+                None
+            }
+            Action::ClearHistory => {
+                if !self.operations.history_clear {
+                    return;
+                }
+                self.operations.history_clear = false;
+                Some(Request::ClearHistory)
+            }
             Action::Cancel => {
                 self.operations.confirmation = None;
                 self.operations.dialog = None;
@@ -1110,75 +1157,6 @@ impl Desktop {
         if self.status_panel != Some(status::Panel::History) {
             return None;
         }
-        let view = &self.engine.operations;
-        let mut list = column()
-            .id("operation-history-list")
-            .max_h(px(320.))
-            .overflow_y_scroll()
-            .gap_1();
-        for (i, label) in std::iter::once("Starting state")
-            .chain(view.labels.iter().map(String::as_str))
-            .enumerate()
-        {
-            list = list.child(
-                row()
-                    .id(("history-position", i))
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(if i == view.cursor { SELECTED } else { CONTROL }))
-                    .child(format!(
-                        "{} {i}. {label}",
-                        if i == view.cursor { "●" } else { " " }
-                    ))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |v, event: &ClickEvent, w, cx| {
-                        if event.click_count() == 2 {
-                            v.operation_action(Action::Run(Request::MoveTo(i)), w, cx);
-                        }
-                    })),
-            );
-        }
-        Some(
-            column()
-                .id("operation-history-panel")
-                .absolute()
-                .right(px(12.))
-                .bottom(px(42.))
-                .w(px(540.))
-                .p_4()
-                .gap_3()
-                .bg(rgb(PANEL))
-                .border_1()
-                .border_color(rgb(LINE))
-                .rounded_lg()
-                .shadow_lg()
-                .occlude()
-                .on_mouse_down_out(cx.listener(Self::dismiss_status_panel_outside))
-                .child(div().text_size(px(18.)).child("Undo / redo history"))
-                .child(caption(
-                    "Double-click a state to undo or redo all operations up to it.",
-                ))
-                .when(!view.boundary.is_empty(), |s| {
-                    s.child(caption(view.boundary.clone()))
-                })
-                .child(list)
-                .child(
-                    row()
-                        .child(self.op_button(
-                            "history-undo",
-                            "Undo",
-                            Action::Run(Request::MoveTo(view.cursor.saturating_sub(1))),
-                            cx,
-                        ))
-                        .child(self.op_button(
-                            "history-redo",
-                            "Redo",
-                            Action::Run(Request::MoveTo((view.cursor + 1).min(view.labels.len()))),
-                            cx,
-                        )),
-                )
-                .into_any_element(),
-        )
+        Some(self.history_panel(cx))
     }
 }

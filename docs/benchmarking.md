@@ -116,6 +116,22 @@ that its Checkout action cannot open a checkout dialog. It does not exercise
 physical Ctrl+click. Keep native clipboard and pointer checks separate.
 
 Retain all raw data, executable hashes, limitations and failed/rejected runs.
+For undo history, preserve both release application and test executables first.
+After final release validation/builds, prepare a new disposable fixture with
+`GIT_RUSTLE_UNDO_FIXTURE=<new-path>` and run the ignored test
+`git::operations::tests::prepare_undo_fixture`. It records 100 real branch actions
+and restores position 80. Run `scripts/benchmark-undo.ps1 -Fixture <path>
+-Baseline <exe> -OutputDirectory <new-directory>`. The suite alternates 15
+baseline/candidate openings after one warm-up each, then measures candidate-only
+scrolling (120 intervals per launch) and clearing (worker delivery and empty-panel
+frame). Each clear starts from a restored fixture journal; the runner checks
+durable clearing plus unchanged HEAD, refs, staging, files and config. These
+scroll intervals include handler CPU, scheduling, layout and paint submission;
+they exclude physical input and scanout. The older baseline lacks scroll/clear
+instrumentation. Check pointer controls, current/redo styles, confirmation and
+cancellation separately. Compare large-clone startup and the existing ignored
+`engine::tests::benchmark_desktop_mutations` on both preserved test executables.
+
 For the interactive rebase editor, run `scripts/benchmark-rebase.ps1 -Baseline <exe>
 -OutputDirectory <new-directory>` after release validation/builds. It creates a
 disposable linear 1,001-commit repository, alternates baseline/candidate openings

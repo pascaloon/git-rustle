@@ -74,10 +74,16 @@ discards conflict-resolution edits. A whole sequence occupies one history entry.
 
 ## Undo and redo
 
-The bottom-right **Undo / redo history** button opens the state list. The filled
-dot identifies the current position. Double-click a state to undo/redo all changes
-between it and the current position. There are no Ctrl+Z/Ctrl+Y Git shortcuts.
+The bottom-right **History** button opens a compact timeline, newest first.
+**Current** marks your position; faded **Redo** steps are ahead of it.
+Use Undo/Redo or double-click a state to restore it. There are no Ctrl+Z/Ctrl+Y Git shortcuts.
 Creating another operation after undo replaces the redo tail.
+
+**Clear… → Clear history** removes all undo and redo steps for this worktree,
+including after restarting the app. It preserves the current files, staging,
+commits, branches and configuration. Clearing is unavailable during an active Git
+operation. Recovery objects remain protected; this clears navigation history,
+not checkpoint storage shared with other worktrees.
 
 History is per worktree and persists in its Git directory under
 `rustle-operations/journal.json`. Checkpoints include HEAD, refs, local config,

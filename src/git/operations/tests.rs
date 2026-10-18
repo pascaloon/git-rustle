@@ -75,6 +75,151 @@ fn branches_undo_redo_jump_and_fork() {
 }
 
 #[test]
+fn clear_history_preserves_dirty_state_removes_both_tails_and_persists() {
+    let f = Fixture::new();
+    f.run(Request::Create {
+        name: "topic".into(),
+        target: "HEAD".into(),
+    });
+    f.run(Request::Rename {
+        old: "topic".into(),
+        new: "renamed".into(),
+    });
+    f.run(Request::MoveTo(1));
+    f.write("file.txt", "staged\n");
+    f.git(&["add", "file.txt"]);
+    f.write("file.txt", "unstaged\n");
+    f.write("untracked.txt", "keep me\n");
+    let context = Context::new(f.root()).unwrap();
+    let before = context.snapshot().unwrap();
+    let pins = f.git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/rustle/checkpoints/",
+    ]);
+    let outcome = execute(f.root(), Request::ClearHistory);
+    assert!(outcome.result.is_ok());
+    assert!(!outcome.refresh_repository);
+    assert!(!Request::ClearHistory.is_read_only());
+    assert!(!Request::ClearHistory.changes_repository());
+    assert!(outcome.view.labels.is_empty());
+    assert_eq!(outcome.view.cursor, 0);
+    assert!(before.equivalent(&context.snapshot().unwrap()));
+    assert_eq!(
+        pins,
+        f.git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/rustle/checkpoints/"
+        ])
+    );
+    assert!(f.run(Request::Inspect).labels.is_empty());
+    assert!(execute(f.root(), Request::MoveTo(1)).result.is_err());
+    f.run(Request::ClearHistory);
+    let view = f.run(Request::Create {
+        name: "new-start".into(),
+        target: "HEAD".into(),
+    });
+    assert_eq!(view.labels.len(), 1);
+    f.run(Request::MoveTo(0));
+    assert!(before.equivalent(&context.snapshot().unwrap()));
+}
+
+#[test]
+fn clear_history_refuses_active_and_pending_recovery() {
+    let f = Fixture::new();
+    f.conflict();
+    execute(f.root(), Request::Merge("topic".into()));
+    let context = Context::new(f.root()).unwrap();
+    let journal_path = context.directory.join("journal.json");
+    let before = fs::read(&journal_path).unwrap();
+    assert!(execute(f.root(), Request::ClearHistory).result.is_err());
+    assert_eq!(before, fs::read(&journal_path).unwrap());
+    f.run(Request::Abort);
+    let mut journal = context.load().unwrap();
+    journal.pending = Some(Pending {
+        label: "Interrupted operation".into(),
+        before: context.snapshot().unwrap(),
+    });
+    context.save(&journal).unwrap();
+    let before = fs::read(&journal_path).unwrap();
+    assert!(execute(f.root(), Request::ClearHistory).result.is_err());
+    assert_eq!(before, fs::read(&journal_path).unwrap());
+}
+
+#[test]
+fn clear_history_is_scoped_to_its_worktree_journal() {
+    let f = Fixture::new();
+    let linked_dir = tempfile::tempdir().unwrap();
+    let linked = linked_dir.path().join("linked");
+    f.git(&["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+    f.run(Request::Create {
+        name: "topic".into(),
+        target: "HEAD".into(),
+    });
+    let primary = Context::new(f.root()).unwrap();
+    let secondary = Context::new(&linked).unwrap();
+    secondary.save(&primary.load().unwrap()).unwrap();
+    let original = fs::read(primary.directory.join("journal.json")).unwrap();
+    let refs = f.git(&["show-ref"]);
+    let out = execute(&linked, Request::ClearHistory);
+    assert!(out.result.is_ok());
+    assert!(secondary.load().unwrap().entries.is_empty());
+    assert_eq!(
+        original,
+        fs::read(primary.directory.join("journal.json")).unwrap()
+    );
+    assert_eq!(refs, f.git(&["show-ref"]));
+}
+
+#[test]
+#[ignore = "creates a new disposable 100-step undo benchmark fixture"]
+fn prepare_undo_fixture() {
+    let root = PathBuf::from(
+        std::env::var_os("GIT_RUSTLE_UNDO_FIXTURE").expect("GIT_RUSTLE_UNDO_FIXTURE"),
+    );
+    assert!(!root.exists(), "Use a new fixture directory");
+    fs::create_dir_all(&root).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "Undo Benchmark"],
+        vec!["config", "user.email", "bench@example.invalid"],
+        vec!["config", "commit.gpgSign", "false"],
+        vec!["config", "core.autocrlf", "false"],
+        vec!["config", "core.hooksPath", "disabled-hooks"],
+    ] {
+        output(&root, &args).unwrap();
+    }
+    fs::write(root.join("file.txt"), "base\n").unwrap();
+    output(&root, &["add", "."]).unwrap();
+    output(&root, &["commit", "-m", "Initial commit"]).unwrap();
+    for i in 0..100 {
+        let request = if i == 0 {
+            Request::Create {
+                name: "topic-0".into(),
+                target: "HEAD".into(),
+            }
+        } else {
+            Request::Rename {
+                old: format!("topic-{}", i - 1),
+                new: format!("topic-{i}"),
+            }
+        };
+        assert!(execute(&root, request).result.is_ok());
+    }
+    let out = execute(&root, Request::MoveTo(80));
+    assert!(out.result.is_ok());
+    assert_eq!(out.view.labels.len(), 100);
+    assert_eq!(out.view.cursor, 80);
+    fs::write(
+        root.join(".git/rustle-operations/benchmark-journal.json"),
+        fs::read(root.join(".git/rustle-operations/journal.json")).unwrap(),
+    )
+    .unwrap();
+    fs::write(root.join(".git/rustle-undo-benchmark"), "undo fixture 1\n").unwrap();
+}
+
+#[test]
 fn merge_conflict_continue_undo_and_redo() {
     let f = Fixture::new();
     f.conflict();

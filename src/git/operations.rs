@@ -55,10 +55,17 @@ pub enum Request {
         edited: String,
     },
     MoveTo(usize),
+    ClearHistory,
     Checkout(crate::checkout::Request),
     Commit(crate::pending::Request),
 }
 impl Request {
+    pub fn changes_repository(&self) -> bool {
+        if let Self::OnBranch { request, .. } = self {
+            return request.changes_repository();
+        }
+        !self.is_read_only() && !matches!(self, Self::ClearHistory)
+    }
     pub fn is_read_only(&self) -> bool {
         if let Self::OnBranch { request, .. } = self {
             return request.is_read_only();
@@ -1333,7 +1340,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
         view,
         refresh_remotes: result.is_ok() && matches!(request, Request::PushReviewed(_)),
         result,
-        refresh_repository: !request.is_read_only(),
+        refresh_repository: request.changes_repository(),
     }
 }
 fn invalidate(journal: &mut Journal, reason: &str) {
@@ -1368,6 +1375,15 @@ fn execute_inner(
     loaded_plan: &mut Option<Plan>,
 ) -> Result<String> {
     match request {
+        Request::ClearHistory => {
+            if journal.pending.is_some() || context.conflict()?.is_some() {
+                return Err("Finish or abort the active operation before clearing history.".into());
+            }
+            journal.entries.clear();
+            journal.cursor = 0;
+            journal.boundary.clear();
+            return Ok("Undo history cleared.".into());
+        }
         Request::Inspect => {
             if context.conflict()?.is_none() {
                 if let Some(pending) = journal.pending.clone() {

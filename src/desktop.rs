@@ -674,7 +674,7 @@ impl Desktop {
                                     );
                                     v.operation_action(operations::Action::Submit, window, cx);
                                 }
-                                Some("history") => {
+                                Some("history" | "history-scroll" | "history-clear") => {
                                     v.engine.mark("desktop operation requested");
                                     v.operation_action(operations::Action::History, window, cx);
                                 }
@@ -729,8 +729,16 @@ impl Desktop {
                                 _ => {}
                             }
                         }
+                        if v.scenario_started && v.scenario.as_deref() == Some("history-clear")
+                            && v.history_scenario_ready() && !v.engine.operation_error
+                        {
+                            v.engine.mark("desktop clear requested");
+                            v.operation_action(operations::Action::ReviewClear, window, cx);
+                            v.operation_action(operations::Action::ClearHistory, window, cx);
+                        }
                         if v.scenario_started && v.scroll_step == 0 {
                             let ready = match v.scenario.as_deref() {
+                                Some("history-scroll") => v.history_scenario_ready(),
                                 Some("rebase-scroll" | "rebase-edit") => v.rebase_scenario_ready(),
                                 Some("settings-tabs") => {
                                     v.engine.app.settings.open && !v.engine.app.settings.busy
@@ -2570,6 +2578,11 @@ impl Desktop {
     fn scenario_ready(&self) -> bool {
         let app = &self.engine.app;
         match self.scenario.as_deref() {
+            Some("history-clear") => {
+                !self.engine.operation_busy
+                    && self.engine.operations.labels.is_empty()
+                    && self.engine.operation_status == "Undo history cleared."
+            }
             Some(
                 "operations" | "history" | "push-review" | "push-review-orange" | "push-review-red"
                 | "integrate-review" | "graph-menu",
@@ -2589,9 +2602,9 @@ impl Desktop {
                     && !self.engine.operation_busy
             }
             Some(
-                "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize" | "files-scroll"
-                | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll" | "tabs"
-                | "settings-tabs" | "checkout-dialog" | "status-panels",
+                "history-scroll" | "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize"
+                | "files-scroll" | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll"
+                | "tabs" | "settings-tabs" | "checkout-dialog" | "status-panels",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2735,7 +2748,9 @@ impl Render for Desktop {
                     }
                     v.scroll_step += 1;
                     if v.scroll_step <= 121 {
+                        let handler_start = Instant::now();
                         match v.scenario.as_deref() {
+                            Some("history-scroll") => v.history_scenario_scroll(v.scroll_step),
                             Some("rebase-scroll" | "rebase-edit") => {
                                 v.rebase_scenario_step(v.scroll_step, window, cx);
                             }
@@ -2799,7 +2814,11 @@ impl Render for Desktop {
                                 v.graph_scroll.scroll_to_item(row, ScrollStrategy::Top);
                             }
                         }
-                        v.frame_start = Some(Instant::now());
+                        v.frame_start = Some(if v.scenario.as_deref() == Some("history-scroll") {
+                            handler_start
+                        } else {
+                            Instant::now()
+                        });
                         cx.notify();
                     } else {
                         v.engine.mark("desktop scroll done (120 measured frames)");
