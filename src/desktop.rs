@@ -18,6 +18,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod landing;
 mod operations;
 
 pub fn run(mut engine: Engine) {
@@ -62,6 +63,7 @@ pub fn run(mut engine: Engine) {
                 window.on_window_should_close(cx, move |_, cx| {
                     weak.update(cx, |v, cx| {
                         if v.engine.operation_busy
+                            || v.engine.recents_loading
                             || v.engine.app.pending.busy
                             || v.engine.app.branches.busy
                             || v.engine.app.settings.saving
@@ -133,6 +135,8 @@ enum Action {
 }
 
 struct Desktop {
+    picking_directory: bool,
+    opening_directory: bool,
     engine: Engine,
     operations: operations::Panel,
     search: Entity<InputState>,
@@ -557,9 +561,9 @@ impl Desktop {
                 }
             }),
         ];
-        let messages = engine.messages();
         let task = cx.spawn_in(window, async move |view, cx| {
             loop {
+                let Ok(messages) = view.update(cx, |v, _| v.engine.messages()) else { break; };
                 let message =
                     futures_lite::future::or(async { messages.recv().await.ok() }, async {
                         Timer::after(Duration::from_millis(250)).await;
@@ -568,6 +572,8 @@ impl Desktop {
                     .await;
                 if view
                     .update_in(cx, |v, window, cx| {
+                        // A folder may have opened while this receiver was awaiting a message.
+                        if !messages.same_channel(&v.engine.messages()) { return; }
                         let old = v.engine.app.graph_selected();
                         let saving = v.engine.app.settings.saving;
                         v.engine.tick(message);
@@ -590,6 +596,17 @@ impl Desktop {
                         {
                             v.scenario_started = true;
                             match v.scenario.as_deref() {
+                                Some("landing-open") if v.engine.landing() => {
+                                    if let Some(path) = std::env::var_os("GIT_RUSTLE_LANDING_REPO") {
+                                        v.open_repository(path.into(), cx);
+                                    }
+                                }
+                                Some("landing-forget") if v.engine.landing() => {
+                                    if let Some(path) = v.engine.recents.first().cloned() {
+                                        v.engine.mark("forget repository requested");
+                                        v.engine.forget_repository(path);
+                                    }
+                                }
                                 Some("operations" | "operations-create") => {
                                     v.operation_action(
                                         operations::Action::Open(
@@ -748,6 +765,7 @@ impl Desktop {
                                 && (v.scenario.is_none() || v.scenario_presented)
                         }) || (v.close_requested
                             && !v.engine.operation_busy
+                            && !v.engine.recents_loading
                             && !v.engine.app.pending.busy
                             && !v.engine.app.branches.busy
                             && !v.engine.app.settings.saving)
@@ -766,6 +784,8 @@ impl Desktop {
         });
         let diff_scroll = UniformListScrollHandle::new();
         Self {
+            picking_directory: false,
+            opening_directory: false,
             engine,
             operations,
             search,
@@ -2566,6 +2586,19 @@ impl Desktop {
         }
     }
     fn snapshot(&self) -> String {
+        if self.engine.landing() {
+            return format!(
+                "Git Rustle\nlanding page\nOpen Directory\nrecent_count={}\n{}\n{}\n",
+                self.engine.recents.len(),
+                self.engine
+                    .recents
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                self.engine.recents_error
+            );
+        }
         let app = &self.engine.app;
         format!(
             "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\ncheckout_choices={}\noperations={} cursor={} conflicts={}\n{}\n",
@@ -2606,6 +2639,11 @@ impl Desktop {
 }
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.engine.landing()
+            || (self.opening_directory && self.engine.repository_path().is_empty())
+        {
+            return self.landing_page(window, cx).into_any_element();
+        }
         self.sync_inputs(window, cx);
         let content = if self.operations.tab.is_some() {
             self.operations_content(cx)
@@ -2918,6 +2956,7 @@ impl Render for Desktop {
             .children(dialog)
             .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
+            .into_any_element()
     }
 }
 

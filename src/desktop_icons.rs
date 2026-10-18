@@ -4,6 +4,11 @@ use std::borrow::Cow;
 pub struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if path == "rustle/app-icon.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/app-icon.png"
+            ))));
+        }
         let name = match path {
             "icons/circle-x.svg" => "clear",
             "icons/check.svg" => "check",

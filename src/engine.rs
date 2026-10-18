@@ -12,6 +12,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 pub(crate) enum Msg {
+    Wake,
+    Recents(Result<Vec<PathBuf>, String>),
     Operation(Box<git::operations::Outcome>),
     OperationsView(Box<git::operations::View>),
     Search(search::Matches),
@@ -306,6 +308,9 @@ fn refresh_repo(path: PathBuf, tx: Sender<Msg>) {
 }
 
 pub struct Engine {
+    pub recents: Vec<PathBuf>,
+    pub recents_loading: bool,
+    pub recents_error: String,
     pub app: App,
     pub operations: git::operations::View,
     pub operation_status: String,
@@ -368,6 +373,27 @@ impl Engine {
             .map(|r| r.workdir().unwrap_or(r.path()).display().to_string())
             .unwrap_or_default()
     }
+    pub fn landing(&self) -> bool {
+        self.repo_seen && self.repo.is_none()
+    }
+    pub fn open_directory(&self, path: PathBuf) -> Self {
+        // Release the desktop task from this engine's receiver immediately.
+        let _ = self.tx.try_send(Msg::Wake);
+        Self::new(path, self.no_cache, Instant::now())
+    }
+    pub fn forget_repository(&mut self, path: PathBuf) {
+        if self.recents_loading {
+            return;
+        }
+        self.recents_loading = true;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = crate::recent::file()
+                .and_then(|file| crate::recent::update(&file, crate::recent::Change::Forget(path)))
+                .map_err(|e| e.to_string());
+            let _ = tx.send_blocking(Msg::Recents(result));
+        });
+    }
     pub fn new(path: PathBuf, no_cache: bool, start: Instant) -> Self {
         let (tx, rx) = async_channel::unbounded();
         let cache_path = if no_cache {
@@ -385,7 +411,23 @@ impl Engine {
             let result =
                 git::open(&path).and_then(|repo| Ok((repo.clone(), git::snapshot_refs(&repo)?)));
             let opened = result.is_ok();
+            let recent_path = result
+                .as_ref()
+                .ok()
+                .map(|(r, _)| r.workdir().unwrap_or(r.path()).to_path_buf());
             let _ = repo_tx.send_blocking(Msg::Repo(Box::new(result)));
+            if !cfg!(test) {
+                let result = crate::recent::file()
+                    .and_then(|file| {
+                        crate::recent::update(
+                            &file,
+                            recent_path
+                                .map_or(crate::recent::Change::Load, crate::recent::Change::Open),
+                        )
+                    })
+                    .map_err(|e| e.to_string());
+                let _ = repo_tx.send_blocking(Msg::Recents(result));
+            }
             if opened {
                 // Git for Windows config and attributes path discovery may
                 // launch Git. Warm both shared caches on this worker before a
@@ -399,6 +441,9 @@ impl Engine {
         app.pending.autofocus = true;
         app.pending.want_refresh = true;
         Self {
+            recents: vec![],
+            recents_loading: !cfg!(test),
+            recents_error: String::new(),
             operations: Default::default(),
             operation_status: String::new(),
             operation_error: false,
@@ -1200,6 +1245,19 @@ impl Engine {
                         decide(app, self.cache_fp);
                     }
                 }
+                Msg::Wake => {}
+                Msg::Recents(result) => {
+                    self.recents_loading = false;
+                    match result {
+                        Ok(entries) => {
+                            self.recents = entries;
+                            self.recents_error.clear();
+                        }
+                        Err(error) => self.recents_error = format!("Recent repositories: {error}"),
+                    }
+                    timing.mark("recent repositories ready");
+                    app.needs_redraw = true;
+                }
                 Msg::Repo(result) => {
                     self.repo_seen = true;
                     match *result {
@@ -1324,6 +1382,9 @@ impl Engine {
         }
     }
     pub fn autoquit_ready(&self, delay: Duration) -> bool {
+        if self.recents_loading {
+            return false;
+        }
         if self.first_frame && matches!(self.app.load, LoadState::Error(_)) {
             return self.first_frame_at.is_some_and(|t| t.elapsed() >= delay);
         }
@@ -1374,6 +1435,37 @@ fn decide(app: &mut App, cache_fp: Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn non_repository_lands_and_can_open_repository_after_failure() {
+        let empty = tempfile::tempdir().unwrap();
+        let mut e = Engine::new(empty.path().into(), true, Instant::now());
+        until(&mut e, Engine::landing);
+        assert!(matches!(e.app.load, LoadState::Error(_)));
+        let repo = fixture();
+        let old_messages = e.messages();
+        e = e.open_directory(repo.path().join("does-not-exist"));
+        until(&mut e, Engine::landing);
+        e = e.open_directory(repo.path().into());
+        assert!(!old_messages.same_channel(&e.messages()));
+        until(&mut e, |e| e.app.history.len() == 2 && !e.app.is_walking());
+        assert!(!e.landing());
+        assert_eq!(
+            e.app.repo_name,
+            repo.path().file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn empty_repository_opens_graph_instead_of_landing() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git::command::checked(repo.path(), &["init", "-q"]).unwrap();
+        let nested = repo.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let mut e = Engine::new(nested, true, Instant::now());
+        until(&mut e, |e| e.repo_seen);
+        assert!(!e.landing());
+        assert!(!e.repository_path().is_empty());
+    }
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {

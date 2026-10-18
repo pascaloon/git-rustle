@@ -14,6 +14,7 @@ mod graph;
 mod model;
 mod pending;
 mod provider_settings;
+mod recent;
 mod remote;
 mod search;
 mod settings;

@@ -19,8 +19,11 @@ cargo build --release --locked
 
 `PATH` can be a repository or a directory inside it; the default is the working
 directory. `--no-cache` disables persistent application caches. `--help` and
-`--version` are also available. Launch the executable with a repository path when
-opening it outside that repository.
+`--version` are also available. When the directory is outside a repository, the
+landing page offers **Open Directory** (the native Windows folder picker) and the
+20 most recently opened repositories. Click a repository to reopen it, or **×**
+to forget it. History is shared by all Git Rustle instances for the current user
+and stored in `%LOCALAPPDATA%\git-rustle\recent-repositories.json`.
 
 The Windows executable embeds the approved windblown-leaf artwork from
 `assets/app-icon.png`, with transparent corners; GPUI uses the same icon for the

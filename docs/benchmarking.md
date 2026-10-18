@@ -122,6 +122,18 @@ scrolling remains fast; moving to GPU rendering does not imply faster startup.
 
 ## 1. Preserve a trustworthy baseline
 
+For landing-page changes, compare native repository startup with the baseline,
+then run `scripts/benchmark-landing.ps1 -Candidate <exe> -Repository <repo>
+-OutputDirectory <new-directory>`. The candidate-only suite discards one warm-up
+and retains 15 launches each for landing with 20 entries, opening the first recent
+repository, and forgetting it. It uses isolated history, includes stale paths,
+and checks persisted MRU/removal and final model state. Landing timing ends at
+the next-frame callback; open timing starts at the shared repository-open handler
+and ends at its first history frame; forget timing includes storage and the next
+redraw callback. These exclude physical input and folder-picker navigation. Check
+the native picker, cancellation and row clicks separately on an unlocked desktop.
+Use `GIT_RUSTLE_RECENTS_FILE` for history isolation in other benchmark suites too.
+
 Before editing code, build the current implementation and copy its release
 executable somewhere the next build will not overwrite. Use a unique run folder:
 
