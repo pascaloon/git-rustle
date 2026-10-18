@@ -274,6 +274,15 @@ pub(super) struct Avatars {
     session: Arc<()>,
 }
 impl Avatars {
+    pub(super) fn release_images(&mut self, cx: &mut gpui::App) {
+        let mut released = HashSet::new();
+        for image in self.images.values().chain(self.profiles.values()) {
+            if released.insert(image.id()) {
+                image.clone().remove_asset(cx);
+            }
+        }
+        *self = Default::default(); // invalidates all in-flight UI deliveries too
+    }
     fn remember_authors(
         &mut self,
         authors: impl IntoIterator<Item = (gix::ObjectId, Option<String>)>,
@@ -422,7 +431,12 @@ pub(super) fn avatar(image: Option<&Arc<Image>>, name: &str, size: f32) -> Div {
         .overflow_hidden()
         .bg(rgb(CONTROL));
     if let Some(image) = image {
-        frame.child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
+        frame.child(
+            img(image.clone())
+                .size_full()
+                .rounded_full()
+                .object_fit(ObjectFit::Cover),
+        )
     } else {
         frame
             .flex()
@@ -720,6 +734,9 @@ impl Desktop {
     // Reuse already loaded remote headers; local headers and disk photos are read
     // on a worker independently of the network debounce and provider requests.
     pub(super) fn resolve_avatar_authors(&mut self, cx: &mut Context<Self>) {
+        if self.engine.app.settings.open || self.image_cache.busy {
+            return;
+        }
         self.avatars
             .remember_remote_authors(self.engine.app.selected_id(), &self.engine.app.ghosts);
         if self.scenario.as_deref() == Some("avatar-scroll")
@@ -857,6 +874,9 @@ impl Desktop {
     }
 
     pub(super) fn sync_avatars(&mut self, cx: &mut Context<Self>) {
+        if self.engine.app.settings.open || self.image_cache.busy {
+            return;
+        }
         if self.scenario.as_deref() == Some("avatar-scroll") {
             return;
         }
@@ -920,6 +940,7 @@ impl Desktop {
         let session = self.avatars.session.clone();
         let request_path = path.clone();
         let no_cache = self.engine.no_cache();
+        let photos = remote::requests::PhotoCache::new(&path);
         cx.spawn(async move |view, cx| {
             let images = cx
                 .background_executor()
@@ -928,6 +949,7 @@ impl Desktop {
                     let Ok(mut client) = Client::new(&path, &remote, no_cache) else {
                         return images;
                     };
+                    client.set_photo_cache(photos);
                     let mut resolved = HashMap::new();
                     for (id, email) in ids {
                         let cached = email.as_ref().and_then(|e| resolved.get(e)).cloned();

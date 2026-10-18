@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Repository,
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [string]$Baseline,
+    [string]$ImageCacheSeed,
     [switch]$RequireSyntax,
     [switch]$RejectCompetingBuilds,
     [int]$Samples = 15,
@@ -18,6 +19,18 @@ $saved = @{}
 $names = @('GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES')
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
+    # The last viewport's author worker can finish after the 120th frame.
+    # Keep the process alive for the final-state assertion; measured intervals
+    # still end at desktop scroll done, before this settling period.
+    $env:GIT_RUSTLE_AUTOQUIT = if ($scenario -eq 'avatar-reuse-scroll') { '2500' } else { '100' }
+    if ($scenario -in @('settings-cache','settings-cache-clear')) {
+        if (!$ImageCacheSeed) { throw 'Cache-control scenarios require a disposable ImageCacheSeed and isolated LOCALAPPDATA' }
+        $marker = Join-Path $env:LOCALAPPDATA 'cache-benchmark-fixture'
+        if (!(Test-Path $marker) -or (Get-Content $marker -Raw) -cne 'disposable image cache benchmark') { throw 'Missing disposable-cache marker' }
+        $cache = Join-Path $env:LOCALAPPDATA 'git-rustle/cache/avatars-v1'
+        New-Item -ItemType Directory -Force $cache | Out-Null
+        Copy-Item -Path (Join-Path $ImageCacheSeed '*.bin') -Destination $cache -Force
+    }
     if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     $log = Join-Path $OutputDirectory "$label-$scenario-$sample.txt"
     $env:GIT_RUSTLE_SCENARIO = $scenario
@@ -32,6 +45,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -eq 'settings-cache' -and $state -notmatch 'image_cache_bytes=[1-9][0-9]* image_cache_images=500 image_cache_busy=false') { throw "Expected 500 seeded images and a completed size scan: $log" }
+    if ($scenario -eq 'settings-cache-clear' -and $state -notmatch 'image_cache_bytes=0 image_cache_images=0 image_cache_busy=false image_cache_cleared=true') { throw "Expected an empty cache after clearing: $log" }
     if ($scenario -in @('request-compose','request-edit','request-tabs','request-clear') -and
         ($state -notmatch 'request_open=true request_members=10000 request_sending=false' -or $text -match 'POST ')) {
         throw "Expected a retained composer with 10,000 members and no submission: $log"
@@ -64,6 +79,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        { $_ -in 'settings-cache','settings-cache-clear' } { 'desktop scenario frame' }
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'desktop scenario frame' }
         'request-compose' { 'request composer ready' }
         'request-open' { 'desktop scenario frame' }
@@ -94,6 +110,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        'settings-cache' { 'image cache requested' }
+        'settings-cache-clear' { 'image cache clear requested' }
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'avatar cache requested' }
         'request-compose' { 'request composer requested' }
         'request-open' { 'request composer requested' }

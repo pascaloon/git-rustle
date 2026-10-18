@@ -1,15 +1,59 @@
 //! Public, credential-free avatar bytes shared by all repositories of this OS user.
 use super::{Provider, Remote};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub(super) const MAX_IMAGE: u64 = 256 * 1024;
 const TTL: u64 = 86400;
 
 pub(crate) struct Cache {
     directory: PathBuf,
+    control: Arc<Control>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct Control {
+    generation: AtomicU64,
+    write: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Stats {
+    pub bytes: u64,
+    pub images: usize,
+}
+
+// The cache is flat. Never traverse directories or links, or delete unrelated
+// files. Temporary files have the exact writer-generated numeric suffix.
+fn owned_file(name: &str) -> bool {
+    let Some(tail) = name
+        .strip_prefix("image-")
+        .or_else(|| name.strip_prefix("author-"))
+    else {
+        return false;
+    };
+    let Some(hash) = tail.get(..40) else {
+        return false;
+    };
+    if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let suffix = &tail[40..];
+    suffix == ".bin"
+        || suffix
+            .strip_prefix('.')
+            .and_then(|s| s.strip_suffix(".tmp"))
+            .and_then(|s| s.split_once('-'))
+            .is_some_and(|(pid, seq)| {
+                !pid.is_empty()
+                    && !seq.is_empty()
+                    && pid.bytes().chain(seq.bytes()).all(|b| b.is_ascii_digit())
+            })
 }
 
 impl Cache {
@@ -23,7 +67,90 @@ impl Cache {
     }
 
     pub fn at(directory: PathBuf) -> Self {
-        Self { directory }
+        static CONTROLS: OnceLock<Mutex<HashMap<PathBuf, Weak<Control>>>> = OnceLock::new();
+        let mut controls = CONTROLS.get_or_init(Default::default).lock().unwrap();
+        if controls.len() > 256 {
+            controls.retain(|_, v| v.strong_count() != 0);
+        }
+        let control = controls
+            .get(&directory)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let control = Arc::new(Control::default());
+                controls.insert(directory.clone(), Arc::downgrade(&control));
+                control
+            });
+        let generation = control.generation.load(Ordering::Acquire);
+        Self {
+            directory,
+            control,
+            generation,
+        }
+    }
+
+    fn files(&self) -> std::io::Result<Vec<fs::DirEntry>> {
+        match fs::symlink_metadata(&self.directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(std::io::Error::other(
+                    "Images cache path is not a regular directory",
+                ));
+            }
+            Ok(_) => {}
+        }
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if kind.is_file() && owned_file(&entry.file_name().to_string_lossy()) {
+                files.push(entry);
+            }
+        }
+        Ok(files)
+    }
+
+    pub fn stats(&self) -> std::io::Result<Stats> {
+        let mut stats = Stats::default();
+        for file in self.files()? {
+            match file.metadata() {
+                Ok(meta) => {
+                    stats.bytes = stats.bytes.saturating_add(meta.len());
+                    let name = file.file_name();
+                    let name = name.to_string_lossy();
+                    stats.images +=
+                        usize::from(name.starts_with("image-") && name.ends_with(".bin"));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(stats)
+    }
+
+    pub fn clear(&self) -> std::io::Result<Stats> {
+        let _write = self.control.write.lock().unwrap();
+        let files = self.files()?;
+        fs::create_dir_all(&self.directory)?;
+        // Do not resurrect old JSON photos when the binary cache was cleared.
+        fs::write(self.directory.join("cleared"), [])?;
+        self.control.generation.fetch_add(1, Ordering::AcqRel);
+        for file in files {
+            match fs::remove_file(file.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.stats()
+    }
+
+    pub fn legacy_allowed(&self) -> bool {
+        !self.directory.join("cleared").exists()
     }
 
     fn file(&self, category: &str, key: &str) -> PathBuf {
@@ -45,6 +172,10 @@ impl Cache {
     }
 
     fn write(&self, category: &str, key: &str, bytes: &[u8]) -> bool {
+        let _write = self.control.write.lock().unwrap();
+        if self.generation != self.control.generation.load(Ordering::Acquire) {
+            return false;
+        }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = self.file(category, key);
         let tmp = path.with_extension(format!(
@@ -126,6 +257,70 @@ mod tests {
 
     const PHOTO: &[u8] = b"\x89PNG\r\n\x1a\nfixture";
     const URL: &str = "https://avatars.example/u/42?s=64";
+
+    #[test]
+    fn clearing_reports_exact_size_preserves_other_files_and_invalidates_old_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::at(dir.path().join("photos"));
+        assert_eq!(cache.stats().unwrap(), Stats::default());
+        assert!(!cache.directory.exists());
+        let remote = Remote::parse("origin", "https://github.com/a/one.git", None).unwrap();
+        assert!(cache.store_image(URL, PHOTO));
+        cache.store_identity(&remote, "alice@example.com", URL);
+        assert_eq!(
+            cache.stats().unwrap(),
+            Stats {
+                bytes: (PHOTO.len() + URL.len()) as u64,
+                images: 1
+            }
+        );
+        fs::write(cache.directory.join("unrelated.bin"), b"keep").unwrap();
+        let nested = cache.directory.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("image-test.bin"), b"keep").unwrap();
+        let other = Cache::at(dir.path().join("other"));
+        assert_eq!(cache.clear().unwrap(), Stats::default());
+        assert_eq!(
+            fs::read(cache.directory.join("unrelated.bin")).unwrap(),
+            b"keep"
+        );
+        assert!(nested.join("image-test.bin").exists());
+        assert!(cache.image(URL).is_none());
+        assert!(cache.identity(&remote, "alice@example.com").is_none());
+        assert!(!cache.legacy_allowed());
+        assert!(!cache.store_image(URL, PHOTO));
+        let fresh = Cache::at(cache.directory.clone());
+        assert!(fresh.store_image(URL, PHOTO));
+        assert!(other.store_image(URL, PHOTO));
+    }
+
+    #[test]
+    fn downloads_started_before_clear_cannot_repopulate_it_afterward() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::at(dir.path().into());
+        let ready = std::sync::Barrier::new(5);
+        let cleared = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            let mut jobs = Vec::new();
+            for _ in 0..4 {
+                let (ready, cleared) = (&ready, &cleared);
+                let path = dir.path();
+                jobs.push(scope.spawn(move || {
+                    let old = Cache::at(path.into());
+                    ready.wait();
+                    cleared.wait();
+                    old.store_image(URL, PHOTO)
+                }));
+            }
+            ready.wait();
+            cache.clear().unwrap();
+            cleared.wait();
+            for job in jobs {
+                assert!(!job.join().unwrap());
+            }
+        });
+        assert_eq!(cache.stats().unwrap(), Stats::default());
+    }
 
     #[test]
     fn binary_images_are_shared_and_partial_stale_or_oversized_files_are_misses() {

@@ -1,5 +1,6 @@
 //! PR/MR composition. Blocking I/O belongs on a worker; typing never hits the API.
 pub(crate) use super::avatars::Cache as PhotoCache;
+pub(crate) use super::avatars::Stats as PhotoStats;
 pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};
@@ -416,6 +417,10 @@ impl<'a> Client<'a> {
         self.photos.as_ref().filter(|_| !self.no_cache)
     }
 
+    pub(crate) fn set_photo_cache(&mut self, cache: Option<PhotoCache>) {
+        self.photos = cache;
+    }
+
     pub fn author_for_email(&mut self, sha: &str, email: &str) -> Option<Vec<u8>> {
         if let Some(url) = self
             .photo_cache()
@@ -440,7 +445,10 @@ impl<'a> Client<'a> {
             return Some(bytes);
         }
         // Upgrade existing fresh JSON entries without another download.
-        if let Some(bytes) = self.read::<Vec<u8>>(&key, 86400)
+        if self
+            .photo_cache()
+            .is_none_or(|cache| cache.legacy_allowed())
+            && let Some(bytes) = self.read::<Vec<u8>>(&key, 86400)
             && bytes.len() <= super::avatars::MAX_IMAGE as usize
             && image_format(&bytes).is_some()
         {

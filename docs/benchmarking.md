@@ -71,6 +71,19 @@ The other intervals are worker request to result delivery. State summaries inclu
 maximum visible list-row counts to detect a zero-height viewport. They are not a
 substitute for visual or mouse/clipboard verification.
 
+For image-cache controls, run `scripts/benchmark-image-cache.ps1 -Candidate <exe>
+-Image <small-PNG> -OutputDirectory <new-run-directory>`. It creates a disposable
+repository and isolated app-data directory with 500 image files and 500 author
+bindings. Candidate-only `settings-cache` measures size request through the first
+ready frame; `settings-cache-clear` uses the real clear action and measures through
+the empty-cache frame. Each has one warm-up plus 15 launches; the runner restores
+the seed before each launch and verifies counts/bytes. Deletion requires a marker
+in the isolated app-data directory. Never point this fixture at user app data.
+These intervals include filesystem work, scheduling and frame submission, but
+exclude physical input and scanout. Compare existing `settings`, `settings-tabs`,
+`scroll`, `avatar-scroll`, cached-avatar delivery and startup against the baseline.
+Check round photo edges and the size/clear controls in the native window too.
+
 For footer panel changes, also run `-Scenarios status-panels` on a small disposable
 repository. It cycles Details open/closed and History open/closed through the UI
 handlers for 120 measured next-frame intervals. History inspection runs only when
@@ -245,6 +258,10 @@ photo API requests. Logs record worker dispatch-to-delivery milliseconds, snapsh
 require visible reused profiles, and frame JSON retains 120 intervals per launch.
 One photo is shared by all seeded identities: this measures reuse/scheduling/rendering,
 not mixed-image decoding, cold provider responses or physical input latency.
+`avatar-reuse-scroll` keeps the process alive until at least 2.5 seconds after
+the first frame so the final viewport's background author lookup can settle
+before its state assertion. Its 120 measured scroll intervals end before this
+settling period; the assertion still requires visible reused profiles.
 
 For cached-avatar delivery, preserve an application baseline containing the
 `avatar-cache` instrumentation before changing production image handling. On the

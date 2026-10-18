@@ -18,6 +18,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod image_cache;
 mod landing;
 mod operations;
 mod rebase;
@@ -138,11 +139,13 @@ enum Action {
     SettingsProvider(Option<&'static str>),
     SaveSettings,
     ForgetToken,
+    ClearImages,
 }
 
 struct Desktop {
     composer: Option<requests::Composer>,
     avatars: requests::Avatars,
+    image_cache: image_cache::State,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
@@ -747,7 +750,7 @@ impl Desktop {
                                     v.search
                                         .update(cx, |s, cx| s.set_value("m: merge", window, cx));
                                 }
-                                Some("settings" | "settings-tabs") => {
+                                Some("settings" | "settings-tabs" | "settings-cache" | "settings-cache-clear") => {
                                     v.action(Action::Settings, window, cx)
                                 }
                                 Some("compare") => {
@@ -773,6 +776,14 @@ impl Desktop {
                                 }
                                 _ => {}
                             }
+                        }
+                        if v.scenario_started && v.scenario.as_deref() == Some("settings-cache-clear")
+                            && !v.image_cache.busy && v.image_cache.stats.is_some()
+                            && !v.image_cache.cleared
+                        {
+                            let root = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("isolated app data required"));
+                            assert_eq!(std::fs::read_to_string(root.join("cache-benchmark-fixture")).unwrap(), "disposable image cache benchmark");
+                            v.action(Action::ClearImages, window, cx);
                         }
                         if v.scenario_started && v.scenario.as_deref() == Some("history-clear")
                             && v.history_scenario_ready() && !v.engine.operation_error
@@ -851,6 +862,7 @@ impl Desktop {
         Self {
             composer: None,
             avatars: Default::default(),
+            image_cache: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
@@ -1327,6 +1339,7 @@ impl Desktop {
                 }
             }
             Action::SaveSettings => app.settings.save_page(),
+            Action::ClearImages => {}
             Action::ForgetToken => {
                 if !app.settings.busy && app.settings.page > 0 {
                     let d = &mut app.settings.providers[app.settings.page - 1];
@@ -1339,6 +1352,12 @@ impl Desktop {
         if matches!(action, Action::Head | Action::JumpBranch) {
             self.graph_scroll
                 .scroll_to_item(app.graph_selected(), ScrollStrategy::Center);
+        }
+        if matches!(
+            action,
+            Action::Settings | Action::Tab(Tab::Settings) | Action::ClearImages
+        ) {
+            self.image_cache_request(matches!(action, Action::ClearImages), cx);
         }
         self.changed(cx);
         self.sync_inputs(window, cx);
@@ -1462,14 +1481,16 @@ impl Desktop {
             _ => None,
         };
         let text: SharedString = text.into();
-        let enabled = (!matches!(action, Action::Diff)
-            || self.engine.app.pending.selected
-            || matches!(
-                self.selected_commits
-                    .ids(self.engine.app.selected_id())
-                    .len(),
-                1 | 2
-            ))
+        let enabled = (!matches!(action, Action::ClearImages)
+            || (!self.image_cache.busy && self.image_cache.stats.is_some()))
+            && (!matches!(action, Action::Diff)
+                || self.engine.app.pending.selected
+                || matches!(
+                    self.selected_commits
+                        .ids(self.engine.app.selected_id())
+                        .len(),
+                    1 | 2
+                ))
             && (!matches!(
                 action,
                 Action::SettingsTab(_)
@@ -2672,7 +2693,10 @@ impl Desktop {
                 .child(self.button("forget", if draft.forget { "✓ Forget saved token" } else { "Forget saved token" }, Action::ForgetToken, cx));
         }
         column()
+            .id("settings-page")
             .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .p_6()
             .gap_4()
             .child(div().text_size(px(20.)).child("Settings"))
@@ -2705,6 +2729,7 @@ impl Desktop {
                     .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
                     .child(settings.status.clone()),
             )
+            .child(self.image_cache_controls(cx))
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
@@ -2734,6 +2759,13 @@ impl Desktop {
                     && !self.engine.operation_busy
             }
             Some("request-compose" | "request-open") => self.composer.is_some(),
+            Some("settings-cache" | "settings-cache-clear") => {
+                !app.settings.busy
+                    && !self.image_cache.busy
+                    && self.image_cache.stats.is_some()
+                    && (self.scenario.as_deref() != Some("settings-cache-clear")
+                        || self.image_cache.cleared)
+            }
             Some("avatar-cache" | "avatar-cache-busy") => self.avatars.first_visible_ready(),
             Some(
                 "history-scroll"
@@ -2811,12 +2843,16 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\n{}\n{}\n{}\n{}",
+                "footer_panel={:?}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}",
                 self.status_panel,
                 self.engine.operation_status,
                 self.operations.summary(),
                 self.request_summary(cx),
-                self.avatars.summary()
+                self.avatars.summary(),
+                self.image_cache.stats.map_or(0, |s| s.bytes),
+                self.image_cache.stats.map_or(0, |s| s.images),
+                self.image_cache.busy,
+                self.image_cache.cleared
             ),
         )
     }
