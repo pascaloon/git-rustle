@@ -246,6 +246,22 @@ require visible reused profiles, and frame JSON retains 120 intervals per launch
 One photo is shared by all seeded identities: this measures reuse/scheduling/rendering,
 not mixed-image decoding, cold provider responses or physical input latency.
 
+For cached-avatar delivery, preserve an application baseline containing the
+`avatar-cache` instrumentation before changing production image handling. On the
+large clone with a fresh persisted binding and image for its first graph author,
+run `benchmark-desktop.ps1 -Scenarios avatar-cache -Baseline <exe> -Samples 15`.
+The scenario clears session avatar state, scrolls to the top, and measures from
+that request to the next-frame callback after GPUI has decoded the first visible
+photo. It uses the real local-author worker and existing disk cache; other authors
+may have cache misses. It includes worker scheduling, cache I/O, decoding and
+frame submission, excluding physical input and display scanout. Normal network
+requests remain enabled, so record cache/network conditions and retain the logs.
+Run candidate-only `avatar-cache-busy` too: it holds the photo-network worker busy
+and requires the same cached photo to become renderable independently. The old
+implementation cannot complete this second scenario. Compare `scroll`,
+`avatar-scroll` and `avatar-reuse-scroll` against the preserved baseline separately;
+do not infer scrolling performance from the single-photo delivery interval.
+
 For landing-page changes, compare native repository startup with the baseline,
 then run `scripts/benchmark-landing.ps1 -Candidate <exe> -Repository <repo>
 -OutputDirectory <new-directory>`. The candidate-only suite discards one warm-up

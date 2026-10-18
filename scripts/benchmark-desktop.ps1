@@ -50,6 +50,9 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -eq 'avatar-reuse-scroll' -and $state -notmatch 'avatar_visible_ready=[1-9]') {
         throw "Expected visible rows to reuse known author profiles: $log"
     }
+    if ($scenario -in @('avatar-cache','avatar-cache-busy') -and $state -notmatch 'avatar_visible_ready=[1-9]') {
+        throw "Expected a cached photo on the first visible graph row: $log"
+    }
     if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
@@ -61,6 +64,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        { $_ -in 'avatar-cache','avatar-cache-busy' } { 'desktop scenario frame' }
         'request-compose' { 'request composer ready' }
         'request-open' { 'desktop scenario frame' }
         'request-clear' { 'desktop scroll done' }
@@ -90,6 +94,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        { $_ -in 'avatar-cache','avatar-cache-busy' } { 'avatar cache requested' }
         'request-compose' { 'request composer requested' }
         'request-open' { 'request composer requested' }
         'branches' { 'branch activity requested' }

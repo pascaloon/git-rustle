@@ -710,6 +710,15 @@ impl Desktop {
                                     v.frame_start = Some(Instant::now());
                                     cx.notify();
                                 }
+                                Some("avatar-cache" | "avatar-cache-busy") => {
+                                    v.avatars = Default::default();
+                                    v.reset_avatar_repository();
+                                    // Exercise cached delivery behind a stuck network job.
+                                    v.avatars.block_network_for_scenario(v.scenario.as_deref() == Some("avatar-cache-busy"));
+                                    v.engine.mark("avatar cache requested");
+                                    v.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    cx.notify();
+                                }
                                 Some("scroll" | "graph-resize" | "avatar-scroll" | "avatar-reuse-scroll") => {
                                     if matches!(v.scenario.as_deref(), Some("avatar-scroll" | "avatar-reuse-scroll")) {
                                         let path = std::env::var_os("GIT_RUSTLE_AVATAR_FIXTURE").expect("avatar image fixture required");
@@ -2714,6 +2723,7 @@ impl Desktop {
                     && !self.engine.operation_busy
             }
             Some("request-compose" | "request-open") => self.composer.is_some(),
+            Some("avatar-cache" | "avatar-cache-busy") => self.avatars.first_visible_ready(),
             Some(
                 "history-scroll"
                 | "rebase-scroll"
@@ -2973,6 +2983,10 @@ impl Render for Desktop {
             && self.scenario.is_some()
             && !self.scenario_presented
             && self.scenario_ready()
+            && (!matches!(
+                self.scenario.as_deref(),
+                Some("avatar-cache" | "avatar-cache-busy")
+            ) || self.avatars.first_visible_decoded(window, cx))
         {
             let weak = cx.entity().downgrade();
             window.on_next_frame(move |_, cx| {

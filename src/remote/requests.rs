@@ -1,4 +1,5 @@
 //! PR/MR composition. Blocking I/O belongs on a worker; typing never hits the API.
+pub(crate) use super::avatars::Cache as PhotoCache;
 pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};

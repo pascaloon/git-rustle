@@ -10,7 +10,8 @@ use gpui_component::{
     text::TextView,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    hash::Hash,
     sync::Arc,
 };
 
@@ -209,23 +210,116 @@ impl Composer {
     }
 }
 
+// FIFO eviction bounds memory without dropping every warm entry at a threshold.
+// Reads never mutate recency or allocate on the render path.
+pub(super) struct Retained<K, V, const N: usize> {
+    entries: HashMap<K, V>,
+    order: VecDeque<K>,
+}
+impl<K, V, const N: usize> Default for Retained<K, V, N> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+impl<K: Eq + Hash + Clone, V, const N: usize> Retained<K, V, N> {
+    fn insert(&mut self, key: K, value: V) {
+        if !self.entries.contains_key(&key) {
+            if self.entries.len() == N
+                && let Some(old) = self.order.pop_front()
+            {
+                self.entries.remove(&old);
+            }
+            self.order.push_back(key.clone());
+        }
+        self.entries.insert(key, value);
+    }
+    fn remove(&mut self, key: &K) {
+        if self.entries.remove(key).is_some() {
+            self.order.retain(|old| old != key);
+        }
+    }
+}
+impl<K, V, const N: usize> std::ops::Deref for Retained<K, V, N> {
+    type Target = HashMap<K, V>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl<K: Eq + Hash + Clone, V, const N: usize> Extend<(K, V)> for Retained<K, V, N> {
+    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, entries: T) {
+        for (key, value) in entries {
+            self.insert(key, value);
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Avatars {
     path: std::path::PathBuf,
-    pub images: HashMap<gix::ObjectId, Arc<Image>>,
+    pub images: Retained<gix::ObjectId, Arc<Image>, 512>,
     pub scenario_image: Option<Arc<Image>>,
     pub reuse_scenario_image: Option<Arc<Image>>,
-    attempted: HashSet<gix::ObjectId>,
+    attempted: Retained<gix::ObjectId, (), 4096>,
     pending: bool,
     selected: Option<(gix::ObjectId, Instant)>,
     visible: Vec<gix::ObjectId>,
     viewport_changed: Option<Instant>,
-    profiles: HashMap<String, Arc<Image>>,
-    authors: HashMap<gix::ObjectId, Option<String>>,
+    profiles: Retained<String, Arc<Image>, 256>,
+    authors: Retained<gix::ObjectId, Option<String>, 32768>,
+    disk_misses: Retained<String, (), 4096>,
     authors_pending: bool,
     session: Arc<()>,
 }
 impl Avatars {
+    fn remember_authors(
+        &mut self,
+        authors: impl IntoIterator<Item = (gix::ObjectId, Option<String>)>,
+    ) {
+        for (id, email) in authors {
+            // A local lookup started before a remote preview may return a miss
+            // after that preview has supplied the immutable author header.
+            if email.is_some() || self.authors.get(&id).is_none_or(Option::is_none) {
+                self.authors.insert(id, email);
+            }
+        }
+    }
+
+    fn remember_remote_authors(
+        &mut self,
+        selected: Option<gix::ObjectId>,
+        ghosts: &HashMap<gix::ObjectId, crate::git::CommitDetails>,
+    ) {
+        for id in selected.into_iter().chain(self.visible.iter().copied()) {
+            if let Some(details) = ghosts.get(&id)
+                && !details.author_email.is_empty()
+                && self.authors.get(&id).and_then(|email| email.as_deref())
+                    != Some(details.author_email.as_str())
+            {
+                self.authors.insert(id, Some(details.author_email.clone()));
+            }
+        }
+    }
+
+    pub fn first_visible_ready(&self) -> bool {
+        self.visible
+            .first()
+            .is_some_and(|id| self.image(id).is_some())
+    }
+
+    pub fn first_visible_decoded(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
+        self.visible
+            .first()
+            .and_then(|id| self.image(id))
+            .is_some_and(|image| image.clone().get_render_image(window, cx).is_some())
+    }
+
+    pub fn block_network_for_scenario(&mut self, blocked: bool) {
+        self.pending = blocked;
+    }
+
     pub fn observe(&mut self, ids: impl Iterator<Item = gix::ObjectId> + Clone) -> bool {
         if !self.visible.iter().copied().eq(ids.clone()) {
             self.visible.clear();
@@ -260,9 +354,9 @@ impl Avatars {
     pub fn seed_reuse_scenario(&mut self) {
         if let Some(image) = &self.reuse_scenario_image {
             for email in self.authors.values().flatten() {
-                self.profiles
-                    .entry(email.clone())
-                    .or_insert_with(|| image.clone());
+                if !self.profiles.contains_key(email) {
+                    self.profiles.insert(email.clone(), image.clone());
+                }
             }
         }
     }
@@ -288,6 +382,35 @@ fn local_authors(
                 None
             });
             (*id, email)
+        })
+        .collect()
+}
+
+// This path cannot initialize credentials, an HTTP client, or make a request.
+// Resolve all visible cached profiles before considering any network misses.
+fn cached_profiles(
+    cache: &remote::requests::PhotoCache,
+    remote: &Remote,
+    emails: impl Iterator<Item = String>,
+) -> Vec<(String, Option<Arc<Image>>)> {
+    let mut seen = HashSet::new();
+    let mut images = HashMap::new();
+    emails
+        .filter_map(|email| {
+            if !seen.insert(email.clone()) {
+                return None;
+            }
+            let image = cache.identity(remote, &email).and_then(|url| {
+                images
+                    .entry(url.clone())
+                    .or_insert_with(|| {
+                        let bytes = cache.image(&url)?;
+                        let format = remote::requests::image_format(&bytes)?;
+                        Some(Arc::new(Image::from_bytes(format, bytes)))
+                    })
+                    .clone()
+            });
+            Some((email, image))
         })
         .collect()
 }
@@ -594,9 +717,11 @@ impl Desktop {
         }
     }
 
-    // Only local Git metadata is inspected here, on a worker. This is independent
-    // of both the network debounce and an in-flight provider request.
+    // Reuse already loaded remote headers; local headers and disk photos are read
+    // on a worker independently of the network debounce and provider requests.
     pub(super) fn resolve_avatar_authors(&mut self, cx: &mut Context<Self>) {
+        self.avatars
+            .remember_remote_authors(self.engine.app.selected_id(), &self.engine.app.ghosts);
         if self.scenario.as_deref() == Some("avatar-scroll")
             || self.avatars.authors_pending
             || (self.engine.app.branches.remotes.is_empty()
@@ -604,9 +729,10 @@ impl Desktop {
         {
             return;
         }
-        if self.avatars.authors.len() >= 512 {
-            self.avatars.authors.clear();
-        }
+        let remote = self.avatar_remote();
+        let read_cache = remote.is_some()
+            && !self.engine.no_cache()
+            && self.scenario.as_deref() != Some("avatar-reuse-scroll");
         let selected = self.engine.app.selected_id();
         let ids: Vec<_> = selected
             .into_iter()
@@ -617,7 +743,15 @@ impl Desktop {
                     .copied()
                     .filter(|id| Some(*id) != selected),
             )
-            .filter(|id| !self.avatars.authors.contains_key(id))
+            .filter(|id| match self.avatars.authors.get(id) {
+                None => true,
+                Some(Some(email)) => {
+                    read_cache
+                        && !self.avatars.profiles.contains_key(email)
+                        && !self.avatars.disk_misses.contains_key(email)
+                }
+                Some(None) => false,
+            })
             .take(80)
             .collect();
         if ids.is_empty() {
@@ -626,11 +760,53 @@ impl Desktop {
         self.avatars.authors_pending = true;
         let path = self.avatars.path.clone();
         let session = self.avatars.session.clone();
-        let start = (self.scenario.as_deref() == Some("avatar-reuse-scroll")).then(Instant::now);
+        let known: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                self.avatars
+                    .authors
+                    .get(id)
+                    .map(|email| (*id, email.clone()))
+            })
+            .collect();
+        let available: HashSet<_> = self.avatars.profiles.keys().cloned().collect();
+        let start = matches!(
+            self.scenario.as_deref(),
+            Some("avatar-reuse-scroll" | "avatar-cache" | "avatar-cache-busy")
+        )
+        .then(Instant::now);
         cx.spawn(async move |view, cx| {
-            let authors = cx
+            let (authors, profiles) = cx
                 .background_executor()
-                .spawn(async move { local_authors(&path, &ids) })
+                .spawn(async move {
+                    let unknown: Vec<_> = ids
+                        .into_iter()
+                        .filter(|id| !known.iter().any(|(known, _)| known == id))
+                        .collect();
+                    let mut authors = known;
+                    if !unknown.is_empty() {
+                        authors.extend(local_authors(&path, &unknown));
+                    }
+                    let emails: Vec<_> = authors
+                        .iter()
+                        .filter_map(|(_, e)| e.as_ref())
+                        .filter(|email| !available.contains(*email))
+                        .cloned()
+                        .collect();
+                    let profiles =
+                        if let Some(remote) = remote.filter(|_| read_cache && !emails.is_empty()) {
+                            let cache = crate::git::open(&path).ok().and_then(|repo| {
+                                remote::requests::PhotoCache::new(&crate::git::git_dir(&repo))
+                            });
+                            match cache {
+                                Some(cache) => cached_profiles(&cache, &remote, emails.into_iter()),
+                                None => emails.into_iter().map(|email| (email, None)).collect(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                    (authors, profiles)
+                })
                 .await;
             let _ = view.update(cx, |v, cx| {
                 if !Arc::ptr_eq(&v.avatars.session, &session) {
@@ -640,19 +816,37 @@ impl Desktop {
                 // A photo request may finish before its local author header does.
                 for (id, email) in &authors {
                     if let (Some(email), Some(image)) = (email, v.avatars.images.get(id)) {
-                        if v.avatars.profiles.len() >= 256 {
-                            v.avatars.profiles.clear();
-                        }
                         v.avatars.profiles.insert(email.clone(), image.clone());
                     }
                 }
-                v.avatars.authors.extend(authors);
+                v.avatars.remember_authors(authors);
+                for (email, image) in profiles {
+                    if let Some(image) = image {
+                        v.avatars.profiles.insert(email, image);
+                    } else if !v.avatars.profiles.contains_key(&email) {
+                        v.avatars.disk_misses.insert(email, ());
+                    }
+                }
                 if let Some(start) = start {
                     v.avatars.seed_reuse_scenario();
                     v.engine.mark(format!(
                         "avatar local resolution {:.3} ms",
                         start.elapsed().as_secs_f64() * 1000.
                     ));
+                    if matches!(
+                        v.scenario.as_deref(),
+                        Some("avatar-cache" | "avatar-cache-busy")
+                    ) {
+                        v.engine.mark(format!(
+                            "avatar cache state {} first_remote={}",
+                            v.avatars.summary(),
+                            v.avatars.visible.first().is_some_and(|id| v
+                                .engine
+                                .app
+                                .ghosts
+                                .contains_key(id))
+                        ));
+                    }
                 }
                 // The viewport may have moved while this worker was reading.
                 v.resolve_avatar_authors(cx);
@@ -702,22 +896,9 @@ impl Desktop {
             return;
         }
         // Discovery is already done on a worker. Never read config or Git here.
-        let Some(remote) = self
-            .engine
-            .app
-            .branches
-            .remotes
-            .values()
-            .find(|u| u.remote.name == "origin")
-            .or_else(|| self.engine.app.branches.remotes.values().next())
-            .map(|u| u.remote.clone())
-        else {
+        let Some(remote) = self.avatar_remote() else {
             return;
         };
-        if self.avatars.attempted.len() >= 512 {
-            self.avatars.attempted.clear();
-            self.avatars.images.clear();
-        }
         let ids: Vec<_> = std::iter::once(id)
             .chain(
                 self.avatars
@@ -726,7 +907,9 @@ impl Desktop {
                     .copied()
                     .filter(|other| *other != id),
             )
-            .filter(|id| !self.avatars.attempted.contains(id) && self.avatars.image(id).is_none())
+            .filter(|id| {
+                !self.avatars.attempted.contains_key(id) && self.avatars.image(id).is_none()
+            })
             .take(4)
             .map(|id| (id, self.avatars.authors.get(&id).cloned().flatten()))
             .collect();
@@ -774,13 +957,11 @@ impl Desktop {
                 }
                 v.avatars.pending = false;
                 for (id, email, image) in images {
-                    v.avatars.attempted.insert(id);
+                    v.avatars.attempted.insert(id, ());
                     if let Some(image) = image {
-                        if v.avatars.profiles.len() >= 256 {
-                            v.avatars.profiles.clear();
-                        }
                         // Failed/unpublished commits never poison an author's profile.
                         if let Some(email) = email {
+                            v.avatars.disk_misses.remove(&email);
                             v.avatars.profiles.insert(email, image.clone());
                         }
                         v.avatars.images.insert(id, image);
@@ -790,6 +971,17 @@ impl Desktop {
             });
         })
         .detach();
+    }
+
+    fn avatar_remote(&self) -> Option<Remote> {
+        self.engine
+            .app
+            .branches
+            .remotes
+            .values()
+            .find(|u| u.remote.name == "origin")
+            .or_else(|| self.engine.app.branches.remotes.values().next())
+            .map(|u| u.remote.clone())
     }
 
     fn people_field(&self, reviewer: bool, cx: &mut Context<Self>) -> Div {
@@ -1074,6 +1266,128 @@ impl Desktop {
 mod tests {
     use super::{Arc, Instant, Member, People, Person};
     use gix::bstr::ByteSlice;
+
+    #[test]
+    fn remote_author_metadata_reuses_a_profile_and_survives_a_late_local_miss() {
+        let id = gix::ObjectId::from_bytes_or_panic(&[1; 20]);
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+        ));
+        let details = crate::git::CommitDetails {
+            id,
+            parents: Vec::new(),
+            author_name: "Shared Name".into(),
+            author_email: "alice@example.com".into(),
+            author_time: 0,
+            author_offset: 0,
+            committer_name: String::new(),
+            committer_email: String::new(),
+            commit_time: 0,
+            commit_offset: 0,
+            message: String::new(),
+        };
+        let mut avatars = super::Avatars {
+            pending: true,
+            ..Default::default()
+        };
+        avatars.observe(std::iter::once(id));
+        avatars.authors.insert(id, None); // object is absent from the local clone
+        avatars
+            .profiles
+            .insert(details.author_email.clone(), image.clone());
+        avatars.remember_remote_authors(None, &[(id, details)].into_iter().collect());
+        assert!(Arc::ptr_eq(avatars.image(&id).unwrap(), &image));
+        avatars.remember_authors([(id, None)]); // already running local worker finishes
+        assert!(Arc::ptr_eq(avatars.image(&id).unwrap(), &image));
+        assert!(avatars.pending); // no network request was needed
+    }
+
+    #[test]
+    fn retained_cache_evicts_one_entry_and_updates_do_not_duplicate_its_queue() {
+        let mut cache = super::Retained::<u32, u32, 3>::default();
+        for n in 0..3 {
+            cache.insert(n, n);
+        }
+        cache.insert(1, 10);
+        cache.insert(3, 3);
+        assert!(!cache.contains_key(&0));
+        assert_eq!(cache.get(&1), Some(&10));
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.order.len(), 3);
+        cache.remove(&2);
+        cache.insert(2, 20);
+        cache.insert(4, 4);
+        assert!(!cache.contains_key(&1));
+        assert_eq!(cache.get(&2), Some(&20));
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.order.len(), 3);
+    }
+
+    #[test]
+    fn disk_profiles_resolve_past_a_miss_and_share_image_allocations_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::remote::requests::PhotoCache::at(dir.path().into());
+        let remote =
+            crate::remote::Remote::parse("origin", "https://github.com/a/repo.git", None).unwrap();
+        let url = "https://avatars.example/u/42?s=64";
+        let bytes = b"\x89PNG\r\n\x1a\nfixture";
+        assert!(cache.store_image(url, bytes));
+        for email in ["alice@example.com", "alias@example.com"] {
+            cache.store_identity(&remote, email, url);
+        }
+        let profiles = super::cached_profiles(
+            &cache,
+            &remote,
+            [
+                "missing@example.com",
+                "alice@example.com",
+                "alias@example.com",
+                "alice@example.com",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert_eq!(profiles.len(), 3);
+        assert!(profiles[0].1.is_none());
+        assert_eq!(profiles[1].1.as_ref().unwrap().bytes, bytes);
+        assert!(Arc::ptr_eq(
+            profiles[1].1.as_ref().unwrap(),
+            profiles[2].1.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn returning_to_an_earlier_commit_reuses_the_profile_after_512_rows() {
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+        ));
+        let mut avatars = super::Avatars::default();
+        avatars
+            .profiles
+            .insert("shared@example.com".into(), image.clone());
+        let mut first = None;
+        for n in 0..700_u32 {
+            let mut bytes = [0; 20];
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+            let id = gix::ObjectId::from_bytes_or_panic(&bytes);
+            first.get_or_insert(id);
+            avatars
+                .authors
+                .insert(id, Some("shared@example.com".into()));
+            avatars.images.insert(id, image.clone());
+            avatars.attempted.insert(id, ());
+        }
+        let first = first.unwrap();
+        assert!(!avatars.images.contains_key(&first)); // per-commit image was evicted
+        avatars.observe(std::iter::once(first));
+        assert!(Arc::ptr_eq(avatars.image(&first).unwrap(), &image));
+        assert_eq!(avatars.authors.len(), 700);
+        assert_eq!(avatars.images.len(), 512);
+        assert_eq!(avatars.attempted.len(), 700);
+    }
+
     #[test]
     fn known_author_image_is_reused_during_scrolling_and_an_inflight_download() {
         use crate::git::command::checked;

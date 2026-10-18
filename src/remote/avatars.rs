@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) const MAX_IMAGE: u64 = 256 * 1024;
 const TTL: u64 = 86400;
 
-pub(super) struct Cache {
+pub(crate) struct Cache {
     directory: PathBuf,
 }
 
