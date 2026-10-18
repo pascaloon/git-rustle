@@ -22,6 +22,16 @@ directory. `--no-cache` disables persistent application caches. `--help` and
 `--version` are also available. Launch the executable with a repository path when
 opening it outside that repository.
 
+The Windows executable embeds the approved windblown-leaf artwork from
+`assets/app-icon.png`, with transparent corners; GPUI uses the same icon for the
+native window and taskbar.
+The checked-in `assets/app-icon.ico` contains sizes from 16 to 256 pixels. To
+regenerate it after replacing the square source image, install Pillow and run
+`python scripts/generate-app-icon.py`. Normal builds do not require Python.
+Run `python scripts/remove-icon-matte.py INPUT.png OUTPUT.png` on the original
+opaque artwork to remove its corner-connected white matte while preserving
+interior pixels. The icon generator retains the resulting alpha channel.
+
 ## Desktop workflow
 
 - Click a history row to inspect its full message, author, committer, dates,

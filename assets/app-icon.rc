@@ -1,0 +1,2 @@
+// ID 1 is also loaded by GPUI for the native window/taskbar icon.
+1 ICON "app-icon.ico"
