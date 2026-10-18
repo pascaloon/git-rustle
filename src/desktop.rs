@@ -1480,7 +1480,9 @@ impl Desktop {
                                 .whitespace_nowrap()
                                 .child(if v.matches.files {if let Some(file)=item.file {v.matches.styled_filename(&cs.files[file].path,&item.name)}else{v.matches.styled(format!("{prefix} {}",item.name))}} else {StyledText::new(format!("{prefix} {}",item.name))}),
                         )
-                        .when_some(cs.node_total(node),|s,(a,r)|s.child(diff_stats(a,r)))
+                        .when(!item.is_folder() || !item.expanded, |s| {
+                            s.when_some(cs.node_total(node), |s, (a, r)| s.child(diff_stats(a, r)))
+                        })
                         .child(caption(
                             item.kind
                                 .map(|k| k.letter().to_string())
