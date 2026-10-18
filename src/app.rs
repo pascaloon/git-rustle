@@ -495,6 +495,58 @@ impl App {
         self.history.parents(i).first().copied()
     }
 
+    fn diff_source(
+        &self,
+        old: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Option<Box<crate::diff::changes::RemoteSource>> {
+        let new_source = self.ghost_sources.get(&new);
+        let old_source = old.as_ref().and_then(|id| self.ghost_sources.get(id));
+        Some(Box::new(crate::diff::changes::RemoteSource {
+            remote: new_source.or(old_source)?.clone(),
+            old_remote: old_source.cloned(),
+            compare: new_source.is_none() || old != self.parent_of(&new),
+        }))
+    }
+
+    fn new_changes(&mut self, old: Option<ObjectId>, new: ObjectId) -> ChangeSet {
+        let mut changes = ChangeSet::new(self.new_key(), old, new);
+        changes.remote_source = self.diff_source(old, new);
+        changes
+    }
+
+    fn refresh_diff_sources(&mut self) {
+        let target = |cs: &ChangeSet| (cs.key, cs.old, cs.new);
+        let targets = [
+            self.details_changes.as_ref().map(target),
+            match &self.mode {
+                Mode::Diff(view) => Some(target(&view.changes)),
+                Mode::Graph => None,
+            },
+            self.parked_diff.as_ref().map(|view| target(&view.changes)),
+        ];
+        for (key, old, new) in targets.into_iter().flatten() {
+            let Some(source) = self.diff_source(old, new) else {
+                // An open tab must outlive the graph's temporary local-only state.
+                continue;
+            };
+            let changes = self.changes_by_key_mut(key).unwrap();
+            if changes.remote_source.as_ref() == Some(&source) {
+                continue;
+            }
+            changes.remote_source = Some(source);
+            if changes.requested && (!changes.loaded || changes.error.is_some()) {
+                // Ignore any late local-worker result and retry through the API.
+                let next_key = self.new_key();
+                let changes = self.changes_by_key_mut(key).unwrap();
+                changes.key = next_key;
+                changes.requested = false;
+                changes.loaded = false;
+                changes.error = None;
+            }
+        }
+    }
+
     /// Keep `details_changes` pointed at the selected commit.
     pub fn sync_details_changes(&mut self) {
         if self.pending.selected {
@@ -514,9 +566,8 @@ impl App {
         if self.details_changes.as_ref().map(|c| c.new) == Some(id) {
             return;
         }
-        let key = self.new_key();
         let parent = self.parent_of(&id);
-        self.details_changes = Some(ChangeSet::new(key, parent, id));
+        self.details_changes = Some(self.new_changes(parent, id));
         self.details_cursor = TreeCursor {
             rows: self.details_cursor.rows,
             ..TreeCursor::default()
@@ -542,14 +593,7 @@ impl App {
             Mode::Graph => match self.details_changes.as_mut() {
                 Some(cs) if !cs.requested => {
                     cs.requested = true;
-                    vec![DiffReq::Tree {
-                        key: cs.key,
-                        old: cs.old,
-                        new: cs.new,
-                        remote: None,
-                        old_remote: None,
-                        compare: false,
-                    }]
+                    vec![DiffReq::tree(cs)]
                 }
                 _ => Vec::new(),
             },
@@ -615,8 +659,8 @@ impl App {
                 (Some(ta), Some(tb)) if tb < ta => (b, a),
                 _ => (a, b),
             };
-            let key = self.new_key();
-            self.show_view(ChangeSet::new(key, Some(old), new), None);
+            let changes = self.new_changes(Some(old), new);
+            self.show_view(changes, None);
         } else if let [id] = ids {
             self.open_parent_diff(*id);
         }
@@ -630,9 +674,9 @@ impl App {
             let cursor = self.details_cursor;
             self.show_view(cs, Some(cursor));
         } else {
-            let key = self.new_key();
             let parent = self.parent_of(&id);
-            self.show_view(ChangeSet::new(key, parent, id), None);
+            let changes = self.new_changes(parent, id);
+            self.show_view(changes, None);
         }
     }
 
@@ -865,6 +909,7 @@ impl App {
         }
         self.ghosts = preview.ghosts;
         self.ghost_sources = preview.sources;
+        self.refresh_diff_sources();
         self.ghost_branches = preview.branches;
         self.ghost_tags = preview.tags;
         self.ghost_status = if preview.errors.is_empty() {
@@ -2133,6 +2178,61 @@ mod tests {
             app.branches.remotes.clear();
             app.set_refs(refs);
             assert!(!app.labels.contains_key(&live));
+        }
+    }
+
+    #[test]
+    fn late_remote_metadata_retries_pending_and_failed_diffs_without_accepting_old_results() {
+        for failed in [false, true] {
+            for tab in 0..3 {
+                let mut app = app_with(3);
+                let id = app.selected_id().unwrap();
+                app.sync_details_changes();
+                if tab > 0 {
+                    app.open_diff();
+                }
+                if tab == 2 {
+                    app.park_diff();
+                }
+                let request = app.pending_requests().remove(0);
+                let DiffReq::Tree {
+                    key, remote: None, ..
+                } = request
+                else {
+                    panic!("expected local request")
+                };
+                if failed {
+                    app.changes_by_key_mut(key)
+                        .unwrap()
+                        .set_tree(Err("Object could not be found".into()));
+                }
+                let remote =
+                    crate::remote::Remote::parse("origin", "https://github.com/test/repo", None)
+                        .unwrap();
+                app.install_preview(crate::remote::history::Preview {
+                    history: None,
+                    ghosts: Default::default(),
+                    sources: [(id, remote.clone())].into_iter().collect(),
+                    branches: Vec::new(),
+                    tags: Vec::new(),
+                    errors: Vec::new(),
+                });
+                // Replacing the key prevents a late local error from overwriting
+                // a remote result, including on a parked tab or details panel.
+                assert!(app.changes_by_key_mut(key).is_none());
+                let request = app.pending_requests().remove(0);
+                let DiffReq::Tree {
+                    key: next,
+                    remote: Some(source),
+                    ..
+                } = request
+                else {
+                    panic!("expected API retry")
+                };
+                assert_ne!(key, next);
+                assert_eq!(source, remote);
+                assert!(app.changes_by_key_mut(next).unwrap().error.is_none());
+            }
         }
     }
 

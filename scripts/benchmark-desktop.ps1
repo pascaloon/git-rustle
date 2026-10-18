@@ -45,6 +45,11 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -in @('remote-diff','remote-pair') -and
+        ($state -notmatch 'diff_files=[1-9][0-9]* diff_failed=false' -or $state -notmatch '[1-9][0-9]* ghost commits' -or
+         $text -notmatch 'file diff \((?:[2-9]|[1-9][0-9]+) rows\)')) {
+        throw "Expected a loaded remote diff with unfetched commits: $log"
+    }
     if ($scenario -eq 'settings-cache' -and $state -notmatch 'image_cache_bytes=[1-9][0-9]* image_cache_images=500 image_cache_busy=false') { throw "Expected 500 seeded images and a completed size scan: $log" }
     if ($scenario -eq 'settings-cache-clear' -and $state -notmatch 'image_cache_bytes=0 image_cache_images=0 image_cache_busy=false image_cache_cleared=true') { throw "Expected an empty cache after clearing: $log" }
     if ($scenario -in @('request-compose','request-edit','request-tabs','request-clear') -and
@@ -100,6 +105,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'settings-tabs' { 'desktop scroll done' }
         'status-panels' { 'desktop scroll done' }
         'compare' { 'file diff (' }
+        'remote-diff' { 'file diff (' }
+        'remote-pair' { 'file diff (' }
         'branches' { 'branch activity ready' }
         'diff' { 'file diff (' }
         'search' { 'search ready' }
@@ -125,6 +132,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending' { 'pending status requested' }
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
+        'remote-diff' { 'remote diff requested' }
+        'remote-pair' { 'remote diff requested' }
     }
     $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }

@@ -36,6 +36,20 @@ pub enum DiffReq {
     },
 }
 
+impl DiffReq {
+    pub fn tree(changes: &ChangeSet) -> Self {
+        let source = changes.remote_source.as_deref();
+        Self::Tree {
+            key: changes.key,
+            old: changes.old,
+            new: changes.new,
+            remote: source.map(|s| s.remote.clone()),
+            old_remote: source.and_then(|s| s.old_remote.clone()),
+            compare: source.is_some_and(|s| s.compare),
+        }
+    }
+}
+
 /// Horizontal scroll step, in cells.
 const HSTEP: usize = 8;
 
@@ -108,14 +122,7 @@ impl DiffView {
         let mut out = Vec::new();
         if !self.changes.requested {
             self.changes.requested = true;
-            out.push(DiffReq::Tree {
-                key: self.changes.key,
-                old: self.changes.old,
-                new: self.changes.new,
-                remote: None,
-                old_remote: None,
-                compare: false,
-            });
+            out.push(DiffReq::tree(&self.changes));
         }
         if let Some(cur) = self.current
             && self.diff_for != Some(cur)

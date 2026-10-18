@@ -10,6 +10,18 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+For remote-diff routing or refresh changes, generate a fresh cached remote fixture
+with `remote::history::tests::prepare_native_fixture` after builds finish. Run
+`benchmark-desktop.ps1 -Scenarios remote-diff,remote-pair` against it: these wait
+for ghost metadata, use the normal graph selection/Diff handlers, and require a
+nonempty file list without an error. They measure selection through selected-file
+worker delivery, excluding physical input and scanout, and are candidate-only
+for binaries without these scenarios. The ignored engine harness
+`engine::tests::benchmark_remote_diff_refresh` measures parent and divergent-pair
+diff recovery after clearing graph metadata (one warm-up and 15 cached samples).
+It verifies the Git object remains absent and refs unchanged. Compare normal
+startup with the preserved baseline; keep all generated samples under target/bench.
+
 For Git mutation and recovery changes, also follow the operation-specific
 [worker and native measurements](git-operations.md#performance-validation).
 Compare the existing desktop mutation harness against a preserved baseline test

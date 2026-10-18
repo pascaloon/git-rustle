@@ -853,28 +853,7 @@ impl Engine {
             app.sync_details_changes();
             let reqs = app.pending_requests();
             if !reqs.is_empty() {
-                for mut req in reqs {
-                    if let DiffReq::Tree {
-                        old,
-                        new,
-                        remote,
-                        old_remote,
-                        compare,
-                        ..
-                    } = &mut req
-                    {
-                        *remote = app
-                            .ghost_sources
-                            .get(new)
-                            .or_else(|| old.as_ref().and_then(|id| app.ghost_sources.get(id)))
-                            .cloned();
-                        *old_remote = old
-                            .as_ref()
-                            .and_then(|id| app.ghost_sources.get(id))
-                            .cloned();
-                        *compare = remote.is_some()
-                            && (!app.ghost_sources.contains_key(new) || *old != app.parent_of(new));
-                    }
+                for req in reqs {
                     if matches!(req, DiffReq::Tree { .. }) {
                         timing.mark("diff requested");
                     } else {
@@ -1548,6 +1527,88 @@ mod tests {
             !e.refreshing && !e.app.want_refresh && !e.app.is_walking()
         });
         assert_eq!(e.app.history.len(), 2);
+    }
+
+    fn remote_diff_after_local_refresh(pair: bool) -> f64 {
+        let dir = fixture();
+        let mut e = Engine::new(dir.path().into(), false, Instant::now());
+        until(&mut e, |e| {
+            e.app.history.complete && e.app.pending.known && !e.app.is_walking()
+        });
+        let local = e.app.history.clone();
+        let head = e.app.head_id().unwrap();
+        let remote = remote::Remote::parse(
+            "origin",
+            "https://remote-diff-fixture.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for (sha, offset) in [("f".repeat(40), 1), ("a".repeat(40), 2)] {
+            remote::files::seed_native_fixture(e.repo.as_ref().unwrap(), &remote, &sha);
+            let id = gix::ObjectId::from_hex(sha.as_bytes()).unwrap();
+            let mut details = git::commit_details(e.repo.as_ref().unwrap(), &head).unwrap();
+            details.id = id;
+            details.parents = vec![head];
+            details.commit_time += offset;
+            let mut row = e.app.history.commits[0];
+            row.id = id;
+            row.parents = e.app.history.push_parents(&[head]);
+            row.commit_time = details.commit_time;
+            e.app.history.commits.insert(0, row);
+            e.app.ghosts.insert(id, details);
+            e.app.ghost_sources.insert(id, remote.clone());
+            ids.push(id);
+        }
+        e.app
+            .open_selected_diff(if pair { &ids } else { &ids[1..] });
+        // A local walk completes after opening the tab but before its first request.
+        // The remote commit is deliberately never fetched into the object database.
+        e.app.set_cached(local, true);
+        let started = Instant::now();
+        until(
+            &mut e,
+            |e| matches!(&e.app.mode, app::Mode::Diff(v) if v.diff.is_some() || v.changes.error.is_some()),
+        );
+        let ms = started.elapsed().as_secs_f64() * 1000.;
+        let app::Mode::Diff(view) = &e.app.mode else {
+            unreachable!()
+        };
+        assert!(view.changes.error.is_none(), "{:?}", view.changes.error);
+        assert_eq!(view.changes.files[0].path, "remote-example.txt");
+        assert!(view.diff.as_ref().is_some_and(|d| d.added > 0));
+        assert!(e.repo.as_ref().unwrap().find_object(ids[1]).is_err());
+        assert_eq!(
+            git::snapshot_refs(e.repo.as_ref().unwrap())
+                .unwrap()
+                .head_id,
+            Some(head)
+        );
+        ms
+    }
+
+    #[test]
+    fn remote_parent_and_pair_diffs_survive_a_local_history_refresh() {
+        remote_diff_after_local_refresh(false);
+        remote_diff_after_local_refresh(true);
+    }
+
+    #[test]
+    #[ignore = "cached remote diff worker recovery: one warm-up and 15 samples"]
+    fn benchmark_remote_diff_refresh() {
+        for pair in [false, true] {
+            let mut samples = Vec::new();
+            for sample in 0..16 {
+                let ms = remote_diff_after_local_refresh(pair);
+                if sample > 0 {
+                    samples.push(ms);
+                }
+            }
+            println!(
+                "remote_diff_refresh_pair_{pair}_ms={}",
+                serde_json::to_string(&samples).unwrap()
+            );
+        }
     }
     #[test]
     fn desktop_engine_commits_selected_files_and_preserves_unchecked_changes() {

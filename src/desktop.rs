@@ -616,7 +616,9 @@ impl Desktop {
                         if dragging {
                             v.scroll_selection(window, cx);
                         }
+                        let remote_diff = matches!(v.scenario.as_deref(), Some("remote-diff" | "remote-pair"));
                         if !v.scenario_started && v.engine.autoquit_ready(Duration::from_millis(20))
+                            && (!remote_diff || !v.engine.app.ghosts.is_empty())
                         {
                             v.scenario_started = true;
                             match v.scenario.as_deref() {
@@ -756,6 +758,17 @@ impl Desktop {
                                 Some("compare") => {
                                     v.action(Action::Select(0, false), window, cx);
                                     v.action(Action::Select(1, true), window, cx);
+                                    v.action(Action::Diff, window, cx);
+                                }
+                                Some("remote-diff" | "remote-pair") => {
+                                    let remote_row = v.engine.app.history.commits.iter().position(|c| v.engine.app.ghosts.contains_key(&c.id)).unwrap();
+                                    v.engine.mark("remote diff requested");
+                                    v.action(Action::Select(remote_row, false), window, cx);
+                                    if v.scenario.as_deref() == Some("remote-pair") {
+                                        let head = v.engine.app.head_id().unwrap();
+                                        let local_row = v.engine.app.history.index_of(&head).unwrap();
+                                        v.action(Action::Select(local_row, true), window, cx);
+                                    }
                                     v.action(Action::Diff, window, cx);
                                 }
                                 Some("request-open") => {
@@ -2789,7 +2802,7 @@ impl Desktop {
                 | "avatar-reuse-scroll",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
-            Some("diff" | "pending-diff" | "compare") => {
+            Some("diff" | "pending-diff" | "compare" | "remote-diff" | "remote-pair") => {
                 matches!(&app.mode,Mode::Diff(v) if v.diff.as_ref().is_some_and(|d| d.syntax.is_some()))
             }
             Some("search") => app.search.result.as_ref().is_some_and(|r| r.done),
@@ -2814,7 +2827,7 @@ impl Desktop {
         }
         let app = &self.engine.app;
         format!(
-            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\ncheckout_choices={}\noperations={} cursor={} conflicts={}\n{}\n",
+            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\ndiff_files={} diff_failed={}\ncheckout_choices={}\noperations={} cursor={} conflicts={}\n{}\n",
             app.repo_name,
             app.history.len(),
             app.details
@@ -2832,6 +2845,11 @@ impl Desktop {
                     .map_or(0, |s| s.span_count()),
                 _ => 0,
             },
+            match &app.mode {
+                Mode::Diff(v) => v.changes.files.len(),
+                _ => 0,
+            },
+            matches!(&app.mode, Mode::Diff(v) if v.changes.error.is_some()),
             app.checkout_confirmation
                 .as_ref()
                 .map_or(0, |d| d.choices.len()),
