@@ -195,9 +195,10 @@ executable. Record limitations alongside startup and native interaction samples.
 
 For check cadence and cache changes, also run
 `cargo test --release --locked update::tests::benchmark_check -- --ignored --exact --nocapture`.
-It retains one warm-up plus 15 samples each for metadata requests, fresh cache
-reads, and expired-cache requests including persistence. It uses the production
-check/cache functions with a controlled clock and a loopback release server.
+It retains one warm-up plus 15 samples each for metadata requests, startup checks
+with recent saved state, and scheduled checks including persistence. All checks
+now refresh the feed; saved results never suppress startup requests. It uses the
+production check functions with a controlled clock and a loopback release server.
 For actual network timing, explicitly run
 `cargo test --release --locked update::tests::benchmark_live_check -- --ignored --exact --nocapture`.
 This makes six unauthenticated, read-only GitHub release requests (one warm-up,

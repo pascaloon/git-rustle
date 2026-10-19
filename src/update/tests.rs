@@ -166,67 +166,77 @@ fn commit_draft_transfer_preserves_unicode_and_unchecked_files() {
     assert_eq!(copy.checks, draft.checks);
 }
 
-#[test]
-fn malformed_cache_is_ignored() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("updates.json");
-    fs::write(&path, b"partial json").unwrap();
-    assert_eq!(read_cache(&path).checked, 0);
+fn read_last_check(path: &Path) -> LastCheck {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 #[test]
-fn reopening_preserves_the_six_hour_deadline_and_expiry_fetches_new_metadata() {
+fn startup_refreshes_recent_negative_and_current_version_results() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("updates.json");
-    let checked = 100_000;
-    fs::write(
-        &path,
-        serde_json::to_vec(&Cache {
-            checked,
-            available: Some(Available {
-                version: "0.2.0".into(),
-                checksum: "0".repeat(64),
-            }),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    for age in [0, 1, 6 * 60 * 60 - 1] {
-        // An invalid endpoint proves that fresh-cache checks never contact it.
-        let result = check_cached_at("not a URL", "0.1.0", &path, checked + age).unwrap();
-        assert_eq!(result.available.unwrap().version, "0.2.0");
-        assert_eq!(result.next_check_in, Duration::from_secs(6 * 60 * 60 - age));
-    }
     let fixture = Fixture::new("0.3.0", ASSET, vec![], Some(&digest(b"")));
-    let result = check_cached_at(&fixture.api, "0.1.0", &path, checked + 6 * 60 * 60).unwrap();
-    assert_eq!(result.available.unwrap().version, "0.3.0");
-    assert_eq!(result.next_check_in, Duration::from_secs(6 * 60 * 60));
-    assert_eq!(read_cache(&path).checked, checked + 6 * 60 * 60);
+    for previous in [
+        None,
+        Some(Available {
+            version: "0.1.0".into(),
+            checksum: "0".repeat(64),
+        }),
+    ] {
+        fs::write(
+            &path,
+            serde_json::to_vec(&LastCheck {
+                checked: 100_000,
+                available: previous,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let result = check_and_record_at(&fixture.api, "0.1.0", &path, 100_001).unwrap();
+        assert_eq!(result.available.unwrap().version, "0.3.0");
+        assert_eq!(result.next_check_in, CHECK_INTERVAL);
+        let saved = read_last_check(&path);
+        assert_eq!(saved.checked, 100_001);
+        assert_eq!(saved.available.unwrap().version, "0.3.0");
+    }
 }
 
 #[test]
-fn future_cache_timestamps_are_revalidated_and_failed_checks_preserve_cache() {
+fn scheduled_check_fetches_new_metadata_after_six_hours() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("updates.json");
-    fs::write(
-        &path,
-        serde_json::to_vec(&Cache {
-            checked: 100_001,
+    let first = Fixture::new("0.2.0", ASSET, vec![], Some(&digest(b"")));
+    let initial = check_and_record_at(&first.api, "0.1.0", &path, 100_000).unwrap();
+    assert_eq!(initial.available.unwrap().version, "0.2.0");
+    assert_eq!(initial.next_check_in, Duration::from_secs(6 * 60 * 60));
+    let second = Fixture::new("0.3.0", ASSET, vec![], Some(&digest(b"")));
+    let time = 100_000 + initial.next_check_in.as_secs();
+    let next = check_and_record_at(&second.api, "0.1.0", &path, time).unwrap();
+    assert_eq!(next.available.unwrap().version, "0.3.0");
+    assert_eq!(next.next_check_in, CHECK_INTERVAL);
+    assert_eq!(read_last_check(&path).checked, time);
+}
+
+#[test]
+fn invalid_saved_state_cannot_block_checks_and_failures_preserve_last_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("updates.json");
+    let fixture = Fixture::new("0.3.0", ASSET, vec![], Some(&digest(b"")));
+    for bytes in [
+        b"partial json".to_vec(),
+        serde_json::to_vec(&LastCheck {
+            checked: u64::MAX,
             available: None,
         })
         .unwrap(),
-    )
-    .unwrap();
-    let fixture = Fixture::new("0.3.0", ASSET, vec![], Some(&digest(b"")));
-    assert!(
-        check_cached_at(&fixture.api, "0.1.0", &path, 100_000)
-            .unwrap()
-            .available
-            .is_some()
-    );
-    let before = fs::read(&path).unwrap();
-    assert!(check_cached_at("not a URL", "0.1.0", &path, 100_000 + 6 * 60 * 60).is_err());
-    assert_eq!(fs::read(&path).unwrap(), before);
+    ] {
+        fs::write(&path, bytes).unwrap();
+        let result = check_and_record_at(&fixture.api, "0.1.0", &path, 100_000).unwrap();
+        assert_eq!(result.available.unwrap().version, "0.3.0");
+        assert_eq!(result.next_check_in, CHECK_INTERVAL);
+        let before = fs::read(&path).unwrap();
+        assert!(check_and_record_at("not a URL", "0.1.0", &path, 100_001).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 }
 
 #[test]
@@ -302,7 +312,7 @@ fn benchmark_check() {
         let checked = 100_000;
         fs::write(
             &path,
-            serde_json::to_vec(&Cache {
+            serde_json::to_vec(&LastCheck {
                 checked,
                 available: None,
             })
@@ -310,15 +320,13 @@ fn benchmark_check() {
         )
         .unwrap();
         let start = std::time::Instant::now();
-        let result = check_cached_at(&fixture.api, "0.1.0", &path, checked + 1).unwrap();
-        assert_eq!(
-            result.next_check_in,
-            CHECK_INTERVAL - Duration::from_secs(1)
-        );
-        let cached_ms = start.elapsed().as_secs_f64() * 1000.;
+        let result = check_and_record_at(&fixture.api, "0.1.0", &path, checked + 1).unwrap();
+        assert!(result.available.is_some());
+        assert_eq!(result.next_check_in, CHECK_INTERVAL);
+        let fresh_state_ms = start.elapsed().as_secs_f64() * 1000.;
         let start = std::time::Instant::now();
         assert!(
-            check_cached_at(
+            check_and_record_at(
                 &fixture.api,
                 "0.1.0",
                 &path,
@@ -330,7 +338,7 @@ fn benchmark_check() {
         );
         let full_ms = start.elapsed().as_secs_f64() * 1000.;
         println!(
-            "{{\"sample\":{sample},\"metadata_ms\":{metadata_ms},\"cached_ms\":{cached_ms},\"full_ms\":{full_ms}}}"
+            "{{\"sample\":{sample},\"metadata_ms\":{metadata_ms},\"fresh_state_ms\":{fresh_state_ms},\"full_ms\":{full_ms}}}"
         );
     }
 }

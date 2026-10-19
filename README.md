@@ -230,11 +230,11 @@ failed draft uploads can be retried. Build duration is separate from runtime per
 ### Application updates
 
 After its first frame, Git Rustle checks the public `pascaloon/git-rustle`
-GitHub Releases feed on a background worker. Successful checks are cached for
-six hours in `%LOCALAPPDATA%\git-rustle\updates.json`. While open, the app checks
-again when those six hours expire; reopening with an older cache preserves the
-remaining time instead of restarting the interval. Failed checks retry after
-an hour while the app remains open. Offline failures and rate limits stay quiet.
+GitHub Releases feed on a background worker on every launch. While open, the app
+checks again six hours after each successful check. The last successful result is
+recorded in `%LOCALAPPDATA%\git-rustle\updates.json` for diagnostics and never
+suppresses a fresh check. Failed checks retry after an hour while the app remains
+open. Offline failures and rate limits stay quiet.
 Only a newer stable version with the exact Windows x64 asset and a valid GitHub
 SHA-256 digest produces the orange **Update available** button at the left of
 the status bar (including the welcome screen).

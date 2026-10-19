@@ -2,8 +2,7 @@
 use self_update::backends::github::{Update, UpdateBuilder};
 use self_update::{Checksum, Release};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,8 +66,8 @@ fn check_at(api: &str, current: &str) -> Result<Option<Available>, String> {
         .map_or(Ok(None), |release| available(release, current))
 }
 
-#[derive(Default, Deserialize, Serialize)]
-struct Cache {
+#[derive(Deserialize, Serialize)]
+struct LastCheck {
     checked: u64,
     available: Option<Available>,
 }
@@ -91,42 +90,25 @@ fn directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Cannot locate the user's settings directory".into())
 }
 
-fn read_cache(path: &Path) -> Cache {
-    File::open(path)
-        .ok()
-        .and_then(|f| {
-            let mut bytes = Vec::new();
-            f.take(16 * 1024).read_to_end(&mut bytes).ok()?;
-            serde_json::from_slice(&bytes).ok()
-        })
-        .unwrap_or_default()
-}
-
-/// Cache I/O and the network request both stay on the background executor.
+/// Every launch and scheduled check refreshes GitHub on the background executor.
+/// The UI owns the six-hour timer; saved state must not suppress a startup check.
 pub fn check() -> Result<Checked, String> {
     let path = directory()?.join("updates.json");
-    check_cached_at(API, VERSION, &path, now())
+    check_and_record_at(API, VERSION, &path, now())
 }
 
-fn check_cached_at(api: &str, current: &str, path: &Path, time: u64) -> Result<Checked, String> {
-    let cache = read_cache(path);
-    if cache.checked != 0
-        && let Some(age) = time.checked_sub(cache.checked)
-        && age < CHECK_INTERVAL.as_secs()
-    {
-        return Ok(Checked {
-            available: cache.available.filter(|a| {
-                self_update::version::bump_is_greater(current, &a.version).unwrap_or(false)
-            }),
-            // Reopening must not restart the full interval for an older cache.
-            next_check_in: CHECK_INTERVAL - Duration::from_secs(age),
-        });
-    }
+fn check_and_record_at(
+    api: &str,
+    current: &str,
+    path: &Path,
+    time: u64,
+) -> Result<Checked, String> {
     let result = check_at(api, current);
     if let Ok(available) = &result {
-        // A cache write failure must never hide an available update.
+        // Retain the last successful result for diagnostics, never to skip checks.
+        // A state write failure must never hide an available update.
         let _ = fs::create_dir_all(path.parent().unwrap());
-        if let Ok(bytes) = serde_json::to_vec(&Cache {
+        if let Ok(bytes) = serde_json::to_vec(&LastCheck {
             checked: time,
             available: available.clone(),
         }) {
