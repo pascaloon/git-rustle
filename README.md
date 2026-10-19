@@ -221,3 +221,12 @@ Tag pushes and manual runs of `.github/workflows/windows-release.yml` build and
 test the Windows x64 release with the locked dependency graph, smoke-test command
 line flags, and upload `git-rustle.exe` as an unzipped Actions artifact for 90 days.
 Build duration and size are recorded separately from runtime performance.
+
+## License
+
+Git Rustle is licensed under the GNU General Public License version 3 only
+(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
+
+This program is distributed without any warranty, including the implied
+warranties of merchantability or fitness for a particular purpose, to the extent
+permitted by applicable law. See the license for details.
