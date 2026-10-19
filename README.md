@@ -93,7 +93,8 @@ interior pixels. The icon generator retains the resulting alpha channel.
   this history; pushes and outside repository changes invalidate earlier states.
   See [Git operations and recovery](docs/git-operations.md) for safety boundaries,
   supported repository types and benchmark commands.
-- **Settings** configures provider API access.
+- **Settings → General** contains image-cache reset controls and **Check for
+  updates**. The Project, GitLab and GitHub sections configure provider API access.
 - The shell's folder and terminal icons open the repository in Explorer or
   Windows Terminal. Windows Terminal must be installed for its launcher.
 
@@ -122,6 +123,14 @@ Results stream during indexing and retain ancestry through hidden commits.
 Unavailable objects and remote errors are reported as incomplete results.
 Click the field's **×** button or **HEAD** to leave the filter. The branch filter
 also has a clear button.
+
+The branch filter matches branch names and the latest commit author shown in each
+row, ignoring case. Both search fields retain a dim orange border and background
+while filtering, even after focus moves elsewhere. The graph marks the checked-out
+commit with a high-contrast orange **HEAD** badge.
+
+PR/MR badges in the graph are informational. Use the commit context menu to open
+the associated request online.
 
 ### Pending changes and commits
 
@@ -228,6 +237,10 @@ suffix publish prereleases. Published assets are never overwritten by reruns;
 failed draft uploads can be retried. Build duration is separate from runtime performance.
 
 ### Application updates
+
+**Settings → General → Check for updates** checks immediately, independently of
+the scheduled timer, and shows whether the app is current, an update is available,
+or the check failed. It does not install an update automatically.
 
 After its first frame, Git Rustle checks the public `pascaloon/git-rustle`
 GitHub Releases feed on a background worker on every launch. While open, the app

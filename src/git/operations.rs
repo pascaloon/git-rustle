@@ -25,6 +25,11 @@ pub enum Request {
         name: String,
         target: String,
     },
+    CreateTag {
+        name: String,
+        target: String,
+        message: Option<String>,
+    },
     Delete {
         name: String,
         force: bool,
@@ -806,6 +811,78 @@ fn revision(root: &Path, target: &str) -> Result<String> {
         ],
     )
 }
+
+fn create_tag(context: &Context, name: &str, target: &str, message: Option<&str>) -> Result<()> {
+    if name.is_empty() || name.starts_with('-') || name == "HEAD" || name.len() > 1024 {
+        return Err("Enter a valid tag name.".into());
+    }
+    let reference = format!("refs/tags/{name}");
+    output(&context.root, &["check-ref-format", &reference])?;
+    if !matches!(target.len(), 40 | 64) || !target.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Choose a local commit before creating a tag.".into());
+    }
+    if let Some(message) = message
+        && (message.trim().is_empty() || message.len() > 65535 || message.contains('\0'))
+    {
+        return Err("Enter an annotation message of at most 65,535 bytes.".into());
+    }
+    // Resolve the frozen full ID without fetching missing partial-clone objects.
+    let local_only = [("GIT_NO_LAZY_FETCH", OsStr::new("1"))];
+    let bytes = run(
+        &context.root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{target}^{{commit}}"),
+        ],
+        None,
+        &local_only,
+    )
+    .map_err(|_| {
+        "The selected commit is unavailable locally. Fetch it before creating a tag.".to_string()
+    })?;
+    let commit = String::from_utf8(bytes).map_err(err)?.trim().to_string();
+    let mut args = vec!["-c", "tag.gpgSign=false", "tag", "--no-sign"];
+    if message.is_some() {
+        args.extend(["--annotate", "--file", "-"]);
+    }
+    args.extend(["--", name, &commit]);
+    // No --force: an existing tag, including one created externally, is refused.
+    run(
+        &context.root,
+        &args,
+        message.map(str::as_bytes),
+        &local_only,
+    )?;
+    let repo = super::open(&context.root).map_err(err)?;
+    let tag = repo.find_reference(&reference).map_err(err)?;
+    let id = tag
+        .target()
+        .try_id()
+        .ok_or("Created tag has no object target.")?
+        .to_owned();
+    // An annotated tag object is not a commit parent. Protect the object itself
+    // so undo followed by pruning still permits redo of either kind of tag.
+    let edit = gix::refs::transaction::RefEdit::update(
+        format!("refs/rustle/tag-checkpoints/{id}")
+            .try_into()
+            .map_err(err)?,
+        id.to_owned(),
+        gix::refs::transaction::PreviousValue::Any,
+        "Git Rustle tag recovery checkpoint",
+    );
+    repo.edit_references_as(
+        [edit],
+        Some(gix::actor::SignatureRef {
+            name: b"Git Rustle Recovery".as_bstr(),
+            email: b"recovery@rustle.invalid".as_bstr(),
+            time: "0 +0000",
+        }),
+    )
+    .map_err(err)?;
+    Ok(())
+}
 fn clean_worktree(root: &Path) -> Result<()> {
     if !command::checked(
         root,
@@ -1481,6 +1558,7 @@ fn execute_inner(
     }
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
+        Request::CreateTag { name, .. } => format!("Create tag {name}"),
         Request::Delete { name, .. } => format!("Delete branch {name}"),
         Request::Rename { old, new } => format!("Rename {old} to {new}"),
         Request::Pull => "Pull current upstream".into(),
@@ -1503,6 +1581,13 @@ fn execute_inner(
                 validate_name(&context.root, name)?;
                 let target = revision(&context.root, target)?;
                 command::checked(&context.root, &["branch", "--", name, &target])?;
+            }
+            Request::CreateTag {
+                name,
+                target,
+                message,
+            } => {
+                create_tag(context, name, target, message.as_deref())?;
             }
             Request::Delete { name, force } => {
                 validate_name(&context.root, name)?;

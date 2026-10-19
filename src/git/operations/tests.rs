@@ -75,6 +75,205 @@ fn branches_undo_redo_jump_and_fork() {
 }
 
 #[test]
+fn lightweight_tag_uses_frozen_commit_without_identity_and_preserves_dirty_state() {
+    let f = Fixture::new();
+    let target = f.git(&["rev-parse", "HEAD"]);
+    f.write("second.txt", "second\n");
+    f.commit("advance HEAD after choosing target");
+    f.git(&["config", "user.name", ""]);
+    f.git(&["config", "user.email", ""]);
+    f.git(&["config", "user.useConfigOnly", "true"]);
+    f.write("file.txt", "staged\n");
+    f.git(&["add", "file.txt"]);
+    f.write("file.txt", "unstaged\n");
+    f.write("untracked.txt", "keep me\n");
+    let context = Context::new(f.root()).unwrap();
+    let before = context.snapshot().unwrap();
+    let created = f.run(Request::CreateTag {
+        name: "release/v1".into(),
+        target: target.clone(),
+        message: None,
+    });
+    assert_eq!(created.labels, vec!["Create tag release/v1"]);
+    assert_eq!(f.git(&["rev-parse", "refs/tags/release/v1"]), target);
+    assert_eq!(f.git(&["cat-file", "-t", "refs/tags/release/v1"]), "commit");
+    let after = context.snapshot().unwrap();
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.symbolic, before.symbolic);
+    assert_eq!(after.index, before.index);
+    assert_eq!(after.tree, before.tree);
+    assert_eq!(after.config, before.config);
+    f.run(Request::MoveTo(0));
+    assert!(context.snapshot().unwrap().equivalent(&before));
+    f.run(Request::MoveTo(1));
+    assert!(context.snapshot().unwrap().equivalent(&after));
+    assert_eq!(
+        fs::read_to_string(f.root().join("untracked.txt")).unwrap(),
+        "keep me\n"
+    );
+}
+
+#[test]
+fn annotated_tag_is_unsigned_and_redo_survives_pruning_after_undo() {
+    let f = Fixture::new();
+    let target = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["config", "tag.gpgSign", "true"]);
+    f.git(&["config", "gpg.program", "nonexistent-rustle-test-signer"]);
+    f.run(Request::CreateTag {
+        name: "v2".into(),
+        target: target.clone(),
+        message: Some("Release notes\n\nMore details".into()),
+    });
+    let object = f.git(&["rev-parse", "refs/tags/v2"]);
+    assert_ne!(object, target);
+    assert_eq!(f.git(&["cat-file", "-t", &object]), "tag");
+    assert_eq!(f.git(&["rev-parse", "refs/tags/v2^{commit}"]), target);
+    let text = f.git(&["cat-file", "-p", &object]);
+    assert!(text.contains("tagger Rustle Test <test@example.invalid>"));
+    assert!(text.ends_with("Release notes\n\nMore details"));
+    assert!(!text.contains("BEGIN PGP SIGNATURE"));
+    f.run(Request::MoveTo(0));
+    assert!(output(f.root(), &["show-ref", "--verify", "refs/tags/v2"]).is_err());
+    f.git(&["reflog", "expire", "--expire=now", "--all"]);
+    f.git(&["prune", "--expire", "now"]);
+    assert_eq!(f.git(&["cat-file", "-t", &object]), "tag");
+    f.run(Request::MoveTo(1));
+    assert_eq!(f.git(&["rev-parse", "refs/tags/v2"]), object);
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), target);
+}
+
+#[test]
+fn tags_refuse_duplicates_invalid_names_and_unavailable_commits() {
+    let f = Fixture::new();
+    let target = f.git(&["rev-parse", "HEAD"]);
+    f.run(Request::CreateTag {
+        name: "v1".into(),
+        target: target.clone(),
+        message: None,
+    });
+    let before = Context::new(f.root()).unwrap().snapshot().unwrap();
+    for name in [
+        "v1",
+        "",
+        "-bad",
+        "bad..name",
+        "bad name",
+        "bad.lock",
+        "HEAD",
+        "bad\nname",
+    ] {
+        let failed = execute(
+            f.root(),
+            Request::CreateTag {
+                name: name.into(),
+                target: target.clone(),
+                message: Some("Annotation".into()),
+            },
+        );
+        assert!(failed.result.is_err(), "accepted {name:?}");
+        assert_eq!(failed.view.labels, vec!["Create tag v1"]);
+        assert_eq!(failed.view.cursor, 1);
+        assert!(
+            Context::new(f.root())
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .equivalent(&before)
+        );
+    }
+    for target in [
+        "f".repeat(40),
+        "HEAD".into(),
+        f.git(&["rev-parse", "HEAD:file.txt"]),
+    ] {
+        assert!(
+            execute(
+                f.root(),
+                Request::CreateTag {
+                    name: "unavailable".into(),
+                    target,
+                    message: None,
+                }
+            )
+            .result
+            .is_err()
+        );
+    }
+    for message in [String::new(), "\0invalid".into(), "a".repeat(65536)] {
+        assert!(
+            execute(
+                f.root(),
+                Request::CreateTag {
+                    name: "invalid-message".into(),
+                    target: target.clone(),
+                    message: Some(message),
+                }
+            )
+            .result
+            .is_err()
+        );
+    }
+    assert!(
+        Context::new(f.root())
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .equivalent(&before)
+    );
+    assert_eq!(f.git(&["tag", "--list"]), "v1");
+}
+
+#[test]
+#[ignore = "one warm-up and 15 disposable tag creation/undo/redo samples per tag kind"]
+fn benchmark_tags() {
+    use std::time::Instant;
+    for annotated in [false, true] {
+        for sample in 0..16 {
+            let f = Fixture::new();
+            let target = f.git(&["rev-parse", "HEAD"]);
+            f.write("file.txt", "second\n");
+            f.commit("HEAD advanced");
+            f.write("file.txt", "staged\n");
+            f.git(&["add", "file.txt"]);
+            f.write("file.txt", "unstaged\n");
+            f.write("untracked.txt", "retained\n");
+            let context = Context::new(f.root()).unwrap();
+            let before = context.snapshot().unwrap();
+            let start = Instant::now();
+            f.run(Request::CreateTag {
+                name: "bench-tag".into(),
+                target: target.clone(),
+                message: annotated.then(|| "Benchmark annotation".into()),
+            });
+            let create_ms = start.elapsed().as_secs_f64() * 1000.;
+            let after = context.snapshot().unwrap();
+            assert_eq!(after.head, before.head);
+            assert_eq!(after.index, before.index);
+            assert_eq!(after.tree, before.tree);
+            assert_eq!(
+                f.git(&["rev-parse", "refs/tags/bench-tag^{commit}"]),
+                target
+            );
+            let start = Instant::now();
+            f.run(Request::MoveTo(0));
+            let undo_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert!(context.snapshot().unwrap().equivalent(&before));
+            let start = Instant::now();
+            f.run(Request::MoveTo(1));
+            let redo_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert!(context.snapshot().unwrap().equivalent(&after));
+            if sample > 0 {
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"annotated":annotated,
+                    "create_ms":create_ms,"undo_ms":undo_ms,"redo_ms":redo_ms})
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn clear_history_preserves_dirty_state_removes_both_tails_and_persists() {
     let f = Fixture::new();
     f.run(Request::Create {

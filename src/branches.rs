@@ -28,6 +28,7 @@ pub struct Entry {
     pub target: Target,
     pub current: bool,
     search: String,
+    author_search: String,
     pub activity: Option<Activity>,
 }
 
@@ -179,6 +180,7 @@ impl Browser {
                         target,
                         current,
                         search,
+                        author_search: String::new(),
                         activity: None,
                     },
                 );
@@ -203,6 +205,7 @@ impl Browser {
                         target,
                         current: false,
                         search,
+                        author_search: String::new(),
                         activity: None,
                     },
                 );
@@ -251,10 +254,20 @@ impl Browser {
         let q = self.query.to_lowercase();
         self.visible = self
             .entries
-            .iter()
+            .iter_mut()
             .enumerate()
-            .filter(|(_, e)| e.search.contains(&q))
-            .map(|(i, _)| i)
+            .filter_map(|(i, e)| {
+                // Empty/name-matching queries never need an author index.
+                if e.search.contains(&q) {
+                    return Some(i);
+                }
+                if e.author_search.is_empty()
+                    && let Some(activity) = e.activity.as_ref().filter(|a| !a.author.is_empty())
+                {
+                    e.author_search = activity.author.to_lowercase();
+                }
+                e.author_search.contains(&q).then_some(i)
+            })
             .collect();
         self.selected = self.selected.min(self.visible.len().saturating_sub(1));
         self.ensure_visible();
@@ -372,6 +385,206 @@ impl Browser {
 mod tests {
     use super::*;
     use crate::git::{RefEntry, RefKind};
+
+    fn owner_refs() -> RefSnapshot {
+        RefSnapshot {
+            refs: ["feature/ui", "maintenance"]
+                .into_iter()
+                .enumerate()
+                .map(|(n, name)| RefEntry {
+                    name: name.into(),
+                    id: ObjectId::from_hex(format!("{:040x}", n + 1).as_bytes()).unwrap(),
+                    kind: RefKind::Branch,
+                })
+                .collect(),
+            ..RefSnapshot::default()
+        }
+    }
+
+    fn owner_activity(author: &str) -> Activity {
+        Activity {
+            author: author.into(),
+            author_time: 1,
+            commit_time: 1,
+            recent: 1,
+            limited: false,
+        }
+    }
+
+    #[test]
+    fn filter_matches_branch_name_or_latest_author_without_combining_fields() {
+        let refs = owner_refs();
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        let target = browser
+            .entries
+            .iter()
+            .find(|e| e.target.name == "feature/ui")
+            .unwrap()
+            .target
+            .clone();
+        browser.install_activity(vec![(target, owner_activity("Zoë Ångström"))], Some(&refs));
+        for query in ["FEATURE/UI", "zOË", "ÅNGSTRÖM"] {
+            browser.query = query.into();
+            browser.filter();
+            assert_eq!(browser.visible.len(), 1);
+            assert_eq!(browser.chosen().unwrap().target.name, "feature/ui");
+        }
+        browser.query = "ui Zoë".into();
+        browser.filter();
+        assert!(
+            browser.visible.is_empty(),
+            "query must match within a name or author"
+        );
+        browser.query.clear();
+        browser.filter();
+        assert_eq!(browser.visible.len(), 2);
+    }
+
+    #[test]
+    fn active_author_query_updates_when_activity_arrives_and_ref_tip_changes() {
+        let mut refs = owner_refs();
+        let mut browser = Browser {
+            query: "ALICE".into(),
+            ..Browser::default()
+        };
+        browser.rebuild(Some(&refs));
+        assert!(browser.visible.is_empty());
+        let original = browser
+            .entries
+            .iter()
+            .find(|e| e.target.name == "feature/ui")
+            .unwrap()
+            .target
+            .clone();
+        browser.install_activity(
+            vec![(original, owner_activity("Alice Example"))],
+            Some(&refs),
+        );
+        assert_eq!(browser.chosen().unwrap().target.name, "feature/ui");
+        refs.refs[0].id = ObjectId::from_hex(b"3333333333333333333333333333333333333333").unwrap();
+        browser.rebuild(Some(&refs));
+        assert!(
+            browser.visible.is_empty(),
+            "previous tip's author must not leak into new tip"
+        );
+        let updated = browser
+            .entries
+            .iter()
+            .find(|e| e.target.name == "feature/ui")
+            .unwrap()
+            .target
+            .clone();
+        browser.install_activity(vec![(updated, owner_activity("Bob Example"))], Some(&refs));
+        assert!(browser.visible.is_empty());
+        browser.query = "bOB".into();
+        browser.filter();
+        assert_eq!(
+            browser.chosen().unwrap().activity.as_ref().unwrap().author,
+            "Bob Example"
+        );
+    }
+
+    #[test]
+    fn author_filter_uses_displayed_shared_tip_activity_for_remote_entries() {
+        let mut refs = owner_refs();
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        let target = browser
+            .entries
+            .iter()
+            .find(|e| e.target.name == "feature/ui")
+            .unwrap()
+            .target
+            .clone();
+        browser.install_activity(vec![(target, owner_activity("Shared Author"))], Some(&refs));
+        refs.refs.push(RefEntry {
+            name: "origin/feature/ui".into(),
+            id: refs.refs[0].id,
+            kind: RefKind::Remote,
+        });
+        browser.query = "shared AUTHOR".into();
+        browser.rebuild(Some(&refs));
+        assert_eq!(browser.visible.len(), 2);
+        assert!(
+            browser
+                .visible
+                .iter()
+                .all(|&i| browser.entries[i].activity.as_ref().unwrap().author == "Shared Author")
+        );
+    }
+
+    #[test]
+    #[ignore = "cached branch-name and latest-author filtering performance"]
+    fn benchmark_owner_filter() {
+        let mut report = Vec::new();
+        for count in [1000, 10000] {
+            let refs = RefSnapshot {
+                refs: (0..count)
+                    .map(|n| RefEntry {
+                        name: format!("feature/{n:05}"),
+                        id: ObjectId::from_hex(format!("{:040x}", n + 1).as_bytes()).unwrap(),
+                        kind: RefKind::Branch,
+                    })
+                    .collect(),
+                ..RefSnapshot::default()
+            };
+            let mut browser = Browser::default();
+            browser.rebuild(Some(&refs));
+            let activity: Vec<_> = browser
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(n, e)| {
+                    (
+                        e.target.clone(),
+                        owner_activity(&format!("Owner {:02}", n % 100)),
+                    )
+                })
+                .collect();
+            browser.install_activity(activity.clone(), Some(&refs));
+            let mut samples = Vec::new();
+            for sample in 0..16 {
+                let values = activity.clone();
+                let started = std::time::Instant::now();
+                browser.install_activity(values, Some(&refs));
+                let install_ms = started.elapsed().as_secs_f64() * 1000.;
+                let mut filters = Vec::new();
+                let mut first_author_ms = 0.;
+                for (query, expected) in [
+                    ("FEATURE/", count),
+                    ("OWNER 49", count / 100),
+                    ("unknown owner", 0),
+                    ("", count),
+                ] {
+                    browser.query = query.into();
+                    if query == "OWNER 49" {
+                        let started = std::time::Instant::now();
+                        browser.filter();
+                        first_author_ms = started.elapsed().as_secs_f64() * 1000.;
+                        assert_eq!(browser.visible.len(), expected);
+                    }
+                    let started = std::time::Instant::now();
+                    for _ in 0..100 {
+                        browser.filter();
+                        assert_eq!(std::hint::black_box(browser.visible.len()), expected);
+                    }
+                    filters.push(started.elapsed().as_secs_f64() * 1000. / 100.);
+                }
+                if sample > 0 {
+                    samples.push(serde_json::json!({"sample": sample - 1, "installMs": install_ms,
+                    "nameMs": filters[0], "firstAuthorMs": first_author_ms, "authorMs": filters[1], "missingMs": filters[2], "clearMs": filters[3]}));
+                }
+            }
+            for mut sample in samples {
+                sample["entries"] = count.into();
+                report.push(sample);
+            }
+        }
+        for sample in report {
+            println!("{}", serde_json::to_string(&sample).unwrap());
+        }
+    }
 
     #[test]
     fn opening_stays_at_top_during_activity_updates_until_the_user_navigates() {

@@ -16,12 +16,58 @@ pub struct Project {
     pub avatar: Option<String>,
 }
 
+fn project_avatar_url(remote: &Remote, web: Option<&str>, avatar: &str) -> Option<String> {
+    if safe_image_url(avatar) {
+        return Some(avatar.into());
+    }
+    if remote.provider != Provider::Gitlab || avatar.trim().is_empty() {
+        return None;
+    }
+    let mut base =
+        url::Url::parse(web.filter(|u| safe_web_url(u)).unwrap_or(&remote.endpoint)).ok()?;
+    let project = remote
+        .project
+        .split('/')
+        .map(encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    let prefix = base
+        .path()
+        .strip_suffix(&project)
+        .map(str::to_string)
+        .or_else(|| {
+            base.path()
+                .split_once("/api/v4/")
+                .map(|(prefix, _)| format!("{prefix}/"))
+        })
+        .unwrap_or_else(|| "/".into());
+    base.set_path(&prefix);
+    base.set_query(None);
+    base.set_fragment(None);
+    let resolved = base.join(avatar).ok()?;
+    safe_image_url(resolved.as_str()).then(|| resolved.to_string())
+}
+
+fn project_avatar_key(endpoint: &str, token: Option<&str>, avatar: &str) -> String {
+    format!(
+        "private-project-avatar-v1\0{endpoint}\0{}\0{avatar}",
+        token.unwrap_or("")
+    )
+}
+
 /// GitHub exposes an owner's avatar; GitLab exposes a project avatar.
 impl Client<'_> {
     pub fn project(&mut self, force: bool) -> Result<Project, String> {
-        if !force && let Some(mut project) = self.read::<Project>("project-icon-v1", 86400) {
+        let key = if self.remote.provider == Provider::Gitlab {
+            "project-icon-v2"
+        } else {
+            "project-icon-v1"
+        };
+        if !force && let Some(mut project) = self.read::<Project>(key, 86400) {
             project.web_url = project.web_url.filter(|u| safe_web_url(u));
-            project.avatar = project.avatar.filter(|u| safe_image_url(u));
+            project.avatar = project
+                .avatar
+                .and_then(|u| project_avatar_url(self.remote, project.web_url.as_deref(), &u));
             return Ok(project);
         }
         let response = self.get(root(self.remote))?;
@@ -31,15 +77,77 @@ impl Client<'_> {
             Provider::Github => (&value["html_url"], &value["owner"]["avatar_url"]),
             Provider::Gitlab => (&value["web_url"], &value["avatar_url"]),
         };
+        let web_url = web.as_str().filter(|u| safe_web_url(u)).map(str::to_string);
         let project = Project {
-            web_url: web.as_str().filter(|u| safe_web_url(u)).map(str::to_string),
             avatar: avatar
                 .as_str()
-                .filter(|u| safe_image_url(u))
-                .map(str::to_string),
+                .and_then(|u| project_avatar_url(self.remote, web_url.as_deref(), u)),
+            web_url,
         };
-        self.write("project-icon-v1", &project);
+        self.write(key, &project);
         Ok(project)
+    }
+
+    pub fn project_avatar(&mut self, project: &Project) -> Option<Vec<u8>> {
+        let avatar = project.avatar.as_deref()?;
+        if self.remote.provider != Provider::Gitlab {
+            return self.avatar(avatar);
+        }
+        // Only the configured project API receives credentials. Advertised image
+        // URLs can name arbitrary hosts and are always fetched anonymously below.
+        let endpoint = format!("{}/avatar", root(self.remote));
+        for attempt in 0..2 {
+            let key = project_avatar_key(&endpoint, self.token.as_deref(), avatar);
+            if let Some(bytes) = self.photo_cache().and_then(|cache| cache.image(&key)) {
+                return Some(bytes);
+            }
+            if let Some(bytes) = self.photo_cache().and_then(|cache| cache.image(avatar)) {
+                return Some(bytes);
+            }
+            let mut request = self
+                .http
+                .agent
+                .get(&endpoint)
+                .header("User-Agent", "git-rustle/0.1")
+                .header("Accept", "image/*");
+            if let Some(token) = &self.token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            let Ok(mut response) = request.call() else {
+                break;
+            };
+            let status = response.status().as_u16();
+            if attempt == 0 && matches!(status, 401 | 403) && self.token.is_none() {
+                self.token = helper_token(self.path, self.remote);
+                if self.token.is_some() {
+                    continue;
+                }
+            }
+            if status != 200 {
+                break;
+            }
+            let Ok(bytes) = response
+                .body_mut()
+                .with_config()
+                .limit(super::super::avatars::MAX_IMAGE)
+                .read_to_vec()
+            else {
+                break;
+            };
+            if image_format(&bytes).is_none() {
+                break;
+            }
+            // A private namespace, including the credential, is hashed into the
+            // ordinary image cache. Public URL lookups cannot access this key;
+            // the normal size/clear controls and clear-generation barrier apply.
+            if let Some(cache) = self.photo_cache() {
+                cache.store_image(&key, &bytes);
+            }
+            return Some(bytes);
+        }
+        // Older GitLab servers or redirects can still expose a public image.
+        // The HTTP agent disables redirects, so a token never follows one.
+        self.avatar(avatar)
     }
 
     pub fn open_requests(&mut self, force: bool) -> Result<Index, String> {
@@ -210,8 +318,257 @@ pub fn branch_url(remote: &Remote, root: Option<&str>, branch: &str) -> Option<S
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::tests::server as raw_server;
     use super::super::tests::{client, fixture, server};
     use super::*;
+
+    const PROJECT_PHOTO: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDAT\x78\xda\x63\xfc\xff\x1f\x00\x03\x03\x02\x00\xef\xa3\xf9\x84\x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
+    #[test]
+    fn gitlab_relative_icons_preserve_instance_prefix_and_reject_unsafe_urls() {
+        let mut remote =
+            Remote::parse("origin", "git@alias:team/project.git", Some("gitlab")).unwrap();
+        remote.endpoint =
+            "https://code.example/gitlab/api/v4/projects/team%2Fproject/repository/branches".into();
+        for (avatar, expected) in [
+            (
+                "uploads/project.png",
+                "https://code.example/gitlab/uploads/project.png",
+            ),
+            (
+                "/gitlab/uploads/project.png",
+                "https://code.example/gitlab/uploads/project.png",
+            ),
+            (
+                "https://images.example/p.png",
+                "https://images.example/p.png",
+            ),
+            ("//images.example/p.png", "https://images.example/p.png"),
+        ] {
+            assert_eq!(
+                project_avatar_url(
+                    &remote,
+                    Some("https://code.example/gitlab/team/project"),
+                    avatar
+                )
+                .as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            project_avatar_url(&remote, None, "uploads/p.png").as_deref(),
+            Some("https://code.example/gitlab/uploads/p.png")
+        );
+        for unsafe_url in [
+            "javascript:alert(1)",
+            "http://code.example/p.png",
+            "https://user:secret@code.example/p.png",
+            "",
+        ] {
+            assert!(project_avatar_url(&remote, None, unsafe_url).is_none());
+        }
+        remote.provider = Provider::Github;
+        assert!(project_avatar_url(&remote, None, "/uploads/p.png").is_none());
+    }
+
+    #[test]
+    fn corrected_project_metadata_bypasses_old_negative_icon_cache_and_reuses_disk() {
+        let (url, server) = server(vec![(
+            200,
+            "",
+            json!({
+                "web_url":"https://code.example/gitlab/team/project", "avatar_url":"uploads/p.png"
+            }),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(Provider::Gitlab, &url, dir.path());
+        let mut client = client(dir.path(), &remote);
+        client.no_cache = false;
+        client.write("project-icon-v1", &Project::default());
+        let project = client.project(false).unwrap();
+        assert_eq!(
+            project.avatar.as_deref(),
+            Some("https://code.example/gitlab/uploads/p.png")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(client.project(false).unwrap().avatar, project.avatar);
+    }
+
+    #[test]
+    fn gitlab_private_avatar_uses_only_api_credentials_and_partitions_cache() {
+        let (url, server) = raw_server(vec![(200, String::new(), PROJECT_PHOTO.to_vec())]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut remote = fixture(Provider::Gitlab, &url, dir.path());
+        remote.endpoint =
+            format!("{url}/gitlab/api/v4/projects/team%2Fproject/repository/branches");
+        let mut client = client(dir.path(), &remote);
+        client.no_cache = false;
+        let project = Project {
+            web_url: None,
+            avatar: Some("https://unrelated.example/private.png".into()),
+        };
+        assert_eq!(
+            client.project_avatar(&project).as_deref(),
+            Some(PROJECT_PHOTO)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /gitlab/api/v4/projects/team%2Fproject/avatar "));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-only")
+        );
+        // The API socket is gone: this must reuse the credential-bound image.
+        assert_eq!(
+            client.project_avatar(&project).as_deref(),
+            Some(PROJECT_PHOTO)
+        );
+        let endpoint = format!("{}/avatar", root(&remote));
+        let advertised = project.avatar.as_deref().unwrap();
+        let cache = client.photo_cache().unwrap();
+        assert!(cache.image(advertised).is_none());
+        assert!(
+            cache
+                .image(&project_avatar_key(
+                    &endpoint,
+                    Some("another-account"),
+                    advertised
+                ))
+                .is_none()
+        );
+        assert!(
+            cache
+                .image(&project_avatar_key(&endpoint, None, advertised))
+                .is_none()
+        );
+        assert_eq!(cache.stats().unwrap().images, 1);
+        assert_eq!(cache.clear().unwrap().images, 0);
+        assert!(
+            cache
+                .image(&project_avatar_key(
+                    &endpoint,
+                    client.token.as_deref(),
+                    advertised
+                ))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gitlab_avatar_redirect_never_forwards_token_and_can_use_public_cache() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let location = format!(
+            "Location: http://{}/stolen\r\n",
+            target.local_addr().unwrap()
+        );
+        let (url, server) = raw_server(vec![(302, location, Vec::new())]);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(Provider::Gitlab, &url, dir.path());
+        let mut client = client(dir.path(), &remote);
+        client.no_cache = false;
+        let project = Project {
+            web_url: None,
+            avatar: Some("https://public.example/p.png".into()),
+        };
+        client.write(
+            &format!("image-{}", project.avatar.as_deref().unwrap()),
+            &PROJECT_PHOTO,
+        );
+        assert_eq!(
+            client.project_avatar(&project).as_deref(),
+            Some(PROJECT_PHOTO)
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(
+            matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn gitlab_project_avatar_reuses_public_cache_without_api_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(
+            Provider::Gitlab,
+            &format!("http://{}", listener.local_addr().unwrap()),
+            dir.path(),
+        );
+        let mut client = client(dir.path(), &remote);
+        client.no_cache = false;
+        let project = Project {
+            web_url: None,
+            avatar: Some("https://public.example/p.png".into()),
+        };
+        client
+            .photo_cache()
+            .unwrap()
+            .store_image(project.avatar.as_deref().unwrap(), PROJECT_PHOTO);
+        assert_eq!(
+            client.project_avatar(&project).as_deref(),
+            Some(PROJECT_PHOTO)
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    #[ignore = "one warm-up and 15 controlled GitLab project icon samples"]
+    fn benchmark_gitlab_project_icon() {
+        let (url, server) = raw_server(
+            (0..16)
+                .map(|_| (200, String::new(), PROJECT_PHOTO.to_vec()))
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(Provider::Gitlab, &url, dir.path());
+        let mut client = client(dir.path(), &remote);
+        client.no_cache = false;
+        for sample in 0..16 {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(
+                    project_avatar_url(
+                        &remote,
+                        Some("https://code.example/gitlab/team/project"),
+                        "uploads/p.png",
+                    )
+                    .unwrap(),
+                );
+            }
+            let normalize_1000_ms = started.elapsed().as_secs_f64() * 1000.;
+            let project = Project {
+                web_url: Some("https://code.example/gitlab/team/project".into()),
+                avatar: Some(format!("https://code.example/gitlab/uploads/{sample}.png")),
+            };
+            client.write("project-icon-v2", &project);
+            let started = std::time::Instant::now();
+            let cached = client.project(false).unwrap();
+            let metadata_cache_ms = started.elapsed().as_secs_f64() * 1000.;
+            assert_eq!(cached.avatar, project.avatar);
+            let started = std::time::Instant::now();
+            let downloaded = client.project_avatar(&project).unwrap();
+            let api_icon_ms = started.elapsed().as_secs_f64() * 1000.;
+            let started = std::time::Instant::now();
+            let cached = client.project_avatar(&project).unwrap();
+            let cached_icon_ms = started.elapsed().as_secs_f64() * 1000.;
+            assert_eq!(downloaded, PROJECT_PHOTO);
+            assert_eq!(cached, downloaded);
+            if sample != 0 {
+                println!(
+                    "{}",
+                    json!({"sample":sample,"normalize_1000_ms":normalize_1000_ms,
+                    "metadata_cache_ms":metadata_cache_ms,"api_icon_ms":api_icon_ms,"cached_icon_ms":cached_icon_ms})
+                );
+            }
+        }
+        assert_eq!(server.join().unwrap().len(), 16);
+        assert_eq!(client.photo_cache().unwrap().stats().unwrap().images, 16);
+        assert_eq!(client.photo_cache().unwrap().clear().unwrap().images, 0);
+    }
 
     #[test]
     fn provider_pagination_project_icons_and_offline_cache_reuse() {

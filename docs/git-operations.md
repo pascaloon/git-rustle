@@ -6,6 +6,14 @@ into the current branch, rebase onto it, or prepare an interactive rebase. The
 review names both the selected commit (including branch/tag labels) and the
 current branch. Changing the current branch or HEAD invalidates that review.
 
+Right-click one local commit and choose **Create tag…** to name that exact commit.
+An empty annotation creates a lightweight tag; adding a message creates an unsigned
+annotated tag with your Git identity. Existing tags are never replaced. Tags stay
+local until you publish them with Git. Creating a tag preserves HEAD, staging and
+working files, and supports Undo/Redo. Missing remote-preview commits must be
+fetched before tagging. The selected full commit ID remains fixed while the dialog
+is open, even if the current branch advances.
+
 Commits carrying local branch labels also offer **Rename <branch>** and
 **Delete <branch>**. Each branch has its own menu entry. Delete uses Git's normal
 merged-work checks; there is no ambiguous "delete unmerged" action. The current
@@ -89,7 +97,9 @@ History is per worktree and persists in its Git directory under
 `rustle-operations/journal.json`. Checkpoints include HEAD, refs, local config,
 the index, and Git trees for staged and working files (including untracked files,
 excluding ignored files). `refs/rustle/checkpoints/` protects checkpoint objects
-from garbage collection and is excluded from Rustle's graph. Recovery objects are
+from garbage collection and is excluded from Rustle's graph. Created tag objects
+are retained separately under `refs/rustle/tag-checkpoints/` so redo still works
+after undo and garbage collection. Recovery objects are
 retained even when history is invalidated; the visible list retains 100 operations.
 Checkpoint storage can grow with edited files. Do not delete it while recovery
 is needed. Normal branch pushes do not publish recovery refs; `git push --mirror`
@@ -120,12 +130,26 @@ HEAD, refs, config and working files are not a single filesystem transaction.
 
 ## Performance validation
 
+For tag creation, the focused
+[`benchmark-tags-toolbar.ps1`](../scripts/benchmark-tags-toolbar.ps1) bundle runs
+fresh native dialog/submit-to-tag-label measurements in disposable repositories,
+the candidate `benchmark_tags` create/undo/redo harness for both tag types, and
+shared desktop mutation plus large-worktree journal comparisons against preserved
+baseline test executables. See the [main workflow](benchmarking.md#gpui-desktop-current-implementation)
+for its exact invocation and timing boundaries. It reuses an existing large local
+mirror for startup/search/scroll comparisons while recording new samples; it
+never creates tags there. Preserve app and test baselines before edits, use fast
+builds only for functional smoke, and finish final release validation/builds before
+the sequential measurements. Physical typing, Git hooks in real projects, public
+provider latency and display scanout require separate evidence.
+
 Use the main [benchmark workflow](benchmarking.md). Preserve the release baseline
 before implementation. Compare native startup and scrolling against that binary,
 then measure mutation workers and UI delivery separately:
 
 ```powershell
 cargo test --release git::operations::tests::benchmark_operations -- --ignored --exact --nocapture
+cargo test --release git::operations::tests::benchmark_tags -- --ignored --exact --nocapture
 cargo test --release git::operations::tests::benchmark_large_worktree_operations -- --ignored --exact --nocapture
 cargo test --release engine::tests::benchmark_desktop_mutations -- --ignored --exact --nocapture
 cargo test --release engine::tests::benchmark_desktop_push_refresh -- --ignored --exact --nocapture

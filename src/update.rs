@@ -97,7 +97,7 @@ pub fn check() -> Result<Checked, String> {
     check_and_record_at(API, VERSION, &path, now())
 }
 
-fn check_and_record_at(
+pub(crate) fn check_and_record_at(
     api: &str,
     current: &str,
     path: &Path,

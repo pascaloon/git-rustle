@@ -68,7 +68,7 @@ if (Test-Path -LiteralPath $providerFixture) {
     $samples = Get-Content -LiteralPath $providerFixture -Raw | ConvertFrom-Json
     $rows += Metric 'provider-loopback-complete-fixture-process' @() $samples.elapsedMs
 }
-$rows | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $OutputDirectory 'summary.json')
+ConvertTo-Json -InputObject @($rows) -Depth 4 | Set-Content (Join-Path $OutputDirectory 'summary.json')
 $lines = @('| Metric | Baseline median/p95 ms | Candidate median/p95 ms | Median delta | p95 delta | Samples B/C |',
     '| --- | ---: | ---: | ---: | ---: | ---: |')
 foreach ($row in $rows) {

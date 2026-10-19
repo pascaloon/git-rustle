@@ -15,6 +15,14 @@ before timing, and run suites sequentially on an unlocked desktop.
 
 ## Additional scenario scripts
 
+[`benchmark-tags-toolbar.ps1`](../../scripts/benchmark-tags-toolbar.ps1) is the
+focused tag/count-slot bundle: shared startup/search/scroll, verified native
+toolbar bounds, disposable tag-dialog/tag-create fixtures, and bounded shared plus
+tag-specific operation workers. Its companion
+[`summarize-tags-toolbar.ps1`](../../scripts/summarize-tags-toolbar.ps1) retains
+absolute/percentage median and p95 deltas. See the main workflow for inputs,
+fixture reuse and measurement limitations.
+
 The parameterized [`benchmark-app-improvements.ps1`](../../scripts/benchmark-app-improvements.ps1)
 bundles startup, graph/search/branches/status panels, focused search/provider
 actions, controlled component measurements and fresh cached remote-preview delivery.

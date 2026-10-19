@@ -4,6 +4,8 @@ use crate::remote::{self, Configuration, Provider};
 use crate::term::{KeyCode, KeyEvent};
 use std::path::Path;
 
+pub const GENERAL_PAGE: usize = 3;
+
 impl Provider {
     pub fn key(self) -> &'static str {
         match self {
@@ -119,6 +121,13 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub fn provider_index(&self) -> Option<usize> {
+        match self.page {
+            1 => Some(0),
+            2 => Some(1),
+            _ => None,
+        }
+    }
     pub fn show(&mut self) {
         self.session = self.session.wrapping_add(1);
         self.open = true;
@@ -154,8 +163,8 @@ impl Settings {
                 self.status = "Project settings apply here. GitLab and GitHub settings apply to all projects.".into();
             }
             Outcome::SavedPage(Ok(message)) => {
-                if self.page > 0 {
-                    let draft = &mut self.providers[self.page - 1];
+                if let Some(index) = self.provider_index() {
+                    let draft = &mut self.providers[index];
                     draft.has_token = !draft.forget && (!draft.token.is_empty() || draft.has_token);
                     draft.saved_url = draft
                         .validated_url(if self.page == 1 {
@@ -231,7 +240,7 @@ impl Settings {
     }
 
     pub fn save_page(&mut self) {
-        if self.busy {
+        if self.busy || self.page == GENERAL_PAGE {
             return;
         }
         self.request = if self.page == 0 {
@@ -239,19 +248,21 @@ impl Settings {
                 .get(self.project_selected)
                 .cloned()
                 .map(Request::SaveProject)
-        } else {
+        } else if let Some(index) = self.provider_index() {
             let provider = if self.page == 1 {
                 Provider::Gitlab
             } else {
                 Provider::Github
             };
-            let draft = self.providers[self.page - 1].clone();
+            let draft = self.providers[index].clone();
             if let Err(error) = draft.validated_url(provider) {
                 self.status = error;
                 self.error = true;
                 return;
             }
             Some(Request::SaveProvider(provider, draft))
+        } else {
+            None
         };
         if self.request.is_some() {
             self.busy = true;
@@ -723,5 +734,26 @@ mod tests {
         );
         assert!(!settings.providers[1].has_token);
         assert_eq!(settings.providers[1].url, "https://github.com");
+    }
+
+    #[test]
+    fn general_page_never_indexes_or_saves_provider_drafts() {
+        let mut settings = Settings {
+            page: GENERAL_PAGE,
+            ..Default::default()
+        };
+        settings.providers[0].url = "https://gitlab.example".into();
+        settings.providers[1].url = "https://github.example".into();
+        assert_eq!(settings.provider_index(), None);
+        settings.save_page();
+        assert!(settings.request.is_none());
+        assert!(!settings.busy && !settings.saving);
+        settings.finish(Outcome::SavedPage(Ok("unrelated completion".into())));
+        assert_eq!(settings.providers[0].url, "https://gitlab.example");
+        assert_eq!(settings.providers[1].url, "https://github.example");
+        settings.page = 1;
+        assert_eq!(settings.provider_index(), Some(0));
+        settings.page = 2;
+        assert_eq!(settings.provider_index(), Some(1));
     }
 }

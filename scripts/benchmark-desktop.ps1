@@ -46,6 +46,24 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -eq 'filter-visuals' -and
+        $state -notmatch 'filter_visual_verified=true filter_visual_states=7 branch_owner_verified=true head_badge_painted=true') {
+        throw "Filter focus/blur, branch author matches or HEAD paint were not verified: $log"
+    }
+    if ($scenario -in @('general-settings','general-tabs') -and
+        $state -notmatch 'settings_page=3 general_verified=true') {
+        throw "General settings did not finish verified on its own page: $log"
+    }
+    if ($scenario -eq 'general-settings' -and
+        ($state -notmatch 'general_update_requests=3 general_update_downloads=0' -or
+         $state -notmatch 'image_cache_bytes=0 image_cache_images=0 image_cache_busy=false image_cache_cleared=true')) {
+        throw "Manual update checks or isolated cache reset did not finish correctly: $log"
+    }
+    if ($scenario -eq 'toolbar-counts' -and
+        ($state -notmatch 'toolbar_bounds_verified=true' -or $state -notmatch 'toolbar_frames=120' -or
+         $state -notmatch 'toolbar_contexts=4' -or $state -notmatch 'toolbar_states=6')) {
+        throw "Toolbar count states or bounds were not fully verified: $log"
+    }
     if ($scenario -in @('search-focus','branch-search-focus','search-clear','search-clear-multi','provider-scroll','provider-menu') -and
         $state -notmatch 'improvement_verified=true') { throw "Native improvement scenario did not verify its final frame: $log" }
     if ($scenario -eq 'search-clear-multi' -and $state -notmatch 'improvement_selected=2(?:\s|$)') {
@@ -85,7 +103,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -in @('avatar-cache','avatar-cache-busy') -and $state -notmatch 'avatar_visible_ready=[1-9]') {
         throw "Expected a cached photo on the first visible graph row: $log"
     }
-    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll','provider-scroll') -and
+    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll','provider-scroll','toolbar-counts') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
         throw "Candidate did not install syntax colors: $log"
@@ -100,8 +118,11 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        { $_ -in 'filter-visuals','general-settings' } { 'desktop scenario frame' }
+        'general-tabs' { 'desktop scroll done' }
         { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop scenario frame' }
         'provider-scroll' { 'desktop scroll done' }
+        'toolbar-counts' { 'desktop scroll done' }
         { $_ -in 'settings-cache','settings-cache-clear' } { 'desktop scenario frame' }
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'desktop scenario frame' }
         'request-compose' { 'request composer ready' }
@@ -136,6 +157,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        'filter-visuals' { 'desktop filter requested' }
+        'general-settings' { 'general settings requested' }
         { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop improvement requested' }
         'settings-cache' { 'image cache requested' }
         'settings-cache-clear' { 'image cache clear requested' }
@@ -155,13 +178,21 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'remote-diff' { 'remote diff requested' }
         'remote-pair' { 'remote diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available','provider-scroll')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','general-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available','provider-scroll','toolbar-counts')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
+    $toolbarHandler = if ($state -match 'toolbar_handler_ms=(\[[^\]\r\n]*\])') { @($Matches[1] | ConvertFrom-Json) } else { @() }
+    $generalMetrics = if ($scenario -eq 'general-settings') {
+        $checks = if ($state -match 'general_checks_ms=(\[[^\]\r\n]*\])') { @($Matches[1] | ConvertFrom-Json) } else { @() }
+        if ($checks.Count -ne 3) { throw 'Expected current/available/error manual-check frame timings' }
+        if ($state -notmatch 'general_cache_clear_frame_ms=Some\(([\d.]+)\)') { throw 'Missing cache-clear-to-frame duration' }
+        [pscustomobject]@{currentCheckMs=$checks[0];availableCheckMs=$checks[1];errorCheckMs=$checks[2];cacheClearFrameMs=[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}
+    } else { $null }
+    if ($scenario -eq 'toolbar-counts' -and $toolbarHandler.Count -ne 24) { throw 'Expected 24 toolbar state-transition CPU samples' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]
     $syntaxMs = if ($syntax -and $marks.ContainsKey('file diff requested')) { $marks[$syntax] - $marks['file diff requested'] } else { $null }
     $presentedMs = if ($marks.ContainsKey('file diff requested')) { $marks['desktop scenario frame'] - $marks['file diff requested'] } else { $null }
-    [pscustomobject]@{syntaxReadyMs=$syntaxMs;scenarioFrameAfterRequestMs=$presentedMs;binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}
+    [pscustomobject]@{generalMetrics=$generalMetrics;toolbarHandlerMs=$toolbarHandler;syntaxReadyMs=$syntaxMs;scenarioFrameAfterRequestMs=$presentedMs;binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}
 }
 try {
     $env:GIT_RUSTLE_TIMING='1'; $env:GIT_RUSTLE_AUTOQUIT='100'

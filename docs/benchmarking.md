@@ -10,6 +10,104 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+For branch-author search, active-filter/HEAD styling, GitLab icons and General
+settings, use the focused sequential runner:
+
+```powershell
+.\scripts\benchmark-branches-settings.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -BaselineHarness $baselineTestExe `
+  -Candidate $candidateExe -CandidateHarness $candidateTestExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'suite')
+```
+
+Preserve both baseline binaries from the exact initial source, including existing
+uncommitted work. When building an archived baseline in a shared Cargo target,
+force a package-only clean before each source tree's build: Cargo can reuse a
+same-package test artifact across manifest paths. Preserve application and test
+executables outside that target before cleaning, and verify source fingerprints.
+Build the final candidate and finish checks before measurements.
+
+This bundle compares startup, graph/search scrolling, branch activity and existing
+settings tabs. A combined native filter scenario checks real focus/blur, clearing,
+author-only branch matches and HEAD painting; General scenarios cover four tabs,
+isolated cache reset and forced loopback update checks (current/available/error),
+including duplicate-check suppression and zero downloads. Provider menu/scroll
+scenarios retain dense badge and context-menu coverage. Shared component harnesses
+cover 1,000 branch tips, request-cache reading, visible-label lookup and update
+checks; new components measure author filtering at 1,000/10,000 entries and
+GitLab icon normalization, authenticated loopback download and cache reuse.
+The branch component's drawing measurement uses the legacy adapter; native
+scrolling is measured separately. Loopback tests cannot establish access to an
+employer's GitLab network or validate its configured credentials.
+
+Each native group and component uses one warm-up and 15 retained samples. Native
+baseline/candidate launch order alternates; component binaries run separately,
+with order reversed between shared harnesses. Report median/p95 and absolute as
+well as percentage differences, and inspect per-launch frame means. Keep raw
+samples, initial/final source fingerprints, failed smoke logs and a Markdown
+report in the ignored run folder. Prior measurements are not substitutes. Stages
+can be resumed with `-Stages` without overwriting completed results, and
+`summarize-branches-settings.ps1` rebuilds tables without rerunning measurements.
+
+For tag creation and the fixed graph-count slot, use the focused sequential
+[`benchmark-tags-toolbar.ps1`](../scripts/benchmark-tags-toolbar.ps1) runner:
+
+```powershell
+.\scripts\benchmark-tags-toolbar.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -BaselineHarness $baselineTestExe `
+  -Candidate $candidateExe -CandidateHarness $candidateTestExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'suite')
+```
+
+Preserve both baseline executables before implementation, validate native hooks
+with a fast-profile functional smoke first, then finish final release tests,
+Clippy and builds before timing. The runner executes already-built harnesses
+directly and rejects competing compilers. A previously prepared large local-origin
+mirror may be reused to avoid fixture setup; collect new measurements for the new
+implementation. Record its identity/refs, both application and harness hashes,
+and any known harness-source differences. An earlier compatible test executable
+is valid only when the shared measured production functions are unchanged; explain
+that limitation instead of assigning it the current source revision.
+
+Shared native measurements are startup (warm/uncached), normal/searched graph
+scrolling and search delivery. Candidate-only `toolbar-counts` verifies unchanged
+search/count bounds across six count states and four width/count-size contexts,
+with 120 measured native frame intervals and 24 real state-transition CPU samples
+per launch. Query-result and resize waits precede sampling; handler CPU is reported
+separately from event-loop/layout/paint intervals. Inspect 15 per-launch means as
+well as correlated pooled values. Bounds assertions are layout evidence, not
+physical pointer or scanout latency.
+
+Native `tag-dialog` and `tag-create` use a fresh four-commit repository for every
+launch. Opening times action-to-frame without submitting. Creation uses the real
+dialog/inputs/submit path and times submission through a refreshed graph tag label.
+The runner independently verifies the annotated `bench-tag` at the frozen selected
+commit (`HEAD~1`), its message, unchanged HEAD/branches and a clean worktree.
+All mutations remain in those disposable fixtures, never the reused large mirror.
+The candidate `git::operations::tests::benchmark_tags` harness measures lightweight
+and annotated creation plus undo/redo (one warm-up and 15 values for each type),
+asserting preservation of HEAD, staging, working and untracked contents.
+
+The bounded shared worker comparisons are
+`engine::tests::benchmark_desktop_mutations` and
+`git::operations::tests::benchmark_large_worktree_operations`. These cover normal
+commit/checkout delivery and the checkpoint create/undo/redo path with 1,001 files,
+clean and dirty. Each harness has its own warm-up and 15 samples per measured
+mode. The two binaries run as separate harness blocks; order reverses between
+the shared harnesses, rather than interleaving internal samples. Their worker
+and Git-process costs exclude native painting; engine polling has approximately
+2 ms resolution. Broader merge/rebase/push suites are unnecessary for this bundle
+unless implementation expands into those paths.
+
+Use `-Stages Startup,History,Toolbar,Tags,Workers` to select unfinished stages;
+existing stage results are retained. `-Samples` controls native launches only;
+the component harnesses retain their fixed 15 samples. Save raw output, failures,
+source/fixture integrity checks, acceptance criteria and the final report under
+the new ignored run folder. `summarize-tags-toolbar.ps1` regenerates tables without
+running measurements. Candidate-only features cannot establish a speedup against
+the baseline; fast-profile smoke timings and previous-run samples are not final
+release performance evidence.
+
 For the graph/search/provider usability bundle, use the sequential
 [app-improvements runner](../scripts/benchmark-app-improvements.ps1). Preserve the
 application baseline before editing and finish every build first. Pass the final

@@ -1,6 +1,7 @@
 param(
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [int]$Samples = 15,
+    [switch]$RejectCompetingBuilds,
     [string[]]$Scenarios = @('operations','operations-create','rebase-plan','history'),
     [Parameter(Mandatory)][string]$OutputDirectory
 )
@@ -31,6 +32,11 @@ function Run-One([string]$scenario, [int]$sample) {
         Git $root @('add','.') | Out-Null
         Git $root @('commit','-qm',"Commit $i") | Out-Null
     }
+    if ($scenario -in @('tag-dialog','tag-create')) {
+        $headBefore = Git $root @('rev-parse','HEAD')
+        $previousCommit = Git $root @('rev-parse','HEAD~1')
+        $headsBefore = Git $root @('for-each-ref','--format=%(refname) %(objectname)','refs/heads')
+    }
     if ($scenario -like 'push-review*') {
         $remote = Join-Path $OutputDirectory "$scenario-$sample-remote.git"
         Git $root @('clone','--bare',$root,$remote) | Out-Null
@@ -46,10 +52,12 @@ function Run-One([string]$scenario, [int]$sample) {
     $env:GIT_RUSTLE_SCENARIO = $scenario
     $env:GIT_RUSTLE_DUMP = Join-Path $OutputDirectory "$scenario-$sample-state.txt"
     $log = Join-Path $OutputDirectory "$scenario-$sample.txt"
+    if ($RejectCompetingBuilds -and @(Get-Process cargo,rustc,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     # Visible native frames are required by the rendering benchmark workflow.
     $process = Start-Process -FilePath $Candidate -ArgumentList @('"' + $root + '"') -WindowStyle Normal -RedirectStandardError $log -PassThru
     if (-not $process.WaitForExit(60000)) { Stop-Process -Id $process.Id; throw "Timed out: $log" }
     $process.Refresh()
+    if ($RejectCompetingBuilds -and @(Get-Process cargo,rustc,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     if ($process.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $start = [regex]::Match($text, '([\d.]+) ms  desktop operation requested')
@@ -60,6 +68,24 @@ function Run-One([string]$scenario, [int]$sample) {
         if ((Get-Content $env:GIT_RUSTLE_DUMP -Raw) -notmatch 'operations=1 cursor=1') { throw 'History entry missing.' }
     }
     $state = Get-Content $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -in @('tag-dialog','tag-create')) {
+        if ($state -notmatch 'tag_scenario_verified=true') { throw "Tag scenario failed native validation: $log" }
+        if ((Git $root @('rev-parse','HEAD')) -ne $headBefore -or
+            (Git $root @('for-each-ref','--format=%(refname) %(objectname)','refs/heads')) -ne $headsBefore -or
+            (Git $root @('status','--porcelain=v1'))) { throw 'Tag scenario changed HEAD, branches or worktree' }
+        if ($scenario -eq 'tag-dialog') {
+            if ($state -notmatch 'dialog=Some\(CreateTag\)' -or (Git $root @('tag','--list','bench-tag'))) {
+                throw 'Expected an unsubmitted tag dialog and no created tag'
+            }
+        } else {
+            if ($state -notmatch 'tag_scenario_created=true tag_scenario_label=true' -or
+                (Git $root @('rev-parse','bench-tag^{commit}')) -ne $previousCommit -or
+                (Git $root @('cat-file','-t','refs/tags/bench-tag')) -ne 'tag' -or
+                (Git $root @('for-each-ref','--format=%(contents:subject)','refs/tags/bench-tag')) -ne 'Benchmark annotation') {
+                throw 'Expected an annotated tag at the frozen selected commit and its refreshed graph label'
+            }
+        }
+    }
     $expected = switch ($scenario) { 'push-review' { 'Trivial' }; 'push-review-orange' { 'Rewrite' }; 'push-review-red' { 'Blocked' } }
     if ($expected -and $state -notmatch "push=Some\($expected\)") { throw "Unexpected push review: $state" }
     if ($scenario -eq 'rebase-plan' -and $state -notmatch 'rebase_open=true') { throw 'Rebase plan tab missing.' }

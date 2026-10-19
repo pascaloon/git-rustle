@@ -18,6 +18,8 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod filter_bench;
+mod general_bench;
 mod image_cache;
 mod improvement_bench;
 mod landing;
@@ -26,6 +28,7 @@ mod provider;
 mod rebase;
 mod requests;
 mod status;
+mod toolbar_bench;
 mod update;
 
 pub fn run(mut engine: Engine) {
@@ -145,6 +148,7 @@ enum Action {
     SaveSettings,
     ForgetToken,
     ClearImages,
+    CheckUpdates,
 }
 
 struct Desktop {
@@ -154,6 +158,9 @@ struct Desktop {
     provider: provider::State,
     image_cache: image_cache::State,
     improvement_bench: improvement_bench::State,
+    toolbar_bench: toolbar_bench::State,
+    filter_bench: filter_bench::State,
+    general_bench: general_bench::State,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
@@ -265,15 +272,76 @@ fn search_query(field: &str, text: &str) -> String {
     }
 }
 
-fn toolbar_filter(input: &Entity<InputState>, cx: &App) -> Input {
-    Input::new(input)
+fn search_has_terms(text: &str) -> bool {
+    let text = text.trim();
+    let terms = if matches!(text.get(..2), Some("m:" | "a:" | "s:" | "f:")) {
+        &text[2..]
+    } else {
+        text
+    };
+    !terms.trim().is_empty()
+}
+
+#[derive(IntoElement)]
+struct ToolbarFilter {
+    input: Input,
+    state: Entity<InputState>,
+    active: bool,
+    observer: Option<filter_bench::Observer>,
+}
+
+impl ToolbarFilter {
+    fn prefix(mut self, prefix: impl IntoElement) -> Self {
+        self.input = self.input.prefix(prefix);
+        self
+    }
+}
+
+impl RenderOnce for ToolbarFilter {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focused = self.state.read(cx).focus_handle(cx).is_focused(window);
+        let border = if focused {
+            ACCENT
+        } else if self.active {
+            FILTER_ACTIVE_BORDER
+        } else {
+            LINE
+        };
+        let background = if self.active { FILTER_ACTIVE_BG } else { BG };
+        if let Some(observer) = self.observer {
+            observer.record(self.active, focused, border, background);
+        }
+        // Own the appearance so the clear-button suffix shares the warm tint.
+        // Input's focus, editor, keyboard and mouse behavior remain unchanged.
+        self.input
+            .appearance(false)
+            .border_1()
+            .rounded_md()
+            .border_color(rgb(border))
+            .bg(rgb(background))
+    }
+}
+
+fn toolbar_filter(
+    input: &Entity<InputState>,
+    active: bool,
+    observer: Option<filter_bench::Observer>,
+    cx: &App,
+) -> ToolbarFilter {
+    let element = Input::new(input)
         .small()
         .min_h(px(30.))
         .py_0()
         .cleanable(true)
         .when(input.read(cx).value().is_empty(), |s| {
             s.prefix(icon("search").text_color(rgb(MUTED)))
-        })
+        });
+    ToolbarFilter {
+        input: element,
+        state: input.clone(),
+        active,
+        observer,
+    }
 }
 
 fn tab_bar() -> Div {
@@ -347,6 +415,27 @@ impl Desktop {
             )
             .into_any_element()
     }
+    fn create_tag_action(&self) -> Option<(Action, bool)> {
+        let app = &self.engine.app;
+        if app.pending.selected {
+            return None;
+        }
+        let id = self.selected_commits.checkout_target(app.selected_id())?;
+        let enabled = !self.engine.operation_busy
+            && !app.pending.busy
+            && !app.branches.busy
+            && !app.settings.saving
+            && self.engine.operations.conflict.is_none()
+            && !app.ghosts.contains_key(&id);
+        Some((
+            Action::Operation(Box::new(operations::Action::Open(
+                operations::Dialog::CreateTag,
+                id.to_string(),
+                id.to_hex_with_len(12).to_string(),
+            ))),
+            enabled,
+        ))
+    }
     fn commit_menu(
         &self,
         position: Point<Pixels>,
@@ -385,6 +474,9 @@ impl Desktop {
                 enabled_checkout,
             ),
         ];
+        if let Some((action, enabled)) = self.create_tag_action() {
+            items.push((action, "tag", "Create tag…".into(), enabled));
+        }
         if enabled_checkout && let Some(id) = app.selected_id() {
             let target = id.to_string();
             let labels = app
@@ -535,8 +627,8 @@ impl Desktop {
         let operations = operations::Panel::new(window, cx);
         engine.mark("GPUI window ready");
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search commits…"));
-        let branch_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter branches…"));
+        let branch_filter = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Filter branches or latest author…"));
         let description = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -559,7 +651,7 @@ impl Desktop {
         let subscriptions = vec![
             cx.subscribe_in(&token, window, |v, state, event, window, cx| {
                 if matches!(event, InputEvent::Focus)
-                    && v.engine.app.settings.page > 0
+                    && v.engine.app.settings.provider_index().is_some()
                     && state.read(cx).value() == crate::provider_settings::MASK
                 {
                     window.defer(cx, |window, cx| {
@@ -645,6 +737,12 @@ impl Desktop {
                                         v.engine.mark("forget repository requested");
                                         v.engine.forget_repository(path);
                                     }
+                                }
+                                Some("general-settings" | "general-tabs") => v.general_scenario_start(window, cx),
+                                Some("filter-visuals") => v.filter_scenario_start(window, cx),
+                                Some("toolbar-counts") => v.toolbar_scenario_start(window, cx),
+                                Some("tag-dialog" | "tag-create") => {
+                                    v.tag_scenario_start(v.scenario.as_deref() == Some("tag-create"), window, cx);
                                 }
                                 Some("operations" | "operations-create") => {
                                     v.operation_action(
@@ -809,6 +907,7 @@ impl Desktop {
                             }
                         }
                         v.improvement_scenario_tick(window, cx);
+                        v.general_scenario_tick(window, cx);
                         if v.scenario_started && v.scenario.as_deref() == Some("settings-cache-clear")
                             && !v.image_cache.busy && v.image_cache.stats.is_some()
                             && !v.image_cache.cleared
@@ -901,6 +1000,9 @@ impl Desktop {
             provider: Default::default(),
             image_cache: Default::default(),
             improvement_bench: Default::default(),
+            toolbar_bench: Default::default(),
+            filter_bench: Default::default(),
+            general_bench: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
@@ -988,8 +1090,8 @@ impl Desktop {
                         .unwrap_or_default();
                     self.project
                         .update(cx, |s, cx| s.set_value(project, window, cx));
-                } else {
-                    let d = &app.settings.providers[app.settings.page - 1];
+                } else if let Some(index) = app.settings.provider_index() {
+                    let d = &app.settings.providers[index];
                     self.api
                         .update(cx, |s, cx| s.set_value(d.url.clone(), window, cx));
                     self.token
@@ -1140,8 +1242,8 @@ impl Desktop {
                 if let Some(d) = s.projects.get_mut(s.project_selected) {
                     d.project = Some(self.project.read(cx).value().to_string());
                 }
-            } else {
-                let d = &mut s.providers[s.page - 1];
+            } else if let Some(index) = s.provider_index() {
+                let d = &mut s.providers[index];
                 d.url = self.api.read(cx).value().to_string();
                 d.set_token_text(self.token.read(cx).value().to_string());
             }
@@ -1408,7 +1510,7 @@ impl Desktop {
                 }
             }
             Action::SettingsTab(i) => {
-                if !app.settings.busy {
+                if !app.settings.busy && i <= crate::settings::GENERAL_PAGE {
                     app.settings.page = i;
                 }
             }
@@ -1426,9 +1528,12 @@ impl Desktop {
             }
             Action::SaveSettings => app.settings.save_page(),
             Action::ClearImages => {}
+            Action::CheckUpdates => {}
             Action::ForgetToken => {
-                if !app.settings.busy && app.settings.page > 0 {
-                    let d = &mut app.settings.providers[app.settings.page - 1];
+                if !app.settings.busy
+                    && let Some(index) = app.settings.provider_index()
+                {
+                    let d = &mut app.settings.providers[index];
                     d.forget = !d.forget;
                     d.token.clear();
                     self.settings_identity = None;
@@ -1439,11 +1544,19 @@ impl Desktop {
             self.graph_scroll
                 .scroll_to_item(app.graph_selected(), ScrollStrategy::Center);
         }
-        if matches!(
-            action,
-            Action::Settings | Action::Tab(Tab::Settings) | Action::ClearImages
-        ) {
+        if app.settings.page == crate::settings::GENERAL_PAGE
+            && matches!(
+                action,
+                Action::Settings
+                    | Action::Tab(Tab::Settings)
+                    | Action::SettingsTab(crate::settings::GENERAL_PAGE)
+                    | Action::ClearImages
+            )
+        {
             self.image_cache_request(matches!(action, Action::ClearImages), cx);
+        }
+        if matches!(action, Action::CheckUpdates) {
+            self.request_update_check(cx);
         }
         self.changed(cx);
         self.sync_inputs(window, cx);
@@ -1568,7 +1681,10 @@ impl Desktop {
         };
         let text: SharedString = text.into();
         let enabled = (!matches!(action, Action::ClearImages)
-            || (!self.image_cache.busy && self.image_cache.stats.is_some()))
+            || (self.engine.app.settings.page == crate::settings::GENERAL_PAGE
+                && !self.image_cache.busy
+                && self.image_cache.stats.is_some()))
+            && (!matches!(action, Action::CheckUpdates) || self.update_check_enabled())
             && (!matches!(action, Action::Diff)
                 || self.engine.app.pending.selected
                 || matches!(
@@ -1592,8 +1708,9 @@ impl Desktop {
                     && !self.engine.app.settings.saving)
                 || matches!(&action, Action::Operation(a) if matches!(a.as_ref(), operations::Action::Cancel)))
             && (!matches!(action, Action::SaveSettings)
-                || self.engine.app.settings.page > 0
-                || !self.engine.app.settings.projects.is_empty());
+                || (self.engine.app.settings.provider_index().is_some()
+                    || (self.engine.app.settings.page == 0
+                        && !self.engine.app.settings.projects.is_empty())));
         let active = match action {
             Action::SettingsTab(i) => self.engine.app.settings.page == i,
             Action::SettingsProvider(provider) => self
@@ -1724,24 +1841,30 @@ impl Desktop {
             )
             .child(div().flex_1())
             .child(self.search_box(cx))
-            .child(
-                caption(if self.engine.app.search.active() {
-                    format!(
-                        "{}/{}",
-                        self.engine
-                            .app
-                            .search
-                            .result
-                            .as_ref()
-                            .map_or(0, |r| r.rows.len()),
-                        self.engine.app.history.len(),
-                    )
-                } else {
-                    format!("{} commits", self.engine.app.history.len())
-                })
-                .flex_shrink_0(),
-            )
+            .child(self.graph_count())
             .into_any_element()
+    }
+    fn graph_count(&self) -> Div {
+        let app = &self.engine.app;
+        let (total, matched) = self.toolbar_count_values();
+        // Every search state reserves the widest possible count for this total.
+        // Monospace digits keep 0/total, partial results and total/total aligned.
+        let digits = total.max(1).ilog10() as usize + 1;
+        let characters = (digits + " commits".len()).max(digits * 2 + 1);
+        let width = (characters as f32 * 7.2 + 8.).max(104.);
+        let text = if app.search.active() {
+            format!("{matched}/{total}")
+        } else {
+            format!("{total} commits")
+        };
+        div()
+            .relative()
+            .w(px(width))
+            .flex_shrink_0()
+            .text_right()
+            .font_family("Cascadia Mono")
+            .children(self.toolbar_bounds_probe(1))
+            .child(caption(text).whitespace_nowrap())
     }
     fn graph(&self, cx: &mut Context<Self>) -> AnyElement {
         let n = self.engine.app.graph_len();
@@ -1847,7 +1970,29 @@ impl Desktop {
                                     .child(v.matches.styled(rec.id.to_hex_with_len(8).to_string())),
                             );
                             if app.head_id() == Some(rec.id) {
-                                r = r.child(div().text_color(rgb(ACCENT)).child("HEAD"));
+                                r = r.child(
+                                    row()
+                                        .id(("head-badge", row_index))
+                                        .relative()
+                                        .h(px(22.))
+                                        .gap_1()
+                                        .px_2()
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .bg(rgb(ACCENT))
+                                        .text_color(rgb(BG))
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .children(v.filter_head_probe())
+                                        .child(icon("head").size(px(14.)).text_color(rgb(BG)))
+                                        .child("HEAD")
+                                        .tooltip(|window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(
+                                                "Current checkout (HEAD)",
+                                            )
+                                            .build(window, cx)
+                                        }),
+                                );
                             }
                             if let Some(labels) = app.labels.get(&rec.id) {
                                 for (label_index, label) in labels
@@ -2037,22 +2182,34 @@ impl Desktop {
                 }
                 menu
             });
-        div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
-            toolbar_filter(&self.search, cx).prefix(
-                row()
-                    .gap_2()
-                    .child(
-                        div()
-                            .pr_1()
-                            .border_r_1()
-                            .border_color(rgb(LINE))
-                            .child(selector),
-                    )
-                    .when(query.is_empty(), |s| {
-                        s.child(icon("search").text_color(rgb(MUTED)))
-                    }),
-            ),
-        )
+        div()
+            .relative()
+            .flex_1()
+            .min_w(px(180.))
+            .max_w(px(420.))
+            .children(self.toolbar_bounds_probe(0))
+            .child(
+                toolbar_filter(
+                    &self.search,
+                    search_has_terms(&query),
+                    self.filter_probe(0),
+                    cx,
+                )
+                .prefix(
+                    row()
+                        .gap_2()
+                        .child(
+                            div()
+                                .pr_1()
+                                .border_r_1()
+                                .border_color(rgb(LINE))
+                                .child(selector),
+                        )
+                        .when(query.is_empty(), |s| {
+                            s.child(icon("search").text_color(rgb(MUTED)))
+                        }),
+                ),
+            )
     }
     fn scroll_region(
         &self,
@@ -2699,7 +2856,12 @@ impl Desktop {
                             .flex_1()
                             .min_w(px(180.))
                             .max_w(px(420.))
-                            .child(toolbar_filter(&self.branch_filter, cx)),
+                            .child(toolbar_filter(
+                                &self.branch_filter,
+                                !browser.query.is_empty(),
+                                self.filter_probe(1),
+                                cx,
+                            )),
                     ),
             )
             .when(browser.loading, |s| {
@@ -2715,7 +2877,20 @@ impl Desktop {
     fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = &self.engine.app.settings;
         let mut form = column().max_w(px(700.)).gap_3();
-        if settings.page == 0 {
+        if settings.page == crate::settings::GENERAL_PAGE {
+            form = form
+                .child(caption("General settings · shared by all repositories"))
+                .child(
+                    self.update_controls(cx)
+                        .relative()
+                        .children(self.general_settings_probe(0)),
+                )
+                .child(
+                    self.image_cache_controls(cx)
+                        .relative()
+                        .children(self.general_settings_probe(1)),
+                );
+        } else if settings.page == 0 {
             form = form
                 .child(caption("Settings for this project"))
                 .child(caption("Repository path"))
@@ -2786,8 +2961,8 @@ impl Desktop {
                     "No remotes configured. Add one with git remote add, then reopen the app.",
                 ));
             }
-        } else {
-            let draft = &settings.providers[settings.page - 1];
+        } else if let Some(index) = settings.provider_index() {
+            let draft = &settings.providers[index];
             form = form.child(caption("Global settings · shared by all your projects"))
                 .child(caption("Custom server or API URL"))
                 .child(Input::new(&self.api).disabled(settings.busy))
@@ -2807,8 +2982,15 @@ impl Desktop {
             .gap_4()
             .child(div().text_size(px(20.)).child("Settings"))
             .child(
-                tab_bar().children(["Project", "GitLab", "GitHub"].into_iter().enumerate().map(
-                    |(page, label)| {
+                tab_bar().children(
+                    [
+                        (crate::settings::GENERAL_PAGE, "General"),
+                        (0, "Project"),
+                        (1, "GitLab"),
+                        (2, "GitHub"),
+                    ]
+                    .into_iter()
+                    .map(|(page, label)| {
                         tab_item(
                             ("settings-tab", page),
                             settings.page == page,
@@ -2820,30 +3002,45 @@ impl Desktop {
                                 v.action(Action::SettingsTab(page), window, cx)
                             }))
                         })
-                    },
-                )),
+                    }),
+                ),
             )
             .child(form)
-            .child(row().child(self.button(
-                "save",
-                if settings.saving { "Saving…" } else { "Save" },
-                Action::SaveSettings,
-                cx,
-            )))
-            .child(
-                div()
-                    .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
-                    .child(settings.status.clone()),
-            )
-            .child(self.image_cache_controls(cx))
+            .when(settings.page != crate::settings::GENERAL_PAGE, |s| {
+                s.child(row().child(self.button(
+                    "save",
+                    if settings.saving { "Saving…" } else { "Save" },
+                    Action::SaveSettings,
+                    cx,
+                )))
+            })
+            .when(settings.page != crate::settings::GENERAL_PAGE, |s| {
+                s.child(
+                    div()
+                        .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
+                        .child(settings.status.clone()),
+                )
+            })
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if let Some(ready) = self.general_scenario_ready() {
+            return ready;
+        }
+        if let Some(ready) = self.filter_scenario_ready() {
+            return ready;
+        }
+        if let Some(ready) = self.toolbar_scenario_ready() {
+            return ready;
+        }
         if let Some(ready) = self.improvement_scenario_ready() {
             return ready;
         }
         let app = &self.engine.app;
         match self.scenario.as_deref() {
+            Some("tag-dialog" | "tag-create") => {
+                self.tag_scenario_ready(self.scenario.as_deref() == Some("tag-create"))
+            }
             Some("history-clear") => {
                 !self.engine.operation_busy
                     && self.engine.operations.labels.is_empty()
@@ -2958,7 +3155,7 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}",
+                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}\n{}\n{}\n{}",
                 self.status_panel,
                 self.updates.available.is_some(),
                 self.updates.open,
@@ -2971,6 +3168,9 @@ impl Desktop {
                 self.image_cache.busy,
                 self.image_cache.cleared,
                 self.improvement_scenario_summary(),
+                self.toolbar_scenario_summary(),
+                self.filter_scenario_summary(),
+                self.general_scenario_summary(),
             ),
         )
     }
@@ -3028,6 +3228,9 @@ impl Render for Desktop {
                 )
                 .into_any_element()
         };
+        self.toolbar_scenario_schedule(window, cx);
+        self.filter_scenario_schedule(window, cx);
+        self.general_scenario_schedule(window, cx);
         let app = &self.engine.app;
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
@@ -3085,6 +3288,7 @@ impl Render for Desktop {
                             Some("settings-tabs") => {
                                 v.action(Action::SettingsTab(v.scroll_step % 3), window, cx)
                             }
+                            Some("general-tabs") => v.general_scenario_step(window, cx),
                             Some("files-scroll") => {
                                 let n = v
                                     .engine
@@ -3171,6 +3375,13 @@ impl Render for Desktop {
             window.on_next_frame(move |window, cx| {
                 let _ = weak.update(cx, |v, cx| {
                     v.improvement_scenario_assert(window, cx);
+                    if v.scenario.as_deref() == Some("filter-visuals") {
+                        v.filter_scenario_assert();
+                    }
+                    v.general_scenario_assert();
+                    if matches!(v.scenario.as_deref(), Some("tag-dialog" | "tag-create")) {
+                        v.tag_scenario_assert(v.scenario.as_deref() == Some("tag-create"));
+                    }
                     v.scenario_presented = true;
                     v.engine.mark("desktop scenario frame");
                 });

@@ -9,6 +9,7 @@ mod history;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Dialog {
     Create,
+    CreateTag,
     Rename,
     Delete,
     Merge,
@@ -41,6 +42,8 @@ pub(super) struct Panel {
     pub tab: Option<Tab>,
     name: Entity<InputState>,
     _name_subscription: Subscription,
+    annotation: Option<Entity<InputState>>,
+    _annotation_subscription: Option<Subscription>,
     target: String,
     label: String,
     current_branch: String,
@@ -64,6 +67,11 @@ pub(super) struct Panel {
     confirmation: Option<(Request, String)>,
     resolution: Entity<InputState>,
     resolution_source: Option<(String, String)>,
+    tag_scenario_target: Option<gix::ObjectId>,
+    tag_scenario_head: Option<gix::ObjectId>,
+    tag_scenario_submitted: bool,
+    tag_scenario_label: bool,
+    tag_scenario_verified: bool,
 }
 struct PlanControls {
     select: Entity<SelectState<Vec<CommitAction>>>,
@@ -92,7 +100,7 @@ impl Panel {
     }
     pub fn summary(&self) -> String {
         format!(
-            "dialog={:?} rebase_open={} push={:?} plan_rows={} plan_visible={} plan_errors={} history_visible={} history_clear={}",
+            "dialog={:?} rebase_open={} push={:?} plan_rows={} plan_visible={} plan_errors={} history_visible={} history_clear={} tag_scenario_created={} tag_scenario_label={} tag_scenario_verified={}",
             self.dialog,
             self.rebase_open,
             self.push.as_ref().map(|p| &p.risk),
@@ -100,7 +108,10 @@ impl Panel {
             self.plan_visible,
             self.draft.errors,
             self.history_visible,
-            self.history_clear
+            self.history_clear,
+            self.tag_scenario_submitted,
+            self.tag_scenario_label,
+            self.tag_scenario_verified,
         )
     }
     pub fn dismiss(&mut self) -> bool {
@@ -108,7 +119,7 @@ impl Panel {
     }
 
     pub fn new(window: &mut Window, cx: &mut Context<Desktop>) -> Self {
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Branch name"));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
         let subscription = cx.subscribe(&name, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
@@ -118,6 +129,8 @@ impl Panel {
             tab: None,
             name,
             _name_subscription: subscription,
+            annotation: None,
+            _annotation_subscription: None,
             target: String::new(),
             label: String::new(),
             current_branch: String::new(),
@@ -141,10 +154,111 @@ impl Panel {
             confirmation: None,
             resolution: cx.new(|cx| InputState::new(window, cx).multi_line(true)),
             resolution_source: None,
+            tag_scenario_target: None,
+            tag_scenario_head: None,
+            tag_scenario_submitted: false,
+            tag_scenario_label: false,
+            tag_scenario_verified: false,
         }
     }
 }
 impl Desktop {
+    pub(super) fn set_tag_scenario_inputs(
+        &mut self,
+        name: &str,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.operations
+            .name
+            .update(cx, |s, cx| s.set_value(name.to_string(), window, cx));
+        self.operations
+            .annotation
+            .as_ref()
+            .expect("tag dialog annotation")
+            .update(cx, |s, cx| s.set_value(message.to_string(), window, cx));
+    }
+
+    pub(super) fn tag_scenario_start(
+        &mut self,
+        create: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.engine.app.history.len() >= 2,
+            "tag fixture needs two commits"
+        );
+        self.action(super::Action::Select(1, false), window, cx);
+        self.operations.tag_scenario_target = self
+            .selected_commits
+            .checkout_target(self.engine.app.selected_id());
+        self.operations.tag_scenario_head = self.engine.app.head_id();
+        assert_ne!(
+            self.operations.tag_scenario_target,
+            self.operations.tag_scenario_head
+        );
+        let (action, enabled) = self.create_tag_action().expect("selected local tag target");
+        assert!(enabled);
+        if !create {
+            self.engine.mark("desktop operation requested");
+        }
+        self.action(action, window, cx);
+        if create {
+            self.set_tag_scenario_inputs("bench-tag", "Benchmark annotation", window, cx);
+            let weak = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                let _ = weak.update(cx, |v, cx| {
+                    v.engine.mark("desktop operation requested");
+                    v.operations.tag_scenario_submitted = true;
+                    v.operation_action(Action::Submit, window, cx);
+                });
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn tag_scenario_ready(&self, create: bool) -> bool {
+        if !create {
+            return self.operations.dialog == Some(Dialog::CreateTag);
+        }
+        self.operations.tag_scenario_submitted
+            && !self.engine.operation_busy
+            && (self.engine.operation_error
+                || self.operations.tag_scenario_target.is_some_and(|id| {
+                    self.engine.app.labels.get(&id).is_some_and(|labels| {
+                        labels.iter().any(|label| {
+                            label.kind == crate::git::RefKind::Tag && label.name == "bench-tag"
+                        })
+                    })
+                }))
+    }
+
+    pub(super) fn tag_scenario_assert(&mut self, create: bool) {
+        assert_eq!(self.engine.app.head_id(), self.operations.tag_scenario_head);
+        if create {
+            assert!(
+                !self.engine.operation_error,
+                "{}",
+                self.engine.operation_status
+            );
+            assert!(self.tag_scenario_ready(true));
+            assert!(
+                self.engine
+                    .operations
+                    .labels
+                    .iter()
+                    .any(|label| label == "Create tag bench-tag")
+            );
+            self.operations.tag_scenario_label = true;
+        } else {
+            assert_eq!(self.operations.dialog, Some(Dialog::CreateTag));
+            assert!(!self.operations.tag_scenario_submitted);
+        }
+        self.operations.tag_scenario_verified = true;
+    }
+
     pub(super) fn current_branch(&self) -> String {
         self.engine
             .app
@@ -246,7 +360,24 @@ impl Desktop {
                 self.operations
                     .name
                     .update(cx, |s, cx| s.set_value("", window, cx));
-                if matches!(dialog, Dialog::Create | Dialog::Rename) {
+                if dialog == Dialog::CreateTag && self.operations.annotation.is_none() {
+                    let annotation = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .multi_line(true)
+                            .placeholder("Optional annotation message")
+                    });
+                    self.operations._annotation_subscription =
+                        Some(cx.subscribe(&annotation, |_, _, event, cx| {
+                            if matches!(event, InputEvent::Change) {
+                                cx.notify();
+                            }
+                        }));
+                    self.operations.annotation = Some(annotation);
+                }
+                if let Some(annotation) = &self.operations.annotation {
+                    annotation.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+                if matches!(dialog, Dialog::Create | Dialog::CreateTag | Dialog::Rename) {
                     self.operations.name.update(cx, |s, cx| s.focus(window, cx));
                 }
                 self.operations.push = None;
@@ -262,6 +393,21 @@ impl Desktop {
                 let name = self.operations.name.read(cx).value().trim().to_string();
                 let request = match self.operations.dialog {
                     Some(Dialog::Create) => Some(Request::Create { name, target }),
+                    Some(Dialog::CreateTag) => {
+                        let message = self
+                            .operations
+                            .annotation
+                            .as_ref()
+                            .expect("tag dialog annotation")
+                            .read(cx)
+                            .value()
+                            .to_string();
+                        Some(Request::CreateTag {
+                            name,
+                            target,
+                            message: (!message.trim().is_empty()).then_some(message),
+                        })
+                    }
                     Some(Dialog::Rename) => Some(Request::Rename {
                         old: target,
                         new: name,
@@ -963,6 +1109,14 @@ impl Desktop {
                     ),
                     "Create branch",
                 ),
+                Dialog::CreateTag => (
+                    "Create tag",
+                    format!(
+                        "Tag {} locally. Add a message to create an annotated tag.",
+                        op.label
+                    ),
+                    "Create tag",
+                ),
                 Dialog::Rename => (
                     "Rename branch",
                     format!(
@@ -1055,8 +1209,14 @@ impl Desktop {
                 }
             } else {
                 body = body.child(detail);
-                if matches!(dialog, Dialog::Create | Dialog::Rename) {
+                if matches!(dialog, Dialog::Create | Dialog::CreateTag | Dialog::Rename) {
                     body = body.child(Input::new(&op.name));
+                }
+                if dialog == Dialog::CreateTag {
+                    body = body.child(caption("Annotation (optional)")).child(
+                        Input::new(op.annotation.as_ref().expect("tag dialog annotation"))
+                            .h(px(100.)),
+                    );
                 }
                 if matches!(dialog, Dialog::Merge | Dialog::Rebase | Dialog::Plan) {
                     body = body.child(
@@ -1084,7 +1244,9 @@ impl Desktop {
                         .push
                         .as_ref()
                         .is_some_and(|p| p.risk != PushRisk::Blocked),
-                    Dialog::Create | Dialog::Rename => !op.name.read(cx).value().trim().is_empty(),
+                    Dialog::Create | Dialog::CreateTag | Dialog::Rename => {
+                        !op.name.read(cx).value().trim().is_empty()
+                    }
                     _ => true,
                 };
             body = body.child(

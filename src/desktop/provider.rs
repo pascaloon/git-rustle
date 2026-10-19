@@ -3,7 +3,14 @@ use super::*;
 use crate::git::RefKind;
 use crate::remote::requests::integration::{self, Association, Index, Project};
 use crate::remote::{self, Provider, Remote, requests::Client};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+};
 
 struct Entry {
     remote: Remote,
@@ -20,7 +27,7 @@ pub(super) struct State {
     requested: Vec<Remote>,
     pending: bool,
     refreshed: Option<Instant>,
-    session: Arc<()>,
+    session: Arc<AtomicU64>,
     seeded: bool,
     force: bool,
     rendered_badges: std::cell::Cell<usize>,
@@ -86,6 +93,19 @@ fn request_label(provider: Provider, association: &Association) -> String {
 }
 
 impl Desktop {
+    pub(super) fn release_provider_images(&mut self, cx: &mut gpui::App) {
+        let mut released = std::collections::HashSet::new();
+        for entry in self.provider.entries.values_mut() {
+            if let Some(image) = entry.image.take()
+                && released.insert(image.id())
+            {
+                image.remove_asset(cx);
+            }
+        }
+        // A pre-clear download must not restore a removed header image.
+        self.provider.session.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
     pub(super) fn sync_provider(&mut self, cx: &mut Context<Self>) {
         let path = self
             .engine
@@ -129,6 +149,8 @@ impl Desktop {
         self.provider.pending = true;
         self.provider.requested = remotes.clone();
         let session = self.provider.session.clone();
+        let image_generation = session.load(AtomicOrdering::Acquire);
+        let load_images = !self.image_cache.clearing;
         let no_cache = self.engine.no_cache();
         let force = self.provider.force;
         self.provider.force = false;
@@ -190,7 +212,8 @@ impl Desktop {
             }
             for remote in remotes {
                 let load_path = path.clone();
-                let entry = cx
+                let image_session = session.clone();
+                let mut entry = cx
                     .background_executor()
                     .spawn(async move {
                         let mut project = Project::default();
@@ -200,14 +223,14 @@ impl Desktop {
                             project = client.project(force).unwrap_or_default();
                             // A failed list does not create misleading stale 'open' badges.
                             requests = client.open_requests(force).unwrap_or_default();
-                            image = project
-                                .avatar
-                                .as_deref()
-                                .and_then(|u| client.avatar(u))
-                                .and_then(|bytes| {
+                            if load_images
+                                && image_session.load(AtomicOrdering::Acquire) == image_generation
+                            {
+                                image = client.project_avatar(&project).and_then(|bytes| {
                                     remote::requests::image_format(&bytes)
                                         .map(|format| Arc::new(Image::from_bytes(format, bytes)))
                                 });
+                            }
                         }
                         Entry {
                             remote,
@@ -223,6 +246,9 @@ impl Desktop {
                             || !Arc::ptr_eq(&v.provider.session, &session)
                         {
                             return false;
+                        }
+                        if session.load(AtomicOrdering::Acquire) != image_generation {
+                            entry.image = None;
                         }
                         v.provider.entries.insert(entry.remote.name.clone(), entry);
                         cx.notify();
@@ -267,7 +293,7 @@ impl Desktop {
         &self,
         kind: RefKind,
         name: &str,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> Option<Stateful<Div>> {
         let (entry, branch) = self.provider.branch(kind, name)?;
         let requests = entry.requests.get(branch)?;
@@ -281,7 +307,6 @@ impl Desktop {
             .map(|r| format!("{} · {}", request_label(entry.remote.provider, r), r.title))
             .collect::<Vec<_>>()
             .join("\n");
-        let url = request.url.clone();
         self.provider
             .rendered_badges
             .set(self.provider.rendered_badges.get() + 1);
@@ -297,15 +322,10 @@ impl Desktop {
                 .text_size(px(12.))
                 .text_color(rgb(ACCENT_HOVER))
                 .bg(rgb(REMOTE_BG))
-                .cursor_pointer()
                 .child(label)
                 .tooltip(move |w, cx| {
                     gpui_component::tooltip::Tooltip::new(title.clone()).build(w, cx)
-                })
-                .on_click(cx.listener(move |v, _, w, cx| {
-                    v.action(Action::OpenProviderUrl(url.clone()), w, cx);
-                    cx.stop_propagation();
-                })),
+                }),
         )
     }
 

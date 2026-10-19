@@ -5,6 +5,7 @@ use crate::remote::requests::{PhotoCache, PhotoStats};
 #[derive(Default)]
 pub(super) struct State {
     pub busy: bool,
+    pub clearing: bool,
     pub stats: Option<PhotoStats>,
     pub cleared: bool,
     message: String,
@@ -17,6 +18,10 @@ impl Desktop {
             return;
         }
         self.image_cache.busy = true;
+        self.image_cache.clearing = clear;
+        if clear {
+            self.release_provider_images(cx);
+        }
         self.image_cache.cleared = false;
         self.image_cache.message = if clear {
             "Clearing…"
@@ -42,6 +47,7 @@ impl Desktop {
                 .await;
             let _ = view.update(cx, |v, cx| {
                 v.image_cache.busy = false;
+                v.image_cache.clearing = false;
                 match result {
                     Ok(stats) => {
                         v.image_cache.stats = Some(stats);
@@ -50,6 +56,7 @@ impl Desktop {
                             if clear { "Images cache cleared." } else { "" }.into();
                         if clear {
                             v.avatars.release_images(cx);
+                            v.release_provider_images(cx);
                         }
                         v.engine.mark(if clear {
                             "image cache cleared"
@@ -101,7 +108,7 @@ impl Desktop {
             .gap_2()
             .child(div().text_color(rgb(TEXT)).child("Images cache"))
             .child(caption(
-                "Downloaded author photos · shared by all repositories",
+                "Downloaded author and project images · shared by all repositories",
             ))
             .child(
                 row()
