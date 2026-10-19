@@ -195,6 +195,11 @@ impl Desktop {
     }
 
     fn status_messages(&self) -> [Option<Message<'_>>; 9] {
+        if self.engine.landing() {
+            let mut messages = std::array::from_fn(|_| None);
+            messages[0] = message("App", self.notice.as_str(), Level::Error);
+            return messages;
+        }
         messages(
             &self.engine.app,
             &self.engine.operation_status,
@@ -208,9 +213,12 @@ impl Desktop {
     pub(super) fn status_bar(&self, cx: &Context<Self>) -> AnyElement {
         let messages = self.status_messages();
         let primary = primary(&messages);
-        let (text, level) = primary.map_or(("Repository ready", Level::Info), |m| {
-            (m.text.as_ref(), m.level)
-        });
+        let ready = if self.engine.landing() {
+            "Ready"
+        } else {
+            "Repository ready"
+        };
+        let (text, level) = primary.map_or((ready, Level::Info), |m| (m.text.as_ref(), m.level));
         row()
             .id("status-bar")
             .h(px(HEIGHT))
@@ -221,6 +229,7 @@ impl Desktop {
             .border_color(rgb(LINE))
             .bg(rgb(PANEL))
             .text_size(px(12.))
+            .children(self.update_button(cx))
             .child(
                 div()
                     .size(px(6.))

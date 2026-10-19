@@ -32,6 +32,7 @@ mod desktop_theme;
 mod desktop_wrap;
 mod engine;
 mod selectable;
+mod update;
 use std::path::PathBuf;
 use std::time::Instant;
 struct Options {
@@ -66,6 +67,7 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn main() {
+    let draft = update::take_draft();
     let start = Instant::now();
     let opts = match parse_args() {
         Ok(opts) => opts,
@@ -74,5 +76,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    desktop::run(engine::Engine::new(opts.path, opts.no_cache, start));
+    let mut engine = engine::Engine::new(opts.path, opts.no_cache, start);
+    update::restore_draft(&mut engine, draft);
+    desktop::run(engine);
 }

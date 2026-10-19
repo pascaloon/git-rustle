@@ -43,6 +43,9 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -eq 'status-panels' -and $state -notmatch 'footer_panel=Some\(Details\)') {
         throw "Expected the final toggle to leave Details open: $log"
     }
+    if ($scenario -eq 'update-available' -and $state -notmatch 'update_available=true') {
+        throw "Expected an available update without installing it: $log"
+    }
     if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
@@ -69,6 +72,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'tabs' { 'desktop scroll done' }
         'settings-tabs' { 'desktop scroll done' }
         'status-panels' { 'desktop scroll done' }
+        'update-available' { 'desktop scroll done' }
         'compare' { 'file diff (' }
         'branches' { 'branch activity ready' }
         'diff' { 'file diff (' }
@@ -92,7 +96,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll','update-available')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

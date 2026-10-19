@@ -78,6 +78,41 @@ opening its panel. The runner checks that the final Details panel is open. This
 is candidate-only for binaries without the scenario; verify real pointer toggles,
 selected button styling and dismissal separately in the native app.
 
+For application updates, preserve the release executable before editing, then
+compare native startup and `-Scenarios scroll,status-panels` against that baseline.
+Run candidate-only `-Scenarios update-available` on a small disposable repository:
+it shows a synthetic update and alternates its confirmation open/closed for 120
+measured next-frame intervals per launch. Installation is disabled in this scenario.
+The normal benchmark scenarios skip live update checks for reproducibility.
+Verify the footer's absent/available states, pointer opening and Later separately.
+After all builds finish, run the controlled loopback component measurement:
+
+```powershell
+$env:GIT_RUSTLE_UPDATE_BENCH_EXE = (Resolve-Path target/release/git-rustle.exe).Path
+cargo test --release --locked update::tests::benchmark_update -- --ignored --exact --nocapture
+```
+
+Discard any invocation that compiles first. Save the repeated stdout under the
+ignored run folder. The harness discards one warm-up and retains 15 samples of a
+GitHub-format release check and a verified download/install of the full release
+executable to a disposable path. These include loopback HTTP, hashing, disk I/O
+and the crate's replacement path for a non-running destination. They exclude
+public Internet latency, GPUI, restart, and Windows running-image cleanup. The
+separate subprocess regression exercises replacement of a running Windows test
+executable. Record limitations alongside startup and native interaction samples.
+
+For check cadence and cache changes, also run
+`cargo test --release --locked update::tests::benchmark_check -- --ignored --exact --nocapture`.
+It retains one warm-up plus 15 samples each for metadata requests, fresh cache
+reads, and expired-cache requests including persistence. It uses the production
+check/cache functions with a controlled clock and a loopback release server.
+For actual network timing, explicitly run
+`cargo test --release --locked update::tests::benchmark_live_check -- --ignored --exact --nocapture`.
+This makes six unauthenticated, read-only GitHub release requests (one warm-up,
+five measured). Save the raw outcomes as well as durations: a 404 or rate limit
+measures that response, not successful release discovery. These measurements
+exclude UI dispatch/paint and are separate from executable download/install.
+
 For scrollbar or diff rendering changes, also run `-Scenarios files-scroll,diff-scroll,diff-pan`
 against a fixture with hundreds of changed files and a long, wide modified text file.
 These scenarios collect the same 120 frame intervals while moving the file list,

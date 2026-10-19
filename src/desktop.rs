@@ -23,6 +23,7 @@ mod operations;
 mod rebase;
 mod requests;
 mod status;
+mod update;
 
 pub fn run(mut engine: Engine) {
     engine.mark("GPUI initialization requested");
@@ -65,7 +66,8 @@ pub fn run(mut engine: Engine) {
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
                     weak.update(cx, |v, cx| {
-                        if v.composer.as_ref().is_some_and(|c| c.busy())
+                        if v.updates.installing
+                            || v.composer.as_ref().is_some_and(|c| c.busy())
                             || v.engine.operation_busy
                             || v.engine.recents_loading
                             || v.engine.app.pending.busy
@@ -141,6 +143,7 @@ enum Action {
 }
 
 struct Desktop {
+    updates: update::Updates,
     composer: Option<requests::Composer>,
     avatars: requests::Avatars,
     picking_directory: bool,
@@ -529,8 +532,11 @@ impl Desktop {
         });
         let detail_text = cx.new(TextBlock::new);
         let diff_path = cx.new(TextBlock::new);
-        let new_branch =
-            cx.new(|cx| InputState::new(window, cx).placeholder("New branch (optional)"));
+        let new_branch = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("New branch (optional)");
+            state.set_value(engine.app.pending.branch.value.clone(), window, cx);
+            state
+        });
         let api = cx.new(|cx| InputState::new(window, cx).placeholder("API URL"));
         let project = cx.new(|cx| InputState::new(window, cx).placeholder("Project path"));
         let token = cx.new(|cx| {
@@ -596,6 +602,7 @@ impl Desktop {
                         let old = v.engine.app.graph_selected();
                         let saving = v.engine.app.settings.saving;
                         v.engine.tick(message);
+                        v.poll_updates(cx);
                         v.sync_operations(window, cx);
                         v.sync_avatars(cx);
                         if saving && !v.engine.app.settings.saving {
@@ -698,6 +705,11 @@ impl Desktop {
                                 }
                                 Some("status-panels") => {
                                     v.toggle_status_panel(status::Panel::Details);
+                                    v.scroll_step = 1;
+                                    v.frame_start = Some(Instant::now());
+                                    cx.notify();
+                                }
+                                Some("update-available") => {
                                     v.scroll_step = 1;
                                     v.frame_start = Some(Instant::now());
                                     cx.notify();
@@ -810,6 +822,7 @@ impl Desktop {
                             v.engine.autoquit_ready(Duration::from_millis(ms))
                                 && (v.scenario.is_none() || v.scenario_presented)
                         }) || (v.close_requested
+                            && !v.updates.installing
                             && !v.composer.as_ref().is_some_and(|c| c.busy())
                             && !v.engine.operation_busy
                             && !v.engine.recents_loading
@@ -831,6 +844,7 @@ impl Desktop {
         });
         let diff_scroll = UniformListScrollHandle::new();
         Self {
+            updates: Default::default(),
             composer: None,
             avatars: Default::default(),
             picking_directory: false,
@@ -1016,6 +1030,9 @@ impl Desktop {
         cx.notify();
     }
     fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if self.updates.open {
+            return;
+        }
         if self.status_panel == Some(status::Panel::Details) {
             self.status_panel = None;
         }
@@ -2706,7 +2723,7 @@ impl Desktop {
                 "history-scroll" | "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize"
                 | "files-scroll" | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll"
                 | "tabs" | "settings-tabs" | "checkout-dialog" | "status-panels" | "request-edit"
-                | "request-tabs" | "avatar-scroll",
+                | "request-tabs" | "avatar-scroll" | "update-available",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
             Some("diff" | "pending-diff" | "compare") => {
@@ -2763,8 +2780,10 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\n{}\n{}\n{}",
+                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}",
                 self.status_panel,
+                self.updates.available.is_some(),
+                self.updates.open,
                 self.engine.operation_status,
                 self.operations.summary(),
                 self.request_summary()
@@ -2777,7 +2796,14 @@ impl Render for Desktop {
         if self.engine.landing()
             || (self.opening_directory && self.engine.repository_path().is_empty())
         {
-            return self.landing_page(window, cx).into_any_element();
+            let landing = self.landing_page(window, cx);
+            return column()
+                .relative()
+                .size_full()
+                .child(landing)
+                .child(self.status_bar(cx))
+                .children(self.update_dialog(cx))
+                .into_any_element();
         }
         self.sync_inputs(window, cx);
         let content = if self.composer.as_ref().is_some_and(|c| c.active) {
@@ -2868,6 +2894,9 @@ impl Render for Desktop {
                                 } else {
                                     v.operation_action(operations::Action::History, window, cx);
                                 }
+                            }
+                            Some("update-available") => {
+                                v.updates.open = v.scroll_step % 2 == 1;
                             }
                             Some("settings-tabs") => {
                                 v.action(Action::SettingsTab(v.scroll_step % 3), window, cx)
@@ -2976,6 +3005,14 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if v.updates.open {
+                    if e.keystroke.key == "escape" && !v.updates.installing {
+                        v.updates.open = false;
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if e.keystroke.key == "escape" && v.status_panel.take().is_some() {
                     cx.notify();
                     cx.stop_propagation();
@@ -3071,6 +3108,7 @@ impl Render for Desktop {
             .children(dialog)
             .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
+            .children(self.update_dialog(cx))
             .into_any_element()
     }
 }

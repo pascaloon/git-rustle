@@ -202,7 +202,41 @@ tests, but the executable enters GPUI and never opens a console input loop.
 
 ## Windows CI artifacts
 
-Tag pushes and manual runs of `.github/workflows/windows-release.yml` build and
-test the Windows x64 release with the locked dependency graph, smoke-test command
-line flags, and upload `git-rustle.exe` as an unzipped Actions artifact for 90 days.
-Build duration and size are recorded separately from runtime performance.
+Manual runs of `.github/workflows/windows-release.yml` build and test the Windows
+x64 executable and retain an Actions artifact for 90 days. To publish a release,
+update the package version in `Cargo.toml` and `Cargo.lock`, commit it, then push
+the matching tag (for example `v0.2.0`). The workflow rejects a tag that differs
+from the compiled version. After tests and smoke checks pass, it uploads
+`git-rustle-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` to a draft GitHub Release,
+then publishes it with generated release notes. Tags containing a prerelease
+suffix publish prereleases. Published assets are never overwritten by reruns;
+failed draft uploads can be retried. Build duration is separate from runtime performance.
+
+### Application updates
+
+After its first frame, Git Rustle checks the public `pascaloon/git-rustle`
+GitHub Releases feed on a background worker. Successful checks are cached for
+six hours in `%LOCALAPPDATA%\git-rustle\updates.json`. While open, the app checks
+again when those six hours expire; reopening with an older cache preserves the
+remaining time instead of restarting the interval. Failed checks retry after
+an hour while the app remains open. Offline failures and rate limits stay quiet.
+Only a newer stable version with the exact Windows x64 asset and a valid GitHub
+SHA-256 digest produces the orange **Update available** button at the left of
+the status bar (including the welcome screen).
+
+Click the button and choose **Update and restart**, or **Later**. The app waits
+for active Git operations, request submissions and settings saves. `self_update`
+downloads the offered version, verifies its pinned SHA-256 digest, and replaces
+the executable using its Windows helper. Closing is deferred during installation.
+The new process reopens the current repository with the commit message,
+new-branch field and file selections; other unsaved forms close as stated in the
+confirmation. If restart fails, the app remains open with a retry action.
+Multiple instances serialize installation and refuse downgrades. The executable
+directory must be writable; protected installations require a manual update.
+
+Checks and downloads use HTTPS without a bundled GitHub token. Digests protect
+against corrupt or changed downloads; they are not publisher signatures. This
+release flow does not currently add Authenticode or an independent signing key.
+GitHub repository/release permissions therefore remain the update trust boundary.
+An initial version containing this updater must be installed manually before
+subsequent releases can be installed from inside the app.

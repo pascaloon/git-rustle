@@ -3,17 +3,23 @@ name: Windows release
 on:
   push:
     tags:
-      - '**'
+      - 'v*'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
     name: Build and test Windows x64
     runs-on: windows-2025
     timeout-minutes: 30
+    permissions:
+      contents: write
     defaults:
       run:
         shell: pwsh
@@ -54,6 +60,19 @@ jobs:
             '- Build timing measures CI throughput, not application runtime performance.'
           ) | Add-Content $env:GITHUB_STEP_SUMMARY
 
+      - name: Validate release version
+        run: |
+          $metadata = cargo +stable metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'git-rustle').version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Release tag must be v$version to match Cargo.toml"
+          }
+          $reported = & './target/x86_64-pc-windows-msvc/release/git-rustle.exe' --version
+          if ($LASTEXITCODE -ne 0 -or $reported -cne "git-rustle $version") {
+            throw 'Executable version does not match Cargo.toml'
+          }
+
       - name: Run release-mode tests
         run: |
           cargo +stable test --release --locked --target x86_64-pc-windows-msvc
@@ -75,3 +94,30 @@ jobs:
           retention-days: 90
           overwrite: false
           include-hidden-files: false
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $asset = 'git-rustle-x86_64-pc-windows-msvc.exe'
+          Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/git-rustle.exe' -Destination $asset
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -Encoding utf8NoBOM SHA256SUMS
+          $existing = gh release view $tag --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if (-not ($existing | ConvertFrom-Json).isDraft) {
+              throw 'This release is already published. Publish a new version instead of replacing its assets.'
+            }
+            gh release upload $tag $asset SHA256SUMS --clobber
+          } else {
+            gh release create $tag $asset SHA256SUMS --verify-tag --draft --generate-notes --title $tag
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; no release was published.' }
+          # Publish only after every asset is uploaded. Previews stay out of /releases/latest.
+          $flags = @()
+          if ($tag.Contains('-')) { $flags += @('--prerelease', '--latest=false') }
+          gh release edit $tag --draft=false @flags
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
