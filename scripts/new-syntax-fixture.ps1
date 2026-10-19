@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Path,
     [int]$Lines = 1200,
     [int]$Width = 12,
-    [ValidateSet('Rust','Batch','PowerShell')][string]$Language = 'Rust'
+    [ValidateSet('Rust','Batch','PowerShell','CSharp','Xaml')][string]$Language = 'Rust'
 )
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Path) { throw 'Choose a new fixture directory' }
@@ -12,10 +12,12 @@ git -C $Path init -q
 git -C $Path config user.name Benchmark
 git -C $Path config user.email benchmark@example.invalid
 git -C $Path config core.autocrlf false
-$extension = switch ($Language) { 'Rust' {'rs'} 'Batch' {'bat'} 'PowerShell' {'ps1'} }
+$extension = switch ($Language) { 'Rust' {'rs'} 'Batch' {'bat'} 'PowerShell' {'ps1'} 'CSharp' {'cs'} 'Xaml' {'xaml'} }
 foreach ($version in 1,2) {
     $source = [Text.StringBuilder]::new()
     $header = switch ($Language) {
+        'CSharp' { "/* Complete-source multiline comment`n   Unicode is intentional: café 世界. */`npublic class View {`n" }
+        'Xaml' { "<!-- Complete-source multiline comment`n     Unicode is intentional: café 世界. -->`n<Grid xmlns:x=`"http://schemas.microsoft.com/winfx/2006/xaml`">`n" }
         'Rust' { "/* Complete-source multiline comment`n   Unicode is intentional: café 世界. */`n" }
         'Batch' { "@echo off`nREM Unicode is intentional: café 世界.`nsetlocal EnableDelayedExpansion`n" }
         'PowerShell' { "<# Complete-source multiline comment`n   Unicode is intentional: café 世界. #>`n" }
@@ -23,12 +25,16 @@ foreach ($version in 1,2) {
     [void]$source.Append($header)
     foreach ($i in 1..$Lines) {
         $line = switch ($Language) {
+            'CSharp' { 'public int Item{0}(int value) {{ var label = "{1}"; return value + {2}; }}' -f $i, ('wide source text ' * $Width), $version }
+            'Xaml' { '<TextBlock x:Name="Item{0}" Grid.Row="{2}" Tag="{1}" Text="{{Binding Name}}" />' -f $i, ('wide source text ' * $Width), $version }
             'Rust' { 'pub fn item_{0}(value: usize) -> usize {{ let label = "{1}"; value + {2} }}' -f $i, ('wide source text ' * $Width), $version }
             'Batch' { 'if %ERRORLEVEL% equ 0 echo "item_{0}: {1}" {2}' -f $i, ('wide source text ' * $Width), $version }
             'PowerShell' { 'function Get-Item{0} {{ param([string]$Name) $Count = {2}; Write-Output "{1} $Name" }}' -f $i, ('wide source text ' * $Width), $version }
         }
         [void]$source.Append($line + "`n")
     }
+    if ($Language -eq 'CSharp') { [void]$source.Append("}`n") }
+    if ($Language -eq 'Xaml') { [void]$source.Append("</Grid>`n") }
     # These are inert source fixtures, never executed.
     [IO.File]::WriteAllText((Join-Path $Path "000-wide.$extension"), $source.ToString(), [Text.UTF8Encoding]::new($false))
     foreach ($i in 1..300) {

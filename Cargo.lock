@@ -2248,6 +2248,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tree-sitter-batch",
+ "tree-sitter-c-sharp",
  "tree-sitter-cmake",
  "tree-sitter-highlight",
  "tree-sitter-javascript",
@@ -2256,6 +2257,7 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.61.2",
+ "xmlparser",
 ]
 
 [[package]]
@@ -9091,6 +9093,12 @@ dependencies = [
  "mac",
  "markup5ever",
 ]
+
+[[package]]
+name = "xmlparser"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xmlwriter"

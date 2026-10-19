@@ -1,4 +1,6 @@
-//! Deferred Tree-sitter coloring. No parsing, queries, or source scans on the UI thread.
+//! Deferred syntax coloring. No parsing, queries, or source scans on the UI thread.
+mod xml;
+
 use super::sidebyside::decode;
 use gpui_component::highlighter::LanguageRegistry;
 use std::{
@@ -191,7 +193,8 @@ fn language(path: &str) -> Option<&'static str> {
             "rs" => "rust",
             "c" | "h" => "c",
             "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
-            "cs" => "csharp",
+            "cs" | "csx" => "csharp",
+            "xaml" | "axaml" | "xml" => "xml",
             "js" | "jsx" | "mjs" | "cjs" => "javascript",
             "ts" | "mts" | "cts" => "typescript",
             "tsx" => "tsx",
@@ -223,9 +226,14 @@ fn language(path: &str) -> Option<&'static str> {
 }
 // Some grammar crates publish extension queries rather than a complete language.
 fn configuration(lang: &str) -> Option<HighlightConfiguration> {
-    // These grammars are not bundled by gpui-component. Reuse the same bounded
-    // worker and map their additional capture names onto our existing palette.
+    // Supply queries missing from gpui-component and standalone grammars. Reuse
+    // the bounded worker and map additional capture names onto our palette.
     let standalone = match lang {
+        // gpui-component bundles the parser but exposes an empty C# query.
+        "csharp" => Some((
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            tree_sitter_c_sharp::HIGHLIGHTS_QUERY.replace("@module", "@type"),
+        )),
         "batch" => Some((
             tree_sitter_batch::LANGUAGE.into(),
             tree_sitter_batch::HIGHLIGHTS_QUERY.replace("@label", "@title"),
@@ -288,15 +296,6 @@ impl Painter {
         // Invalid UTF-8 still displays through the diff's lossy decoder, without colors.
         std::str::from_utf8(source).ok()?;
         let lang = language(path)?;
-        let config = self
-            .configs
-            .entry(lang.into())
-            .or_insert_with(|| configuration(lang))
-            .as_ref()?;
-        if cancel.load(Ordering::Relaxed) != 0 {
-            return None;
-        }
-
         // Parse complete source, including collapsed context, in exactly the same
         // representation that selection and wrapping use. This preserves multiline state.
         let mut text = String::with_capacity(source.len());
@@ -314,6 +313,18 @@ impl Painter {
                 return None;
             }
         }
+        if lang == "xml" {
+            return xml::highlight(&text, &starts, &ends, cancel);
+        }
+        let config = self
+            .configs
+            .entry(lang.into())
+            .or_insert_with(|| configuration(lang))
+            .as_ref()?;
+        if cancel.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+
         self.highlighter.parser().reset();
         let events = self
             .highlighter
@@ -464,6 +475,141 @@ mod tests {
                 side.spans
             );
         }
+    }
+
+    #[test]
+    fn dotnet_extensions_are_case_insensitive() {
+        for path in ["View.xaml.cs", "Program.CS", "script.CsX"] {
+            assert_eq!(language(path), Some("csharp"));
+        }
+        for path in [
+            "View.xaml",
+            "View.XAML",
+            "View.axaml",
+            "App.AXAML",
+            "data.XML",
+        ] {
+            assert_eq!(language(path), Some("xml"));
+        }
+    }
+
+    #[test]
+    fn csharp_has_real_tokens_and_multiline_context() {
+        let source = "using System;\r\nnamespace Demo;\r\n[Obsolete]\r\npublic record Person(string Name);\r\npublic class View {\r\n/* hidden context\r\nstill a comment café */\r\npublic int GetCount() => 42;\r\nstring Message = $\"Hello {nameof(View)} 世界\";\r\nstring Raw = \"\"\"\r\nhello 世界\r\n\"\"\";\r\n}\r\n";
+        let side = paint("View.xaml.CS", source);
+        for (no, token, category) in [
+            (1, "using", "keyword"),
+            (3, "Obsolete", "attribute"),
+            (4, "record", "keyword"),
+            (4, "Person", "type"),
+            (5, "class", "keyword"),
+            (5, "View", "type"),
+            (7, "still a comment café", "comment"),
+            (8, "GetCount", "function"),
+            (8, "int", "type"),
+            (8, "42", "number"),
+            (9, "Hello ", "string"),
+            (11, "hello 世界", "string"),
+        ] {
+            let line = source.lines().nth(no as usize - 1).unwrap();
+            assert!(
+                has(&side, no, line, token, category),
+                "{no}: {token} {category}: {:?}",
+                side.line(no)
+            );
+        }
+        let line = source.lines().nth(10).unwrap();
+        let start = line.find('世').unwrap();
+        assert_eq!(
+            clipped(side.line(11), start..line.len()),
+            vec![Span {
+                range: 0..6,
+                style: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn xaml_namespaces_properties_bindings_and_multiline_context() {
+        let source = "<?xml version=\"1.0\"?>\r\n<Window x:Class=\"Demo.View\"\r\n xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\r\n xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\r\n<!-- hidden context\r\nstill a comment café -->\r\n<Grid><TextBlock x:Name=\"Greeting\" Grid.Row=\"1\"\r\n Text=\"{Binding Name, StringFormat='Hello 世界'}\" /></Grid>\r\n<TextBlock>hello &amp; goodbye</TextBlock>\r\n<![CDATA[raw 世界]]>\r\n</Window>\r\n";
+        let side = paint("View.XAML", source);
+        for (no, token, category) in [
+            (1, "xml", "keyword"),
+            (2, "Window", "tag"),
+            (2, "x:Class", "property"),
+            (2, "Demo.View", "string"),
+            (4, "xmlns:x", "property"),
+            (6, "still a comment café", "comment"),
+            (7, "TextBlock", "tag"),
+            (7, "Grid.Row", "property"),
+            (8, "{Binding Name, StringFormat='Hello 世界'}", "string"),
+            (9, "&amp;", "constant"),
+            (10, "raw 世界", "string"),
+            (11, "Window", "tag"),
+        ] {
+            let line = source.lines().nth(no as usize - 1).unwrap();
+            assert!(
+                has(&side, no, line, token, category),
+                "{no}: {token} {category}: {:?}",
+                side.line(no)
+            );
+        }
+        let line = source.lines().nth(7).unwrap();
+        let start = line.find('世').unwrap();
+        assert_eq!(
+            clipped(side.line(8), start..start + 6),
+            vec![Span {
+                range: 0..6,
+                style: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn xml_incomplete_suffix_keeps_prefix_and_span_invariants() {
+        for source in [
+            "<Grid>\r\n\t<TextBlock Text=\"café 世界\" />\r\n<Button Text=\"unfinished",
+            "<Grid>\n<TextBlock Text=\"hello\" />\n<!-- unfinished",
+            "<Grid><TextBlock Text=\"hello\" />",
+        ] {
+            let side = paint("View.xaml", source);
+            assert!(has(&side, 1, source.lines().next().unwrap(), "Grid", "tag"));
+            for (i, raw) in source.split_inclusive('\n').enumerate() {
+                let line = decode(raw.as_bytes());
+                let mut end = 0;
+                for span in side.line(i as u32 + 1) {
+                    assert!(span.range.start >= end);
+                    assert!(line.get(span.range.clone()).is_some());
+                    end = span.range.end;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xml_entities_dtd_and_resource_limits() {
+        let source = "<?xml version=\"1.0\"?>\n<!DOCTYPE Grid [<!ENTITY name \"world\">]>\n<Grid>hello &name; &#x4e16; &amp;</Grid>";
+        let side = paint("View.xaml", source);
+        for token in ["&name;", "&#x4e16;", "&amp;"] {
+            assert!(has(
+                &side,
+                3,
+                source.lines().nth(2).unwrap(),
+                token,
+                "constant"
+            ));
+        }
+        let mut painter = Painter::default();
+        assert!(
+            painter
+                .side("x.xaml", b"<Grid/>", &AtomicUsize::new(1))
+                .spans
+                .is_empty()
+        );
+        assert!(paint("x.xaml", &"x".repeat(MAX_LINE + 1)).spans.is_empty());
+
+        let dense = format!("<Grid>{}</Grid>", "<A/>\n".repeat(40_000));
+        assert!(paint("x.xaml", &dense).spans.is_empty());
     }
 
     #[test]
@@ -670,7 +816,20 @@ mod tests {
                 )
             })
             .collect::<String>();
+        let csharp = format!("public class View {{\n{}\n}}", (0..600).map(|i| format!(
+            "public int Item{i}(int value) {{ var label = \"Hello 世界\"; return value + {i}; }}\n"
+        )).collect::<String>());
+        let xaml = format!(
+            "<Grid xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n{}\n</Grid>",
+            (0..600)
+                .map(|i| format!(
+                    "<TextBlock x:Name=\"Item{i}\" Grid.Row=\"{i}\" Text=\"{{Binding Name}}\" />\n"
+                ))
+                .collect::<String>()
+        );
         for (path, text) in [
+            ("View.cs", csharp),
+            ("View.xaml", xaml),
             ("wide.rs", rust),
             ("a.py", python),
             ("a.json", json),

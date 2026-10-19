@@ -4,6 +4,7 @@ param(
     [string]$Baseline,
     [string]$ImageCacheSeed,
     [switch]$RequireSyntax,
+    [ValidateRange(0,200000)][int]$ExpectedSyntaxSpans = 0,
     [switch]$RejectCompetingBuilds,
     [int]$Samples = 15,
     [string[]]$Scenarios = @('scroll','branches','diff','search','settings'),
@@ -80,6 +81,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
         throw "Candidate did not install syntax colors: $log"
+    }
+    if ($ExpectedSyntaxSpans -gt 0 -and $label -eq 'candidate' -and
+        ($state -notmatch 'syntax_spans=([0-9]+)' -or [int]$Matches[1] -ne $ExpectedSyntaxSpans)) {
+        throw "Candidate did not install the complete expected syntax spans ($ExpectedSyntaxSpans): $log"
     }
     $marks = @{}
     foreach ($m in [regex]::Matches($text,'([\d.]+) ms  ([^\r\n]+)')) {

@@ -1,8 +1,8 @@
 # Diff syntax highlighting
 
 The diff becomes readable as soon as its existing file worker finishes. A separate,
-lazily started worker colors complete old/new source texts with Tree-sitter and
-delivers an immutable span table. View, request and file identities guard delivery;
+lazily started worker colors complete old/new source texts with Tree-sitter or the
+streaming XML tokenizer and delivers an immutable span table. View, request and file identities guard delivery;
 switching files cannot apply an old result or reset selection/scroll position.
 The worker retains one pending request, cancels superseded work, and caches
 compiled queries. The current/parked diff retains its spans; reopening a file
@@ -18,10 +18,18 @@ not restart at hunk boundaries. Each renamed side uses its own filename.
 
 ## Coverage and limits
 
-The bundled gpui-component Tree-sitter grammars cover Rust, C/C++, C#, JavaScript
+The bundled gpui-component Tree-sitter grammars cover Rust, C/C++, JavaScript
 (including JSX), TypeScript/TSX, Python, JSON/JSONC, TOML, YAML, Bash, Go, Ruby,
 Java, HTML, CSS, SQL, Markdown, Swift, Scala, Zig, Elixir, GraphQL, Protocol
 Buffers, CMake, Make and patch files.
+The C# parser uses its upstream highlight query because gpui-component supplies an
+empty query. C# covers .cs (including .xaml.cs code-behind) and .csx.
+A streaming XML tokenizer colors XAML (.xaml), Avalonia XAML (.axaml), and .xml: element
+names, namespace-qualified attributes, values, comments, entities, and CDATA.
+XAML bindings and markup extensions share the attribute string color; embedded
+code and semantic type resolution are not separately analyzed. In malformed XML,
+valid prefix colors are retained and the unparseable remainder stays plain. XML
+entities are colored as references; they are never expanded or fetched.
 Two standalone grammars add Windows Batch (.bat, .cmd) and PowerShell
 (.ps1, .psm1, .psd1), with case-insensitive extension detection.
 Detection also recognizes Makefile/GNUmakefile, CMakeLists.txt, Gemfile/Rakefile
@@ -75,7 +83,7 @@ RequireSyntax rejects an accidentally uncolored source fixture.
 Each scrolling launch saves 120 measured next-frame intervals. They include
 scheduling, layout and paint submission, not physical input latency or scanout.
 The component harness prints one first-use sample (sample -1, retained separately)
-and 15 warm samples for Rust, Python, JSON, Batch, PowerShell and large-file fallback. It separately
+and 15 warm samples for Rust, Python, JSON, Batch, PowerShell, C#, XAML and large-file fallback. It separately
 times cached range lookup/clipping for 50 rows; this excludes shaping and paint.
 Component timings are candidate-only. Native baseline/candidate comparisons
 establish the end-to-end regression budget.
@@ -98,3 +106,11 @@ Batch or PowerShell contents. Existing UTF-8 and file/work limits still apply.
 
 Summarize these suites with scripts/summarize-syntax-benchmark.ps1 -Run $benchRun
 -Suites batch,powershell.
+
+For C# and XAML coverage, use -Language CSharp or -Language Xaml with the same
+fixture generator and native scenarios; summarize with -Suites csharp,xaml.
+For the 600-line, width-12 fixtures, pass -ExpectedSyntaxSpans 22814 for C#
+and -ExpectedSyntaxSpans 18022 for XAML. This also rejects one-sided timeouts;
+RequireSyntax alone only establishes that some colors were installed.
+Check actual token colors: a recognized extension or compiling an empty query
+alone does not establish highlighting support.
