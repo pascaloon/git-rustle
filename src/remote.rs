@@ -663,9 +663,10 @@ fn parse_page(
     if response.status != 200 {
         return Err(match response.status {
         401 | 404 => "API authentication required or repository not found; set GH_TOKEN / GITLAB_TOKEN or configure Git credentials".into(),
-        403 | 429 => "API access denied or rate limited; cached branches remain available; retry later with F5".into(),
+        403 | 429 => "API access denied or rate limited; use Refresh to retry later".into(),
         301 | 302 | 307 | 308 => "Repository moved; update the remote URL in Git configuration".into(),
-        status => format!("API returned HTTP {status}; cached branches remain available"),
+        500..=599 => format!("Remote server temporarily unavailable (HTTP {}); use Refresh to retry", response.status),
+        status => format!("API returned HTTP {status}; use Refresh to retry"),
     });
     }
     #[derive(Deserialize)]
@@ -1272,6 +1273,29 @@ mod tests {
             requests
         });
         (url, handle)
+    }
+
+    #[test]
+    fn api_failures_explain_retry_without_claiming_endpoint_specific_cache() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            for status in [403, 429, 500, 502, 503, 504] {
+                let response = || Response {
+                    status,
+                    etag: None,
+                    next: None,
+                    body: Vec::new(),
+                };
+                let branch_error = parse_page(provider, response(), None).err().unwrap();
+                let tag_error = parse_tags(provider, response()).err().unwrap();
+                assert_eq!(branch_error, tag_error);
+                assert!(tag_error.contains("Refresh"));
+                assert!(!tag_error.contains("cached branches"));
+                if status >= 500 {
+                    assert!(tag_error.contains("temporarily unavailable"));
+                    assert!(tag_error.contains(&format!("HTTP {status}")));
+                }
+            }
+        }
     }
 
     #[test]

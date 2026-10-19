@@ -87,6 +87,9 @@ impl SelectItem for CommitAction {
     }
 }
 impl Panel {
+    pub(super) fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.confirmation.is_some() || self.history_clear
+    }
     pub fn summary(&self) -> String {
         format!(
             "dialog={:?} rebase_open={} push={:?} plan_rows={} plan_visible={} plan_errors={} history_visible={} history_clear={}",

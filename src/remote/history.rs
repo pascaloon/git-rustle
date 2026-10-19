@@ -696,9 +696,14 @@ pub fn load_stream(
             }
         } else {
             preview.errors.push(format!(
-                "{} tags: {}; cached tags retained",
+                "{} tags: {}; {}",
                 command::clean(&remote.name),
-                failure.unwrap_or_else(|| "pagination limit reached".into())
+                failure.unwrap_or_else(|| "pagination limit reached; use Refresh to retry".into()),
+                if stored.tags.is_empty() {
+                    "tag preview unavailable"
+                } else {
+                    "cached tags retained"
+                }
             ));
         }
     }
@@ -1154,6 +1159,169 @@ mod tests {
             assert!(!offline.errors.is_empty());
             assert_eq!(offline.ghosts.len(), 3);
             assert_eq!(offline.tags.len(), 1);
+        }
+    }
+
+    // Each forced refresh makes exactly one tag request. The same path covers
+    // initial failure, a repeated failure, recovery and a fresh disk-cache hit.
+    fn tag_refresh_samples(provider: Provider, rounds: usize) -> Vec<serde_json::Value> {
+        let (dir, repo, refs, local) = fixture();
+        let head = refs.head_id.unwrap();
+        let tags = match provider {
+            Provider::Github => json!([{"name":"v-next", "commit":{"sha":head.to_string()}}]),
+            Provider::Gitlab => json!([{"name":"v-next", "commit":{"id":head.to_string()}}]),
+        };
+        let body = serde_json::to_vec(&tags).unwrap();
+        let mut responses = vec![(200, String::new(), body.clone())];
+        for _ in 0..rounds {
+            responses.extend([
+                (502, String::new(), Vec::new()),
+                (502, String::new(), Vec::new()),
+                (200, String::new(), body.clone()),
+            ]);
+        }
+        let (url, server) = super::super::tests::server(responses);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some(provider.key()),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/repository/branches");
+        let update = Update {
+            remote: remote.clone(),
+            branches: vec![Branch {
+                name: "main".into(),
+                sha: head.to_string(),
+            }],
+            scoped: true,
+            cached: false,
+            stale: false,
+        };
+        let (cache, _) = cache_file(&crate::git::git_dir(&repo), &remote, None).unwrap();
+        let cache = cache.with_extension("history.json");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(cache.clone());
+        let before_refs = command::checked(dir.path(), &["show-ref"]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let updates = std::slice::from_ref(&update);
+        let first = load(&repo, &local, &refs, updates, false, false, &cancel);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(first.tags, vec![(head, "origin/v-next".into())]);
+        let mut samples = Vec::new();
+        for sample in 0..rounds {
+            let start = Instant::now();
+            let cached = load(&repo, &local, &refs, updates, false, false, &cancel);
+            let cached_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert!(cached.errors.is_empty(), "{:?}", cached.errors);
+            assert_eq!(cached.tags, first.tags);
+            let before_cache = std::fs::read(&cache).unwrap();
+            let mut failed_ms = [0.; 2];
+            for elapsed in &mut failed_ms {
+                let mut published = false;
+                let start = Instant::now();
+                let failed = load_stream(
+                    &repo,
+                    &local,
+                    &refs,
+                    updates,
+                    &[],
+                    true,
+                    false,
+                    &cancel,
+                    Some(&mut |preview| {
+                        assert_eq!(preview.tags, first.tags);
+                        assert!(preview.errors.is_empty());
+                        published = true;
+                    }),
+                );
+                *elapsed = start.elapsed().as_secs_f64() * 1000.;
+                assert!(published);
+                assert_eq!(failed.tags, first.tags);
+                assert_eq!(failed.errors.len(), 1);
+                assert!(failed.errors[0].contains("502"));
+                assert_eq!(std::fs::read(&cache).unwrap(), before_cache);
+            }
+            let start = Instant::now();
+            let recovered = load(&repo, &local, &refs, updates, true, false, &cancel);
+            let recovered_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert!(recovered.errors.is_empty(), "{:?}", recovered.errors);
+            assert_eq!(recovered.tags, first.tags);
+            if sample > 0 {
+                samples.push(json!({"sample":sample, "cached_ms":cached_ms,
+                    "failed_502_ms":failed_ms[0], "repeated_502_ms":failed_ms[1],
+                    "recovered_200_ms":recovered_ms}));
+            }
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1 + rounds * 3);
+        assert!(requests.iter().all(|r| r.contains("/tags?")));
+        assert_eq!(
+            command::checked(dir.path(), &["show-ref"]).unwrap(),
+            before_refs
+        );
+        samples
+    }
+
+    #[test]
+    fn tag_refresh_retains_cache_through_repeated_502_and_recovers() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            tag_refresh_samples(provider, 1);
+        }
+    }
+
+    #[test]
+    fn first_tag_failure_explains_missing_preview_and_retry() {
+        let (_dir, repo, refs, local) = fixture();
+        let (url, server) = super::super::tests::server(vec![(502, String::new(), Vec::new())]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/repository/branches");
+        let update = Update {
+            remote,
+            branches: vec![Branch {
+                name: "main".into(),
+                sha: refs.head_id.unwrap().to_string(),
+            }],
+            scoped: true,
+            cached: false,
+            stale: false,
+        };
+        let preview = load(
+            &repo,
+            &local,
+            &refs,
+            &[update],
+            false,
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(preview.tags.is_empty());
+        assert_eq!(
+            preview.errors,
+            vec![
+                "origin tags: Remote server temporarily unavailable (HTTP 502); use Refresh to retry; tag preview unavailable"
+            ]
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[ignore = "explicit controlled-loopback tag failure and recovery performance measurement"]
+    fn benchmark_tag_refresh() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "provider":provider.key(), "warmups":1, "samples":tag_refresh_samples(provider, 16)
+            })).unwrap());
         }
     }
 

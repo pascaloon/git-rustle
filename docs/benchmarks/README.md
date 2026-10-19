@@ -15,6 +15,15 @@ before timing, and run suites sequentially on an unlocked desktop.
 
 ## Additional scenario scripts
 
+The parameterized [`benchmark-app-improvements.ps1`](../../scripts/benchmark-app-improvements.ps1)
+bundles startup, graph/search/branches/status panels, focused search/provider
+actions, controlled component measurements and fresh cached remote-preview delivery.
+It accepts preserved executable paths and uses an isolated app-data directory.
+Its companion [`summarize-app-improvements.ps1`](../../scripts/summarize-app-improvements.ps1)
+can regenerate comparison tables without rerunning measurements. See the
+[workflow recipe](../benchmarking.md#gpui-desktop-current-implementation) for
+measurement boundaries, native input checks and limitations.
+
 Each dated directory below contains `run-benchmarks.ps1` and `summarize.ps1`.
 These are preserved reproduction recipes with setup assumptions, rather than
 standalone replacements for the parameterized harnesses in `scripts/`.

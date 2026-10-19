@@ -10,6 +10,73 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+For the graph/search/provider usability bundle, use the sequential
+[app-improvements runner](../scripts/benchmark-app-improvements.ps1). Preserve the
+application baseline before editing and finish every build first. Pass the final
+release test executable directly so fixture/component measurements cannot compile:
+
+```powershell
+.\scripts\benchmark-app-improvements.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -CandidateHarness $candidateTestExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'suite')
+```
+
+This groups native startup (warm/uncached), large-history scroll/search-scroll,
+branch activity, search delivery and status-panel rendering against the baseline.
+It then measures candidate-only search focus in Graph/Branches, clearing single
+and multiple selections, provider-badge scrolling and the provider context menu.
+Search-clear scenarios use actual input subscriptions and selection handlers,
+render a different viewport before clearing, and assert the last selected commit,
+retained multiple selection and actual viewport visibility after the final frame.
+The native fixture needs at least three commits matching `m: merge`; the multiple
+selection scenario also toggles its latest row off before clearing. These focus
+measurements dispatch Ctrl+F through the native keyboard listeners and assert
+the target input focus; verify physical keyboard input separately. Header photo/badge
+fixtures require an observed badge render and decoded header image, exercising
+cached rendering without public-provider traffic. Hover tooltips, actual pointer menus and browser
+opening also need native visual/input checks.
+
+The runner uses isolated app data under its output directory, rejects competing
+builds, retains raw stdout/frames/model dumps and hashes, and generates
+`summary.json`/`summary.md`. `-Stages Startup,History,Actions,Components,Preview`
+can select unfinished stages; existing stage directories are never overwritten.
+The cached remote-preview fixture is generated immediately before its comparison
+to respect the five-minute cache TTL. The default component measurement is
+`remote::history::tests::benchmark_tag_refresh`: one warm-up and 15 samples for
+each provider's cached tags, first/repeated HTTP 502 retention and later HTTP 200
+recovery. It asserts cached publication before the request, unchanged cache bytes
+on failures and unchanged refs. Loopback timings include test-server scheduling;
+they do not characterize public API latency or an automatic retry policy.
+The second default harness, `remote::requests::integration::tests::benchmark_provider_cache`,
+measures one warm-up and 15 warm disk reads/parses/validations of a 10,000-request
+JSON cache; it does not measure project metadata or HTTP requests.
+`desktop::provider::tests::benchmark_provider_lookup` separately measures
+populated branch-to-request lookups without layout or network work.
+Extra ignored component tests can be supplied with `-ComponentTests`.
+
+The Components stage also runs
+[`benchmark-provider-fixture.ps1`](../scripts/benchmark-provider-fixture.ps1)
+against the already-built candidate test executable. It discards one warm-up and
+records 15 complete process durations for
+`remote::requests::integration::tests::provider_pagination_project_icons_and_offline_cache_reuse`,
+requiring exactly one successful test in every launch. The fixture covers both
+providers' project-icon metadata, request pagination, cache persistence and offline
+cache reuse. Its elapsed time includes process launch/loader, disposable fixture
+construction, loopback HTTP, disk work, test assertions and redirected log I/O;
+it excludes parent output validation. This is a coarse candidate-only measurement,
+not isolated API latency or native worker/render delivery. Raw stdout/stderr,
+warm-up, samples and executable hash are retained under `components/provider-fixture`.
+It isolates app data and temporary files under that directory and requires no
+additional Rust compilation. The summary labels this boundary explicitly.
+
+Frame intervals include event-loop scheduling, layout and paint submission;
+focus/clear/menu intervals run from production handler dispatch to the next
+qualifying native frame. They exclude physical input latency and display scanout.
+Candidate-only scenarios cannot establish a before/after speedup; use the shared
+comparisons to detect regressions. Correlated frame samples and 15-launch p95s
+are descriptive evidence, not confidence intervals. Retain all runs and write
+the final decision, confounders and limitations in `$benchRun/report.md`.
+
 For remote-diff routing or refresh changes, generate a fresh cached remote fixture
 with `remote::history::tests::prepare_native_fixture` after builds finish. Run
 `benchmark-desktop.ps1 -Scenarios remote-diff,remote-pair` against it: these wait

@@ -46,6 +46,14 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if ($scenario -in @('search-focus','branch-search-focus','search-clear','search-clear-multi','provider-scroll','provider-menu') -and
+        $state -notmatch 'improvement_verified=true') { throw "Native improvement scenario did not verify its final frame: $log" }
+    if ($scenario -eq 'search-clear-multi' -and $state -notmatch 'improvement_selected=2(?:\s|$)') {
+        throw "Expected two selections preserved after clearing search: $log"
+    }
+    if ($scenario -in @('provider-scroll','provider-menu') -and $state -notmatch 'provider_badges_rendered=[1-9][0-9]*') {
+        throw "Expected rendered provider badges and decoded fixture image: $log"
+    }
     if ($scenario -in @('remote-diff','remote-pair') -and
         ($state -notmatch 'diff_files=[1-9][0-9]* diff_failed=false' -or $state -notmatch '[1-9][0-9]* ghost commits' -or
          $text -notmatch 'file diff \((?:[2-9]|[1-9][0-9]+) rows\)')) {
@@ -77,7 +85,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -in @('avatar-cache','avatar-cache-busy') -and $state -notmatch 'avatar_visible_ready=[1-9]') {
         throw "Expected a cached photo on the first visible graph row: $log"
     }
-    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll') -and
+    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll','provider-scroll') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
         throw "Candidate did not install syntax colors: $log"
@@ -92,6 +100,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop scenario frame' }
+        'provider-scroll' { 'desktop scroll done' }
         { $_ -in 'settings-cache','settings-cache-clear' } { 'desktop scenario frame' }
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'desktop scenario frame' }
         'request-compose' { 'request composer ready' }
@@ -126,6 +136,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop improvement requested' }
         'settings-cache' { 'image cache requested' }
         'settings-cache-clear' { 'image cache clear requested' }
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'avatar cache requested' }
@@ -144,7 +155,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'remote-diff' { 'remote diff requested' }
         'remote-pair' { 'remote diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available','provider-scroll')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

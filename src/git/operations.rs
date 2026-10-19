@@ -1101,7 +1101,7 @@ fn push_reviewed(context: &Context, journal: &mut Journal, review: &PushPreview)
         )?;
     }
     Ok(format!(
-        "Pushed {} to {}/{}. Earlier history is sealed.",
+        "Pushed {} to {}/{}.",
         review.local_branch, review.remote, review.branch
     ))
 }

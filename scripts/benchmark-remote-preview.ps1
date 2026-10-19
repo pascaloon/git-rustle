@@ -5,6 +5,7 @@ param(
     [int]$Samples = 15,
     [switch]$NativeCandidate,
     [switch]$NativeBaseline,
+    [switch]$RejectCompetingBuilds,
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\remote-preview"
 )
 # Use the fresh fixture from remote::history::tests::prepare_native_fixture.
@@ -20,11 +21,13 @@ foreach ($name in @('GIT_RUSTLE_TIMING', 'GIT_RUSTLE_AUTOQUIT', 'GIT_RUSTLE_KEYS
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 function Run-One([string]$exe, [string]$label, [int]$sample) {
+    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     $log = Join-Path $OutputDirectory "$label-$sample.txt"
     $windowStyle = if (($NativeCandidate -and $label -eq 'candidate') -or ($NativeBaseline -and $label -eq 'baseline')) { 'Normal' } else { 'Hidden' }
     $process = Start-Process -FilePath $exe -ArgumentList @('"' + $Repository + '"') -WindowStyle $windowStyle -RedirectStandardError $log -PassThru
     if (-not $process.WaitForExit(30000)) { Stop-Process -Id $process.Id; throw "Timed out: $log" }
     $process.Refresh()
+    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     if ($process.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $start = [regex]::Match($text, '([\d.]+) ms  ghost preview requested')

@@ -470,6 +470,10 @@ fn pull_fetches_only_upstream_and_push_seals_history() {
     );
     let result = execute(&clone, Request::PushReviewed(preview_push(&clone).unwrap()));
     assert!(result.result.is_ok(), "{:?}", result.result);
+    assert_eq!(
+        result.result.as_ref().unwrap(),
+        "Pushed main to origin/main."
+    );
     assert!(result.view.labels.is_empty());
     assert!(result.view.boundary.contains("Push"));
 }

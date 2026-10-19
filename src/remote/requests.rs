@@ -4,6 +4,7 @@ pub(crate) use super::avatars::Stats as PhotoStats;
 pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};
+pub mod integration;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -515,7 +516,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    fn server(
+    pub(super) fn server(
         responses: Vec<(u16, &str, Value)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -569,7 +570,7 @@ mod tests {
         });
         (url, handle)
     }
-    fn fixture(provider: Provider, url: &str, path: &Path) -> Remote {
+    pub(super) fn fixture(provider: Provider, url: &str, path: &Path) -> Remote {
         let mut r = Remote::parse(
             "origin",
             "https://example.invalid/team/project.git",
@@ -606,7 +607,7 @@ mod tests {
             draft: true,
         }
     }
-    fn client<'a>(path: &'a Path, remote: &'a Remote) -> Client<'a> {
+    pub(super) fn client<'a>(path: &'a Path, remote: &'a Remote) -> Client<'a> {
         Client {
             path,
             git_dir: path.join(".git"),

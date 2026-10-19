@@ -19,8 +19,10 @@ use gpui_component::{
 };
 use std::time::{Duration, Instant};
 mod image_cache;
+mod improvement_bench;
 mod landing;
 mod operations;
+mod provider;
 mod rebase;
 mod requests;
 mod status;
@@ -112,6 +114,7 @@ enum Tab {
 
 #[derive(Clone)]
 enum Action {
+    OpenProviderUrl(String),
     NewRequest(String),
     Operation(Box<operations::Action>),
     Tab(Tab),
@@ -148,7 +151,9 @@ struct Desktop {
     updates: update::Updates,
     composer: Option<requests::Composer>,
     avatars: requests::Avatars,
+    provider: provider::State,
     image_cache: image_cache::State,
+    improvement_bench: improvement_bench::State,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
@@ -349,6 +354,9 @@ impl Desktop {
         cx: &Context<Self>,
     ) -> AnyElement {
         let app = &self.engine.app;
+        if app.branches.open {
+            return self.provider_branch_menu(position, window, cx);
+        }
         let count = self.selected_commits.ids(app.selected_id()).len();
         let enabled_diff = app.pending.selected || matches!(count, 1 | 2);
         let enabled_checkout = !app.pending.selected
@@ -465,6 +473,7 @@ impl Desktop {
                 }
             }
         }
+        self.provider_commit_items(&mut items);
         let menu_height =
             ((items.len() * 36 + 10) as f32).min(f32::from(window.viewport_size().height) - 16.);
         let p = point(
@@ -560,12 +569,7 @@ impl Desktop {
             }),
             cx.subscribe(&search, |v, state, event, cx| {
                 if matches!(event, InputEvent::Change) {
-                    v.engine.app.search.text.value =
-                        search_query(v.search_field, &state.read(cx).value());
-                    v.matches = Matches::new(&v.engine.app.search.text.value);
-                    v.selected_commits.clear();
-                    v.engine.app.search.changed();
-                    v.changed(cx);
+                    v.graph_search_changed(&state.read(cx).value(), cx);
                 }
             }),
             cx.subscribe(&branch_filter, |v, state, event, cx| {
@@ -608,9 +612,11 @@ impl Desktop {
                         v.poll_updates(cx);
                         v.sync_operations(window, cx);
                         v.sync_avatars(cx);
+                        v.sync_provider(cx);
                         if saving && !v.engine.app.settings.saving {
                             v.settings_identity = None;
                             v.avatars = Default::default();
+                            v.provider.invalidate();
                         }
                         if old != v.engine.app.graph_selected() {
                             v.graph_scroll.scroll_to_item(
@@ -799,9 +805,10 @@ impl Desktop {
                                     v.context_menu = Some(point(px(220.), px(210.)));
                                     cx.notify();
                                 }
-                                _ => {}
+                                _ => v.improvement_scenario_start(window, cx),
                             }
                         }
+                        v.improvement_scenario_tick(window, cx);
                         if v.scenario_started && v.scenario.as_deref() == Some("settings-cache-clear")
                             && !v.image_cache.busy && v.image_cache.stats.is_some()
                             && !v.image_cache.cleared
@@ -885,11 +892,15 @@ impl Desktop {
             }
         });
         let diff_scroll = UniformListScrollHandle::new();
+        let select_focus = cx.focus_handle();
+        select_focus.focus(window);
         Self {
             updates: Default::default(),
             composer: None,
             avatars: Default::default(),
+            provider: Default::default(),
             image_cache: Default::default(),
+            improvement_bench: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
@@ -942,7 +953,7 @@ impl Desktop {
             frame_samples: Vec::new(),
             frame_start: None,
             selection: Default::default(),
-            select_focus: cx.focus_handle(),
+            select_focus,
         }
     }
     fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1015,6 +1026,42 @@ impl Desktop {
         self.engine.app.needs_redraw = true;
         self.engine.tick(None);
         cx.notify();
+    }
+    fn graph_search_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let app = &mut self.engine.app;
+        let was_active = app.search.active();
+        let selected = self.selected_commits.last(app.selected_id());
+        app.search.text.value = search_query(self.search_field, text);
+        self.matches = Matches::new(&app.search.text.value);
+        app.search.changed();
+        if was_active
+            && !app.search.active()
+            && let Some(index) = selected.and_then(|id| app.history.index_of(&id))
+        {
+            app.select(index);
+            self.graph_scroll
+                .scroll_to_item(app.graph_selected(), ScrollStrategy::Center);
+        }
+        self.changed(cx);
+    }
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.updates.open
+            || self.engine.app.checkout_confirmation.is_some()
+            || self.operations.modal_open()
+            || self.composer.as_ref().is_some_and(|c| c.active)
+            || self.operations.tab.is_some()
+            || self.engine.app.settings.open
+            || matches!(self.engine.app.mode, Mode::Diff(_))
+        {
+            return false;
+        }
+        let input = if self.engine.app.branches.open {
+            &self.branch_filter
+        } else {
+            &self.search
+        };
+        input.update(cx, |s, cx| s.focus(window, cx));
+        true
     }
     fn scroll_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let bounds = self.diff_horizontal.bounds.get();
@@ -1104,6 +1151,13 @@ impl Desktop {
             self.diff_horizontal.set_x(px(0.));
         }
         self.context_menu = None;
+        if let Action::OpenProviderUrl(url) = action {
+            if crate::remote::requests::safe_web_url(&url) {
+                cx.open_url(&url);
+            }
+            cx.notify();
+            return;
+        }
         if let Action::NewRequest(source) = action {
             self.open_request(source, window, cx);
             return;
@@ -1156,9 +1210,11 @@ impl Desktop {
             app.begin_navigation();
         }
         match action {
+            Action::OpenProviderUrl(_) => unreachable!(),
             Action::NewRequest(_) => unreachable!(),
             Action::Operation(_) => unreachable!(),
             Action::Refresh => {
+                self.provider.invalidate();
                 app.want_refresh = true;
                 app.pending.want_refresh = true;
                 app.branches.want_refresh = Some(true);
@@ -1618,8 +1674,8 @@ impl Desktop {
             .px_3()
             .border_b_1()
             .border_color(rgb(LINE))
-            .child(self.button("head", "HEAD", Action::Head, cx))
             .child(self.button("refresh", "", Action::Refresh, cx))
+            .child(self.button("head", "", Action::Head, cx))
             .child(self.button(
                 "pull",
                 "Pull",
@@ -1652,30 +1708,6 @@ impl Desktop {
                     cx,
                 ),
             )
-            .child(caption(format!(
-                "{} commits",
-                self.engine
-                    .app
-                    .search
-                    .result
-                    .as_ref()
-                    .map_or(self.engine.app.history.len(), |r| r.rows.len())
-            )))
-            .child(
-                self.button(
-                    "new-request",
-                    "PR / MR",
-                    Action::NewRequest(
-                        self.engine
-                            .app
-                            .refs
-                            .as_ref()
-                            .and_then(|r| r.head_branch.clone())
-                            .unwrap_or_default(),
-                    ),
-                    cx,
-                ),
-            )
             .when(
                 self.selected_commits
                     .ids(self.engine.app.selected_id())
@@ -1692,6 +1724,23 @@ impl Desktop {
             )
             .child(div().flex_1())
             .child(self.search_box(cx))
+            .child(
+                caption(if self.engine.app.search.active() {
+                    format!(
+                        "{}/{}",
+                        self.engine
+                            .app
+                            .search
+                            .result
+                            .as_ref()
+                            .map_or(0, |r| r.rows.len()),
+                        self.engine.app.history.len(),
+                    )
+                } else {
+                    format!("{} commits", self.engine.app.history.len())
+                })
+                .flex_shrink_0(),
+            )
             .into_any_element()
     }
     fn graph(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1792,6 +1841,7 @@ impl Desktop {
                             r = r.child(graph_canvas(cells, flags, graph_width)).child(
                                 div()
                                     .w(px(76.))
+                                    .font_family("Cascadia Mono")
                                     .flex_shrink_0()
                                     .text_color(rgb(if ghost { MUTED } else { ACCENT }))
                                     .child(v.matches.styled(rec.id.to_hex_with_len(8).to_string())),
@@ -1800,31 +1850,46 @@ impl Desktop {
                                 r = r.child(div().text_color(rgb(ACCENT)).child("HEAD"));
                             }
                             if let Some(labels) = app.labels.get(&rec.id) {
-                                for label in
-                                    labels.iter().filter(|label| label.name != "HEAD").take(3)
+                                for (label_index, label) in labels
+                                    .iter()
+                                    .filter(|label| label.name != "HEAD")
+                                    .take(3)
+                                    .enumerate()
                                 {
                                     let remote = label.kind == crate::git::RefKind::Remote;
                                     let color = if remote { REMOTE_TEXT } else { SEARCH_TEXT };
-                                    r = r.child(
-                                        row()
-                                            .gap_1()
-                                            .rounded_sm()
-                                            .px_1()
-                                            .flex_shrink_0()
-                                            .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
-                                            .text_color(rgb(color))
-                                            .max_w(px(170.))
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .when(label.remote_only, |badge| {
-                                                badge.child(
-                                                    icon("cloud")
-                                                        .size(px(14.))
-                                                        .text_color(rgb(color)),
-                                                )
-                                            })
-                                            .child(v.matches.styled(label.name.clone())),
-                                    );
+                                    r = r
+                                        .child(
+                                            row()
+                                                .id(("ref-badge", label_index))
+                                                .tooltip({
+                                                    let name = label.name.clone();
+                                                    move |w, cx| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            name.clone(),
+                                                        )
+                                                        .build(w, cx)
+                                                    }
+                                                })
+                                                .gap_1()
+                                                .rounded_sm()
+                                                .px_1()
+                                                .flex_shrink_0()
+                                                .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
+                                                .text_color(rgb(color))
+                                                .max_w(px(170.))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .when(label.remote_only, |badge| {
+                                                    badge.child(
+                                                        icon("cloud")
+                                                            .size(px(14.))
+                                                            .text_color(rgb(color)),
+                                                    )
+                                                })
+                                                .child(v.matches.styled(label.name.clone())),
+                                        )
+                                        .children(v.provider_badge(label.kind, &label.name, cx));
                                 }
                             }
                             r = r
@@ -2518,6 +2583,12 @@ impl Desktop {
                         let entry = &b.entries[b.visible[i]];
                         row()
                             .id(("branch", i))
+                            .tooltip({
+                                let name = entry.target.label();
+                                move |w, cx| {
+                                    gpui_component::tooltip::Tooltip::new(name.clone()).build(w, cx)
+                                }
+                            })
                             .w_full()
                             .h(px(40.))
                             .px_4()
@@ -2530,6 +2601,15 @@ impl Desktop {
                                     if entry.current { "● " } else { "" },
                                     entry.target.label()
                                 )),
+                            ))
+                            .children(v.provider_badge(
+                                if entry.target.remote.is_some() {
+                                    crate::git::RefKind::Remote
+                                } else {
+                                    crate::git::RefKind::Branch
+                                },
+                                &entry.target.label(),
+                                cx,
                             ))
                             .child(
                                 div()
@@ -2588,6 +2668,15 @@ impl Desktop {
                                     v.action(Action::JumpBranch, window, cx);
                                 }
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |v, e: &MouseDownEvent, w, cx| {
+                                    v.action(Action::Branch(i), w, cx);
+                                    v.context_menu = Some(e.position);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
                     })
                     .collect()
             }),
@@ -2604,19 +2693,6 @@ impl Desktop {
                     .border_b_1()
                     .border_color(rgb(LINE))
                     .child(caption(format!("{} branches", browser.visible.len())))
-                    .child(
-                        self.button(
-                            "branch-request",
-                            "Create PR / MR",
-                            Action::NewRequest(
-                                browser
-                                    .chosen()
-                                    .map(|e| e.target.name.clone())
-                                    .unwrap_or_default(),
-                            ),
-                            cx,
-                        ),
-                    )
                     .child(div().flex_1())
                     .child(
                         div()
@@ -2763,6 +2839,9 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if let Some(ready) = self.improvement_scenario_ready() {
+            return ready;
+        }
         let app = &self.engine.app;
         match self.scenario.as_deref() {
             Some("history-clear") => {
@@ -2879,7 +2958,7 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}",
+                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}",
                 self.status_panel,
                 self.updates.available.is_some(),
                 self.updates.open,
@@ -2890,7 +2969,8 @@ impl Desktop {
                 self.image_cache.stats.map_or(0, |s| s.bytes),
                 self.image_cache.stats.map_or(0, |s| s.images),
                 self.image_cache.busy,
-                self.image_cache.cleared
+                self.image_cache.cleared,
+                self.improvement_scenario_summary(),
             ),
         )
     }
@@ -3082,10 +3162,15 @@ impl Render for Desktop {
                 self.scenario.as_deref(),
                 Some("avatar-cache" | "avatar-cache-busy")
             ) || self.avatars.first_visible_decoded(window, cx))
+            && (!matches!(
+                self.scenario.as_deref(),
+                Some("provider-scroll" | "provider-menu")
+            ) || self.provider_scenario_ready(window, cx))
         {
             let weak = cx.entity().downgrade();
-            window.on_next_frame(move |_, cx| {
-                let _ = weak.update(cx, |v, _| {
+            window.on_next_frame(move |window, cx| {
+                let _ = weak.update(cx, |v, cx| {
+                    v.improvement_scenario_assert(window, cx);
                     v.scenario_presented = true;
                     v.engine.mark("desktop scenario frame");
                 });
@@ -3112,6 +3197,17 @@ impl Render for Desktop {
             .relative()
             .size_full()
             .track_focus(&self.select_focus)
+            .capture_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.modifiers.control
+                    && !e.keystroke.modifiers.alt
+                    && !e.keystroke.modifiers.shift
+                    && e.keystroke.key == "f"
+                    && v.focus_search(window, cx)
+                {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
+            }))
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
                 if v.updates.open {
                     if e.keystroke.key == "escape" && !v.updates.installing {
@@ -3199,6 +3295,7 @@ impl Render for Desktop {
                     .px_4()
                     .border_b_1()
                     .border_color(rgb(LINE))
+                    .children(self.provider_icon())
                     .child(
                         column()
                             .flex_1()
