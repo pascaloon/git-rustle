@@ -131,7 +131,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; no release was published.' }
           # Publish only after every asset is uploaded. Concurrent stable tags use
           # GitHub's date/semantic-version selection rather than last-job-finished.
-          $releaseId = gh api "repos/$env:GH_REPO/releases/tags/$tag" --jq .id
+          # The tag endpoint does not return drafts; the CLI also searches drafts.
+          $releaseId = gh release view $tag --json databaseId --jq .databaseId
           if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the uploaded draft.' }
           $preview = if ($tag.Contains('-')) { 'true' } else { 'false' }
           $latest = if ($tag.Contains('-')) { 'false' } else { 'legacy' }
