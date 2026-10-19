@@ -49,6 +49,8 @@ pub enum LoadState {
 pub struct Label {
     pub name: String,
     pub kind: RefKind,
+    /// Provider tip that differs from the locally stored remote-tracking ref.
+    pub remote_only: bool,
 }
 
 pub struct App {
@@ -493,6 +495,58 @@ impl App {
         self.history.parents(i).first().copied()
     }
 
+    fn diff_source(
+        &self,
+        old: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Option<Box<crate::diff::changes::RemoteSource>> {
+        let new_source = self.ghost_sources.get(&new);
+        let old_source = old.as_ref().and_then(|id| self.ghost_sources.get(id));
+        Some(Box::new(crate::diff::changes::RemoteSource {
+            remote: new_source.or(old_source)?.clone(),
+            old_remote: old_source.cloned(),
+            compare: new_source.is_none() || old != self.parent_of(&new),
+        }))
+    }
+
+    fn new_changes(&mut self, old: Option<ObjectId>, new: ObjectId) -> ChangeSet {
+        let mut changes = ChangeSet::new(self.new_key(), old, new);
+        changes.remote_source = self.diff_source(old, new);
+        changes
+    }
+
+    fn refresh_diff_sources(&mut self) {
+        let target = |cs: &ChangeSet| (cs.key, cs.old, cs.new);
+        let targets = [
+            self.details_changes.as_ref().map(target),
+            match &self.mode {
+                Mode::Diff(view) => Some(target(&view.changes)),
+                Mode::Graph => None,
+            },
+            self.parked_diff.as_ref().map(|view| target(&view.changes)),
+        ];
+        for (key, old, new) in targets.into_iter().flatten() {
+            let Some(source) = self.diff_source(old, new) else {
+                // An open tab must outlive the graph's temporary local-only state.
+                continue;
+            };
+            let changes = self.changes_by_key_mut(key).unwrap();
+            if changes.remote_source.as_ref() == Some(&source) {
+                continue;
+            }
+            changes.remote_source = Some(source);
+            if changes.requested && (!changes.loaded || changes.error.is_some()) {
+                // Ignore any late local-worker result and retry through the API.
+                let next_key = self.new_key();
+                let changes = self.changes_by_key_mut(key).unwrap();
+                changes.key = next_key;
+                changes.requested = false;
+                changes.loaded = false;
+                changes.error = None;
+            }
+        }
+    }
+
     /// Keep `details_changes` pointed at the selected commit.
     pub fn sync_details_changes(&mut self) {
         if self.pending.selected {
@@ -512,9 +566,8 @@ impl App {
         if self.details_changes.as_ref().map(|c| c.new) == Some(id) {
             return;
         }
-        let key = self.new_key();
         let parent = self.parent_of(&id);
-        self.details_changes = Some(ChangeSet::new(key, parent, id));
+        self.details_changes = Some(self.new_changes(parent, id));
         self.details_cursor = TreeCursor {
             rows: self.details_cursor.rows,
             ..TreeCursor::default()
@@ -540,14 +593,7 @@ impl App {
             Mode::Graph => match self.details_changes.as_mut() {
                 Some(cs) if !cs.requested => {
                     cs.requested = true;
-                    vec![DiffReq::Tree {
-                        key: cs.key,
-                        old: cs.old,
-                        new: cs.new,
-                        remote: None,
-                        old_remote: None,
-                        compare: false,
-                    }]
+                    vec![DiffReq::tree(cs)]
                 }
                 _ => Vec::new(),
             },
@@ -613,8 +659,8 @@ impl App {
                 (Some(ta), Some(tb)) if tb < ta => (b, a),
                 _ => (a, b),
             };
-            let key = self.new_key();
-            self.show_view(ChangeSet::new(key, Some(old), new), None);
+            let changes = self.new_changes(Some(old), new);
+            self.show_view(changes, None);
         } else if let [id] = ids {
             self.open_parent_diff(*id);
         }
@@ -628,9 +674,9 @@ impl App {
             let cursor = self.details_cursor;
             self.show_view(cs, Some(cursor));
         } else {
-            let key = self.new_key();
             let parent = self.parent_of(&id);
-            self.show_view(ChangeSet::new(key, parent, id), None);
+            let changes = self.new_changes(parent, id);
+            self.show_view(changes, None);
         }
     }
 
@@ -761,6 +807,7 @@ impl App {
                     .map(|r| Label {
                         name: r.name.clone(),
                         kind: r.kind,
+                        remote_only: false,
                     })
                     .collect(),
             );
@@ -778,6 +825,7 @@ impl App {
                     Label {
                         name: "HEAD".into(),
                         kind: RefKind::Head,
+                        remote_only: false,
                     },
                 );
             }
@@ -795,24 +843,36 @@ impl App {
 
     pub fn remote_labels(&mut self) {
         self.search.invalidate();
-        // API metadata adds labels only. It never changes the local walk tips or cache.
+        // Replace only API overlays. Fetched remote-tracking labels stay on their
+        // actual local objects, even when a provider reports a different tip.
+        self.labels.retain(|_, labels| {
+            labels.retain(|label| !label.remote_only);
+            !labels.is_empty()
+        });
         for (name, update) in &self.branches.remotes {
-            let prefix = format!("{name}/");
-            for labels in self.labels.values_mut() {
-                labels.retain(|l| !(l.kind == RefKind::Remote && l.name.starts_with(&prefix)));
-            }
             for branch in &update.branches {
                 if let Ok(id) = ObjectId::from_hex(branch.sha.as_bytes()) {
+                    let label_name = format!("{name}/{}", branch.name);
                     if self.ghosts.contains_key(&id)
-                        && !self.ghost_branches.iter().any(|(tip, name)| {
-                            *tip == id && *name == format!("{}/{}", update.remote.name, branch.name)
-                        })
+                        && !self
+                            .ghost_branches
+                            .iter()
+                            .any(|(tip, name)| *tip == id && *name == label_name)
                     {
                         continue;
                     }
-                    self.labels.entry(id).or_default().push(Label {
-                        name: format!("{name}/{}", branch.name),
+                    let labels = self.labels.entry(id).or_default();
+                    // When fetched and live tips agree, the real ref badge suffices.
+                    if labels
+                        .iter()
+                        .any(|label| label.kind == RefKind::Remote && label.name == label_name)
+                    {
+                        continue;
+                    }
+                    labels.push(Label {
+                        name: label_name,
                         kind: RefKind::Remote,
+                        remote_only: true,
                     });
                 }
             }
@@ -826,6 +886,7 @@ impl App {
                 labels.push(Label {
                     name: name.clone(),
                     kind: RefKind::Tag,
+                    remote_only: false,
                 });
             }
         }
@@ -848,6 +909,7 @@ impl App {
         }
         self.ghosts = preview.ghosts;
         self.ghost_sources = preview.sources;
+        self.refresh_diff_sources();
         self.ghost_branches = preview.branches;
         self.ghost_tags = preview.tags;
         self.ghost_status = if preview.errors.is_empty() {
@@ -2039,6 +2101,139 @@ mod tests {
         assert_eq!(text.matches("HEAD").count(), 1);
         app.set_refs(RefSnapshot::default());
         assert!(app.labels.is_empty()); // Unborn HEAD has no commit to label.
+    }
+
+    #[test]
+    fn provider_labels_preserve_fetched_refs_and_mark_only_different_live_tips() {
+        use crate::git::RefEntry;
+        for url in [
+            "https://github.com/test/repo",
+            "https://gitlab.com/test/repo",
+        ] {
+            let mut app = app_with(3);
+            let live = app.history.commits[0].id;
+            let fetched = app.history.commits[1].id;
+            let refs = RefSnapshot {
+                refs: vec![
+                    RefEntry {
+                        name: "origin/main".into(),
+                        id: fetched,
+                        kind: RefKind::Remote,
+                    },
+                    RefEntry {
+                        name: "origin/unlisted".into(),
+                        id: fetched,
+                        kind: RefKind::Remote,
+                    },
+                ],
+                ..Default::default()
+            };
+            app.set_refs(refs.clone());
+            let mut update = crate::remote::Update {
+                remote: crate::remote::Remote::parse("origin", url, None).unwrap(),
+                branches: vec![crate::remote::Branch {
+                    name: "main".into(),
+                    sha: live.to_string(),
+                }],
+                scoped: false,
+                cached: false,
+                stale: false,
+            };
+            app.branches.update(update.clone(), app.refs.as_ref());
+            // The live tip is already a local object: cloud state must describe
+            // the branch's provider origin, not whether the commit is a ghost.
+            for _ in 0..2 {
+                app.remote_labels();
+                let labels = &app.labels[&fetched];
+                assert_eq!(labels.len(), 2);
+                assert!(labels.iter().all(|l| !l.remote_only));
+                let cloud = &app.labels[&live];
+                assert_eq!(cloud.len(), 1);
+                assert_eq!(cloud[0].name, "origin/main");
+                assert_eq!(cloud[0].kind, RefKind::Remote);
+                assert!(cloud[0].remote_only);
+                assert_eq!(app.refs.as_ref().unwrap().refs[0].id, fetched);
+            }
+            // A local fetch converges with the live tip: leave just the real ref.
+            let mut refreshed = refs.clone();
+            refreshed.refs[0].id = live;
+            app.set_refs(refreshed);
+            assert_eq!(app.labels[&live].len(), 1);
+            assert!(!app.labels[&live][0].remote_only);
+            assert_eq!(app.labels[&fetched][0].name, "origin/unlisted");
+            // A provider can also move back to an already fetched object.
+            update.branches[0].sha = fetched.to_string();
+            app.branches.update(update.clone(), app.refs.as_ref());
+            app.remote_labels();
+            assert!(app.labels[&fetched].iter().any(|l| l.remote_only));
+            assert!(!app.labels[&live][0].remote_only);
+            // Removing an API branch removes only its overlay, even for a full
+            // provider listing. Fetched refs stay until Git itself removes them.
+            update.branches.clear();
+            app.branches.update(update, app.refs.as_ref());
+            app.remote_labels();
+            assert!(app.labels.values().flatten().all(|l| !l.remote_only));
+            assert_eq!(app.labels[&live][0].name, "origin/main");
+            assert_eq!(app.labels[&fetched][0].name, "origin/unlisted");
+            app.branches.remotes.clear();
+            app.set_refs(refs);
+            assert!(!app.labels.contains_key(&live));
+        }
+    }
+
+    #[test]
+    fn late_remote_metadata_retries_pending_and_failed_diffs_without_accepting_old_results() {
+        for failed in [false, true] {
+            for tab in 0..3 {
+                let mut app = app_with(3);
+                let id = app.selected_id().unwrap();
+                app.sync_details_changes();
+                if tab > 0 {
+                    app.open_diff();
+                }
+                if tab == 2 {
+                    app.park_diff();
+                }
+                let request = app.pending_requests().remove(0);
+                let DiffReq::Tree {
+                    key, remote: None, ..
+                } = request
+                else {
+                    panic!("expected local request")
+                };
+                if failed {
+                    app.changes_by_key_mut(key)
+                        .unwrap()
+                        .set_tree(Err("Object could not be found".into()));
+                }
+                let remote =
+                    crate::remote::Remote::parse("origin", "https://github.com/test/repo", None)
+                        .unwrap();
+                app.install_preview(crate::remote::history::Preview {
+                    history: None,
+                    ghosts: Default::default(),
+                    sources: [(id, remote.clone())].into_iter().collect(),
+                    branches: Vec::new(),
+                    tags: Vec::new(),
+                    errors: Vec::new(),
+                });
+                // Replacing the key prevents a late local error from overwriting
+                // a remote result, including on a parked tab or details panel.
+                assert!(app.changes_by_key_mut(key).is_none());
+                let request = app.pending_requests().remove(0);
+                let DiffReq::Tree {
+                    key: next,
+                    remote: Some(source),
+                    ..
+                } = request
+                else {
+                    panic!("expected API retry")
+                };
+                assert_ne!(key, next);
+                assert_eq!(source, remote);
+                assert!(app.changes_by_key_mut(next).unwrap().error.is_none());
+            }
+        }
     }
 
     #[test]

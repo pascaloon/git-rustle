@@ -23,6 +23,8 @@ pub struct ChangeSet {
     /// `None` means the empty tree (root commit).
     pub old: Option<ObjectId>,
     pub new: ObjectId,
+    /// Keep provider provenance with the diff, independently of graph refreshes.
+    pub remote_source: Option<Box<RemoteSource>>,
     pub files: Arc<Vec<FileChange>>,
     pub tree: FileTree,
     /// Tree diff requested from the worker.
@@ -40,12 +42,20 @@ pub struct ChangeSet {
     totals: Vec<(u32, u32, bool)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSource {
+    pub remote: crate::remote::Remote,
+    pub old_remote: Option<crate::remote::Remote>,
+    pub compare: bool,
+}
+
 impl ChangeSet {
     pub fn new(key: u32, old: Option<ObjectId>, new: ObjectId) -> Self {
         ChangeSet {
             key,
             old,
             new,
+            remote_source: None,
             files: Arc::new(Vec::new()),
             tree: FileTree::default(),
             requested: false,

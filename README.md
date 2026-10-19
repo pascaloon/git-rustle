@@ -17,6 +17,17 @@ cargo build --release --locked
 .\target\release\git-rustle.exe [PATH]
 ```
 
+For faster optimized builds during development, use the `fast` profile:
+
+```powershell
+cargo build --profile fast --locked
+.\target\fast\git-rustle.exe [PATH]
+```
+
+It inherits the release settings with LTO disabled and 16 code-generation units.
+The first build creates a separate dependency cache. Use the release profile for
+shipping and runtime performance validation.
+
 `PATH` can be a repository or a directory inside it; the default is the working
 directory. `--no-cache` disables persistent application caches. `--help` and
 `--version` are also available. When the directory is outside a repository, the
@@ -137,6 +148,10 @@ branch browser requests the full listing. Remote enrichment prioritizes selected
 branches and bounds background work. Activity uses the latest 100 first-parent
 commits and counts commits from the past seven days.
 
+Blue `origin/branch` graph badges stay on the locally fetched tracking refs.
+When the provider reports a different tip, a separate blue badge with the same
+name and a cloud icon marks that tip. Matching tips share one badge.
+
 Ghost previews preserve merge ancestry and selection. Immutable metadata, trees,
 file contents and assembled previews are cached separately; branch/tag caches
 have a five-minute TTL. Refresh revalidates them. Cached results remain usable
@@ -240,3 +255,12 @@ release flow does not currently add Authenticode or an independent signing key.
 GitHub repository/release permissions therefore remain the update trust boundary.
 An initial version containing this updater must be installed manually before
 subsequent releases can be installed from inside the app.
+
+## License
+
+Git Rustle is licensed under the GNU General Public License version 3 only
+(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
+
+This program is distributed without any warranty, including the implied
+warranties of merchantability or fitness for a particular purpose, to the extent
+permitted by applicable law. See the license for details.

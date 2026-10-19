@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Repository,
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [string]$Baseline,
+    [string]$ImageCacheSeed,
     [switch]$RequireSyntax,
     [switch]$RejectCompetingBuilds,
     [int]$Samples = 15,
@@ -18,6 +19,18 @@ $saved = @{}
 $names = @('GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES')
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
+    # The last viewport's author worker can finish after the 120th frame.
+    # Keep the process alive for the final-state assertion; measured intervals
+    # still end at desktop scroll done, before this settling period.
+    $env:GIT_RUSTLE_AUTOQUIT = if ($scenario -eq 'avatar-reuse-scroll') { '2500' } else { '100' }
+    if ($scenario -in @('settings-cache','settings-cache-clear')) {
+        if (!$ImageCacheSeed) { throw 'Cache-control scenarios require a disposable ImageCacheSeed and isolated LOCALAPPDATA' }
+        $marker = Join-Path $env:LOCALAPPDATA 'cache-benchmark-fixture'
+        if (!(Test-Path $marker) -or (Get-Content $marker -Raw) -cne 'disposable image cache benchmark') { throw 'Missing disposable-cache marker' }
+        $cache = Join-Path $env:LOCALAPPDATA 'git-rustle/cache/avatars-v1'
+        New-Item -ItemType Directory -Force $cache | Out-Null
+        Copy-Item -Path (Join-Path $ImageCacheSeed '*.bin') -Destination $cache -Force
+    }
     if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
     $log = Join-Path $OutputDirectory "$label-$scenario-$sample.txt"
     $env:GIT_RUSTLE_SCENARIO = $scenario
@@ -32,9 +45,20 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
-    if ($scenario -in @('request-compose','request-edit','request-tabs') -and
+    if ($scenario -in @('remote-diff','remote-pair') -and
+        ($state -notmatch 'diff_files=[1-9][0-9]* diff_failed=false' -or $state -notmatch '[1-9][0-9]* ghost commits' -or
+         $text -notmatch 'file diff \((?:[2-9]|[1-9][0-9]+) rows\)')) {
+        throw "Expected a loaded remote diff with unfetched commits: $log"
+    }
+    if ($scenario -eq 'settings-cache' -and $state -notmatch 'image_cache_bytes=[1-9][0-9]* image_cache_images=500 image_cache_busy=false') { throw "Expected 500 seeded images and a completed size scan: $log" }
+    if ($scenario -eq 'settings-cache-clear' -and $state -notmatch 'image_cache_bytes=0 image_cache_images=0 image_cache_busy=false image_cache_cleared=true') { throw "Expected an empty cache after clearing: $log" }
+    if ($scenario -in @('request-compose','request-edit','request-tabs','request-clear') -and
         ($state -notmatch 'request_open=true request_members=10000 request_sending=false' -or $text -match 'POST ')) {
         throw "Expected a retained composer with 10,000 members and no submission: $log"
+    }
+    if ($scenario -in @('request-open','request-clear') -and
+        ($state -notmatch 'request_open=true .*request_sending=false request_body_bytes=0' -or $text -match 'POST ')) {
+        throw "Expected an open composer with an empty description and no submission: $log"
     }
     if ($scenario -eq 'checkout-dialog' -and
         ($state -notmatch 'checkout_choices=[1-9]' -or $text -match 'checkout requested')) {
@@ -46,7 +70,13 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($scenario -eq 'update-available' -and $state -notmatch 'update_available=true') {
         throw "Expected an available update without installing it: $log"
     }
-    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll') -and
+    if ($scenario -eq 'avatar-reuse-scroll' -and $state -notmatch 'avatar_visible_ready=[1-9]') {
+        throw "Expected visible rows to reuse known author profiles: $log"
+    }
+    if ($scenario -in @('avatar-cache','avatar-cache-busy') -and $state -notmatch 'avatar_visible_ready=[1-9]') {
+        throw "Expected a cached photo on the first visible graph row: $log"
+    }
+    if ($scenario -in @('scroll','search-scroll','graph-resize','tabs','avatar-scroll','avatar-reuse-scroll') -and
         $state -notmatch 'viewport_rows=\[[1-9]') { throw "Graph did not render rows: $log" }
     if ($RequireSyntax -and $label -eq 'candidate' -and $state -notmatch 'syntax_spans=[1-9][0-9]*') {
         throw "Candidate did not install syntax colors: $log"
@@ -57,10 +87,15 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        { $_ -in 'settings-cache','settings-cache-clear' } { 'desktop scenario frame' }
+        { $_ -in 'avatar-cache','avatar-cache-busy' } { 'desktop scenario frame' }
         'request-compose' { 'request composer ready' }
+        'request-open' { 'desktop scenario frame' }
+        'request-clear' { 'desktop scroll done' }
         'request-edit' { 'desktop scroll done' }
         'request-tabs' { 'desktop scroll done' }
         'avatar-scroll' { 'desktop scroll done' }
+        'avatar-reuse-scroll' { 'desktop scroll done' }
         'scroll' { 'desktop scroll done' }
         'graph-resize' { 'desktop scroll done' }
         'checkout-dialog' { 'desktop scroll done' }
@@ -74,6 +109,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'status-panels' { 'desktop scroll done' }
         'update-available' { 'desktop scroll done' }
         'compare' { 'file diff (' }
+        'remote-diff' { 'file diff (' }
+        'remote-pair' { 'file diff (' }
         'branches' { 'branch activity ready' }
         'diff' { 'file diff (' }
         'search' { 'search ready' }
@@ -84,7 +121,11 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        'settings-cache' { 'image cache requested' }
+        'settings-cache-clear' { 'image cache clear requested' }
+        { $_ -in 'avatar-cache','avatar-cache-busy' } { 'avatar cache requested' }
         'request-compose' { 'request composer requested' }
+        'request-open' { 'request composer requested' }
         'branches' { 'branch activity requested' }
         'diff' { 'file diff requested' }
         'search' {
@@ -95,8 +136,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'pending' { 'pending status requested' }
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }
+        'remote-diff' { 'remote diff requested' }
+        'remote-pair' { 'remote diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','avatar-scroll','update-available')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]

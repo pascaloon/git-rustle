@@ -3,7 +3,7 @@ name = "git-rustle"
 version = "0.1.0"
 edition = "2024"
 description = "Fast Windows-native GPU-accelerated Git client"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
@@ -48,6 +48,11 @@ codegen-units = 1
 panic = "abort"
 strip = true
 debug = false
+
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
 
 [profile.dev]
 opt-level = 1

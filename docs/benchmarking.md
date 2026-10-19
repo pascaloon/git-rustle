@@ -10,6 +10,18 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+For remote-diff routing or refresh changes, generate a fresh cached remote fixture
+with `remote::history::tests::prepare_native_fixture` after builds finish. Run
+`benchmark-desktop.ps1 -Scenarios remote-diff,remote-pair` against it: these wait
+for ghost metadata, use the normal graph selection/Diff handlers, and require a
+nonempty file list without an error. They measure selection through selected-file
+worker delivery, excluding physical input and scanout, and are candidate-only
+for binaries without these scenarios. The ignored engine harness
+`engine::tests::benchmark_remote_diff_refresh` measures parent and divergent-pair
+diff recovery after clearing graph metadata (one warm-up and 15 cached samples).
+It verifies the Git object remains absent and refs unchanged. Compare normal
+startup with the preserved baseline; keep all generated samples under target/bench.
+
 For Git mutation and recovery changes, also follow the operation-specific
 [worker and native measurements](git-operations.md#performance-validation).
 Compare the existing desktop mutation harness against a preserved baseline test
@@ -70,6 +82,19 @@ excludes input-device latency and does not measure scanout or claim display FPS.
 The other intervals are worker request to result delivery. State summaries include
 maximum visible list-row counts to detect a zero-height viewport. They are not a
 substitute for visual or mouse/clipboard verification.
+
+For image-cache controls, run `scripts/benchmark-image-cache.ps1 -Candidate <exe>
+-Image <small-PNG> -OutputDirectory <new-run-directory>`. It creates a disposable
+repository and isolated app-data directory with 500 image files and 500 author
+bindings. Candidate-only `settings-cache` measures size request through the first
+ready frame; `settings-cache-clear` uses the real clear action and measures through
+the empty-cache frame. Each has one warm-up plus 15 launches; the runner restores
+the seed before each launch and verifies counts/bytes. Deletion requires a marker
+in the isolated app-data directory. Never point this fixture at user app data.
+These intervals include filesystem work, scheduling and frame submission, but
+exclude physical input and scanout. Compare existing `settings`, `settings-tabs`,
+`scroll`, `avatar-scroll`, cached-avatar delivery and startup against the baseline.
+Check round photo edges and the size/clear controls in the native window too.
 
 For footer panel changes, also run `-Scenarios status-panels` on a small disposable
 repository. It cycles Details open/closed and History open/closed through the UI
@@ -203,6 +228,18 @@ scrolling remains fast; moving to GPU rendering does not imply faster startup.
 
 ### Provider composition and photos
 
+For empty-description regressions, also run candidate-only
+`benchmark-desktop.ps1 -Scenarios request-open,request-clear` on a disposable local
+repository with one commit and no provider remote. `request-open` uses the actual
+NewRequest action from the toolbar/context menu and leaves the description empty;
+it measures action-to-rendered-frame time. `request-clear` alternates Markdown text
+and an empty description for 120 measured frame callbacks, ending empty. Both
+require an empty editor in the final snapshot and perform no submission. Compare
+the existing `request-compose,request-edit` scenarios with the preserved baseline
+for construction/editing regressions. A prefilled composer alone cannot validate
+empty-placeholder rendering: native pointer opening from both entry points and
+typing/clearing the description must also work.
+
 After preserving the baseline and finishing release validation/builds, compare
 startup and `benchmark-desktop.ps1 -Scenarios scroll,branches -Baseline <exe>` on
 the large history. Run candidate-only
@@ -244,6 +281,50 @@ Record authenticated live checks separately using the ignored
 the child process environment. Never log the token. It only reads project/members,
 the latest commit and its image; request creation remains a local fixture test.
 Keep native cached remote-preview comparison in the run as a regression check.
+
+For shared binary-photo cache changes, preserve both the baseline application and
+test executables. Compare the existing `benchmark_author_cache` harness in each
+preserved test executable after builds finish: it records 15 samples after one
+warm-up, with 100 warm reads per sample. The candidate seeds equivalent 4 KiB image
+bytes directly in its binary cache; the old harness seeds a JSON byte array. These
+measure cached identity/image I/O and parsing, excluding image decoding and real
+network downloads. Also run candidate-only
+`remote::requests::tests::benchmark_shared_author_cache` to resolve different commit
+IDs through the same persisted email binding with the API unavailable. It reports
+binary versus JSON storage sizes for the same payload.
+
+Set `GIT_RUSTLE_AUTHOR_REPO` to the large read-only clone and run the ignored
+`desktop::requests::tests::benchmark_local_author_reuse` harness. It reads 40 local
+author headers per sample and measures shared-image lookup separately. It excludes
+worker scheduling and GPU paint. Compare native startup, `scroll` and `avatar-scroll`
+with the baseline; `avatar-scroll` uses a preloaded shared photo. Then run candidate-only
+`avatar-reuse-scroll` with `GIT_RUSTLE_AVATAR_FIXTURE` set to that photo. This scenario
+uses the real background local-author worker and profile lookup while scrolling,
+seeding positive profiles with the fixture image after each lookup and issuing no
+photo API requests. Logs record worker dispatch-to-delivery milliseconds, snapshots
+require visible reused profiles, and frame JSON retains 120 intervals per launch.
+One photo is shared by all seeded identities: this measures reuse/scheduling/rendering,
+not mixed-image decoding, cold provider responses or physical input latency.
+`avatar-reuse-scroll` keeps the process alive until at least 2.5 seconds after
+the first frame so the final viewport's background author lookup can settle
+before its state assertion. Its 120 measured scroll intervals end before this
+settling period; the assertion still requires visible reused profiles.
+
+For cached-avatar delivery, preserve an application baseline containing the
+`avatar-cache` instrumentation before changing production image handling. On the
+large clone with a fresh persisted binding and image for its first graph author,
+run `benchmark-desktop.ps1 -Scenarios avatar-cache -Baseline <exe> -Samples 15`.
+The scenario clears session avatar state, scrolls to the top, and measures from
+that request to the next-frame callback after GPUI has decoded the first visible
+photo. It uses the real local-author worker and existing disk cache; other authors
+may have cache misses. It includes worker scheduling, cache I/O, decoding and
+frame submission, excluding physical input and display scanout. Normal network
+requests remain enabled, so record cache/network conditions and retain the logs.
+Run candidate-only `avatar-cache-busy` too: it holds the photo-network worker busy
+and requires the same cached photo to become renderable independently. The old
+implementation cannot complete this second scenario. Compare `scroll`,
+`avatar-scroll` and `avatar-reuse-scroll` against the preserved baseline separately;
+do not infer scrolling performance from the single-photo delivery interval.
 
 For landing-page changes, compare native repository startup with the baseline,
 then run `scripts/benchmark-landing.ps1 -Candidate <exe> -Repository <repo>

@@ -493,7 +493,7 @@ pub fn file(
 }
 
 #[cfg(test)]
-pub(super) fn seed_native_fixture(repo: &gix::Repository, remote: &Remote, sha: &str) {
+pub(crate) fn seed_native_fixture(repo: &gix::Repository, remote: &Remote, sha: &str) {
     let session = Session::new(repo, remote, false).unwrap();
     let root = remote.endpoint.strip_suffix("/branches").unwrap();
     let blob = "d".repeat(40);

@@ -45,16 +45,33 @@ Complete member metadata is cached for five minutes and partitioned by repositor
 remote endpoint and credentials. Failed/partial rosters are not cached as success.
 Pagination is bounded to 10,000 entries and reports an error if incomplete.
 
-Graph and commit-detail photos start with initials. After selection and the visible
-graph viewport settle for 350 ms, a worker resolves visible authors, coalesces equal
-commit email identities and loads small images. Each batch performs at most four
-new author lookups. Scrolling doesn't start new lookups until the viewport settles.
-Images and identities have one-day disk caches, partitioned by credentials; the UI
-retains bounded session caches (512 commit entries, 256 author profiles). Settings
-changes invalidate the session images. Downloads are bounded to 256 KiB and never
-forward provider credentials to image hosts or follow redirects. Unavailable,
-private, unsupported or unassociated profiles keep initials. `--no-cache` disables
-these disk reads/writes as well as the existing application caches.
+Graph and commit-detail photos start with initials. Newly visible rows inspect only
+their local Git author headers on a background worker, without waiting for scrolling
+to settle or for a provider request to finish. An exact author email immediately
+reuses the same in-memory image on every matching row, even when those commits have
+never requested a photo. Equal display names alone do not share photos. This local
+step does not decode commit messages or read Git on the UI thread.
+
+New provider/photo requests still wait until selection and the visible graph viewport
+settle for 350 ms. Each batch handles at most four unresolved commits. The UI retains
+bounded session caches (512 commit entries/author bindings, 256 author profiles).
+Settings changes invalidate session images. New rows still need a short local author
+lookup; only known commit-to-email bindings can render their photo in the first frame.
+
+Photos are stored once per avatar URL as the original compressed PNG/JPEG/WebP bytes
+under the user's `git-rustle/cache/avatars-v1` directory (`LOCALAPPDATA` on Windows).
+These binary files are shared across repositories, worktrees and credentials; image
+downloads are public and never receive provider credentials or follow redirects.
+An email-to-avatar URL binding is also shared across repositories of the same provider
+API installation, preventing repeat commit API lookups after restarting. Different
+providers/installations have separate author bindings. Both photos and bindings
+expire after one day so changed profiles can refresh. Fresh older JSON image caches
+migrate on use without downloading, and their migrated entry is removed. PR/member
+metadata and commit API caches retain their existing credential partitions.
+
+Downloads and disk image reads are bounded to 256 KiB. Unavailable, private,
+unsupported or unassociated profiles keep initials. `--no-cache` disables all photo
+and identity disk reads/writes as well as the existing application caches.
 
 ## Provider contracts
 

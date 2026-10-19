@@ -18,6 +18,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod image_cache;
 mod landing;
 mod operations;
 mod rebase;
@@ -140,12 +141,14 @@ enum Action {
     SettingsProvider(Option<&'static str>),
     SaveSettings,
     ForgetToken,
+    ClearImages,
 }
 
 struct Desktop {
     updates: update::Updates,
     composer: Option<requests::Composer>,
     avatars: requests::Avatars,
+    image_cache: image_cache::State,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
@@ -620,7 +623,9 @@ impl Desktop {
                         if dragging {
                             v.scroll_selection(window, cx);
                         }
+                        let remote_diff = matches!(v.scenario.as_deref(), Some("remote-diff" | "remote-pair"));
                         if !v.scenario_started && v.engine.autoquit_ready(Duration::from_millis(20))
+                            && (!remote_diff || !v.engine.app.ghosts.is_empty())
                         {
                             v.scenario_started = true;
                             match v.scenario.as_deref() {
@@ -722,12 +727,25 @@ impl Desktop {
                                     v.frame_start = Some(Instant::now());
                                     cx.notify();
                                 }
-                                Some("scroll" | "graph-resize" | "avatar-scroll") => {
-                                    if v.scenario.as_deref() == Some("avatar-scroll") {
+                                Some("avatar-cache" | "avatar-cache-busy") => {
+                                    v.avatars = Default::default();
+                                    v.reset_avatar_repository();
+                                    // Exercise cached delivery behind a stuck network job.
+                                    v.avatars.block_network_for_scenario(v.scenario.as_deref() == Some("avatar-cache-busy"));
+                                    v.engine.mark("avatar cache requested");
+                                    v.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    cx.notify();
+                                }
+                                Some("scroll" | "graph-resize" | "avatar-scroll" | "avatar-reuse-scroll") => {
+                                    if matches!(v.scenario.as_deref(), Some("avatar-scroll" | "avatar-reuse-scroll")) {
                                         let path = std::env::var_os("GIT_RUSTLE_AVATAR_FIXTURE").expect("avatar image fixture required");
                                         let bytes = std::fs::read(path).expect("read avatar fixture");
                                         let format = crate::remote::requests::image_format(&bytes).expect("PNG, JPEG or WebP avatar fixture");
-                                        v.avatars.scenario_image = Some(std::sync::Arc::new(Image::from_bytes(format, bytes)));
+                                        let image = std::sync::Arc::new(Image::from_bytes(format, bytes));
+                                        if v.scenario.as_deref() == Some("avatar-reuse-scroll") {
+                                            v.avatars.reuse_scenario_image = Some(image);
+                                            v.avatars.seed_reuse_scenario();
+                                        } else { v.avatars.scenario_image = Some(image); }
                                     }
                                     v.scroll_step = 1;
                                     v.frame_start = Some(Instant::now());
@@ -746,7 +764,7 @@ impl Desktop {
                                     v.search
                                         .update(cx, |s, cx| s.set_value("m: merge", window, cx));
                                 }
-                                Some("settings" | "settings-tabs") => {
+                                Some("settings" | "settings-tabs" | "settings-cache" | "settings-cache-clear") => {
                                     v.action(Action::Settings, window, cx)
                                 }
                                 Some("compare") => {
@@ -754,7 +772,23 @@ impl Desktop {
                                     v.action(Action::Select(1, true), window, cx);
                                     v.action(Action::Diff, window, cx);
                                 }
-                                Some("request-compose" | "request-edit" | "request-tabs") => {
+                                Some("remote-diff" | "remote-pair") => {
+                                    let remote_row = v.engine.app.history.commits.iter().position(|c| v.engine.app.ghosts.contains_key(&c.id)).unwrap();
+                                    v.engine.mark("remote diff requested");
+                                    v.action(Action::Select(remote_row, false), window, cx);
+                                    if v.scenario.as_deref() == Some("remote-pair") {
+                                        let head = v.engine.app.head_id().unwrap();
+                                        let local_row = v.engine.app.history.index_of(&head).unwrap();
+                                        v.action(Action::Select(local_row, true), window, cx);
+                                    }
+                                    v.action(Action::Diff, window, cx);
+                                }
+                                Some("request-open") => {
+                                    let source = v.engine.app.refs.as_ref()
+                                        .and_then(|r| r.head_branch.clone()).unwrap_or_default();
+                                    v.action(Action::NewRequest(source), window, cx);
+                                }
+                                Some("request-compose" | "request-edit" | "request-tabs" | "request-clear") => {
                                     v.request_scenario(window, cx);
                                 }
                                 Some("compare-menu") => {
@@ -768,6 +802,14 @@ impl Desktop {
                                 _ => {}
                             }
                         }
+                        if v.scenario_started && v.scenario.as_deref() == Some("settings-cache-clear")
+                            && !v.image_cache.busy && v.image_cache.stats.is_some()
+                            && !v.image_cache.cleared
+                        {
+                            let root = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("isolated app data required"));
+                            assert_eq!(std::fs::read_to_string(root.join("cache-benchmark-fixture")).unwrap(), "disposable image cache benchmark");
+                            v.action(Action::ClearImages, window, cx);
+                        }
                         if v.scenario_started && v.scenario.as_deref() == Some("history-clear")
                             && v.history_scenario_ready() && !v.engine.operation_error
                         {
@@ -778,7 +820,7 @@ impl Desktop {
                         if v.scenario_started && v.scroll_step == 0 {
                             let ready = match v.scenario.as_deref() {
                                 Some("history-scroll") => v.history_scenario_ready(),
-                                Some("request-edit" | "request-tabs") => v.composer.is_some(),
+                                Some("request-edit" | "request-tabs" | "request-clear") => v.composer.is_some(),
                                 Some("rebase-scroll" | "rebase-edit") => v.rebase_scenario_ready(),
                                 Some("settings-tabs") => {
                                     v.engine.app.settings.open && !v.engine.app.settings.busy
@@ -831,7 +873,7 @@ impl Desktop {
                             && !v.engine.app.settings.saving)
                         {
                             if let Some(path) = std::env::var_os("GIT_RUSTLE_DUMP") {
-                                let _ = std::fs::write(path, v.snapshot());
+                                let _ = std::fs::write(path, v.snapshot(cx));
                             }
                             cx.quit();
                         }
@@ -847,6 +889,7 @@ impl Desktop {
             updates: Default::default(),
             composer: None,
             avatars: Default::default(),
+            image_cache: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
@@ -1326,6 +1369,7 @@ impl Desktop {
                 }
             }
             Action::SaveSettings => app.settings.save_page(),
+            Action::ClearImages => {}
             Action::ForgetToken => {
                 if !app.settings.busy && app.settings.page > 0 {
                     let d = &mut app.settings.providers[app.settings.page - 1];
@@ -1338,6 +1382,12 @@ impl Desktop {
         if matches!(action, Action::Head | Action::JumpBranch) {
             self.graph_scroll
                 .scroll_to_item(app.graph_selected(), ScrollStrategy::Center);
+        }
+        if matches!(
+            action,
+            Action::Settings | Action::Tab(Tab::Settings) | Action::ClearImages
+        ) {
+            self.image_cache_request(matches!(action, Action::ClearImages), cx);
         }
         self.changed(cx);
         self.sync_inputs(window, cx);
@@ -1461,14 +1511,16 @@ impl Desktop {
             _ => None,
         };
         let text: SharedString = text.into();
-        let enabled = (!matches!(action, Action::Diff)
-            || self.engine.app.pending.selected
-            || matches!(
-                self.selected_commits
-                    .ids(self.engine.app.selected_id())
-                    .len(),
-                1 | 2
-            ))
+        let enabled = (!matches!(action, Action::ClearImages)
+            || (!self.image_cache.busy && self.image_cache.stats.is_some()))
+            && (!matches!(action, Action::Diff)
+                || self.engine.app.pending.selected
+                || matches!(
+                    self.selected_commits
+                        .ids(self.engine.app.selected_id())
+                        .len(),
+                    1 | 2
+                ))
             && (!matches!(
                 action,
                 Action::SettingsTab(_)
@@ -1649,11 +1701,15 @@ impl Desktop {
             n,
             cx.processor(|v, range: std::ops::Range<usize>, _, cx| {
                 v.viewport_rows[0] = v.viewport_rows[0].max(range.len());
+                v.reset_avatar_repository();
                 let app = &v.engine.app;
-                v.avatars.observe(range.clone().filter_map(|row| {
+                let changed = v.avatars.observe(range.clone().filter_map(|row| {
                     app.history_index(row)
                         .map(|i| v.engine.app.history.commits[i].id)
                 }));
+                if changed {
+                    v.resolve_avatar_authors(cx);
+                }
                 v.engine.app.list_rows = range.len().max(1);
                 v.engine.app.scroll = range.start;
                 let app = &v.engine.app;
@@ -1747,15 +1803,26 @@ impl Desktop {
                                 for label in
                                     labels.iter().filter(|label| label.name != "HEAD").take(3)
                                 {
+                                    let remote = label.kind == crate::git::RefKind::Remote;
+                                    let color = if remote { REMOTE_TEXT } else { SEARCH_TEXT };
                                     r = r.child(
-                                        div()
+                                        row()
+                                            .gap_1()
                                             .rounded_sm()
                                             .px_1()
-                                            .bg(rgb(SELECTED))
-                                            .text_color(rgb(SEARCH_TEXT))
+                                            .flex_shrink_0()
+                                            .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
+                                            .text_color(rgb(color))
                                             .max_w(px(170.))
                                             .overflow_hidden()
                                             .whitespace_nowrap()
+                                            .when(label.remote_only, |badge| {
+                                                badge.child(
+                                                    icon("cloud")
+                                                        .size(px(14.))
+                                                        .text_color(rgb(color)),
+                                                )
+                                            })
                                             .child(v.matches.styled(label.name.clone())),
                                     );
                                 }
@@ -1778,8 +1845,7 @@ impl Desktop {
                                         .text_color(rgb(MUTED))
                                         .child(requests::avatar(
                                             v.avatars
-                                                .images
-                                                .get(&rec.id)
+                                                .image(&rec.id)
                                                 .or(v.avatars.scenario_image.as_ref()),
                                             app.history.author(i),
                                             22.,
@@ -2176,7 +2242,7 @@ impl Desktop {
                                 ))
                                 .when_some(self.detail_id, |s, id| {
                                     s.child(requests::avatar(
-                                        self.avatars.images.get(&id),
+                                        self.avatars.image(&id),
                                         app.details
                                             .as_ref()
                                             .map(|d| d.author_name.as_str())
@@ -2657,7 +2723,10 @@ impl Desktop {
                 .child(self.button("forget", if draft.forget { "✓ Forget saved token" } else { "Forget saved token" }, Action::ForgetToken, cx));
         }
         column()
+            .id("settings-page")
             .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .p_6()
             .gap_4()
             .child(div().text_size(px(20.)).child("Settings"))
@@ -2690,6 +2759,7 @@ impl Desktop {
                     .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
                     .child(settings.status.clone()),
             )
+            .child(self.image_cache_controls(cx))
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
@@ -2718,15 +2788,39 @@ impl Desktop {
                     && self.operations.rebase_open
                     && !self.engine.operation_busy
             }
-            Some("request-compose") => self.composer.is_some(),
+            Some("request-compose" | "request-open") => self.composer.is_some(),
+            Some("settings-cache" | "settings-cache-clear") => {
+                !app.settings.busy
+                    && !self.image_cache.busy
+                    && self.image_cache.stats.is_some()
+                    && (self.scenario.as_deref() != Some("settings-cache-clear")
+                        || self.image_cache.cleared)
+            }
+            Some("avatar-cache" | "avatar-cache-busy") => self.avatars.first_visible_ready(),
             Some(
-                "history-scroll" | "rebase-scroll" | "rebase-edit" | "scroll" | "graph-resize"
-                | "files-scroll" | "diff-scroll" | "diff-pan" | "search-scroll" | "wrap-scroll"
-                | "tabs" | "settings-tabs" | "checkout-dialog" | "status-panels" | "request-edit"
-                | "request-tabs" | "avatar-scroll" | "update-available",
+                "history-scroll"
+                | "rebase-scroll"
+                | "rebase-edit"
+                | "scroll"
+                | "graph-resize"
+                | "files-scroll"
+                | "diff-scroll"
+                | "diff-pan"
+                | "search-scroll"
+                | "wrap-scroll"
+                | "tabs"
+                | "settings-tabs"
+                | "checkout-dialog"
+                | "status-panels"
+                | "request-edit"
+                | "request-tabs"
+                | "request-clear"
+                | "avatar-scroll"
+                | "avatar-reuse-scroll"
+                | "update-available",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
-            Some("diff" | "pending-diff" | "compare") => {
+            Some("diff" | "pending-diff" | "compare" | "remote-diff" | "remote-pair") => {
                 matches!(&app.mode,Mode::Diff(v) if v.diff.as_ref().is_some_and(|d| d.syntax.is_some()))
             }
             Some("search") => app.search.result.as_ref().is_some_and(|r| r.done),
@@ -2735,7 +2829,7 @@ impl Desktop {
             _ => true,
         }
     }
-    fn snapshot(&self) -> String {
+    fn snapshot(&self, cx: &gpui::App) -> String {
         if self.engine.landing() {
             return format!(
                 "Git Rustle\nlanding page\nOpen Directory\nrecent_count={}\n{}\n{}\n",
@@ -2751,7 +2845,7 @@ impl Desktop {
         }
         let app = &self.engine.app;
         format!(
-            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\ncheckout_choices={}\noperations={} cursor={} conflicts={}\n{}\n",
+            "Git Rustle\n{}\n{} commits\n{}\n{}\n{}\nviewport_rows={:?}\nsyntax_spans={}\ndiff_files={} diff_failed={}\ncheckout_choices={}\noperations={} cursor={} conflicts={}\n{}\n",
             app.repo_name,
             app.history.len(),
             app.details
@@ -2769,6 +2863,11 @@ impl Desktop {
                     .map_or(0, |s| s.span_count()),
                 _ => 0,
             },
+            match &app.mode {
+                Mode::Diff(v) => v.changes.files.len(),
+                _ => 0,
+            },
+            matches!(&app.mode, Mode::Diff(v) if v.changes.error.is_some()),
             app.checkout_confirmation
                 .as_ref()
                 .map_or(0, |d| d.choices.len()),
@@ -2780,13 +2879,18 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}",
+                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}",
                 self.status_panel,
                 self.updates.available.is_some(),
                 self.updates.open,
                 self.engine.operation_status,
                 self.operations.summary(),
-                self.request_summary()
+                self.request_summary(cx),
+                self.avatars.summary(),
+                self.image_cache.stats.map_or(0, |s| s.bytes),
+                self.image_cache.stats.map_or(0, |s| s.images),
+                self.image_cache.busy,
+                self.image_cache.cleared
             ),
         )
     }
@@ -2882,7 +2986,7 @@ impl Render for Desktop {
                         let handler_start = Instant::now();
                         match v.scenario.as_deref() {
                             Some("history-scroll") => v.history_scenario_scroll(v.scroll_step),
-                            Some("request-edit" | "request-tabs") => {
+                            Some("request-edit" | "request-tabs" | "request-clear") => {
                                 v.request_scenario_step(window, cx)
                             }
                             Some("rebase-scroll" | "rebase-edit") => {
@@ -2974,6 +3078,10 @@ impl Render for Desktop {
             && self.scenario.is_some()
             && !self.scenario_presented
             && self.scenario_ready()
+            && (!matches!(
+                self.scenario.as_deref(),
+                Some("avatar-cache" | "avatar-cache-busy")
+            ) || self.avatars.first_visible_decoded(window, cx))
         {
             let weak = cx.entity().downgrade();
             window.on_next_frame(move |_, cx| {
