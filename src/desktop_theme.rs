@@ -11,7 +11,6 @@ pub const TEXT: u32 = 0xeee9e4;
 pub const MUTED: u32 = 0xa39b94;
 pub const INSPECTOR_LINE: u32 = 0x1c1c1c;
 pub const INSPECTOR_MUTED: u32 = 0x999999;
-pub const INSPECTOR_HASH: u32 = 0xb5b5b5;
 pub const ACCENT: u32 = 0xff914d;
 pub const ACCENT_HOVER: u32 = 0xffad75;
 pub const SELECTED: u32 = 0x301c10;

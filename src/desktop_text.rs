@@ -95,7 +95,6 @@ pub enum TextRole {
     Label,
     Value,
     Muted,
-    Hash,
 }
 
 #[derive(Clone)]
@@ -247,11 +246,6 @@ impl TextBlock {
                 .text_size(px(12.))
                 .line_height(px(19.))
                 .text_color(rgb(desktop_theme::INSPECTOR_MUTED)),
-            TextRole::Hash => content
-                .font_family("Cascadia Mono")
-                .text_size(px(11.))
-                .line_height(px(19.))
-                .text_color(rgb(desktop_theme::INSPECTOR_HASH)),
         };
         content
             .on_mouse_down(

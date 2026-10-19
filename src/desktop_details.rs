@@ -46,23 +46,6 @@ pub fn document(details: &CommitDetails) -> Document {
         doc.push(TextRole::Muted, &details.committer_email);
         doc.push(TextRole::Muted, &committed);
     }
-    doc.push(TextRole::Label, "COMMIT");
-    doc.push(TextRole::Hash, &details.id.to_string());
-    doc.push(
-        TextRole::Label,
-        if details.parents.len() == 1 {
-            "PARENT"
-        } else {
-            "PARENTS"
-        },
-    );
-    if details.parents.is_empty() {
-        doc.push(TextRole::Muted, "Root commit · no parents");
-    } else {
-        for parent in &details.parents {
-            doc.push(TextRole::Hash, &parent.to_string());
-        }
-    }
     doc
 }
 
@@ -89,7 +72,6 @@ mod tests {
         assert!(doc.text.contains("  keep indentation\n第二行"));
         assert!(doc.text.contains("Zoë 🦀"));
         assert!(doc.text.contains("René"));
-        assert!(doc.text.contains("Root commit"));
         for section in &doc.sections {
             assert_eq!(&doc.text[section.range.clone()], section.text.as_ref());
         }
