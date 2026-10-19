@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git Rustle — the fast, free &amp; open-source Git client for Windows</title>
+  <meta name="description" content="Git Rustle is a free, open-source, GPU-accelerated Git client for Windows written in Rust. Virtualized history, GPU-painted graph lanes and background workers keep every interaction snappy.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Git Rustle — the fast, free &amp; open-source Git client for Windows">
+  <meta property="og:description" content="Windows-native, GPU-accelerated, written in Rust. Free and open source under GPL-3.0.">
+  <meta property="og:image" content="assets/og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav" id="top">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top" aria-label="Git Rustle home">
+        <img src="assets/icon-192.png" width="28" height="28" alt="">
+        <span class="wordmark">Git <span class="rust">Rust</span>le</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="#speed">Speed</a>
+        <a href="#features">Features</a>
+        <a href="#open-source">Open source</a>
+        <a href="#download">Download</a>
+        <a class="icon-link" href="https://github.com/pascaloon/git-rustle" aria-label="Git Rustle on GitHub" rel="noopener">
+          <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        </a>
+      </nav>
+      <a class="btn btn-primary btn-sm" href="https://github.com/pascaloon/git-rustle/releases/latest/download/git-rustle-x86_64-pc-windows-msvc.exe">
+        <svg class="win" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M0 2.3 6.5 1.4v6.3H0zM7.3 1.3 16 0v7.7H7.3zM0 8.4h6.5v6.3L0 13.8zm7.3 0H16V16l-8.7-1.2z"/></svg>
+        Download
+      </a>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- ───────────────────────── HERO ───────────────────────── -->
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="streaks" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <p class="pill reveal">
+            <span class="dot"></span>
+            Free &amp; open source · GPL-3.0 · Windows
+          </p>
+          <h1 id="hero-title" class="reveal">
+            <span class="wordmark">Git <span class="rust">Rust</span>le</span>
+          </h1>
+          <p class="tagline reveal">A Git client that keeps up with you.</p>
+          <p class="lede reveal">
+            Windows-native, GPU-accelerated and written in Rust. History, diffs,
+            search and remote previews stream in on background workers so the
+            interface never waits. Free and open source — always.
+          </p>
+          <div class="cta reveal">
+            <a class="btn btn-primary btn-lg" href="https://github.com/pascaloon/git-rustle/releases/latest/download/git-rustle-x86_64-pc-windows-msvc.exe">
+              <svg class="win" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M0 2.3 6.5 1.4v6.3H0zM7.3 1.3 16 0v7.7H7.3zM0 8.4h6.5v6.3L0 13.8zm7.3 0H16V16l-8.7-1.2z"/></svg>
+              Download for Windows
+            </a>
+            <a class="btn btn-ghost btn-lg" href="https://github.com/pascaloon/git-rustle" rel="noopener">View source on GitHub</a>
+          </div>
+          <p class="cta-meta reveal">
+            <span class="mono version" data-version>v0.1.2</span>
+            <span class="sep">·</span> x64 · latest release
+            <span class="sep">·</span> <a href="https://github.com/pascaloon/git-rustle/releases/latest" rel="noopener">Release notes &amp; SHA-256</a>
+          </p>
+        </div>
+        <div class="hero-art reveal" aria-hidden="true">
+          <div class="glow"></div>
+          <img class="hero-icon" src="assets/icon-512.png" width="512" height="512" alt="">
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── APP MOCK ───────────────────────── -->
+    <section class="mock-section" aria-label="Application preview">
+      <div class="wrap">
+        <div class="app reveal" role="img" aria-label="Stylized preview of the Git Rustle window: commit graph, branch badges and side-by-side diff">
+          <div class="app-title">
+            <span class="app-title-left">
+              <img src="assets/icon-192.png" width="16" height="16" alt="">
+              <span>git-rustle</span>
+              <span class="app-sep">—</span>
+              <span class="muted">C:\Projects\git-rustle</span>
+            </span>
+            <span class="app-win-controls"><i></i><i></i><i></i></span>
+          </div>
+          <div class="app-tabs">
+            <span class="tab active">Git Graph</span>
+            <span class="tab">Branches</span>
+            <span class="tab">Diff</span>
+            <span class="tab">Settings</span>
+            <span class="app-tabs-spacer"></span>
+            <span class="app-icon-btn" title="Open in Explorer"></span>
+            <span class="app-icon-btn" title="Open terminal"></span>
+          </div>
+          <div class="app-toolbar">
+            <span class="tbtn primary">HEAD</span>
+            <span class="tbtn">Pull</span>
+            <span class="tbtn">Push <i class="shield"></i></span>
+            <span class="tbtn">New branch</span>
+            <span class="tbtn">Refresh</span>
+            <span class="search"><span class="search-icon"></span><span class="search-text">f: desktop_theme.rs</span><span class="caret"></span></span>
+          </div>
+          <div class="app-body">
+            <div class="graph">
+              <svg class="lanes" viewBox="0 0 96 352" preserveAspectRatio="none" aria-hidden="true">
+                <!-- lane 0 (orange / main) -->
+                <path d="M16 0 V352" stroke="#ff914d" stroke-width="2" fill="none"/>
+                <!-- lane 1 (cyan) merges into main -->
+                <path d="M48 32 V160 C48 190 16 180 16 208" stroke="#66d9ef" stroke-width="2" fill="none"/>
+                <path d="M16 64 C16 90 48 80 48 112" stroke="#66d9ef" stroke-width="2" fill="none" opacity="0"/>
+                <!-- lane 2 (purple) branch -->
+                <path d="M80 96 V256 C80 290 16 280 16 320" stroke="#c792ff" stroke-width="2" fill="none"/>
+                <!-- commits -->
+                <circle cx="16" cy="16" r="4.5" fill="#000" stroke="#ff914d" stroke-width="2"/>
+                <circle cx="48" cy="48" r="4.5" fill="#66d9ef"/>
+                <circle cx="16" cy="80" r="4.5" fill="#ff914d"/>
+                <circle cx="80" cy="112" r="4.5" fill="#c792ff"/>
+                <circle cx="48" cy="144" r="4.5" fill="#66d9ef"/>
+                <circle cx="16" cy="176" r="4.5" fill="#ff914d"/>
+                <circle cx="16" cy="208" r="4.5" fill="#ff914d"/>
+                <circle cx="80" cy="240" r="4.5" fill="#c792ff"/>
+                <circle cx="16" cy="272" r="4.5" fill="#ff914d"/>
+                <circle cx="16" cy="304" r="4.5" fill="#ff914d"/>
+                <circle cx="16" cy="336" r="4.5" fill="#ff914d"/>
+              </svg>
+              <ul class="rows">
+                <li class="row pending"><span class="msg">Pending changes</span><span class="badge pend">3 files</span><span class="meta"></span></li>
+                <li class="row"><span class="msg">Virtualize branch browser rows</span><span class="badge remote"><i class="cloud"></i>origin/feature/branches</span><span class="meta">2m</span></li>
+                <li class="row selected"><span class="msg">Paint graph lanes on the GPU</span><span class="badge head">main</span><span class="badge remote">origin/main</span><span class="meta">1h</span></li>
+                <li class="row"><span class="msg">Add <mark>desktop_theme</mark> OLED palette</span><span class="meta">3h</span></li>
+                <li class="row"><span class="msg">Coalesce commit detail requests</span><span class="meta">5h</span></li>
+                <li class="row"><span class="msg">Overlap repository load with DirectX init</span><span class="badge tag">v0.1.2</span><span class="meta">1d</span></li>
+                <li class="row"><span class="msg">Stream search results during indexing</span><span class="meta">1d</span></li>
+                <li class="row"><span class="msg">Remote preview: cache immutable trees</span><span class="meta">2d</span></li>
+                <li class="row"><span class="msg">Side-by-side diff with intraline highlights</span><span class="meta">2d</span></li>
+                <li class="row"><span class="msg">Interactive rebase plan editor</span><span class="meta">3d</span></li>
+                <li class="row"><span class="msg">Initial GPUI desktop shell</span><span class="badge tag">v0.1.0</span><span class="meta">4d</span></li>
+              </ul>
+            </div>
+            <div class="diff">
+              <div class="diff-head">
+                <span class="mono path">src/<b>desktop_theme</b>.rs</span>
+                <span class="stats"><span class="add">+6</span> <span class="del">−2</span></span>
+              </div>
+              <div class="diff-body mono">
+                <div class="side">
+                  <div class="ln ctx"><i>12</i>pub const MUTED: u32 = 0xa39b94;</div>
+                  <div class="ln del"><i>13</i>pub const ACCENT: u32 = <s>0xf97316</s>;</div>
+                  <div class="ln del"><i>14</i>pub const ACCENT_HOVER: u32 = <s>0xfb923c</s>;</div>
+                  <div class="ln ctx"><i>15</i>pub const SELECTED: u32 = 0x301c10;</div>
+                  <div class="ln gap"><i></i></div>
+                  <div class="ln gap"><i></i></div>
+                  <div class="ln gap"><i></i></div>
+                  <div class="ln ctx"><i>16</i>pub const REMOTE_TEXT: u32 = 0x8ccaff;</div>
+                  <div class="ln ctx"><i>17</i>pub const REMOTE_BG: u32 = 0x11283c;</div>
+                </div>
+                <div class="side">
+                  <div class="ln ctx"><i>12</i>pub const MUTED: u32 = 0xa39b94;</div>
+                  <div class="ln add"><i>13</i>pub const ACCENT: u32 = <b>0xff914d</b>;</div>
+                  <div class="ln add"><i>14</i>pub const ACCENT_HOVER: u32 = <b>0xffad75</b>;</div>
+                  <div class="ln ctx"><i>15</i>pub const SELECTED: u32 = 0x301c10;</div>
+                  <div class="ln add"><i>16</i>pub const SELECTION: u32 = 0xff914d55;</div>
+                  <div class="ln add"><i>17</i>pub const SEARCH_TEXT: u32 = 0xffbc87;</div>
+                  <div class="ln add"><i>18</i>pub const SEARCH_BG: u32 = 0xff914d33;</div>
+                  <div class="ln ctx"><i>19</i>pub const REMOTE_TEXT: u32 = 0x8ccaff;</div>
+                  <div class="ln ctx"><i>20</i>pub const REMOTE_BG: u32 = 0x11283c;</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="app-status">
+            <span class="status-update">Update available</span>
+            <span class="muted">main · up to date with origin/main</span>
+            <span class="app-tabs-spacer"></span>
+            <span class="muted">Undo / redo history</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── SPEED ───────────────────────── -->
+    <section class="section" id="speed" aria-labelledby="speed-title">
+      <div class="wrap">
+        <p class="eyebrow reveal">Performance is the product</p>
+        <h2 id="speed-title" class="reveal">Built for speed, not for show.</h2>
+        <p class="section-lede reveal">
+          Every layer is designed around one rule: the UI thread never waits.
+          Git Rustle is engineered to feel instant on repositories with
+          hundreds of thousands of commits.
+        </p>
+
+        <div class="cards cards-3">
+          <article class="card reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <h3>Virtualized everything</h3>
+            <p>History, branches, changed files and diff lines only construct the rows you can see. Scroll a million-line diff like it is ten.</p>
+          </article>
+          <article class="card reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4v16M18 4v16M6 12c0-4 12 4 12 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></div>
+            <h3>GPU-painted graph</h3>
+            <p>Graph lanes, diff selections and intraline highlights are drawn directly by DirectX through GPUI — no DOM, no layout thrash.</p>
+          </article>
+          <article class="card reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <h3>Background workers</h3>
+            <p>Repository loading, status, search, diffs, stats, network and commit details run off the UI thread. Results stream in as they land.</p>
+          </article>
+          <article class="card reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v4H4zM4 13h16v4H4z" stroke="currentColor" stroke-width="2" fill="none"/><path d="M7 9h.01M7 15h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <h3>Persistent caches</h3>
+            <p>Packed history, lazy message/path search indexes and immutable remote metadata are reused across launches. Second open is faster than the first.</p>
+          </article>
+          <article class="card reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 8v4l3 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <h3>Zero idle redraws</h3>
+            <p>An idle window costs nothing. Frames are only produced when something changes, so Git Rustle stays out of your GPU and battery budget.</p>
+          </article>
+          <article class="card reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z" stroke="currentColor" stroke-width="2" stroke-linejoin="round" fill="none"/></svg></div>
+            <h3>Instant startup</h3>
+            <p>Repository loading and layout overlap DirectX initialization. The first history frame appears while the window is still fading in.</p>
+          </article>
+        </div>
+
+        <div class="build reveal">
+          <div class="build-copy">
+            <h3>Compiled for the metal</h3>
+            <p>
+              Release binaries are built with fat link-time optimization and a
+              single code-generation unit, powered by
+              <a href="https://github.com/GitoxideLabs/gitoxide" rel="noopener">Gitoxide</a>
+              for pure-Rust repository access and
+              <a href="https://www.gpui.rs/" rel="noopener">GPUI</a>
+              for the renderer. Performance regressions are measured against a
+              preserved baseline executable before every notable change.
+            </p>
+          </div>
+          <pre class="terminal mono" aria-label="Release build profile"><code><span class="c"># Cargo.toml</span>
+<span class="k">[profile.release]</span>
+opt-level     = <span class="n">3</span>
+lto           = <span class="s">"fat"</span>
+codegen-units = <span class="n">1</span>
+panic         = <span class="s">"abort"</span>
+
+<span class="p">PS&gt;</span> cargo build --release --locked
+<span class="ok">    Finished</span> `release` profile [optimized] target(s)</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── FEATURES ───────────────────────── -->
+    <section class="section section-alt" id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <p class="eyebrow reveal">Everything you reach for</p>
+        <h2 id="features-title" class="reveal">A complete client. Nothing bolted on.</h2>
+
+        <div class="cards cards-4">
+          <article class="card reveal">
+            <h3>Commit graph &amp; inspector</h3>
+            <p>Resizable lane graph with branch, tag and remote badges. Click a row for the full message, author, committer, dates, parents and hash.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Side-by-side diffs</h3>
+            <p>Intraline highlights, word wrap, horizontal panning and line-accurate copying. Syntax colors for Rust, C/C++, C#, JS/TS, Python, Go, Java, Ruby, shell, HTML/CSS, JSON, TOML, YAML, SQL and Markdown.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Search that streams</h3>
+            <p>Type to filter history as indexes build. Scope with prefixes:
+              <span class="chips"><code>f:</code><code>a:</code><code>m:</code><code>s:</code></span>
+              for paths, authors, messages and hashes.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Remote previews</h3>
+            <p>Browse GitHub and GitLab branches, tags and missing commits through read-only APIs. Ghost previews never fetch objects or touch your refs.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Interactive rebase</h3>
+            <p>Reorder, reword, squash, fixup, edit and drop from an editable plan. Conflicts guide you through compare, edit, stage, continue, skip or abort.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Undo / redo history</h3>
+            <p>Commits and checkouts record recoverable states. Double-click to move backward or forward. Nothing is force-reset or auto-stashed behind your back.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Pending changes composer</h3>
+            <p>Pick files and folders with checkboxes, write a multiline message and optionally branch off in one step. Drafts survive browsing diffs.</p>
+          </article>
+          <article class="card reveal">
+            <h3>Safe in-app updates</h3>
+            <p>Updates come straight from public GitHub Releases, verified against pinned SHA-256 digests, and restart with your draft intact.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── OPEN SOURCE ───────────────────────── -->
+    <section class="section" id="open-source" aria-labelledby="oss-title">
+      <div class="wrap">
+        <p class="eyebrow reveal">Free &amp; open source</p>
+        <h2 id="oss-title" class="reveal">Free. Open. <span class="rust">Yours.</span></h2>
+        <p class="section-lede reveal">
+          Git Rustle is free software under the GNU GPL-3.0. No license keys,
+          no subscriptions, no accounts, no telemetry. The whole client is on
+          GitHub for you to read, audit, fork and improve.
+        </p>
+
+        <div class="cards cards-3">
+          <article class="card card-accent reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 7v5c0 5 3.5 8.5 8 9 4.5-.5 8-4 8-9V7z" stroke="currentColor" stroke-width="2" stroke-linejoin="round" fill="none"/><path d="m9 12 2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></div>
+            <h3>Free forever</h3>
+            <p>Download and use it on every machine you own. There is no paid tier, trial period or sign-up form — just a single portable executable.</p>
+          </article>
+          <article class="card card-accent reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M14 4l-4 16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></div>
+            <h3>Open source, GPL-3.0</h3>
+            <p>Every line is public. Read how diffs are computed, audit how tokens are stored, or fork it and make it yours. Copyleft keeps it that way.</p>
+          </article>
+          <article class="card card-accent reveal">
+            <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10M8 10l4 4 4-4M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></div>
+            <h3>Transparent updates</h3>
+            <p>The in-app updater pulls from the public GitHub Releases feed over HTTPS and verifies SHA-256 digests. Checksums ship next to every build.</p>
+          </article>
+        </div>
+
+        <div class="oss-links reveal">
+          <a class="btn btn-ghost" href="https://github.com/pascaloon/git-rustle" rel="noopener">Star on GitHub</a>
+          <a class="btn btn-ghost" href="https://github.com/pascaloon/git-rustle/issues" rel="noopener">Report an issue</a>
+          <a class="btn btn-ghost" href="https://github.com/pascaloon/git-rustle/blob/main/LICENSE" rel="noopener">Read the license</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── DOWNLOAD ───────────────────────── -->
+    <section class="section download" id="download" aria-labelledby="download-title">
+      <div class="wrap">
+        <div class="download-card reveal">
+          <div class="download-main">
+            <img src="assets/icon-192.png" width="72" height="72" alt="" class="download-icon">
+            <p class="eyebrow">Windows 10 / 11 · x64</p>
+            <h2 id="download-title">Get Git <span class="rust">Rust</span>le</h2>
+            <p class="section-lede">
+              One portable <code class="mono">.exe</code>. No installer, no account,
+              no cost. Download the latest release and open a repository.
+            </p>
+            <div class="cta">
+              <a class="btn btn-primary btn-lg" href="https://github.com/pascaloon/git-rustle/releases/latest/download/git-rustle-x86_64-pc-windows-msvc.exe">
+                <svg class="win" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M0 2.3 6.5 1.4v6.3H0zM7.3 1.3 16 0v7.7H7.3zM0 8.4h6.5v6.3L0 13.8zm7.3 0H16V16l-8.7-1.2z"/></svg>
+                Download for Windows
+              </a>
+              <a class="btn btn-ghost btn-lg" href="https://github.com/pascaloon/git-rustle/releases/latest" rel="noopener">Latest release notes</a>
+            </div>
+            <p class="cta-meta">
+              <span class="mono version" data-version>v0.1.2</span>
+              <span class="sep">·</span> <code class="mono">git-rustle-x86_64-pc-windows-msvc.exe</code>
+              <span class="sep">·</span> <a href="https://github.com/pascaloon/git-rustle/releases" rel="noopener">All releases</a>
+            </p>
+            <p class="note">
+              Windows only. Git Rustle renders with DirectX and integrates with
+              Windows Credential Manager, Explorer and Windows Terminal; other
+              platforms are not supported.
+            </p>
+          </div>
+          <aside class="download-side">
+            <h3>Requirements</h3>
+            <ul class="checks">
+              <li>Windows 10 or 11, x64</li>
+              <li>A DirectX-capable graphics driver</li>
+              <li><a href="https://git-scm.com/download/win" rel="noopener">Git for Windows</a> on <code class="mono">PATH</code> for commits, checkouts and recovery</li>
+              <li>Windows Terminal (optional) for the terminal launcher</li>
+            </ul>
+            <h3>Build from source</h3>
+            <pre class="terminal mono small"><code><span class="p">PS&gt;</span> git clone https://github.com/pascaloon/git-rustle.git
+<span class="p">PS&gt;</span> cd git-rustle
+<span class="p">PS&gt;</span> cargo build --release --locked
+<span class="p">PS&gt;</span> .\target\release\git-rustle.exe [PATH]</code></pre>
+            <p class="note">Requires a stable Rust MSVC toolchain and Visual Studio C++ Build Tools.</p>
+          </aside>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <div class="footer-brand">
+        <img src="assets/icon-192.png" width="24" height="24" alt="">
+        <span class="wordmark">Git <span class="rust">Rust</span>le</span>
+      </div>
+      <p class="footer-text">
+        Free and open-source software, licensed
+        <a href="https://github.com/pascaloon/git-rustle/blob/main/LICENSE" rel="noopener">GPL-3.0-only</a>.
+        Made with Rust and GPUI.
+      </p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="https://github.com/pascaloon/git-rustle" rel="noopener">GitHub</a>
+        <a href="https://github.com/pascaloon/git-rustle/releases/latest" rel="noopener">Latest release</a>
+        <a href="https://github.com/pascaloon/git-rustle/issues" rel="noopener">Issues</a>
+        <a href="#top">Back to top</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+</html>
