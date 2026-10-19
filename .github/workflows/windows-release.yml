@@ -68,8 +68,11 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
             throw "Release tag must be v$version to match Cargo.toml"
           }
-          $reported = & './target/x86_64-pc-windows-msvc/release/git-rustle.exe' --version
-          if ($LASTEXITCODE -ne 0 -or $reported -cne "git-rustle $version") {
+          # PowerShell does not wait for a Windows GUI-subsystem executable.
+          # Keep its stdout open until it exits, then validate the captured value.
+          $process = Start-Process -FilePath './target/x86_64-pc-windows-msvc/release/git-rustle.exe' -ArgumentList '--version' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput version.txt -RedirectStandardError version-error.txt
+          $reported = (Get-Content -LiteralPath version.txt -Raw).Trim()
+          if ($process.ExitCode -ne 0 -or $reported -cne "git-rustle $version") {
             throw 'Executable version does not match Cargo.toml'
           }
 
@@ -80,10 +83,10 @@ jobs:
 
       - name: Smoke-test release executable
         run: |
-          & './target/x86_64-pc-windows-msvc/release/git-rustle.exe' --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & './target/x86_64-pc-windows-msvc/release/git-rustle.exe' --help
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $process = Start-Process -FilePath './target/x86_64-pc-windows-msvc/release/git-rustle.exe' -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput help.txt -RedirectStandardError help-error.txt
+          if ($process.ExitCode -ne 0 -or (Get-Content -LiteralPath help.txt -Raw) -notmatch 'Usage:') {
+            throw 'Executable help smoke check failed'
+          }
 
       - name: Upload single release executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
