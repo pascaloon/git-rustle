@@ -42,6 +42,16 @@ jobs:
           rustc +stable --version --verbose
           cargo +stable --version
 
+      - name: Restore Rust build cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-msvc-rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-msvc-rust-
+
       - name: Build release executable and record build timing
         run: |
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -54,7 +64,7 @@ jobs:
             '## Windows release build',
             "- Commit: $env:GITHUB_SHA",
             "- Ref: $env:GITHUB_REF",
-            "- Clean release build (including dependency downloads): $($timer.Elapsed.TotalSeconds.ToString('F3')) s",
+            "- Release build (with available cache, including dependency downloads): $($timer.Elapsed.TotalSeconds.ToString('F3')) s",
             "- Executable size: $($exe.Length) bytes",
             "- SHA-256: $hash",
             '- Build timing measures CI throughput, not application runtime performance.'
