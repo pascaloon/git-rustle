@@ -129,8 +129,11 @@ jobs:
             gh release create $tag $asset SHA256SUMS --verify-tag --draft --generate-notes --title $tag
           }
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; no release was published.' }
-          # Publish only after every asset is uploaded. Previews stay out of /releases/latest.
-          $flags = @()
-          if ($tag.Contains('-')) { $flags += @('--prerelease', '--latest=false') }
-          gh release edit $tag --draft=false @flags
+          # Publish only after every asset is uploaded. Concurrent stable tags use
+          # GitHub's date/semantic-version selection rather than last-job-finished.
+          $releaseId = gh api "repos/$env:GH_REPO/releases/tags/$tag" --jq .id
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the uploaded draft.' }
+          $preview = if ($tag.Contains('-')) { 'true' } else { 'false' }
+          $latest = if ($tag.Contains('-')) { 'false' } else { 'legacy' }
+          gh api --method PATCH "repos/$env:GH_REPO/releases/$releaseId" -F draft=false -F "prerelease=$preview" -f "make_latest=$latest" --silent
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
