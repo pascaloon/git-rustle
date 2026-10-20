@@ -10,6 +10,148 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+### Saved external-tool list
+
+For the persistent tool list, one-time background discovery and Diff picker, use
+the focused runner after preserving application and test baselines from the exact
+pre-change source and completing functional checks/final optimized builds:
+
+```powershell
+.\scripts\benchmark-tools-list.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -BaselineHarness $baselineTestExe `
+  -Candidate $candidateExe -CandidateHarness $candidateTestExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'suite')
+```
+
+The shared controls are warm/uncached startup, ordinary selected-file Diff,
+General tab frames and controlled manual-update/cache actions. The candidate
+native external-tools case verifies real Configure/list/editor/picker actions;
+four actual fields must paint at usable width, with name/executable heights of
+32 pixels and argument heights of 92 pixels. The shared worker harness measures
+discovery/preparation and real controlled process wait/merge output. The new
+`external_tools::tests::benchmark_tool_list` isolates first scan, saved reload,
+saving, legacy migration and stable-ID selection. New features establish absolute
+cost; they do not have a baseline speedup claim. This bounded suite intentionally
+avoids unrelated branch/search/stash measurements.
+
+Each native group has one discarded warm-up and 15 retained launches, alternating
+shared binary order. Each component mode retains 15 samples after its own warm-up;
+executables run sequentially, with no competing builds. The runner isolates
+LOCALAPPDATA and TEMP, records raw logs/source/binary/fixture provenance and checks
+integrity. First-scan native launches receive fresh app-data and two fake install
+roots, guarded by `.git-rustle-tools-list-fixture` with exact contents
+`disposable external tools list fixture`. The opt-in discovery-root environment
+override is ignored without that marker. Fake applications are never launched;
+configuration and scan-completed persistence are verified even when discovery is
+empty. Fixture preparation and postcondition checks are outside measured clocks.
+
+Preflight rejects compiler/linker processes and Cargo builds/tests. An existing
+`cargo run` is allowed only after Windows process metadata proves its parent
+chain is waiting on a live Git Rustle executable under this workspace's target
+directory. Missing permissions or ambiguous ancestry reject the run. PID/start
+identities are checked again before reuse; the permitted background application
+and launcher ancestry are recorded without command arguments. Keep the existing
+user application open and disclose that it can still consume CPU/GPU/I/O; this
+exception does not establish zero background load.
+
+The companion summarizer retains pooled frame timings and per-launch means,
+reports separate list-action/worker intervals, and records every shared joint
+median/p95 increase above 5% and 1 ms for workers/startup, or above 5% and 0.10 ms
+for frames/in-memory CPU. Retain all crossings and any bounded diagnostic repeats;
+do not average away failures. Scan/loopback fixtures do not measure the user's
+installed editor startup or interactive editing latency, OS credential access,
+physical pointer/display scanout or employer-network access. Store the report and
+raw samples under ignored `target/bench/<run>`; use new measurements for each
+implementation and preserve baseline executables before edits.
+
+For the graph/branch/stash/tools/reference-storage bundle, use the sequential
+[`benchmark-todos.ps1`](../scripts/benchmark-todos.ps1) runner with preserved
+application **and test harness** executables from the exact initial source:
+
+```powershell
+.\scripts\benchmark-todos.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -BaselineHarness $baselineTestExe `
+  -Candidate $candidateExe -CandidateHarness $candidateTestExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'suite')
+```
+
+Finish product changes, functional checks, Clippy and final builds before this
+run. Preserve both binaries outside Cargo's build output and record fingerprints;
+when sharing a target directory between archived/current source trees, force a
+package-only clean before building each source tree to prevent manifest-path
+artifact reuse. The runner builds nothing and rejects competing compilers. A
+prepared large local-origin mirror can be reused, but collect new samples for the
+new implementation. Generated output must stay under ignored `target/bench/`.
+
+| Area | Measurements |
+| --- | --- |
+| Startup and existing graph behavior | Warm/uncached startup with post-frame public update checks suppressed by `startup-local`; normal/searched scrolling, branch activity, search, diff delivery and existing settings tabs against the preserved baseline. |
+| General settings layout and controls | Shared `general-tabs` renders General in 120-frame tab cycles; `general-settings` compares controlled loopback current/available/error manual checks and isolated eight-image cache clearing through verified paint, plus the bundled request-to-frame interval. Both binaries receive fresh cache fixtures per launch; no public update HTTP or installation occurs. |
+| Pending/HEAD/Diff navigation and graph layout | Candidate `todo-graph` verifies the bundled real actions and final frame, with staged, unstaged and untracked changes and another branch newer than HEAD. |
+| Branch sorting and hover | Candidate `branch-sort` and `graph-hover` each retain 120 native frame intervals per launch; separate component sorting at 1,000/10,000 entries and viewport-bounded hover CPU. |
+| Stash panel/apply/delete | A fresh clean three-stash fixture per native launch; apply retains all entries and produces pending changes, delete removes only the selected entry. Shared commit/checkpoint workers measure the affected journal path; candidate stash workers also measure undo/redo and conflict/abort. |
+| External tools | Candidate General controls render without launching installed applications. Worker samples use an isolated controlled executable, byte-exact temporary inputs, real process waiting and merge output; they exclude actual installed GUI editing latency. |
+| Reference storage and case-distinct checkout | Native explicit conversion operates only on a fresh marked repository; backend components keep files/reftable snapshot/head costs separate, and Case/case checkout samples stay separate. No automatic conversion occurs while reading a repository. |
+| Cached icons, request badges and MR targets | Shared provider cache/lookup/icon and graph search controls; candidate fresh-client cached-icon reopening, one 10k-association search projection, and bounded parent-target inference. Inference reports both parent-model CPU and actual repository/ref/object access. |
+
+The runner creates isolated `LOCALAPPDATA`, `TEMP` and `TMP` directories with
+markers. Process-only Git configuration trusts only the workspace/read-only
+fixture and the marked disposable roots; it restores all inherited environment
+values afterward. Native mutations require the exact marker
+`.git/git-rustle-todos-fixture` containing `disposable todos benchmark fixture`.
+`benchmark-desktop.ps1 -DisposableFixtureRoot` refuses an unmarked fixture root,
+creates a new repository for every warm-up/measured launch, retains it for
+inspection, and independently checks HEAD/branches and the expected stash or
+index/worktree outcome. The marker is inside `.git`, so it does not create a
+pending untracked file. Fixture preparation and postcondition checks are outside
+the timed native interval. The large mirror is never used for native mutations.
+
+Every native group has one warm-up and 15 retained launches. Shared launch order
+alternates; component harnesses contain their own warm-up/15 retained samples and
+run as separate binary blocks, reversing order between shared harnesses. Keep
+`entries`, `backend`, `distribution`, `branch`, `dirty` and search `operation`
+groups separate. The parser uses case-sensitive grouping for Case/case, rejects
+missing/duplicate component samples and records stage completeness. Frames within
+a launch are correlated: report both pooled values and 15 launch means. Native
+bundled action-to-frame durations cover the whole scenario, while component
+workers isolate the affected operation. Neither establishes physical pointer or
+display scanout latency.
+
+`branch-sort` requires at least two branches with loaded activity; `graph-hover`
+requires history longer than the visible viewport. Both use the prepared large
+mirror. Their 120 action-to-paint intervals include the actual handler, with
+120 separate handler-CPU values and paint-bound observations per launch; assertion
+work occurs outside each recorded frame clock. Retain pooled handler values and
+15 handler launch means separately rather than adding CPU twice to frame time.
+
+Activity-recency weighting remains a **test-only prototype**. Its shared-tip,
+neighboring-tip and spread-tip distributions compare old counts with weighting
+using the same bounded worker body and alternating internal order. Inspect
+`prototype-recency-summary.json`; those paired controls are not production
+baseline comparisons and are excluded from the main comparison rows. A weighted
+ranking must not be integrated unless the user's no-extra-cost constraint is
+satisfied. Preserve the current ranking if the measurements do not justify it.
+
+Cached-image reopening uses fixture credentials and disk data, excluding OS
+credential discovery and native decode/paint; a controlled streaming test checks
+that the cached image arrives while request-list HTTP is blocked. Provider
+metadata changes refresh active badge queries without HTTP on typing. Parent
+inference is bounded and uses available local refs/objects; ambiguous siblings,
+missing objects or budget limits fall back to the provider's actual default.
+Stash samples cover one entry in worker fixtures and three native entries, not
+scaling across thousands of existing stashes. Loopback and local-origin fixtures
+do not establish employer-network access or production credential correctness.
+
+Use `-Stages Startup,History,Actions,Components` to resume only unfinished stages;
+existing raw stage directories are never overwritten. `-Samples` controls native
+launches only; component groups always retain 15 samples. Run
+[`summarize-todos.ps1`](../scripts/summarize-todos.ps1) after measurements to rebuild
+tables without rerunning executables. Retain raw logs, stage/provenance/integrity
+JSON, source fingerprints, failed smoke runs and `report.md`. Report absolute and
+percentage median/p95 deltas, all threshold crossings and limitations; finite
+measurements cannot guarantee zero regression. Do not edit measured source or
+scripts after final builds or during the run.
+
 For branch-author search, active-filter/HEAD styling, GitLab icons and General
 settings, use the focused sequential runner:
 

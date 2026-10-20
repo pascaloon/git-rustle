@@ -4,7 +4,7 @@ use crate::git::RefKind;
 use crate::remote::requests::integration::{self, Association, Index, Project};
 use crate::remote::{self, Provider, Remote, requests::Client};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         Arc,
@@ -31,6 +31,8 @@ pub(super) struct State {
     seeded: bool,
     force: bool,
     rendered_badges: std::cell::Cell<usize>,
+    search_revision: u64,
+    search_projection: Option<(u64, u64)>,
 }
 
 impl State {
@@ -58,7 +60,7 @@ impl State {
                     .strip_prefix('/')
                     .map(|branch| (entry, branch))
             }),
-            RefKind::Branch => {
+            RefKind::Branch | RefKind::Head => {
                 let (remote, branch) = self.upstreams.get(name)?;
                 self.entries
                     .get(remote)
@@ -72,6 +74,46 @@ impl State {
         self.entries
             .get("origin")
             .or_else(|| self.entries.values().next())
+    }
+
+    fn search_labels(
+        &self,
+        labels: &HashMap<gix::ObjectId, Vec<crate::app::Label>>,
+    ) -> HashMap<gix::ObjectId, Vec<String>> {
+        let mut out = HashMap::new();
+        for (id, labels) in labels {
+            let mut values = Vec::new();
+            for label in labels {
+                let Some((entry, branch)) = self.branch(label.kind, &label.name) else {
+                    continue;
+                };
+                let Some(requests) = entry.requests.get(branch) else {
+                    continue;
+                };
+                for request in requests {
+                    values.push(format!(
+                        "{} · {}",
+                        request_label(entry.remote.provider, request),
+                        request.title
+                    ));
+                }
+                if let Some(first) = requests.first()
+                    && requests.len() > 1
+                {
+                    values.push(format!(
+                        "{} +{}",
+                        request_label(entry.remote.provider, first),
+                        requests.len() - 1
+                    ));
+                }
+            }
+            if !values.is_empty() {
+                values.sort_unstable();
+                values.dedup();
+                out.insert(*id, values);
+            }
+        }
+        out
     }
 }
 
@@ -92,7 +134,43 @@ fn request_label(provider: Provider, association: &Association) -> String {
     )
 }
 
+fn prioritize_header_remote(remotes: &mut [Remote]) {
+    // Match State::preferred: a cached header must not wait behind another
+    // remote's request-list HTTP timeout.
+    let preferred = remotes
+        .iter()
+        .position(|remote| remote.name == "origin")
+        .or_else(|| {
+            remotes
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.name.cmp(&b.name))
+                .map(|(i, _)| i)
+        });
+    if let Some(preferred) = preferred {
+        remotes.swap(0, preferred);
+    }
+}
+
 impl Desktop {
+    pub(super) fn invalidate_provider_search_labels(&mut self) {
+        self.provider.invalidate();
+        self.engine.set_provider_search_labels(HashMap::new());
+    }
+
+    fn refresh_provider_search_labels(&mut self) {
+        let key = (
+            self.engine.app.labels_revision(),
+            self.provider.search_revision,
+        );
+        if self.provider.search_projection == Some(key) {
+            return;
+        }
+        let labels = self.provider.search_labels(&self.engine.app.labels);
+        self.provider.search_projection = Some(key);
+        self.engine.set_provider_search_labels(labels);
+    }
+
     pub(super) fn release_provider_images(&mut self, cx: &mut gpui::App) {
         let mut released = std::collections::HashSet::new();
         for entry in self.provider.entries.values_mut() {
@@ -116,7 +194,9 @@ impl Desktop {
                 path: path.clone(),
                 ..State::default()
             };
+            self.engine.set_provider_search_labels(HashMap::new());
         }
+        self.refresh_provider_search_labels();
         if self.provider.seeded || self.scenario.is_some() || !self.engine.has_presented() {
             return;
         }
@@ -172,11 +252,12 @@ impl Desktop {
                             ))
                         })
                         .collect::<BTreeMap<_, _>>();
-                    let remotes = if configured.is_empty() {
+                    let mut remotes = if configured.is_empty() {
                         remotes
                     } else {
                         configured
                     };
+                    prioritize_header_remote(&mut remotes);
                     (remotes, upstreams)
                 })
                 .await;
@@ -203,6 +284,8 @@ impl Desktop {
                                 image: None,
                             });
                     }
+                    v.provider.search_revision = v.provider.search_revision.wrapping_add(1);
+                    v.refresh_provider_search_labels();
                     cx.notify();
                     true
                 })
@@ -213,51 +296,74 @@ impl Desktop {
             for remote in remotes {
                 let load_path = path.clone();
                 let image_session = session.clone();
-                let mut entry = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut project = Project::default();
-                        let mut requests = Index::new();
-                        let mut image = None;
-                        if let Ok(mut client) = Client::new(&load_path, &remote, no_cache) {
-                            project = client.project(force).unwrap_or_default();
-                            // A failed list does not create misleading stale 'open' badges.
-                            requests = client.open_requests(force).unwrap_or_default();
-                            if load_images
-                                && image_session.load(AtomicOrdering::Acquire) == image_generation
+                let remote_name = remote.name.clone();
+                let (events, incoming) = async_channel::unbounded();
+                let worker = cx.background_executor().spawn(async move {
+                    if let Ok(mut client) = Client::new(&load_path, &remote, no_cache) {
+                        client.summary_stream(
+                            force,
+                            || {
+                                load_images
+                                    && image_session.load(AtomicOrdering::Acquire)
+                                        == image_generation
+                            },
+                            |event| events.send_blocking(event).is_ok(),
+                        );
+                    } else {
+                        let _ =
+                            events.send_blocking(integration::SummaryEvent::Requests(Index::new()));
+                    }
+                });
+                while let Ok(event) = incoming.recv().await {
+                    let current = view
+                        .update(cx, |v, cx| {
+                            if v.provider.path.as_ref() != Some(&request_path)
+                                || !Arc::ptr_eq(&v.provider.session, &session)
                             {
-                                image = client.project_avatar(&project).and_then(|bytes| {
-                                    remote::requests::image_format(&bytes)
-                                        .map(|format| Arc::new(Image::from_bytes(format, bytes)))
-                                });
+                                return false;
                             }
-                        }
-                        Entry {
-                            remote,
-                            project,
-                            requests,
-                            image,
-                        }
-                    })
-                    .await;
-                let current = view
-                    .update(cx, |v, cx| {
-                        if v.provider.path.as_ref() != Some(&request_path)
-                            || !Arc::ptr_eq(&v.provider.session, &session)
-                        {
-                            return false;
-                        }
-                        if session.load(AtomicOrdering::Acquire) != image_generation {
-                            entry.image = None;
-                        }
-                        v.provider.entries.insert(entry.remote.name.clone(), entry);
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !current {
-                    return;
+                            let Some(entry) = v.provider.entries.get_mut(&remote_name) else {
+                                return false;
+                            };
+                            match event {
+                                integration::SummaryEvent::Project(project) => {
+                                    if entry.project.avatar != project.avatar
+                                        && let Some(image) = entry.image.take()
+                                    {
+                                        image.remove_asset(cx);
+                                    }
+                                    entry.project = project;
+                                }
+                                integration::SummaryEvent::Image(bytes) => {
+                                    if session.load(AtomicOrdering::Acquire) == image_generation {
+                                        if let Some(old) = entry.image.take() {
+                                            old.remove_asset(cx);
+                                        }
+                                        entry.image =
+                                            remote::requests::image_format(&bytes).map(|format| {
+                                                Arc::new(Image::from_bytes(format, bytes))
+                                            });
+                                        v.engine.mark("provider image delivered");
+                                    }
+                                }
+                                integration::SummaryEvent::Requests(requests) => {
+                                    if entry.requests != requests {
+                                        entry.requests = requests;
+                                        v.provider.search_revision =
+                                            v.provider.search_revision.wrapping_add(1);
+                                        v.refresh_provider_search_labels();
+                                    }
+                                }
+                            }
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !current {
+                        return;
+                    }
                 }
+                worker.await;
             }
             let _ = view.update(cx, |v, cx| {
                 if v.provider.path.as_ref() != Some(&request_path)
@@ -581,6 +687,51 @@ impl Desktop {
 mod tests {
     use super::{Arc, Association, Entry, Instant, Project, RefKind, Remote, State};
 
+    #[test]
+    fn cached_header_remote_is_processed_before_other_request_lists() {
+        for names in [
+            vec!["a-slow", "z-other", "origin"],
+            vec!["z-slow", "a-header", "m-other"],
+            vec!["origin"],
+            vec![],
+        ] {
+            let mut remotes: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    Remote::parse(name, "https://github.com/team/project.git", None).unwrap()
+                })
+                .collect();
+            let state = State {
+                entries: remotes
+                    .iter()
+                    .map(|remote| {
+                        (
+                            remote.name.clone(),
+                            Entry {
+                                remote: remote.clone(),
+                                project: Project::default(),
+                                requests: Default::default(),
+                                image: None,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..State::default()
+            };
+            let preferred = state.preferred().map(|entry| entry.remote.name.as_str());
+            super::prioritize_header_remote(&mut remotes);
+            assert_eq!(
+                remotes.first().map(|remote| remote.name.as_str()),
+                preferred
+            );
+            let mut retained: Vec<_> = remotes.iter().map(|remote| remote.name.as_str()).collect();
+            let mut expected = names;
+            retained.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(retained, expected, "other remote requests must be retained");
+        }
+    }
+
     fn state() -> State {
         let remote =
             Remote::parse("upstream", "https://github.com/team/project.git", None).unwrap();
@@ -631,6 +782,92 @@ mod tests {
             .unwrap();
         assert_eq!(entry.requests[branch][0].number, 43);
         assert!(state.branch(RefKind::Remote, "origin/feature/42").is_none());
+        assert!(state.branch(RefKind::Head, "local-name").is_some());
+    }
+
+    #[test]
+    fn search_projection_includes_all_request_badges_and_tracks_association_removal() {
+        let mut state = state();
+        state
+            .entries
+            .get_mut("upstream")
+            .unwrap()
+            .requests
+            .get_mut("feature/42")
+            .unwrap()
+            .push(Association {
+                number: 44,
+                title: "Second target".into(),
+                url: "https://github.com/benchmark/project/pull/44".into(),
+            });
+        let id = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let labels = [(
+            id,
+            vec![
+                crate::app::Label {
+                    name: "local-name".into(),
+                    kind: RefKind::Head,
+                    remote_only: false,
+                },
+                crate::app::Label {
+                    name: "upstream/feature/42".into(),
+                    kind: RefKind::Remote,
+                    remote_only: false,
+                },
+            ],
+        )]
+        .into_iter()
+        .collect();
+        let projected = state.search_labels(&labels);
+        assert!(
+            projected[&id]
+                .iter()
+                .any(|value| value.starts_with("PR #43 ·"))
+        );
+        assert!(
+            projected[&id]
+                .iter()
+                .any(|value| value.starts_with("PR #44 ·"))
+        );
+        assert!(projected[&id].iter().any(|value| value == "PR #43 +1"));
+        assert_eq!(
+            projected[&id].len(),
+            3,
+            "local/upstream aliases must deduplicate"
+        );
+        state.entries.get_mut("upstream").unwrap().requests.clear();
+        assert!(state.search_labels(&labels).is_empty());
+    }
+
+    #[test]
+    #[ignore = "one metadata projection of 10000 associated graph labels"]
+    fn benchmark_provider_search_projection() {
+        let state = state();
+        let labels = (0..10000)
+            .map(|n| {
+                let id = gix::ObjectId::from_hex(format!("{:040x}", n + 1).as_bytes()).unwrap();
+                (
+                    id,
+                    vec![crate::app::Label {
+                        name: format!("upstream/feature/{n}"),
+                        kind: RefKind::Remote,
+                        remote_only: false,
+                    }],
+                )
+            })
+            .collect();
+        for sample in -1..15 {
+            let start = Instant::now();
+            let projected = state.search_labels(&labels);
+            let projection_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert_eq!(projected.len(), 10000);
+            if sample >= 0 {
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"projection_ms":projection_ms})
+                );
+            }
+        }
     }
 
     #[test]

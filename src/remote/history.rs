@@ -249,6 +249,26 @@ pub(super) fn eligible_from_config(
     // Reuse the effective configuration already read during discovery. Only the
     // local ref names remain to read, without spawning another git.exe process.
     let repo = crate::git::open(path).map_err(|e| e.to_string())?;
+    if crate::git::refs::is_reftable(&repo) {
+        let mut names = HashSet::new();
+        for branch in crate::git::refs::raw_refs(&repo)? {
+            let Some(name) = branch.name.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            match upstreams.get(name) {
+                Some((Some(upstream), Some(merge))) if upstream == &remote.name => {
+                    if let Some(name) = merge.strip_prefix("refs/heads/") {
+                        names.insert(name.to_owned());
+                    }
+                }
+                None | Some((None, _)) => {
+                    names.insert(name.to_owned());
+                }
+                _ => {}
+            }
+        }
+        return Ok(names);
+    }
     let platform = repo.references().map_err(|e| e.to_string())?;
     let iter = platform.local_branches().map_err(|e| e.to_string())?;
     let mut names = HashSet::new();

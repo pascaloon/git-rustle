@@ -965,6 +965,53 @@ mod tests {
     }
 
     #[test]
+    fn default_search_includes_branch_tag_and_live_request_badge_text() {
+        let (_dir, repo, input) = fixture();
+        let mut index = Index::default();
+        assert_eq!(run(&mut index, &repo, &input, "feature-needle").rows, [0]);
+        assert_eq!(run(&mut index, &repo, &input, "release-needle").rows, [2]);
+        assert!(run(&mut index, &repo, &input, "MR !742").rows.is_empty());
+        let mut changed = Input {
+            history: input.history.clone(),
+            labels: input.labels.clone(),
+            ghosts: input.ghosts.clone(),
+            sources: input.sources.clone(),
+        };
+        changed
+            .labels
+            .entry(changed.history.commits[1].id)
+            .or_default()
+            .extend([
+                "MR !742 · mrcrossneedle".into(),
+                "PR #18 +1".into(),
+                "PR #19 · Another associated request".into(),
+            ]);
+        let changed = Arc::new(changed);
+        for query in ["MR !742", "mrcrossneedle", "PR #18", "PR #19"] {
+            assert_eq!(run(&mut index, &repo, &changed, query).rows, [1], "{query}");
+        }
+        assert!(
+            run(&mut index, &repo, &changed, "m: MR !742")
+                .rows
+                .is_empty()
+        );
+        let mut replaced = Input {
+            history: input.history.clone(),
+            labels: input.labels.clone(),
+            ghosts: input.ghosts.clone(),
+            sources: input.sources.clone(),
+        };
+        replaced
+            .labels
+            .entry(replaced.history.commits[2].id)
+            .or_default()
+            .push("MR !743 · replacementneedle".into());
+        let replaced = Arc::new(replaced);
+        assert!(run(&mut index, &repo, &replaced, "MR !742").rows.is_empty());
+        assert_eq!(run(&mut index, &repo, &replaced, "MR !743").rows, [2]);
+    }
+
+    #[test]
     fn filtered_rows_navigate_real_commits_and_escape_restores_the_graph() {
         let (_dir, repo, input) = fixture();
         let mut app = App::new();

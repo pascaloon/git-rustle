@@ -6,6 +6,12 @@ into the current branch, rebase onto it, or prepare an interactive rebase. The
 review names both the selected commit (including branch/tag labels) and the
 current branch. Changing the current branch or HEAD invalidates that review.
 
+Checking out a ghost branch in the graph offers **Fetch & checkout branch**.
+It fetches only that remote branch and checks out its local tracking branch,
+creating it if needed or updating the existing tracker by fast-forward only. Divergent local
+commits are never reset or rebased, and Git refuses changes that would overwrite
+working files. Ordinary local branch checkout keeps its existing offline behavior.
+
 Right-click one local commit and choose **Create tag…** to name that exact commit.
 An empty annotation creates a lightweight tag; adding a message creates an unsigned
 annotated tag with your Git identity. Existing tags are never replaced. Tags stay
@@ -47,6 +53,22 @@ Pull fetches only the configured upstream, without tags or submodules, then merg
 Merge, pull and rebase require an attached branch and a clean working tree. Git's
 own hooks and authentication remain in effect; prompts cannot block the UI.
 
+## Stashes
+
+Open **Stashes** in the graph to list saved entries. The list loads on request;
+Refresh picks up changes made in another Git client. **Apply…** requires a clean
+working tree, restores the selected stash and keeps its saved entry. The selected
+object stays fixed even if another stash is pushed before confirmation.
+**Delete…** removes that selected saved entry after confirmation. Apply and Delete
+support History recovery, including the stash stack and its reflog.
+
+A conflicting apply opens Conflicts. Resolve and stage files, then choose
+**Finish applying stash**; this does not create a commit or remove the stash.
+**Abort…** discards tracked resolution changes using Git's merge reset and keeps
+untracked files already restored by the stash. The resulting retained files are
+recorded in History. A stash conflict discovered from another client has no Rustle
+apply checkpoint; resolve and stage it without Continue or Abort controls.
+
 ## Interactive rebase
 
 Right-click the intended base commit and choose **Interactive rebase from here…**.
@@ -79,6 +101,36 @@ During rebase, “ours” means the new base plus already replayed commits and �
 means the commit currently being replayed. Continue refuses unresolved paths.
 Skip omits the current replayed commit; Abort returns to Git's starting state and
 discards conflict-resolution edits. A whole sequence occupies one history entry.
+
+## External diff and merge applications
+
+In Settings → General, choose **Configure tools…** to edit the saved tool list.
+Select an entry to change its name, application path, diff arguments and merge
+arguments. Add or remove entries, then **Save tools** to persist the reviewed
+list. The Diff view's external-tool picker lets you choose a saved application
+by name for that comparison.
+
+After the initial application load, a background scan discovers both VS Code and
+Araxis once. The scan-completed flag is saved even when neither is installed;
+subsequent launches load the saved list without repeating discovery. Existing
+separate diff/merge configuration is migrated without discarding custom applications.
+Custom applications use an absolute `.exe` path and one argument per line. An
+argument containing spaces stays one argument. Scripts and shell command strings
+are not executed.
+
+Diff arguments use `{left}` and `{right}`. Merge arguments also use `{base}` and
+`{output}`; left means ours, right means theirs, and output is the conflicted
+working file. Include the application's wait option. Detected VS Code uses its
+CLI wait launcher, and detected Araxis uses `/wait`, so temporary input copies
+remain available until the comparison window closes. Custom applications must
+provide equivalent waiting behavior.
+
+External diff receives exact local or provider file bytes, including binary data,
+up to 8 MiB per side. Merge receives the three Git index stages; a missing stage
+is an empty input. It edits the working file without staging it. Save and close
+the editor, review its output, then mark the edited file resolved. Other Rustle
+repository mutations are blocked while that merge editor runs. Failed launches
+retain input copies and a pre-merge file copy at the reported temporary path.
 
 ## Undo and redo
 
@@ -116,7 +168,7 @@ editors or arbitrary hooks participate in one transaction.
 
 Git-tree snapshots use configured clean/smudge filters and EOL rules; they are not
 byte-for-byte filesystem backups. Ignored files, Git hook side effects, provider
-settings/credentials, reflogs and server state are outside undo. External pushes
+settings/credentials, reflogs other than the stash stack, and server state are outside undo. External pushes
 that leave no local state change cannot be detected. Checkpointed mutations in
 submodule and sparse-checkout worktrees are refused until their recovery semantics
 can be guaranteed. Files
@@ -129,6 +181,17 @@ restore, stop other mutations and inspect the retained journal/checkpoint refs;
 HEAD, refs, config and working files are not a single filesystem transaction.
 
 ## Performance validation
+
+The focused [`benchmark-tools-list.ps1`](../scripts/benchmark-tools-list.ps1)
+bundle measures shared startup, ordinary Diff delivery and General tab/manual
+controls against freshly preserved application/test baselines. It measures the
+new first-scan/list/editor/picker path in marked per-launch fixtures and compares
+the existing controlled executable-launch worker; the new list component reports
+first initialization, persisted reload, saving, migration and stable-ID selection.
+Discovery fixtures contain fake VS Code/Araxis installations that are never
+executed; worker launch measurements use a controlled test executable. See the
+[benchmark workflow](benchmarking.md#saved-external-tool-list) for boundaries and
+limitations. Earlier broad-suite results do not replace these measurements.
 
 For tag creation, the focused
 [`benchmark-tags-toolbar.ps1`](../scripts/benchmark-tags-toolbar.ps1) bundle runs

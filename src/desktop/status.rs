@@ -237,12 +237,14 @@ impl Desktop {
                     .rounded_full()
                     .bg(rgb(level.color())),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(level.color()))
-                    .child(level.label()),
-            )
+            .when(primary.is_some(), |s| {
+                s.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(level.color()))
+                        .child(level.label()),
+                )
+            })
             .child(
                 div()
                     .flex_1()

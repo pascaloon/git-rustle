@@ -73,6 +73,8 @@ pub struct App {
     pub incoming: Option<History>,
     pub refs: Option<RefSnapshot>,
     pub labels: HashMap<ObjectId, Vec<Label>>,
+    labels_revision: u64,
+    provider_search_labels: HashMap<ObjectId, Vec<String>>,
     pub load: LoadState,
     /// Next row to inspect while waiting for the initial HEAD selection.
     startup_head_search: Option<usize>,
@@ -131,6 +133,8 @@ impl App {
             incoming: None,
             refs: None,
             labels: HashMap::new(),
+            labels_revision: 0,
+            provider_search_labels: HashMap::new(),
             load: LoadState::Empty,
             startup_head_search: Some(0),
             selected: 0,
@@ -174,6 +178,30 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn labels_revision(&self) -> u64 {
+        self.labels_revision
+    }
+
+    /// Provider badges are search metadata, never synthetic Git references.
+    pub fn set_provider_search_labels(
+        &mut self,
+        mut labels: HashMap<ObjectId, Vec<String>>,
+    ) -> bool {
+        labels.retain(|_, values| {
+            values.retain(|value| !value.is_empty());
+            values.sort_unstable();
+            values.dedup();
+            !values.is_empty()
+        });
+        if self.provider_search_labels == labels {
+            return false;
+        }
+        self.provider_search_labels = labels;
+        self.search.invalidate();
+        self.needs_redraw = true;
+        true
+    }
+
     pub fn search_request(&mut self) -> Option<crate::search::Request> {
         if !self.search.wanted {
             return None;
@@ -184,13 +212,20 @@ impl App {
             self.pending.selected = false;
         }
         let input = self.search.input.get_or_insert_with(|| {
+            let mut labels: HashMap<ObjectId, Vec<String>> = self
+                .labels
+                .iter()
+                .map(|(id, labels)| (*id, labels.iter().map(|l| l.name.clone()).collect()))
+                .collect();
+            for (id, values) in &self.provider_search_labels {
+                labels
+                    .entry(*id)
+                    .or_default()
+                    .extend(values.iter().cloned());
+            }
             std::sync::Arc::new(crate::search::Input {
                 history: self.history.clone(),
-                labels: self
-                    .labels
-                    .iter()
-                    .map(|(id, labels)| (*id, labels.iter().map(|l| l.name.clone()).collect()))
-                    .collect(),
+                labels,
                 ghosts: self.ghosts.clone(),
                 sources: self.ghost_sources.clone(),
             })
@@ -264,6 +299,20 @@ impl App {
     pub fn begin_navigation(&mut self) {
         self.startup_head_search = None;
         self.pending.autofocus = false;
+    }
+
+    /// Focus pending changes when present, otherwise follow HEAD as history arrives.
+    pub fn go_to_head(&mut self) {
+        self.begin_navigation();
+        self.settings.open = false;
+        self.branches.open = false;
+        self.park_diff();
+        self.clear_search();
+        self.pending.autofocus = !self.pending.known;
+        self.startup_head_search = Some(0);
+        self.focus_startup_head(true);
+        self.focus = Focus::List;
+        self.needs_redraw = true;
     }
     pub fn select_graph(&mut self, row: usize) {
         if self.graph_len() == 0 {
@@ -843,6 +892,7 @@ impl App {
 
     pub fn remote_labels(&mut self) {
         self.search.invalidate();
+        self.labels_revision = self.labels_revision.wrapping_add(1);
         // Replace only API overlays. Fetched remote-tracking labels stay on their
         // actual local objects, even when a provider reports a different tip.
         self.labels.retain(|_, labels| {
@@ -1154,7 +1204,13 @@ impl App {
         branches.sort_by_key(|t| (t.remote.is_some(), current != Some(&t.name), t.label()));
         let mut choices = branches
             .into_iter()
-            .map(crate::checkout::Request::Branch)
+            .map(|target| {
+                if target.remote.is_some() && self.ghosts.contains_key(&id) {
+                    crate::checkout::Request::FetchBranch(target)
+                } else {
+                    crate::checkout::Request::Branch(target)
+                }
+            })
             .collect::<Vec<_>>();
         choices.push(crate::checkout::Request::Commit {
             id,
@@ -1809,6 +1865,162 @@ mod tests {
         assert_eq!(early.selected, 1);
     }
     #[test]
+    fn go_to_head_prefers_pending_clears_filters_and_keeps_the_draft() {
+        let mut app = app_with(80);
+        let head = app.history.commits[20].id;
+        app.set_refs(RefSnapshot {
+            head_id: Some(head),
+            ..Default::default()
+        });
+        app.install_pending(Ok(dirty_snapshot(head)));
+        app.pending.description.value = "Keep this draft".into();
+        app.search.text.value = "unrelated filter".into();
+        app.search.changed();
+        app.branches.open = true;
+        app.go_to_head();
+        assert!(app.pending.selected);
+        assert_eq!(app.graph_selected(), app.pending.row());
+        assert!(!app.search.active() && !app.branches.open);
+        assert_eq!(app.pending.description.value, "Keep this draft");
+        app.install_pending(Ok(crate::pending::Snapshot {
+            head: Some(head),
+            ..Default::default()
+        }));
+        app.go_to_head();
+        assert!(!app.pending.selected);
+        assert_eq!(app.selected_id(), Some(head));
+    }
+
+    #[test]
+    fn explicit_go_to_head_finishes_when_later_history_arrives() {
+        let head = history(100).commits[70].id;
+        for stale in [false, true] {
+            let mut app = App::new();
+            app.list_rows = 10;
+            app.pending.known = true;
+            app.set_refs(RefSnapshot {
+                head_id: Some(head),
+                ..Default::default()
+            });
+            if stale {
+                app.set_cached(history(20), false);
+            }
+            app.start_walk();
+            let mut first = history(40);
+            first.complete = false;
+            app.push_batch(first);
+            app.begin_navigation(); // Cancel startup focus before explicitly requesting HEAD.
+            assert!(app.startup_head_search.is_none());
+            app.go_to_head();
+            assert_eq!(app.startup_head_search, Some(if stale { 20 } else { 40 }));
+            assert_ne!(app.selected_id(), Some(head));
+
+            let mut tail = history(100);
+            tail.commits.drain(..40);
+            app.push_batch(tail);
+            assert_eq!(app.selected_id(), Some(head));
+            assert!(app.scroll <= 70 && 70 < app.scroll + app.list_rows);
+            assert!(app.startup_head_search.is_none());
+            assert!(!app.pending.autofocus);
+        }
+    }
+
+    #[test]
+    fn navigation_cancels_explicit_head_waiting_for_later_history() {
+        let head = history(100).commits[70].id;
+        for keyboard in [false, true] {
+            let mut app = App::new();
+            app.set_refs(RefSnapshot {
+                head_id: Some(head),
+                ..Default::default()
+            });
+            app.start_walk();
+            let mut first = history(40);
+            first.complete = false;
+            app.push_batch(first);
+            app.go_to_head();
+            assert!(app.startup_head_search.is_some());
+            if keyboard {
+                app.handle_key(key(KeyCode::Down));
+            } else {
+                // The desktop's actual Select action cancels deferred focus first.
+                app.begin_navigation();
+                app.select_graph(3);
+            }
+            let selected = app.selected_id();
+            assert!(app.startup_head_search.is_none() && !app.pending.autofocus);
+            let mut tail = history(100);
+            tail.commits.drain(..40);
+            app.push_batch(tail);
+            assert_eq!(app.selected_id(), selected);
+        }
+    }
+
+    #[test]
+    fn explicit_go_to_head_waits_for_first_pending_status_until_navigation() {
+        for navigate in [false, true] {
+            let mut app = app_with(80);
+            app.pending.known = false;
+            let head = app.history.commits[20].id;
+            app.set_refs(RefSnapshot {
+                head_id: Some(head),
+                ..Default::default()
+            });
+            app.go_to_head();
+            assert_eq!(app.selected_id(), Some(head));
+            assert!(app.startup_head_search.is_none() && app.pending.autofocus);
+            if navigate {
+                app.begin_navigation();
+                app.select_graph(3);
+            }
+            let selected = app.selected_id();
+            app.install_pending(Ok(dirty_snapshot(head)));
+            assert_eq!(app.pending.selected, !navigate);
+            if navigate {
+                assert_eq!(app.selected_id(), selected);
+            } else {
+                assert_eq!(app.graph_selected(), app.pending.row());
+            }
+            assert!(!app.pending.autofocus);
+        }
+
+        let mut app = app_with(80);
+        let head = app.history.commits[20].id;
+        app.set_refs(RefSnapshot {
+            head_id: Some(head),
+            ..Default::default()
+        });
+        app.install_pending(Err("status unavailable".into()));
+        app.go_to_head();
+        assert_eq!(app.selected_id(), Some(head));
+        assert!(!app.pending.autofocus);
+        // A known failed status does not turn this click into ongoing follow mode.
+        app.install_pending(Ok(dirty_snapshot(head)));
+        assert!(!app.pending.selected);
+    }
+
+    #[test]
+    fn provider_badges_refresh_active_search_without_changing_git_refs() {
+        let mut app = app_with(2);
+        let id = app.history.commits[0].id;
+        app.search.text.value = "MR !42".into();
+        app.search.changed();
+        let old = app.search_request().unwrap();
+        let labels = HashMap::from([(id, vec!["MR !42".into()])]);
+        assert!(app.set_provider_search_labels(labels.clone()));
+        let generation = app.search.generation;
+        assert!(!app.set_provider_search_labels(labels));
+        assert_eq!(generation, app.search.generation);
+        let current = app.search_request().unwrap();
+        assert_ne!(old.generation, current.generation);
+        assert_eq!(current.input.labels[&id], ["MR !42"]);
+        assert!(!old.input.labels.contains_key(&id));
+        assert!(!app.labels.contains_key(&id));
+        assert!(app.set_provider_search_labels(HashMap::new()));
+        assert!(!app.search_request().unwrap().input.labels.contains_key(&id));
+    }
+
+    #[test]
     fn pending_refresh_does_not_recenter_after_manual_graph_scrolling() {
         let mut app = app_with(80);
         let head = app.history.commits[20].id;
@@ -2414,6 +2626,97 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(&app.checkout_request,Some(Request::Branch(t)) if t.name == "topic"));
+    }
+
+    #[test]
+    fn ghost_branch_confirmation_fetches_its_frozen_remote_target() {
+        use crate::checkout::Request;
+        let mut app = app_with(3);
+        let id = app.selected_id().unwrap();
+        let sha = id.to_string();
+        let local = app.history.commits[1].id;
+        let remote =
+            crate::remote::Remote::parse("origin", "https://github.com/test/repo", None).unwrap();
+        app.set_refs(RefSnapshot {
+            head_id: Some(local),
+            head_branch: Some("topic/nested".into()),
+            refs: vec![crate::git::RefEntry {
+                name: "topic/nested".into(),
+                id: local,
+                kind: RefKind::Branch,
+            }],
+            ..Default::default()
+        });
+        app.branches.update(
+            crate::remote::Update {
+                remote: remote.clone(),
+                branches: vec![crate::remote::Branch {
+                    name: "topic/nested".into(),
+                    sha: id.to_string(),
+                }],
+                scoped: false,
+                cached: false,
+                stale: false,
+            },
+            app.refs.as_ref(),
+        );
+        app.ghosts.insert(
+            id,
+            CommitDetails {
+                id,
+                parents: vec![local],
+                author_name: String::new(),
+                author_email: String::new(),
+                author_time: 0,
+                author_offset: 0,
+                committer_name: String::new(),
+                committer_email: String::new(),
+                commit_time: 0,
+                commit_offset: 0,
+                message: "Remote-only tip".into(),
+            },
+        );
+        app.ghost_sources.insert(id, remote.clone());
+        app.confirm_commit_checkout(id);
+        assert!(
+            matches!(app.checkout_confirmation.as_ref().unwrap().chosen(),
+            Request::FetchBranch(t) if t.name == "topic/nested"
+                && t.remote.as_deref() == Some("origin")
+                && t.url.as_deref() == Some(remote.url.as_str())
+                && t.sha == sha)
+        );
+        crate::ui::checkout::draw(
+            app.checkout_confirmation.as_mut().unwrap(),
+            &mut crate::term::Screen::new(120, 30),
+        );
+        // A refresh while the confirmation is open cannot downgrade the choice
+        // to an ordinary switch or retarget the branch's original remote.
+        app.branches.remotes.clear();
+        app.ghosts.clear();
+        app.ghost_sources.clear();
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(&app.checkout_request,
+            Some(Request::FetchBranch(t)) if t.sha == sha
+                && t.url.as_deref() == Some(remote.url.as_str())));
+        app.checkout_request = None;
+        app.branches.update(
+            crate::remote::Update {
+                remote,
+                branches: vec![crate::remote::Branch {
+                    name: "topic/nested".into(),
+                    sha: id.to_string(),
+                }],
+                scoped: false,
+                cached: false,
+                stale: false,
+            },
+            app.refs.as_ref(),
+        );
+        app.confirm_commit_checkout(id);
+        assert!(matches!(
+            app.checkout_confirmation.as_ref().unwrap().chosen(),
+            Request::Branch(_)
+        ));
     }
 
     #[test]

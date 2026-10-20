@@ -344,6 +344,9 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.external_merge_busy() {
+            return;
+        }
         let request = match action {
             Action::Open(dialog, target, label) => {
                 self.operations.dialog = Some(dialog);
@@ -578,6 +581,8 @@ impl Desktop {
             Action::Run(
                 request @ (Request::Abort
                 | Request::Skip
+                | Request::ApplyStash(_)
+                | Request::DropStash(_)
                 | Request::Resolve {
                     choice: Resolution::Ours | Resolution::Theirs,
                     ..
@@ -585,8 +590,27 @@ impl Desktop {
             ) => {
                 let text = match &request {
                     Request::Abort => {
-                        "Abort the operation? Conflict-resolution edits will be discarded.".into()
+                        if self
+                            .engine
+                            .operations
+                            .conflict
+                            .as_ref()
+                            .is_some_and(|c| c.kind == "Stash apply")
+                        {
+                            "Abort the stash apply? Tracked conflict edits will be discarded. Untracked files and the stash will be kept.".into()
+                        } else {
+                            "Abort the operation? Conflict-resolution edits will be discarded."
+                                .into()
+                        }
                     }
+                    Request::ApplyStash(stash) => format!(
+                        "Apply {}? Pending changes must be committed or stashed first. The stash will be kept.",
+                        stash.subject
+                    ),
+                    Request::DropStash(stash) => format!(
+                        "Delete {}? Its saved changes will be removed from the stash list. This action can be undone in History.",
+                        stash.subject
+                    ),
                     Request::Skip => "Skip this commit? Its changes will be omitted.".into(),
                     Request::Resolve { path, choice } => format!(
                         "Replace all of {path} with {} and stage it? A deleted side removes the file.",
@@ -613,7 +637,11 @@ impl Desktop {
             {
                 self.engine.app.checkout_notice = None;
             }
-            self.engine.request_operation(request);
+            let refresh_stashes =
+                matches!(&request, Request::ApplyStash(_) | Request::DropStash(_));
+            if self.engine.request_operation(request) && refresh_stashes {
+                self.stash_mutation_started();
+            }
             self.engine.tick(None);
         }
         cx.notify();
@@ -659,11 +687,13 @@ impl Desktop {
                         .child(caption(if conflict.kind == "Rebase" { "During rebase: ours is the new base plus replayed commits; theirs is the commit being replayed." } else { "Ours is your current branch; theirs is the incoming version." }))
                         .child(caption("Edit files in your usual editor. Choosing an entire side replaces and stages it, including binary files and deletions."))
                         .child(row().child(self.op_button("conflict-refresh", "Refresh files", Action::Run(Request::Inspect), cx))
-                            .child(self.op_button("conflict-continue", "Continue", Action::Run(Request::Continue), cx))
-                            .when(conflict.kind != "Merge", |r| r.child(self.op_button("conflict-skip", "Skip commit…", Action::Run(Request::Skip), cx)))
-                            .child(self.op_button("conflict-abort", "Abort…", Action::Run(Request::Abort), cx)))
+                            .when(conflict.kind != "Unmerged index", |r| r.child(self.op_button("conflict-continue", if conflict.kind == "Stash apply" { "Finish applying stash" } else { "Continue" }, Action::Run(Request::Continue), cx)))
+                            .when(matches!(conflict.kind.as_str(), "Rebase" | "Cherry-pick" | "Revert"), |r| r.child(self.op_button("conflict-skip", "Skip commit…", Action::Run(Request::Skip), cx)))
+                            .when(conflict.kind != "Unmerged index", |r| r.child(self.op_button("conflict-abort", "Abort…", Action::Run(Request::Abort), cx))))
                         .child(caption(format!("{} unresolved files", conflict.files.len())));
-                    content = content.child(self.conflict_list(cx));
+                    content = content
+                        .children(self.tools_notice())
+                        .child(self.conflict_list(cx));
                     if conflict.files.is_empty() {
                         content = content.child(caption("No unresolved files. Continue to finish or reach the next rebase step."));
                     }
@@ -1048,6 +1078,7 @@ impl Desktop {
                                 )
                             })),
                     );
+                    buttons = buttons.child(v.tools_merge_button(path, cx));
                     for (j, (label, choice)) in [
                         ("Use ours…", Resolution::Ours),
                         ("Use theirs…", Resolution::Theirs),
@@ -1291,6 +1322,8 @@ impl Desktop {
                     .occlude()
                     .child(
                         column()
+                            .relative()
+                            .children(self.todo_probe(7))
                             .w(px(600.))
                             .p_6()
                             .gap_4()

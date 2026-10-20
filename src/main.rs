@@ -31,6 +31,7 @@ mod desktop_text;
 mod desktop_theme;
 mod desktop_wrap;
 mod engine;
+mod external_tools;
 mod selectable;
 mod update;
 use std::path::PathBuf;

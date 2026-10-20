@@ -18,16 +18,22 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod external_tools;
 mod filter_bench;
 mod general_bench;
+mod ghost_checkout_bench;
+mod hover;
 mod image_cache;
 mod improvement_bench;
 mod landing;
 mod operations;
 mod provider;
 mod rebase;
+mod ref_storage;
 mod requests;
+mod stashes;
 mod status;
+mod todo_bench;
 mod toolbar_bench;
 mod update;
 
@@ -75,10 +81,12 @@ pub fn run(mut engine: Engine) {
                         if v.updates.installing
                             || v.composer.as_ref().is_some_and(|c| c.busy())
                             || v.engine.operation_busy
+                            || v.engine.repository_edit_busy
                             || v.engine.recents_loading
                             || v.engine.app.pending.busy
                             || v.engine.app.branches.busy
                             || v.engine.app.settings.saving
+                            || v.tools_config_busy()
                         {
                             v.notice = "Waiting for the active operation to finish…".into();
                             v.close_requested = true;
@@ -120,6 +128,9 @@ enum Action {
     OpenProviderUrl(String),
     NewRequest(String),
     Operation(Box<operations::Action>),
+    Stashes(Box<stashes::Action>),
+    Tools(Box<external_tools::Action>),
+    RefStorage(ref_storage::Action),
     Tab(Tab),
     Wrap,
     Explorer,
@@ -136,6 +147,7 @@ enum Action {
     Select(usize, bool),
     SearchField(&'static str),
     Branch(usize),
+    BranchSort(crate::branches::SortColumn),
     JumpBranch,
     File(usize),
     Check(usize),
@@ -161,10 +173,16 @@ struct Desktop {
     toolbar_bench: toolbar_bench::State,
     filter_bench: filter_bench::State,
     general_bench: general_bench::State,
+    graph_hover: hover::State,
+    todo_bench: todo_bench::State,
+    ghost_checkout_bench: ghost_checkout_bench::State,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
     operations: operations::Panel,
+    stashes: stashes::State,
+    tools: external_tools::State,
+    ref_storage: ref_storage::State,
     search: Entity<InputState>,
     search_field: &'static str,
     matches: Matches,
@@ -623,6 +641,30 @@ impl Desktop {
         .into_any_element()
     }
 
+    fn poll_tool_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tools_startup_pending()
+            || !self.engine.external_tools_idle()
+            || self.updates.installing
+            || self.composer.as_ref().is_some_and(|c| c.busy())
+            || !self.tools_startup_begin()
+        {
+            return;
+        }
+        self.engine.mark("external tools initialization requested");
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { crate::external_tools::load_or_scan_once() })
+                .await;
+            let _ = view.update_in(cx, |v, window, cx| {
+                v.engine.mark("external tools initialization ready");
+                v.tools_hydrate(result, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn new(mut engine: Engine, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let operations = operations::Panel::new(window, cx);
         engine.mark("GPUI window ready");
@@ -703,12 +745,14 @@ impl Desktop {
                         v.engine.tick(message);
                         v.poll_updates(cx);
                         v.sync_operations(window, cx);
+                        v.sync_stashes(cx);
                         v.sync_avatars(cx);
                         v.sync_provider(cx);
+                        v.poll_tool_discovery(window, cx);
                         if saving && !v.engine.app.settings.saving {
                             v.settings_identity = None;
                             v.avatars = Default::default();
-                            v.provider.invalidate();
+                            v.invalidate_provider_search_labels();
                         }
                         if old != v.engine.app.graph_selected() {
                             v.graph_scroll.scroll_to_item(
@@ -739,7 +783,9 @@ impl Desktop {
                                     }
                                 }
                                 Some("general-settings" | "general-tabs") => v.general_scenario_start(window, cx),
+                                Some("ghost-checkout-existing" | "ghost-checkout-new") => v.ghost_checkout_start(cx),
                                 Some("filter-visuals") => v.filter_scenario_start(window, cx),
+                                Some("todo-graph" | "branch-sort" | "graph-hover" | "stash-panel" | "stash-apply" | "stash-delete" | "external-tools" | "ref-storage") => v.todo_scenario_start(window, cx),
                                 Some("toolbar-counts") => v.toolbar_scenario_start(window, cx),
                                 Some("tag-dialog" | "tag-create") => {
                                     v.tag_scenario_start(v.scenario.as_deref() == Some("tag-create"), window, cx);
@@ -969,14 +1015,17 @@ impl Desktop {
                         if autoquit.is_some_and(|ms| {
                             v.engine.autoquit_ready(Duration::from_millis(ms))
                                 && (v.scenario.is_none() || v.scenario_presented)
+                                && !v.tools_config_busy()
                         }) || (v.close_requested
                             && !v.updates.installing
                             && !v.composer.as_ref().is_some_and(|c| c.busy())
                             && !v.engine.operation_busy
+                            && !v.engine.repository_edit_busy
                             && !v.engine.recents_loading
                             && !v.engine.app.pending.busy
                             && !v.engine.app.branches.busy
-                            && !v.engine.app.settings.saving)
+                            && !v.engine.app.settings.saving
+                            && !v.tools_config_busy())
                         {
                             if let Some(path) = std::env::var_os("GIT_RUSTLE_DUMP") {
                                 let _ = std::fs::write(path, v.snapshot(cx));
@@ -1003,10 +1052,16 @@ impl Desktop {
             toolbar_bench: Default::default(),
             filter_bench: Default::default(),
             general_bench: Default::default(),
+            graph_hover: Default::default(),
+            todo_bench: Default::default(),
+            ghost_checkout_bench: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
             operations,
+            stashes: Default::default(),
+            tools: Default::default(),
+            ref_storage: Default::default(),
             search,
             search_field: "",
             matches: Matches::default(),
@@ -1225,6 +1280,21 @@ impl Desktop {
         if self.updates.open {
             return;
         }
+        if self.ref_storage.confirming && !matches!(action, Action::RefStorage(_)) {
+            return;
+        }
+        if let Action::RefStorage(action) = action {
+            self.ref_storage_action(action, cx);
+            return;
+        }
+        if self.engine.repository_edit_busy
+            && matches!(
+                action,
+                Action::Commit | Action::Checkout | Action::Confirm(_) | Action::SaveSettings
+            )
+        {
+            return;
+        }
         if self.status_panel == Some(status::Panel::Details) {
             self.status_panel = None;
         }
@@ -1262,6 +1332,14 @@ impl Desktop {
         }
         if let Action::NewRequest(source) = action {
             self.open_request(source, window, cx);
+            return;
+        }
+        if let Action::Stashes(action) = action {
+            self.stash_action(*action, window, cx);
+            return;
+        }
+        if let Action::Tools(action) = action {
+            self.tools_action(*action, window, cx);
             return;
         }
         if let Some(c) = &mut self.composer {
@@ -1304,6 +1382,9 @@ impl Desktop {
         {
             return;
         }
+        if matches!(action, Action::Refresh) {
+            self.invalidate_provider_search_labels();
+        }
         let app = &mut self.engine.app;
         if matches!(
             action,
@@ -1315,8 +1396,10 @@ impl Desktop {
             Action::OpenProviderUrl(_) => unreachable!(),
             Action::NewRequest(_) => unreachable!(),
             Action::Operation(_) => unreachable!(),
+            Action::Stashes(_) => unreachable!(),
+            Action::Tools(_) => unreachable!(),
+            Action::RefStorage(_) => unreachable!(),
             Action::Refresh => {
-                self.provider.invalidate();
                 app.want_refresh = true;
                 app.pending.want_refresh = true;
                 app.branches.want_refresh = Some(true);
@@ -1326,15 +1409,7 @@ impl Desktop {
                 if app.settings.saving {
                     return;
                 }
-                app.settings.open = false;
-                app.branches.open = false;
-                app.park_diff();
-                app.clear_search();
-                if let Some(id) = app.head_id()
-                    && let Some(i) = app.history.index_of(&id)
-                {
-                    app.select(i);
-                }
+                app.go_to_head();
                 self.search.update(cx, |s, cx| s.set_value("", window, cx));
             }
             Action::Branches | Action::Tab(Tab::Branches) => {
@@ -1344,7 +1419,7 @@ impl Desktop {
                     app.branches.show(app.refs.as_ref());
                     self.branches_loaded = true;
                 } else {
-                    app.branches.open = true;
+                    app.branches.resume();
                 }
             }
             Action::Settings | Action::Tab(Tab::Settings) => {
@@ -1472,6 +1547,11 @@ impl Desktop {
                 }
             }
             Action::Branch(i) => app.branches.select(i),
+            Action::BranchSort(column) => {
+                app.branches.set_sort(column);
+                self.branches_scroll
+                    .scroll_to_item(app.branches.selected, ScrollStrategy::Center);
+            }
             Action::JumpBranch => {
                 self.selected_commits.clear();
                 if let Some(target) = app.branches.chosen().map(|e| e.target.clone())
@@ -1580,6 +1660,13 @@ impl Desktop {
                 },
                 true,
             ),
+            Request::FetchBranch(t) => (
+                "cloud",
+                "FETCH & CHECKOUT BRANCH",
+                t.label(),
+                "Fetch latest changes and check out this branch. Local updates must fast-forward.",
+                true,
+            ),
             Request::Commit { id, remote } => (
                 "commit",
                 "DETACHED HEAD",
@@ -1680,10 +1767,15 @@ impl Desktop {
             _ => None,
         };
         let text: SharedString = text.into();
-        let enabled = (!matches!(action, Action::ClearImages)
-            || (self.engine.app.settings.page == crate::settings::GENERAL_PAGE
-                && !self.image_cache.busy
-                && self.image_cache.stats.is_some()))
+        let enabled = (!self.engine.repository_edit_busy
+            || !matches!(
+                action,
+                Action::Commit | Action::Checkout | Action::Confirm(_) | Action::SaveSettings
+            ))
+            && (!matches!(action, Action::ClearImages)
+                || (self.engine.app.settings.page == crate::settings::GENERAL_PAGE
+                    && !self.image_cache.busy
+                    && self.image_cache.stats.is_some()))
             && (!matches!(action, Action::CheckUpdates) || self.update_check_enabled())
             && (!matches!(action, Action::Diff)
                 || self.engine.app.pending.selected
@@ -1768,7 +1860,7 @@ impl Desktop {
                         "expand" => "Expand folders",
                         "collapse" => "Collapse folders",
                         "diff" => "Diff selected commits (one or two)",
-                        "head" => "Go to HEAD",
+                        "head" => "Go to pending changes, or HEAD when clean",
                         "checkout" => "Checkout",
                         "copy" => "Copy SHA1",
                         "branch" => "Branches",
@@ -1786,13 +1878,30 @@ impl Desktop {
     }
     fn graph_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         row()
+            .relative()
+            .children(self.todo_probe(0))
             .h(px(48.))
             .flex_shrink_0()
             .px_3()
             .border_b_1()
             .border_color(rgb(LINE))
-            .child(self.button("refresh", "", Action::Refresh, cx))
             .child(self.button("head", "", Action::Head, cx))
+            .child(self.button("refresh", "", Action::Refresh, cx))
+            .child(
+                Button::new("show-stashes")
+                    .small()
+                    .ghost()
+                    .label("Stashes")
+                    .selected(self.stashes.open)
+                    .tooltip("Show saved stashes")
+                    .on_click(cx.listener(|v, _, window, cx| {
+                        v.action(
+                            Action::Stashes(Box::new(stashes::Action::Toggle)),
+                            window,
+                            cx,
+                        )
+                    })),
+            )
             .child(self.button(
                 "pull",
                 "Pull",
@@ -1884,6 +1993,7 @@ impl Desktop {
                 }
                 v.engine.app.list_rows = range.len().max(1);
                 v.engine.app.scroll = range.start;
+                v.graph_hover.update(&v.engine.app, range.clone());
                 let app = &v.engine.app;
                 let graph_width = v.graph_width;
                 range
@@ -1961,14 +2071,50 @@ impl Desktop {
                                     .unwrap_or_default()
                                     .to_vec()
                             };
-                            r = r.child(graph_canvas(cells, flags, graph_width)).child(
-                                div()
-                                    .w(px(76.))
-                                    .font_family("Cascadia Mono")
-                                    .flex_shrink_0()
-                                    .text_color(rgb(if ghost { MUTED } else { ACCENT }))
-                                    .child(v.matches.styled(rec.id.to_hex_with_len(8).to_string())),
-                            );
+                            let node_lane = if app.search.active() {
+                                app.search
+                                    .result
+                                    .as_ref()
+                                    .and_then(|result| result.graph.get(row_index))
+                                    .map_or(rec.node_lane as usize, |row| row.1 as usize)
+                            } else {
+                                rec.node_lane as usize
+                            };
+                            let hovered = v.graph_hover.row(row_index);
+                            r = r
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(px(graph_width))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .child(graph_canvas(cells, flags, hovered, graph_width))
+                                        .when(node_lane as f32 * 14. < graph_width, |graph| {
+                                            graph.child(
+                                                div()
+                                                    .id(("commit-node-hover", row_index))
+                                                    .absolute()
+                                                    .left(px(node_lane as f32 * 14. - 1.))
+                                                    .top(px(8.))
+                                                    .size(px(16.))
+                                                    .on_hover(cx.listener(
+                                                        move |v, entered: &bool, _, cx| {
+                                                            v.hover_commit(row_index, *entered, cx);
+                                                        },
+                                                    )),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(76.))
+                                        .font_family("Cascadia Mono")
+                                        .flex_shrink_0()
+                                        .text_color(rgb(if ghost { MUTED } else { ACCENT }))
+                                        .child(
+                                            v.matches.styled(rec.id.to_hex_with_len(8).to_string()),
+                                        ),
+                                );
                             if app.head_id() == Some(rec.id) {
                                 r = r.child(
                                     row()
@@ -2092,7 +2238,22 @@ impl Desktop {
                                     .to_vec()
                             });
                             r = r
-                                .child(pending_graph_canvas(graph_width, lane, cells, flags))
+                                .relative()
+                                .children(v.todo_probe(1))
+                                .bg(rgb(if selected { 0x4a2b15 } else { 0x241508 }))
+                                .border_l_2()
+                                .border_color(rgb(ACCENT))
+                                .pl(px(6.))
+                                .text_color(rgb(ACCENT_HOVER))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .hover(|s| s.bg(rgb(0x53331c)))
+                                .child(pending_graph_canvas(
+                                    graph_width,
+                                    lane,
+                                    cells,
+                                    flags,
+                                    v.graph_hover.row(row_index),
+                                ))
                                 .child(format!(
                                     "Pending changes  ·  {} files",
                                     app.pending.snapshot.files.len()
@@ -2113,6 +2274,7 @@ impl Desktop {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .children(self.ghost_checkout_graph_probe())
                     .child(self.scroll_region(0, list, Scrollbar::vertical(&self.graph_scroll), cx))
                     .child(
                         div()
@@ -2620,7 +2782,7 @@ impl Desktop {
         )
         .track_scroll(self.diff_scroll.clone())
         .size_full();
-        row()
+        row().relative().children(self.todo_probe(5))
             .flex_1()
             .min_h_0()
             .items_start()
@@ -2662,8 +2824,12 @@ impl Desktop {
                                     .child(self.diff_path.clone()),
                             )
                             .when_some(view.diff.as_ref(), |s,d|s.child(diff_stats(d.added,d.removed)))
+                            .when_some(view.current_change(), |s, change| {
+                                s.child(self.tools_diff_button(change, cx))
+                            })
                             .child(self.button("word-wrap", "", Action::Wrap, cx)),
                     )
+                    .children(self.tools_notice())
                     .when(n == 0, |s| {
                         s.child(caption(if !view.changes.loaded {
                             "Loading files…"
@@ -2752,13 +2918,31 @@ impl Desktop {
                             .bg(rgb(if b.selected == i { SELECTED } else { BG }))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(HOVER)))
-                            .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(
-                                v.branch_matches.styled(format!(
-                                    "{}{}",
-                                    if entry.current { "● " } else { "" },
-                                    entry.target.label()
+                            .child(
+                                icon(if entry.current {
+                                    "head"
+                                } else if entry.local_available {
+                                    "branch"
+                                } else {
+                                    "cloud"
+                                })
+                                .text_color(rgb(
+                                    if entry.current {
+                                        ACCENT
+                                    } else if entry.local_available {
+                                        MUTED
+                                    } else {
+                                        REMOTE_TEXT
+                                    },
                                 )),
-                            ))
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(v.branch_matches.styled(entry.target.label())),
+                            )
                             .children(v.provider_badge(
                                 if entry.target.remote.is_some() {
                                     crate::git::RefKind::Remote
@@ -2806,7 +2990,7 @@ impl Desktop {
                                     ),
                             )
                             .child(
-                                div().w(px(62.)).flex_shrink_0().text_right().child(caption(
+                                div().w(px(90.)).flex_shrink_0().text_right().child(caption(
                                     entry
                                         .activity
                                         .as_ref()
@@ -2864,6 +3048,46 @@ impl Desktop {
                             )),
                     ),
             )
+            .child(
+                row()
+                    .relative()
+                    .children(self.todo_probe(6))
+                    .h(px(34.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(div().w(px(18.)).flex_shrink_0())
+                    .child(div().flex_1().child(self.branch_sort_button(
+                        "sort-branch-name",
+                        "Name",
+                        crate::branches::SortColumn::Name,
+                        cx,
+                    )))
+                    .child(div().w(px(150.)).flex_shrink_0().child(caption("Author")))
+                    .child(
+                        div()
+                            .w(px(190.))
+                            .flex_shrink_0()
+                            .child(self.branch_sort_button(
+                                "sort-branch-activity",
+                                "Activity",
+                                crate::branches::SortColumn::Activity,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .flex_shrink_0()
+                            .child(self.branch_sort_button(
+                                "sort-branch-commit",
+                                "Last commit",
+                                crate::branches::SortColumn::LastCommit,
+                                cx,
+                            )),
+                    ),
+            )
             .when(browser.loading, |s| {
                 s.child(caption("Refreshing branches…"))
             })
@@ -2874,25 +3098,65 @@ impl Desktop {
             .child(self.scroll_region(3, list, Scrollbar::vertical(&self.branches_scroll), cx))
             .into_any_element()
     }
+    fn branch_sort_button(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        column: crate::branches::SortColumn,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let sort = self.engine.app.branches.sort;
+        Button::new(id)
+            .xsmall()
+            .ghost()
+            .selected(sort.column == column)
+            .label(if sort.column == column {
+                format!("{title} {}", if sort.descending { "↓" } else { "↑" })
+            } else {
+                title.into()
+            })
+            .tooltip("Sort this column; click again to reverse")
+            .on_click(
+                cx.listener(move |v, _, window, cx| {
+                    v.action(Action::BranchSort(column), window, cx)
+                }),
+            )
+    }
     fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = &self.engine.app.settings;
-        let mut form = column().max_w(px(700.)).gap_3();
+        let mut form = column().w(px(700.)).max_w_full().flex_shrink_0().gap_3();
         if settings.page == crate::settings::GENERAL_PAGE {
             form = form
                 .child(caption("General settings · shared by all repositories"))
                 .child(
                     self.update_controls(cx)
+                        .flex_shrink_0()
                         .relative()
                         .children(self.general_settings_probe(0)),
                 )
                 .child(
                     self.image_cache_controls(cx)
+                        .flex_shrink_0()
                         .relative()
                         .children(self.general_settings_probe(1)),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .flex_shrink_0()
+                        .child(self.tools_controls(cx))
+                        .children(self.todo_probe(3)),
                 );
         } else if settings.page == 0 {
             form = form
                 .child(caption("Settings for this project"))
+                .child(
+                    div()
+                        .relative()
+                        .child(self.ref_storage_controls(cx))
+                        .children(self.todo_probe(4)),
+                )
                 .child(caption("Repository path"))
                 .child(
                     div()
@@ -2975,14 +3239,18 @@ impl Desktop {
         }
         column()
             .id("settings-page")
+            .w_full()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .when_some(self.todo_settings_scroll(), |page, scroll| {
+                page.track_scroll(&scroll)
+            })
             .p_6()
             .gap_4()
-            .child(div().text_size(px(20.)).child("Settings"))
+            .child(div().flex_shrink_0().text_size(px(20.)).child("Settings"))
             .child(
-                tab_bar().children(
+                tab_bar().flex_shrink_0().children(
                     [
                         (crate::settings::GENERAL_PAGE, "General"),
                         (0, "Project"),
@@ -3024,6 +3292,12 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if let Some(ready) = self.ghost_checkout_ready() {
+            return ready;
+        }
+        if let Some(ready) = self.todo_scenario_ready() {
+            return ready;
+        }
         if let Some(ready) = self.general_scenario_ready() {
             return ready;
         }
@@ -3155,7 +3429,7 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}\n{}\n{}\n{}",
+                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}\n{}\n{}\n{}\n{}\n{}",
                 self.status_panel,
                 self.updates.available.is_some(),
                 self.updates.open,
@@ -3171,6 +3445,8 @@ impl Desktop {
                 self.toolbar_scenario_summary(),
                 self.filter_scenario_summary(),
                 self.general_scenario_summary(),
+                self.todo_scenario_summary(),
+                self.ghost_checkout_summary(),
             ),
         )
     }
@@ -3210,6 +3486,7 @@ impl Render for Desktop {
                         .min_h_0()
                         .items_start()
                         .gap_0()
+                        .children(self.stash_panel(cx))
                         .child(self.graph(cx))
                         .child(
                             div()
@@ -3231,10 +3508,14 @@ impl Render for Desktop {
         self.toolbar_scenario_schedule(window, cx);
         self.filter_scenario_schedule(window, cx);
         self.general_scenario_schedule(window, cx);
+        self.todo_scenario_schedule(window, cx);
+        self.ghost_checkout_schedule(window, cx);
         let app = &self.engine.app;
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
                 dialog_body("Confirm checkout")
+                    .relative()
+                    .children(self.ghost_checkout_modal_probe())
                     .child(caption("Choose how to open this revision."))
                     .child(
                         column()
@@ -3379,6 +3660,8 @@ impl Render for Desktop {
                         v.filter_scenario_assert();
                     }
                     v.general_scenario_assert();
+                    v.todo_scenario_assert();
+                    v.ghost_checkout_assert();
                     if matches!(v.scenario.as_deref(), Some("tag-dialog" | "tag-create")) {
                         v.tag_scenario_assert(v.scenario.as_deref() == Some("tag-create"));
                     }
@@ -3409,6 +3692,26 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .capture_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && v.tools_picker_open() {
+                    v.tools_action(external_tools::Action::ClosePicker, window, cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
+                if e.keystroke.key == "escape"
+                    && matches!(v.engine.app.mode, Mode::Diff(_))
+                    && !v.engine.app.settings.open
+                    && !v.engine.app.branches.open
+                    && !v.operations.modal_open()
+                    && !v.updates.open
+                    && v.status_panel.is_none()
+                    && v.context_menu.is_none()
+                {
+                    v.action(Action::Tab(Tab::Graph), window, cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 if e.keystroke.modifiers.control
                     && !e.keystroke.modifiers.alt
                     && !e.keystroke.modifiers.shift
@@ -3420,6 +3723,13 @@ impl Render for Desktop {
                 }
             }))
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if v.ref_storage.confirming {
+                    if e.keystroke.key == "escape" {
+                        v.ref_storage_action(ref_storage::Action::Cancel, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if v.updates.open {
                     if e.keystroke.key == "escape" && !v.updates.installing {
                         v.updates.open = false;
@@ -3525,6 +3835,7 @@ impl Render for Desktop {
             .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
             .children(self.update_dialog(cx))
+            .children(self.ref_storage_confirmation(cx))
             .into_any_element()
     }
 }
@@ -3687,20 +3998,29 @@ fn pending_graph_canvas(
     lane: usize,
     cells: Vec<GraphCell>,
     flags: Vec<u8>,
+    hovered: Vec<u8>,
 ) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             for (i, cell) in cells.iter().enumerate().take((width / 14.) as usize) {
                 let center = graph_node_center(bounds, i);
-                let color = graph_color(*cell, flags.get(i).copied().unwrap_or(0));
+                let highlighted = hovered
+                    .get(i)
+                    .is_some_and(|flag| flag & crate::graph::hover::GLYPH != 0);
+                let color = if highlighted {
+                    rgb(TEXT).into()
+                } else {
+                    graph_color(*cell, flags.get(i).copied().unwrap_or(0))
+                };
+                let track_width = px(if highlighted { 3. } else { 2. });
                 if i == lane {
                     // Stop at the rim so the pending marker stays hollow on every background.
                     let start = center.y + px(GRAPH_NODE_RADIUS);
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(center.x - px(1.), start),
-                            size(px(2.), bounds.bottom() - start),
+                            point(center.x - track_width / 2., start),
+                            size(track_width, bounds.bottom() - start),
                         ),
                         color,
                     ));
@@ -3708,8 +4028,8 @@ fn pending_graph_canvas(
                 } else if cell.kind() == CellKind::Vertical {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(center.x - px(1.), bounds.top()),
-                            size(px(2.), bounds.size.height),
+                            point(center.x - track_width / 2., bounds.top()),
+                            size(track_width, bounds.size.height),
                         ),
                         color,
                     ));
@@ -3722,7 +4042,12 @@ fn pending_graph_canvas(
     .flex_shrink_0()
 }
 
-fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoElement {
+fn graph_canvas(
+    cells: Vec<GraphCell>,
+    flags: Vec<u8>,
+    hovered: Vec<u8>,
+    width: f32,
+) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -3730,7 +4055,14 @@ fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoE
                 let center = graph_node_center(bounds, i);
                 let x = center.x;
                 let middle = center.y;
-                let color = graph_color(*c, flags.get(i).copied().unwrap_or(0));
+                let hover = hovered.get(i).copied().unwrap_or(0);
+                let highlighted = hover & crate::graph::hover::GLYPH != 0;
+                let base = graph_color(*c, flags.get(i).copied().unwrap_or(0));
+                let color = if highlighted { rgb(TEXT).into() } else { base };
+                let connector = hover & crate::graph::hover::CONNECTOR != 0;
+                let connector_color = if connector { rgb(TEXT).into() } else { base };
+                let vertical_width = px(if highlighted { 3. } else { 2. });
+                let horizontal_width = px(if connector { 3. } else { 2. });
                 let k = c.kind();
                 let top = graph_connects_top(k);
                 let bottom = matches!(
@@ -3747,8 +4079,8 @@ fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoE
                 if top {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(x - px(1.), bounds.top()),
-                            size(px(2.), middle - bounds.top()),
+                            point(x - vertical_width / 2., bounds.top()),
+                            size(vertical_width, middle - bounds.top()),
                         ),
                         color,
                     ));
@@ -3756,8 +4088,8 @@ fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoE
                 if bottom {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(x - px(1.), middle),
-                            size(px(2.), bounds.bottom() - middle),
+                            point(x - vertical_width / 2., middle),
+                            size(vertical_width, bounds.bottom() - middle),
                         ),
                         color,
                     ));
@@ -3771,8 +4103,11 @@ fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoE
                         | CellKind::JoinFromLeft
                 ) {
                     window.paint_quad(fill(
-                        Bounds::new(point(x - px(14.), middle - px(1.)), size(px(14.), px(2.))),
-                        color,
+                        Bounds::new(
+                            point(x - px(14.), middle - horizontal_width / 2.),
+                            size(px(14.), horizontal_width),
+                        ),
+                        connector_color,
                     ));
                 }
                 if matches!(
@@ -3784,8 +4119,11 @@ fn graph_canvas(cells: Vec<GraphCell>, flags: Vec<u8>, width: f32) -> impl IntoE
                         | CellKind::JoinFromRight
                 ) {
                     window.paint_quad(fill(
-                        Bounds::new(point(x, middle - px(1.)), size(px(14.), px(2.))),
-                        color,
+                        Bounds::new(
+                            point(x, middle - horizontal_width / 2.),
+                            size(px(14.), horizontal_width),
+                        ),
+                        connector_color,
                     ));
                 }
                 if matches!(k, CellKind::Node | CellKind::MergeNode) {

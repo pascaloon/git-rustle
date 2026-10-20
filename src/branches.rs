@@ -27,9 +27,34 @@ impl Target {
 pub struct Entry {
     pub target: Target,
     pub current: bool,
+    /// A real local branch exists by exact name or tracks this remote branch.
+    pub local_available: bool,
     search: String,
     author_search: String,
     pub activity: Option<Activity>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortColumn {
+    Name,
+    #[default]
+    Activity,
+    LastCommit,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Sort {
+    pub column: SortColumn,
+    pub descending: bool,
+}
+
+impl Default for Sort {
+    fn default() -> Self {
+        Self {
+            column: SortColumn::Activity,
+            descending: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -114,15 +139,22 @@ pub struct Browser {
     pub activity_requests: usize,
     pub remotes: BTreeMap<String, remote::Update>,
     pub last_check: Option<std::time::Instant>,
+    pub sort: Sort,
 }
 
 impl Browser {
     pub fn show(&mut self, refs: Option<&RefSnapshot>) {
-        self.open = true;
         self.reset_to_top();
         self.rebuild(refs);
+        self.resume();
+    }
+
+    /// Reopening a tab must upgrade the startup's scoped discovery as well.
+    pub fn resume(&mut self) {
+        self.open = true;
         if !self.loading
-            && (self.remotes.values().any(|u| u.scoped)
+            && (!self.errors.is_empty()
+                || self.remotes.values().any(|u| u.scoped)
                 || self
                     .last_check
                     .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(300)))
@@ -179,6 +211,7 @@ impl Browser {
                     Entry {
                         target,
                         current,
+                        local_available: true,
                         search,
                         author_search: String::new(),
                         activity: None,
@@ -186,6 +219,25 @@ impl Browser {
                 );
             }
         }
+        // No extra index work for the ordinary local-only case. Names are
+        // borrowed from the immutable snapshot, never folded or copied.
+        let has_remotes = !self.remotes.is_empty()
+            || entries
+                .last_key_value()
+                .is_some_and(|((remote, _), _)| remote.is_some());
+        let local_names: HashSet<&str> = if has_remotes {
+            refs.into_iter()
+                .flat_map(|refs| &refs.refs)
+                .filter(|r| {
+                    r.kind == RefKind::Branch
+                        || (r.kind == RefKind::Head
+                            && refs.is_some_and(|s| s.head_branch.as_ref() == Some(&r.name)))
+                })
+                .map(|r| r.name.as_str())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for (name, update) in &self.remotes {
             // A successful complete list is authoritative, including branch deletions.
             if !update.stale && !update.scoped {
@@ -204,6 +256,7 @@ impl Browser {
                     Entry {
                         target,
                         current: false,
+                        local_available: false,
                         search,
                         author_search: String::new(),
                         activity: None,
@@ -220,19 +273,19 @@ impl Browser {
             }
         }
         for e in &mut self.entries {
+            if let Some(remote) = &e.target.remote {
+                e.local_available = local_names.contains(e.target.name.as_str())
+                    || refs
+                        .and_then(|s| s.tracking.get(remote))
+                        .is_some_and(|names| names.contains(&e.target.name));
+            }
             e.activity = self
                 .activity_cache
                 .get(&e.target)
                 .or_else(|| by_sha.get(e.target.sha.as_str()).copied())
                 .cloned();
         }
-        self.entries.sort_by(|a, b| {
-            let rank = |e: &Entry| e.activity.as_ref().map(|a| (a.recent, a.commit_time));
-            rank(b)
-                .cmp(&rank(a))
-                .then_with(|| a.target.remote.cmp(&b.target.remote))
-                .then_with(|| a.target.name.cmp(&b.target.name))
-        });
+        self.sort_entries();
         self.filter();
         if self.follow_top {
             self.selected = 0;
@@ -248,6 +301,68 @@ impl Browser {
             self.selected = i;
         }
         self.ensure_visible();
+    }
+
+    pub fn set_sort(&mut self, column: SortColumn) {
+        let keep = self
+            .chosen()
+            .map(|e| (e.target.remote.clone(), e.target.name.clone()));
+        self.sort = Sort {
+            column,
+            descending: if self.sort.column == column {
+                !self.sort.descending
+            } else {
+                column != SortColumn::Name
+            },
+        };
+        self.sort_entries();
+        self.filter();
+        if let Some((remote, name)) = keep
+            && let Some(index) = self.visible.iter().position(|&i| {
+                self.entries[i].target.remote == remote && self.entries[i].target.name == name
+            })
+        {
+            self.selected = index;
+        }
+        self.follow_top = false;
+        self.ensure_visible();
+    }
+
+    fn sort_entries(&mut self) {
+        let sort = self.sort;
+        if sort.column == SortColumn::Activity && sort.descending {
+            // Keep the existing default hot path free of per-comparison mode
+            // dispatch. Header sorts are only paid for when explicitly chosen.
+            self.entries.sort_by(|a, b| {
+                let rank = |e: &Entry| e.activity.as_ref().map(|a| (a.recent, a.commit_time));
+                rank(b)
+                    .cmp(&rank(a))
+                    .then_with(|| a.target.remote.cmp(&b.target.remote))
+                    .then_with(|| a.target.name.cmp(&b.target.name))
+            });
+            return;
+        }
+        self.entries.sort_by(|a, b| {
+            let order = match sort.column {
+                SortColumn::Name => a.target.name.cmp(&b.target.name),
+                SortColumn::Activity => {
+                    let rank = |e: &Entry| e.activity.as_ref().map(|a| (a.recent, a.commit_time));
+                    rank(a).cmp(&rank(b))
+                }
+                SortColumn::LastCommit => {
+                    let rank = |e: &Entry| e.activity.as_ref().map(|a| a.commit_time);
+                    rank(a).cmp(&rank(b))
+                }
+            };
+            let order = if sort.descending {
+                order.reverse()
+            } else {
+                order
+            };
+            order
+                .then_with(|| a.target.remote.cmp(&b.target.remote))
+                .then_with(|| a.target.name.cmp(&b.target.name))
+        });
     }
 
     pub fn filter(&mut self) {
@@ -385,6 +500,378 @@ impl Browser {
 mod tests {
     use super::*;
     use crate::git::{RefEntry, RefKind};
+
+    #[test]
+    fn sort_headers_override_order_toggle_and_preserve_selected_identity() {
+        let refs = RefSnapshot {
+            refs: ["zeta", "alpha", "middle"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| RefEntry {
+                    name: name.into(),
+                    id: ObjectId::from_hex(format!("{:040x}", i + 1).as_bytes()).unwrap(),
+                    kind: RefKind::Branch,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut browser = Browser {
+            rows: 1,
+            ..Default::default()
+        };
+        browser.rebuild(Some(&refs));
+        let values = browser
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.target.clone(),
+                    Activity {
+                        author: "Owner".into(),
+                        author_time: 1,
+                        commit_time: if e.target.name == "middle" { 30 } else { 10 },
+                        recent: if e.target.name == "zeta" { 5 } else { 1 },
+                        limited: false,
+                    },
+                )
+            })
+            .collect();
+        browser.install_activity(values, Some(&refs));
+        browser.select(1);
+        let chosen = browser.chosen().unwrap().target.clone();
+        browser.entries.reverse(); // A header always overrides arbitrary current ordering.
+        browser.filter();
+        let index = browser
+            .visible
+            .iter()
+            .position(|&i| browser.entries[i].target == chosen)
+            .unwrap();
+        browser.select(index);
+        browser.set_sort(SortColumn::Name);
+        assert_eq!(browser.entries[0].target.name, "alpha");
+        assert!(!browser.sort.descending);
+        assert_eq!(browser.chosen().unwrap().target, chosen);
+        browser.set_sort(SortColumn::Name);
+        assert_eq!(browser.entries[0].target.name, "zeta");
+        browser.set_sort(SortColumn::LastCommit);
+        assert_eq!(browser.entries[0].target.name, "middle");
+        browser.set_sort(SortColumn::LastCommit);
+        assert_eq!(browser.entries[0].target.name, "alpha");
+        browser.set_sort(SortColumn::Activity);
+        assert_eq!(browser.entries[0].target.name, "zeta");
+        browser.query = "Owner".into();
+        browser.filter();
+        browser.set_sort(SortColumn::Activity);
+        assert_eq!(browser.entries[0].target.name, "alpha");
+        assert_eq!(browser.visible.len(), 3);
+        assert_eq!(browser.chosen().unwrap().target, chosen);
+        browser.rebuild(Some(&refs));
+        assert!(!browser.sort.descending);
+        assert_eq!(browser.entries[0].target.name, "alpha");
+        assert_eq!(browser.chosen().unwrap().target, chosen);
+    }
+
+    #[test]
+    fn remote_availability_requires_exact_local_name_or_upstream_not_objects() {
+        let id = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let mut refs = RefSnapshot {
+            head_branch: Some("local-work".into()),
+            head_id: Some(id),
+            refs: [
+                ("local-work", RefKind::Head),
+                ("same", RefKind::Branch),
+                ("origin/same", RefKind::Remote),
+                ("origin/remote-only", RefKind::Remote),
+                ("origin/tracked", RefKind::Remote),
+                ("origin/Same", RefKind::Remote),
+            ]
+            .into_iter()
+            .map(|(name, kind)| RefEntry {
+                name: name.into(),
+                id,
+                kind,
+            })
+            .collect(),
+            ..Default::default()
+        };
+        refs.tracking
+            .insert("origin".into(), HashSet::from(["tracked".into()]));
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        let available = |name: &str| {
+            browser
+                .entries
+                .iter()
+                .find(|e| e.target.label() == name)
+                .unwrap()
+                .local_available
+        };
+        assert!(available("local-work") && available("same"));
+        assert!(available("origin/same") && available("origin/tracked"));
+        assert!(!available("origin/remote-only") && !available("origin/Same"));
+        assert!(
+            browser
+                .entries
+                .iter()
+                .find(|e| e.target.name == "local-work")
+                .unwrap()
+                .current
+        );
+        refs.tracking.clear();
+        browser.rebuild(Some(&refs));
+        assert!(
+            !browser
+                .entries
+                .iter()
+                .find(|e| e.target.label() == "origin/tracked")
+                .unwrap()
+                .local_available
+        );
+    }
+
+    #[test]
+    fn reopening_scoped_discovery_requests_complete_list_without_losing_selection() {
+        let remote = remote::Remote::parse("origin", "https://github.com/git/git", None).unwrap();
+        let mut browser = Browser::default();
+        browser.show(Some(&owner_refs()));
+        browser.select(1);
+        let chosen = browser.chosen().unwrap().target.clone();
+        browser.last_check = Some(std::time::Instant::now());
+        browser.remotes.insert(
+            "origin".into(),
+            remote::Update {
+                remote,
+                branches: Vec::new(),
+                scoped: true,
+                cached: false,
+                stale: false,
+            },
+        );
+        browser.want_refresh = None;
+        browser.open = false;
+        browser.resume();
+        assert_eq!(browser.want_refresh, Some(false));
+        assert_eq!(browser.chosen().unwrap().target, chosen);
+        browser.want_refresh = None;
+        browser.loading = true;
+        browser.resume();
+        assert!(browser.want_refresh.is_none());
+        browser.loading = false;
+        browser.remotes.get_mut("origin").unwrap().scoped = false;
+        browser.resume();
+        assert!(browser.want_refresh.is_none());
+        browser.errors.push("another remote failed".into());
+        browser.resume();
+        assert_eq!(browser.want_refresh, Some(false));
+        browser.want_refresh = None;
+        browser.rebuild(Some(&owner_refs()));
+        assert!(browser.want_refresh.is_none()); // A render/rebuild never retries automatically.
+    }
+
+    #[test]
+    #[ignore = "explicit header sort measurement at 1,000/10,000 entries"]
+    fn benchmark_header_sort() {
+        for entries in [1000, 10_000] {
+            let refs = RefSnapshot {
+                refs: (0..entries)
+                    .map(|i| RefEntry {
+                        name: format!("branch-{i:05}"),
+                        id: ObjectId::from_hex(format!("{:040x}", i + 1).as_bytes()).unwrap(),
+                        kind: RefKind::Branch,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut browser = Browser {
+                rows: 34,
+                ..Default::default()
+            };
+            browser.rebuild(Some(&refs));
+            let values = browser
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    (
+                        e.target.clone(),
+                        Activity {
+                            author: "Owner".into(),
+                            author_time: 1,
+                            commit_time: (i % 97) as i64,
+                            recent: (i % 101) as u32,
+                            limited: false,
+                        },
+                    )
+                })
+                .collect();
+            browser.install_activity(values, Some(&refs));
+            browser.select(entries / 2);
+            let chosen = browser.chosen().unwrap().target.clone();
+            for sample in -1..15 {
+                let mut times = Vec::new();
+                for column in [
+                    SortColumn::Name,
+                    SortColumn::Activity,
+                    SortColumn::LastCommit,
+                ] {
+                    let start = std::time::Instant::now();
+                    for _ in 0..20 {
+                        browser.set_sort(column);
+                        std::hint::black_box(&browser.visible);
+                    }
+                    times.push(start.elapsed().as_secs_f64() * 1000.0 / 20.0);
+                    assert_eq!(browser.chosen().unwrap().target, chosen);
+                }
+                if sample >= 0 {
+                    println!(
+                        "{}",
+                        serde_json::json!({"sample":sample,"entries":entries,"nameMs":times[0],"activityMs":times[1],"lastCommitMs":times[2]})
+                    );
+                }
+            }
+        }
+    }
+
+    // Test-only prototype: both variants share the same bounded worker body.
+    // The production Activity layout/ranking remain unchanged until the paired
+    // measurements establish that weighting has no cost.
+    fn activity_prototype<const WEIGHTED: bool>(
+        repo: &gix::Repository,
+        tips: &[Target],
+        now: i64,
+    ) -> Vec<(Target, Activity, u32)> {
+        let mut known = HashMap::new();
+        tips.iter()
+            .filter_map(|target| {
+                let id = ObjectId::from_hex(target.sha.as_bytes()).ok()?;
+                let tip = crate::git::commit_details(repo, &id).ok()?;
+                let mut next = Some(id);
+                let mut recent = 0;
+                let mut score = 0;
+                let mut visited = HashSet::new();
+                for _ in 0..100 {
+                    let Some(id) = next else { break };
+                    if !visited.insert(id) {
+                        break;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(id) {
+                        let Ok(details) = crate::git::commit_details(repo, &id) else {
+                            break;
+                        };
+                        entry.insert(details);
+                    }
+                    let c = &known[&id];
+                    let in_week = c.commit_time >= now - WEEK && c.commit_time <= now;
+                    recent += u32::from(in_week);
+                    if WEIGHTED && in_week {
+                        score += (c.commit_time - (now - WEEK) + 1) as u32;
+                    }
+                    next = c.parents.first().copied();
+                }
+                Some((
+                    target.clone(),
+                    Activity {
+                        author: tip.author_name,
+                        author_time: tip.author_time,
+                        commit_time: tip.commit_time,
+                        recent,
+                        limited: next.is_some(),
+                    },
+                    score,
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "paired old-count/recency prototype; does not change production ranking"]
+    fn benchmark_activity_recency_prototype() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("GIT_RUSTLE_BENCH_REPO").expect("repository required"),
+        );
+        let repo = crate::git::open(&path).unwrap();
+        let bytes =
+            crate::git::command::checked(&path, &["rev-list", "--all", "--max-count=10000"])
+                .unwrap();
+        let ids: Vec<_> = std::str::from_utf8(&bytes).unwrap().lines().collect();
+        assert!(
+            ids.len() >= 1000,
+            "recency prototype requires at least 1,000 commits"
+        );
+        let now =
+            crate::git::commit_details(&repo, &ObjectId::from_hex(ids[0].as_bytes()).unwrap())
+                .unwrap()
+                .commit_time;
+        for distribution in ["shared", "neighbors", "spread"] {
+            let tips: Vec<_> = (0..1000)
+                .map(|n| Target {
+                    name: format!("prototype-{n:04}"),
+                    remote: None,
+                    url: None,
+                    sha: ids[match distribution {
+                        "shared" => 0,
+                        "neighbors" => n,
+                        _ => n * (ids.len() - 1) / 999,
+                    }]
+                    .into(),
+                })
+                .collect();
+            for sample in -1..15 {
+                let mut old_ms = 0.;
+                let mut weighted_ms = 0.;
+                let mut old = Vec::new();
+                let mut weighted = Vec::new();
+                for is_weighted in if sample % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                } {
+                    let start = std::time::Instant::now();
+                    let values = if is_weighted {
+                        activity_prototype::<true>(&repo, &tips, now)
+                    } else {
+                        activity_prototype::<false>(&repo, &tips, now)
+                    };
+                    let ms = start.elapsed().as_secs_f64() * 1000.;
+                    if is_weighted {
+                        weighted_ms = ms;
+                        weighted = values;
+                    } else {
+                        old_ms = ms;
+                        old = values;
+                    }
+                }
+                assert_eq!(old.len(), 1000);
+                assert_eq!(weighted.len(), old.len());
+                for ((target, a, _), (other, b, _)) in old.iter().zip(&weighted) {
+                    assert_eq!(target, other);
+                    assert_eq!(
+                        (
+                            a.author.as_str(),
+                            a.author_time,
+                            a.commit_time,
+                            a.recent,
+                            a.limited
+                        ),
+                        (
+                            b.author.as_str(),
+                            b.author_time,
+                            b.commit_time,
+                            b.recent,
+                            b.limited
+                        )
+                    );
+                }
+                let score: u64 = weighted.iter().map(|(_, _, score)| u64::from(*score)).sum();
+                if sample >= 0 {
+                    println!(
+                        "{}",
+                        serde_json::json!({"sample":sample,"entries":1000,"distribution":distribution,"oldCountMs":old_ms,"weightedMs":weighted_ms,"weightChecksum":score})
+                    );
+                }
+            }
+        }
+    }
 
     fn owner_refs() -> RefSnapshot {
         RefSnapshot {

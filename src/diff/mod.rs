@@ -70,6 +70,66 @@ pub struct TreeDiff {
     pub files: Vec<FileChange>,
 }
 
+/// Preserve the exact bytes passed to an external comparison tool.
+pub fn external_contents(
+    repo: &gix::Repository,
+    change: &FileChange,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(source) = &change.remote {
+        let bytes = crate::remote::files::contents(repo, change, source)?;
+        if bytes.0.len() > MAX_BLOB || bytes.1.len() > MAX_BLOB {
+            return Err("External diff is limited to 8 MiB per side".into());
+        }
+        return Ok(bytes);
+    }
+    let read = |side: Option<Side>| -> Result<Vec<u8>> {
+        let Some(side) = side else {
+            return Ok(Vec::new());
+        };
+        if side.kind == EntryKind::Commit {
+            return Ok(format!("Subproject commit {}\n", side.id).into_bytes());
+        }
+        let mut buf = Vec::new();
+        let data = repo.objects.find_blob(&side.id, &mut buf)?.data;
+        if data.len() > MAX_BLOB {
+            return Err("External diff file exceeds 8 MiB".into());
+        }
+        Ok(data.to_vec())
+    };
+    let old = read(change.old)?;
+    let new = if change.worktree {
+        let root = repo.workdir().ok_or("External diff needs a working tree")?;
+        let path = root.join(&change.path);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.file_type().is_symlink() => std::fs::read_link(path)?
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec(),
+            Ok(m) if m.is_dir() => {
+                return Err("External diff of a working-tree submodule is unavailable".into());
+            }
+            Ok(m) => {
+                if m.len() > MAX_BLOB as u64 {
+                    return Err("External diff file exceeds 8 MiB".into());
+                }
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)?
+                    .take(MAX_BLOB as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > MAX_BLOB {
+                    return Err("External diff file exceeds 8 MiB".into());
+                }
+                bytes
+            }
+        }
+    } else {
+        read(change.new)?
+    };
+    Ok((old, new))
+}
+
 fn tree_of(repo: &gix::Repository, commit: &ObjectId, buf: &mut Vec<u8>) -> Result<ObjectId> {
     let iter = repo.objects.find_commit_iter(commit, buf)?;
     for token in iter {

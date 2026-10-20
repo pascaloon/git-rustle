@@ -10,10 +10,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
+pub mod stashes;
 
 #[derive(Clone, Debug)]
 pub enum Request {
     Inspect,
+    ListStashes,
+    ApplyStash(stashes::Stash),
+    DropStash(stashes::Stash),
     PreviewPush,
     OnBranch {
         branch: String,
@@ -77,7 +81,11 @@ impl Request {
         }
         matches!(
             self,
-            Self::Inspect | Self::PreviewPush | Self::Plan(_) | Self::ReadConflict(_)
+            Self::Inspect
+                | Self::ListStashes
+                | Self::PreviewPush
+                | Self::Plan(_)
+                | Self::ReadConflict(_)
         )
     }
 }
@@ -127,6 +135,7 @@ pub struct PushPreview {
 
 #[derive(Clone, Debug, Default)]
 pub struct View {
+    pub stashes: Option<Vec<stashes::Stash>>,
     pub labels: Vec<String>,
     pub cursor: usize,
     pub boundary: String,
@@ -144,6 +153,8 @@ pub struct Outcome {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Snapshot {
+    #[serde(default)]
+    stash_log: Option<stashes::Log>,
     head: String,
     symbolic: Option<String>,
     refs: BTreeMap<String, String>,
@@ -158,6 +169,7 @@ struct Snapshot {
 impl Snapshot {
     fn equivalent(&self, other: &Self) -> bool {
         self.head == other.head
+            && self.stash_log == other.stash_log
             && self.symbolic == other.symbolic
             && self.refs == other.refs
             && self.config == other.config
@@ -198,6 +210,26 @@ struct Lock {
 }
 struct RepositoryLock {
     _file: fs::File,
+}
+/// Hold across a worker-driven external edit, including the editor's wait process.
+pub(crate) struct RepositoryEditGuard {
+    _lock: RepositoryLock,
+}
+pub(crate) fn repository_edit_guard(root: &Path) -> Result<RepositoryEditGuard> {
+    let context = Context::new(root)?;
+    Ok(RepositoryEditGuard {
+        _lock: RepositoryLock::new(&context.common.join("rustle-operation.lock"))?,
+    })
+}
+pub(crate) fn ensure_storage_migration_allowed(root: &Path) -> Result<RepositoryEditGuard> {
+    let guard = repository_edit_guard(root)?;
+    let context = Context::new(root)?;
+    if context.conflict()?.is_some() || context.load()?.pending.is_some() {
+        return Err(
+            "Finish or abort the active Git operation before changing reference storage.".into(),
+        );
+    }
+    Ok(guard)
 }
 impl RepositoryLock {
     fn new(path: &Path) -> Result<Self> {
@@ -327,25 +359,39 @@ impl Context {
             return Err("Finish or abort the active Git operation first".into());
         }
         let repo = super::open(&self.root).map_err(err)?;
-        let h = repo.head().map_err(err)?;
-        let head = h.id().map(|x| x.to_string()).unwrap_or_default();
-        let symbolic = h.referent_name().map(|n| n.to_string());
+        let h = super::refs::head(&repo)?;
+        let head = h.id.map(|x| x.to_string()).unwrap_or_default();
+        let symbolic = h.symbolic;
         let mut refs = BTreeMap::new();
         let mut symbolic_refs = BTreeMap::new();
-        let platform = repo.references().map_err(err)?;
-        for reference in platform.all().map_err(err)? {
-            let reference = reference.map_err(err)?;
-            let name = reference.name().as_bstr().to_str().map_err(err)?;
-            if name.starts_with("refs/rustle/") {
-                continue;
+        if super::refs::is_reftable(&repo) {
+            for reference in super::refs::raw_refs(&repo)? {
+                if reference.name.starts_with("refs/rustle/") {
+                    continue;
+                }
+                if let Some(symbolic) = reference.symbolic {
+                    symbolic_refs.insert(reference.name, symbolic);
+                } else if let Some(id) = reference.id {
+                    refs.insert(reference.name, id.to_string());
+                }
             }
-            if let Some(symbolic) = reference.target().try_name() {
-                symbolic_refs.insert(
-                    name.into(),
-                    symbolic.as_bstr().to_str().map_err(err)?.into(),
-                );
-            } else if let Some(id) = reference.target().try_id() {
-                refs.insert(name.into(), id.to_string());
+        } else {
+            // Preserve streaming collection for the common files backend.
+            let platform = repo.references().map_err(err)?;
+            for reference in platform.all().map_err(err)? {
+                let reference = reference.map_err(err)?;
+                let name = reference.name().as_bstr().to_str().map_err(err)?;
+                if name.starts_with("refs/rustle/") {
+                    continue;
+                }
+                if let Some(symbolic) = reference.target().try_name() {
+                    symbolic_refs.insert(
+                        name.into(),
+                        symbolic.as_bstr().to_str().map_err(err)?.into(),
+                    );
+                } else if let Some(id) = reference.target().try_id() {
+                    refs.insert(name.into(), id.to_string());
+                }
             }
         }
         let config = fs::read(self.common.join("config")).map_err(err)?;
@@ -426,7 +472,7 @@ impl Context {
         )?
         .is_empty();
         let (tree, index_tree) = if !dirty && !head.is_empty() {
-            let tree = repo.head_tree_id().map_err(err)?.to_string();
+            let tree = super::refs::tree_for_head(&repo)?.to_string();
             (tree.clone(), tree)
         } else {
             let temp = self.directory.join("snapshot.index");
@@ -474,6 +520,7 @@ impl Context {
         // staging flag; a second `git ls-files` process adds no validation.
         let index_entries = index.clone().unwrap_or_default();
         Ok(Snapshot {
+            stash_log: stashes::read_log(self, &repo)?,
             head,
             symbolic,
             refs,
@@ -491,12 +538,18 @@ impl Context {
         // Pin working tree plus local commit tips, protecting deleted/rewritten commits from GC.
         let mut parents = BTreeSet::new();
         for (name, oid) in &snapshot.refs {
-            if name.starts_with("refs/heads/") || name.starts_with("refs/remotes/") {
+            if name.starts_with("refs/heads/")
+                || name.starts_with("refs/remotes/")
+                || name == "refs/stash"
+            {
                 parents.insert(oid.clone());
             }
         }
         if !snapshot.head.is_empty() {
             parents.insert(snapshot.head.clone());
+        }
+        if let Some(log) = &snapshot.stash_log {
+            parents.extend(log.ids()?);
         }
         let identity = "author Git Rustle Recovery <recovery@rustle.invalid> 0 +0000\ncommitter Git Rustle Recovery <recovery@rustle.invalid> 0 +0000\n\nRecovery checkpoint\n";
         let staged = format!("tree {}\n{identity}", snapshot.index_tree);
@@ -518,23 +571,12 @@ impl Context {
                     .map_err(err)?,
             )
             .map_err(err)?;
-        let edit = gix::refs::transaction::RefEdit::update(
-            format!("refs/rustle/checkpoints/{oid}")
-                .try_into()
-                .map_err(err)?,
-            oid.detach(),
-            gix::refs::transaction::PreviousValue::Any,
+        super::refs::protect(
+            &repo,
+            &format!("refs/rustle/checkpoints/{oid}"),
+            &oid.to_string(),
             "Git Rustle recovery checkpoint",
-        );
-        repo.edit_references_as(
-            [edit],
-            Some(gix::actor::SignatureRef {
-                name: b"Git Rustle Recovery".as_bstr(),
-                email: b"recovery@rustle.invalid".as_bstr(),
-                time: "0 +0000",
-            }),
-        )
-        .map_err(err)?;
+        )?;
         Ok(())
     }
     fn conflict(&self) -> Result<Option<Conflict>> {
@@ -549,6 +591,8 @@ impl Context {
                 "Revert"
             } else if self.git.join("sequencer").exists() {
                 "Sequencer"
+            } else if stashes::marker(self).exists() {
+                "Stash apply"
             } else {
                 ""
             };
@@ -749,6 +793,7 @@ impl Context {
                 )?;
             }
         }
+        stashes::restore_log(self, &current.stash_log, &target.stash_log)?;
         let _ = fs::remove_file(&temp);
         if let Some(bytes) = &target_index {
             index_lock.install(&self.git.join("index"), bytes)?;
@@ -856,31 +901,26 @@ fn create_tag(context: &Context, name: &str, target: &str, message: Option<&str>
         &local_only,
     )?;
     let repo = super::open(&context.root).map_err(err)?;
-    let tag = repo.find_reference(&reference).map_err(err)?;
-    let id = tag
-        .target()
-        .try_id()
-        .ok_or("Created tag has no object target.")?
-        .to_owned();
-    // An annotated tag object is not a commit parent. Protect the object itself
-    // so undo followed by pruning still permits redo of either kind of tag.
-    let edit = gix::refs::transaction::RefEdit::update(
-        format!("refs/rustle/tag-checkpoints/{id}")
-            .try_into()
-            .map_err(err)?,
-        id.to_owned(),
-        gix::refs::transaction::PreviousValue::Any,
+    let id = if super::refs::is_reftable(&repo) {
+        super::refs::raw_refs(&repo)?
+            .into_iter()
+            .find(|r| r.name == reference)
+            .and_then(|r| r.id)
+            .ok_or("Created tag has no object target.")?
+    } else {
+        repo.find_reference(&reference)
+            .map_err(err)?
+            .target()
+            .try_id()
+            .ok_or("Created tag has no object target.")?
+            .to_owned()
+    };
+    super::refs::protect(
+        &repo,
+        &format!("refs/rustle/tag-checkpoints/{id}"),
+        &id.to_string(),
         "Git Rustle tag recovery checkpoint",
-    );
-    repo.edit_references_as(
-        [edit],
-        Some(gix::actor::SignatureRef {
-            name: b"Git Rustle Recovery".as_bstr(),
-            email: b"recovery@rustle.invalid".as_bstr(),
-            time: "0 +0000",
-        }),
-    )
-    .map_err(err)?;
+    )?;
     Ok(())
 }
 fn clean_worktree(root: &Path) -> Result<()> {
@@ -1202,6 +1242,7 @@ fn pull(context: &Context) -> Result<()> {
     let target = if remote == "." {
         revision(&context.root, &merge)?
     } else {
+        super::refs::ensure_case_safe(&context.root, &[&tracking])?;
         command::checked(
             &context.root,
             &[
@@ -1369,7 +1410,12 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
         let mut loaded_plan = None;
         let mut preview = None;
         let mut push = None;
+        let mut stash_list = None;
         let result = match &request {
+            Request::ListStashes => stashes::list(&context.root).map(|entries| {
+                stash_list = Some(entries);
+                "Stashes loaded.".into()
+            }),
             Request::OnBranch {
                 branch,
                 head,
@@ -1401,6 +1447,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
         };
         let save = context.save(&journal);
         view = View {
+            stashes: stash_list,
             labels: journal.entries.iter().map(|e| e.label.clone()).collect(),
             cursor: journal.cursor,
             boundary: journal.boundary.clone(),
@@ -1513,6 +1560,27 @@ fn execute_inner(
             return Ok(format!("Resolved {path}."));
         }
         Request::Continue | Request::Skip | Request::Abort => {
+            if stashes::marker(context).exists() {
+                if matches!(request, Request::Skip) {
+                    return Err("A stash apply has no commit to skip.".into());
+                }
+                let mut pending = journal
+                    .pending
+                    .clone()
+                    .ok_or("Stash recovery checkpoint is missing.")?;
+                let abort = matches!(request, Request::Abort);
+                stashes::finish(context, &pending, abort)?;
+                if abort {
+                    pending.label = "Abort stash apply (retained files)".into();
+                }
+                record(context, journal, pending)?;
+                return Ok(if abort {
+                    "Stash apply aborted. Untracked files were retained; the stash was kept."
+                } else {
+                    "Stash applied. The stash was kept."
+                }
+                .into());
+            }
             let action = match request {
                 Request::Continue => "--continue",
                 Request::Skip => "--skip",
@@ -1558,6 +1626,8 @@ fn execute_inner(
     }
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
+        Request::ApplyStash(stash) => format!("Apply stash {}", stash.subject),
+        Request::DropStash(stash) => format!("Delete stash {}", stash.subject),
         Request::CreateTag { name, .. } => format!("Create tag {name}"),
         Request::Delete { name, .. } => format!("Delete branch {name}"),
         Request::Rename { old, new } => format!("Rename {old} to {new}"),
@@ -1577,8 +1647,11 @@ fn execute_inner(
     context.save(journal)?;
     let result: Result<()> = (|| {
         match request {
+            Request::ApplyStash(stash) => stashes::apply(context, stash)?,
+            Request::DropStash(stash) => stashes::drop_stash(context, stash)?,
             Request::Create { name, target } => {
                 validate_name(&context.root, name)?;
+                super::refs::ensure_case_safe(&context.root, &[&format!("refs/heads/{name}")])?;
                 let target = revision(&context.root, target)?;
                 command::checked(&context.root, &["branch", "--", name, &target])?;
             }

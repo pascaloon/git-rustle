@@ -335,9 +335,9 @@ pub fn commit(root: &Path, request: &Request) -> Result<String, String> {
             );
         }
     }
-    let head = repo.head().map_err(|e| e.to_string())?;
-    let current = head.id().map(|id| id.detach());
-    let branch = head.referent_name().map(|name| name.shorten().to_string());
+    let head = super::refs::head(&repo)?;
+    let current = head.id;
+    let branch = head.branch;
     if current != request.head || branch != request.branch {
         return Err("HEAD changed; refresh pending changes before committing".into());
     }
@@ -350,6 +350,7 @@ pub fn commit(root: &Path, request: &Request) -> Result<String, String> {
             root,
             &["check-ref-format", &format!("refs/heads/{branch_name}")],
         )?;
+        super::refs::ensure_case_safe(root, &[&format!("refs/heads/{branch_name}")])?;
         let exists = command::run(
             root,
             &[
@@ -501,15 +502,13 @@ pub fn commit(root: &Path, request: &Request) -> Result<String, String> {
             return Err("A commit hook staged unchecked files. Check those files or adjust the hook; nothing was committed.".into());
         }
         let now = super::open(root).map_err(|e| e.to_string())?;
-        let now = now.head().map_err(|e| e.to_string())?;
+        let now = super::refs::head(&now)?;
         let expected = if branch_name.is_empty() {
             branch.clone()
         } else {
             Some(branch_name.into())
         };
-        if now.id().map(|id| id.detach()) != current
-            || now.referent_name().map(|n| n.shorten().to_string()) != expected
-        {
+        if now.id != current || now.branch != expected {
             return Err("HEAD changed while preparing the commit; refresh before retrying".into());
         }
         let hooks = format!("core.hooksPath={}", transaction.hooks.display());
@@ -523,17 +522,9 @@ pub fn commit(root: &Path, request: &Request) -> Result<String, String> {
     if let Err(error) = result {
         if !branch_name.is_empty() {
             let after = super::open(root)
-                .and_then(|r| {
-                    r.head()
-                        .map(|h| {
-                            (
-                                h.id().map(|id| id.detach()),
-                                h.referent_name().map(|n| n.shorten().to_string()),
-                            )
-                        })
-                        .map_err(Into::into)
-                })
-                .ok();
+                .ok()
+                .and_then(|r| super::refs::head(&r).ok())
+                .map(|h| (h.id, h.branch));
             if after == Some((current, Some(branch_name.into()))) {
                 let restore = if let Some(original) = &branch {
                     command::checked(
@@ -563,10 +554,8 @@ pub fn commit(root: &Path, request: &Request) -> Result<String, String> {
         return Err(error);
     }
     let completed = super::open(root).map_err(|e| e.to_string())?;
-    let id = completed
-        .head()
-        .map_err(|e| e.to_string())?
-        .id()
+    let id = super::refs::head(&completed)?
+        .id
         .ok_or("Git did not create a commit")?
         .to_string();
     let id = id.as_str();
@@ -677,6 +666,34 @@ mod tests {
                 &format!("#!/bin/sh\n{body}\n"),
             );
         }
+    }
+    #[test]
+    fn selected_file_commits_resolve_reftable_head_and_preserve_case_distinct_branch() {
+        let f = Fixture::new(true);
+        super::super::refs::migrate_reftable(f.root()).unwrap();
+        let original = f.git(&["rev-parse", "HEAD"]);
+        f.git(&["branch", "Case"]);
+        f.git(&["branch", "case"]);
+        f.git(&["switch", "Case"]);
+        f.write("a.txt", "new case content\n");
+        let request = f.request(&["a.txt"]);
+        assert_eq!(request.branch.as_deref(), Some("Case"));
+        commit(f.root(), &request).unwrap();
+        assert_ne!(f.git(&["rev-parse", "refs/heads/Case"]), original);
+        assert_eq!(f.git(&["rev-parse", "refs/heads/case"]), original);
+        assert_eq!(f.git(&["symbolic-ref", "--short", "HEAD"]), "Case");
+        assert_eq!(f.git(&["status", "--porcelain=v1"]), "");
+        f.git(&["switch", "case"]);
+        assert_eq!(
+            std::fs::read_to_string(f.root().join("a.txt")).unwrap(),
+            "base a\n"
+        );
+        f.write("b.txt", "new branch content\n");
+        let mut request = f.request(&["b.txt"]);
+        request.new_branch = "CASE".into();
+        commit(f.root(), &request).unwrap();
+        assert_eq!(f.git(&["symbolic-ref", "--short", "HEAD"]), "CASE");
+        assert_eq!(f.git(&["rev-parse", "refs/heads/case"]), original);
     }
     #[test]
     fn status_and_diffs_include_staged_unstaged_untracked_deleted_and_binary() {

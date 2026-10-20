@@ -6,6 +6,8 @@ use gix::ObjectId;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Branch(Target),
+    /// A remote-only graph tip: fetch its branch and fast-forward its tracker.
+    FetchBranch(Target),
     Commit {
         id: ObjectId,
         remote: Option<Remote>,
@@ -15,14 +17,14 @@ pub enum Request {
 impl Request {
     pub fn label(&self) -> String {
         match self {
-            Self::Branch(t) => t.label(),
+            Self::Branch(t) | Self::FetchBranch(t) => t.label(),
             Self::Commit { id, .. } => format!("{} (detached HEAD)", id.to_hex_with_len(12)),
         }
     }
 
     pub fn is_remote(&self) -> bool {
         match self {
-            Self::Branch(t) => t.remote.is_some(),
+            Self::Branch(t) | Self::FetchBranch(t) => t.remote.is_some(),
             Self::Commit { remote, .. } => remote.is_some(),
         }
     }

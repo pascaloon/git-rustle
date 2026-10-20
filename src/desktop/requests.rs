@@ -594,6 +594,7 @@ impl Desktop {
         c.generation += 1;
         let generation = c.generation;
         let path = c.path.clone();
+        let source = c.source.read(cx).value().trim().to_string();
         let no_cache = self.engine.no_cache();
         cx.spawn_in(window, async move |view, cx| {
             let result = cx
@@ -612,7 +613,12 @@ impl Desktop {
                         .ok_or("Configure a GitHub or GitLab remote in Settings first.")?;
                     let metadata = Client::new(path, &remote, no_cache)
                         .and_then(|mut client| client.metadata(force));
-                    Ok::<_, String>((remotes, remote, metadata))
+                    let default = metadata
+                        .as_ref()
+                        .map(|data| data.default_branch.as_str())
+                        .unwrap_or("");
+                    let target = remote::requests::target::infer(path, &source, &remote, default);
+                    Ok::<_, String>((remotes, remote, metadata, source, target))
                 })
                 .await;
             let _ = view.update_in(cx, |v, window, cx| {
@@ -624,18 +630,20 @@ impl Desktop {
                 }
                 c.loading = false;
                 match result {
-                    Ok((remotes, remote, metadata)) => {
+                    Ok((remotes, remote, metadata, source, target)) => {
                         c.remotes = remotes;
                         c.remote = Some(remote);
+                        // A late suggestion must never replace an edited target,
+                        // or apply ancestry from a source that the user changed.
+                        if c.target.read(cx).value().is_empty()
+                            && c.source.read(cx).value().trim() == source
+                        {
+                            c.target.update(cx, |s, cx| s.set_value(target, window, cx));
+                        }
                         match metadata {
                             Ok(data) => {
                                 c.member_count = data.members.len();
                                 c.web_url = data.web_url;
-                                if c.target.read(cx).value().is_empty() {
-                                    c.target.update(cx, |s, cx| {
-                                        s.set_value(data.default_branch, window, cx)
-                                    });
-                                }
                                 c.warning = data.warning;
                                 let people =
                                     Arc::new(data.members.into_iter().map(Person::new).collect());

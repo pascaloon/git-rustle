@@ -15,6 +15,28 @@ before timing, and run suites sequentially on an unlocked desktop.
 
 ## Additional scenario scripts
 
+[`benchmark-tools-list.ps1`](../../scripts/benchmark-tools-list.ps1) focuses on
+saved external-tool entries, one-time discovery and the Diff picker. It compares
+startup/Diff/General controls and the existing launch worker, uses marked fresh
+fake-install fixtures for native first-run actions, and measures list persistence
+and migration separately. Its companion
+[`summarize-tools-list.ps1`](../../scripts/summarize-tools-list.ps1) preserves all
+samples, distinct timings and declared shared gates. See the
+[workflow](../benchmarking.md#saved-external-tool-list) for fixture contracts and
+measurement limits.
+
+[`benchmark-todos.ps1`](../../scripts/benchmark-todos.ps1) bundles shared
+startup/search/diff/scroll/settings controls with candidate graph navigation,
+branch sorting/hover, stash, tools and reference-storage UI checks. It creates
+marker-guarded repositories per mutating launch and isolates app-data/temp paths.
+Shared worker comparisons and candidate operation components run sequentially
+from preserved test executables. Its companion
+[`summarize-todos.ps1`](../../scripts/summarize-todos.ps1) preserves backend,
+branch-case, entry-count and workload groups, validates retained samples, and
+writes the test-only activity-recency paired comparison separately. See the
+[main workflow](../benchmarking.md#gpui-desktop-current-implementation) for
+fixture contracts, safety boundaries and measurement limitations.
+
 [`benchmark-tags-toolbar.ps1`](../../scripts/benchmark-tags-toolbar.ps1) is the
 focused tag/count-slot bundle: shared startup/search/scroll, verified native
 toolbar bounds, disposable tag-dialog/tag-create fixtures, and bounded shared plus

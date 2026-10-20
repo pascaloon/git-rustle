@@ -46,6 +46,241 @@ impl Fixture {
     }
 }
 
+fn stash_fixture(conflict: bool) -> (Fixture, stashes::Stash) {
+    let f = Fixture::new();
+    f.write("file.txt", "stashed contents\n");
+    f.write("stash-only.txt", "untracked stash contents\n");
+    f.git(&[
+        "stash",
+        "push",
+        "--include-untracked",
+        "-m",
+        "stash fixture",
+    ]);
+    if conflict {
+        f.write("file.txt", "new committed contents\n");
+        f.commit("diverge");
+    }
+    let stash = stashes::list(f.root()).unwrap().remove(0);
+    (f, stash)
+}
+
+#[test]
+fn stash_apply_keeps_entry_and_recovers_tracked_and_untracked_files() {
+    let (f, stash) = stash_fixture(false);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    f.run(Request::ApplyStash(stash.clone()));
+    assert_eq!(
+        fs::read(f.root().join("file.txt")).unwrap(),
+        b"stashed contents\n"
+    );
+    assert_eq!(
+        fs::read(f.root().join("stash-only.txt")).unwrap(),
+        b"untracked stash contents\n"
+    );
+    assert_eq!(stashes::list(f.root()).unwrap(), vec![stash]);
+    f.run(Request::MoveTo(0));
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"base\n");
+    assert!(!f.root().join("stash-only.txt").exists());
+    f.run(Request::MoveTo(1));
+    assert_eq!(
+        fs::read(f.root().join("stash-only.txt")).unwrap(),
+        b"untracked stash contents\n"
+    );
+    assert_eq!(head, f.git(&["rev-parse", "HEAD"]));
+}
+
+#[test]
+fn stash_drop_re_resolves_frozen_entry_and_undo_restores_entire_stack() {
+    let (f, stash) = stash_fixture(false);
+    f.write("file.txt", "second stash\n");
+    f.git(&["stash", "push", "-m", "newer"]);
+    let original = stashes::list(f.root()).unwrap();
+    f.run(Request::DropStash(stash.clone()));
+    assert_eq!(stashes::list(f.root()).unwrap().len(), 1);
+    assert_eq!(stashes::list(f.root()).unwrap()[0].oid, original[0].oid);
+    f.run(Request::MoveTo(0));
+    assert_eq!(stashes::list(f.root()).unwrap(), original);
+    f.run(Request::MoveTo(1));
+    assert!(execute(f.root(), Request::DropStash(stash)).result.is_err());
+}
+
+#[test]
+fn stash_conflict_finish_and_abort_remain_recoverable() {
+    for abort in [false, true] {
+        let (f, stash) = stash_fixture(true);
+        let head = f.git(&["rev-parse", "HEAD"]);
+        let result = execute(f.root(), Request::ApplyStash(stash.clone()));
+        assert!(result.result.is_err());
+        assert_eq!(result.view.conflict.unwrap().kind, "Stash apply");
+        if abort {
+            f.run(Request::Abort);
+            assert_eq!(
+                fs::read(f.root().join("file.txt")).unwrap(),
+                b"new committed contents\n"
+            );
+            assert!(f.root().join("stash-only.txt").exists());
+        } else {
+            f.write("file.txt", "resolved\n");
+            let view = f.run(Request::Resolve {
+                path: "file.txt".into(),
+                choice: Resolution::Mark,
+            });
+            assert_eq!(view.conflict.unwrap().kind, "Stash apply");
+            f.run(Request::Continue);
+        }
+        assert_eq!(stashes::list(f.root()).unwrap(), vec![stash]);
+        assert_eq!(head, f.git(&["rev-parse", "HEAD"]));
+        f.run(Request::MoveTo(0));
+        assert!(!f.root().join("stash-only.txt").exists());
+        f.run(Request::MoveTo(1));
+        assert!(f.root().join("stash-only.txt").exists());
+    }
+}
+
+#[test]
+fn stash_apply_refuses_dirty_tree_without_changing_it() {
+    let (f, stash) = stash_fixture(false);
+    f.write("file.txt", "local edits\n");
+    assert!(
+        execute(f.root(), Request::ApplyStash(stash))
+            .result
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(f.root().join("file.txt")).unwrap(),
+        b"local edits\n"
+    );
+    assert!(
+        !Context::new(f.root())
+            .unwrap()
+            .directory
+            .join("stash-apply")
+            .exists()
+    );
+}
+
+#[test]
+fn reftable_stash_drop_restores_log_order_identity_dates_and_last_entry() {
+    let (f, _) = stash_fixture(false);
+    f.write("file.txt", "second stash\n");
+    f.git(&["stash", "push", "-m", "newer"]);
+    f.git(&["refs", "migrate", "--ref-format=reftable"]);
+    let original = stashes::list(f.root()).unwrap();
+    let log = f.git(&[
+        "reflog",
+        "show",
+        "--date=raw",
+        "--format=%H%x00%gn%x00%ge%x00%gD%x00%gs",
+        "refs/stash",
+    ]);
+    f.run(Request::DropStash(original[1].clone()));
+    f.run(Request::MoveTo(0));
+    assert_eq!(stashes::list(f.root()).unwrap(), original);
+    assert_eq!(
+        f.git(&[
+            "reflog",
+            "show",
+            "--date=raw",
+            "--format=%H%x00%gn%x00%ge%x00%gD%x00%gs",
+            "refs/stash"
+        ]),
+        log
+    );
+    f.run(Request::MoveTo(1));
+    f.run(Request::DropStash(original[0].clone()));
+    assert!(stashes::list(f.root()).unwrap().is_empty());
+    assert!(
+        !super::super::command::run(
+            f.root(),
+            &["reflog", "exists", "refs/stash"],
+            None,
+            Duration::from_secs(30)
+        )
+        .unwrap()
+        .status
+        .success()
+    );
+    f.run(Request::MoveTo(1));
+    assert_eq!(stashes::list(f.root()).unwrap()[0].oid, original[0].oid);
+    f.run(Request::MoveTo(2));
+    assert!(stashes::list(f.root()).unwrap().is_empty());
+}
+
+#[test]
+fn reference_storage_migration_invalidates_old_config_checkpoints() {
+    let f = Fixture::new();
+    f.run(Request::Create {
+        name: "topic".into(),
+        target: "HEAD".into(),
+    });
+    f.git(&["refs", "migrate", "--ref-format=reftable"]);
+    assert!(execute(f.root(), Request::MoveTo(0)).result.is_err());
+    assert_eq!(f.git(&["rev-parse", "--show-ref-format"]), "reftable");
+    assert!(
+        !f.git(&["rev-parse", "--verify", "refs/heads/topic"])
+            .is_empty()
+    );
+}
+
+#[test]
+fn reference_storage_migration_refuses_interrupted_pending_mutation() {
+    let f = Fixture::new();
+    let context = Context::new(f.root()).unwrap();
+    let before = context.snapshot().unwrap();
+    let journal = Journal {
+        pending: Some(Pending {
+            label: "Interrupted operation".into(),
+            before,
+        }),
+        ..Journal::default()
+    };
+    context.save(&journal).unwrap();
+    assert!(super::super::refs::migrate_reftable(f.root()).is_err());
+    assert_eq!(f.git(&["rev-parse", "--show-ref-format"]), "files");
+    assert!(context.load().unwrap().pending.is_some());
+}
+
+#[test]
+#[ignore = "One warmup and fifteen disposable stash operation samples"]
+fn benchmark_stashes() {
+    use std::time::Instant;
+    for sample in 0..16 {
+        let (f, stash) = stash_fixture(false);
+        let start = Instant::now();
+        f.run(Request::ApplyStash(stash.clone()));
+        let apply_ms = start.elapsed().as_secs_f64() * 1000.;
+        let start = Instant::now();
+        f.run(Request::MoveTo(0));
+        let undo_ms = start.elapsed().as_secs_f64() * 1000.;
+        let start = Instant::now();
+        f.run(Request::MoveTo(1));
+        let redo_ms = start.elapsed().as_secs_f64() * 1000.;
+        let start = Instant::now();
+        f.run(Request::DropStash(stash));
+        let drop_ms = start.elapsed().as_secs_f64() * 1000.;
+        f.run(Request::MoveTo(1));
+        assert_eq!(stashes::list(f.root()).unwrap().len(), 1);
+        let (c, stash) = stash_fixture(true);
+        let start = Instant::now();
+        assert!(
+            execute(c.root(), Request::ApplyStash(stash))
+                .result
+                .is_err()
+        );
+        let conflict_ms = start.elapsed().as_secs_f64() * 1000.;
+        let start = Instant::now();
+        c.run(Request::Abort);
+        let abort_ms = start.elapsed().as_secs_f64() * 1000.;
+        if sample > 0 {
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"apply_ms":apply_ms,"undo_ms":undo_ms,"redo_ms":redo_ms,"drop_ms":drop_ms,"conflict_ms":conflict_ms,"abort_ms":abort_ms})
+            );
+        }
+    }
+}
+
 #[test]
 fn branches_undo_redo_jump_and_fork() {
     let f = Fixture::new();

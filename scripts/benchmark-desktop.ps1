@@ -3,6 +3,8 @@ param(
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [string]$Baseline,
     [string]$ImageCacheSeed,
+    [string]$DisposableFixtureRoot,
+    [string]$ToolsDiscoveryFixtureRoot,
     [switch]$RequireSyntax,
     [ValidateRange(0,200000)][int]$ExpectedSyntaxSpans = 0,
     [switch]$RejectCompetingBuilds,
@@ -11,15 +13,92 @@ param(
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\desktop"
 )
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/benchmark-processes.ps1"
 $Repository = (Resolve-Path -LiteralPath $Repository).Path
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 if ($Baseline) { $Baseline = (Resolve-Path -LiteralPath $Baseline).Path }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $saved = @{}
-$names = @('GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES')
+$names = @('GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES','LOCALAPPDATA','GIT_RUSTLE_TOOL_DISCOVERY_ROOTS')
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
+function Fixture-Git([string]$Path,[string[]]$Arguments) {
+    $result = @(& git -c "safe.directory=$($Path.Replace('\','/'))" -c core.hooksPath= -c core.autocrlf=false -C $Path @Arguments 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "Disposable fixture Git failed ($Arguments): $($result -join ' ')" }
+    return ($result -join "`n").TrimEnd()
+}
+function Fixture-State([string]$Path) {
+    $files = @(Get-ChildItem -LiteralPath $Path -Recurse -File | Where-Object { !$_.FullName.StartsWith((Join-Path $Path '.git')+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase) } | Sort-Object FullName | ForEach-Object {
+        [pscustomobject]@{path=[IO.Path]::GetRelativePath($Path,$_.FullName);sha256=(Get-FileHash -LiteralPath $_.FullName).Hash}
+    })
+    [pscustomobject]@{head=(Fixture-Git $Path @('rev-parse','HEAD'));branch=(Fixture-Git $Path @('symbolic-ref','HEAD'))
+        refs=(Fixture-Git $Path @('for-each-ref','--format=%(refname) %(objectname)','refs/heads','refs/remotes','refs/tags'))
+        status=(Fixture-Git $Path @('status','--porcelain=v1'));stashes=@((Fixture-Git $Path @('stash','list','--format=%H')) -split "`n" | Where-Object { $_ })
+        index=(Get-FileHash -LiteralPath (Join-Path $Path '.git/index')).Hash;files=$files}
+}
+function New-DisposableFixture([string]$Scenario,[string]$Label,[int]$Sample) {
+    if (!$DisposableFixtureRoot) { throw "$Scenario requires a marker-guarded DisposableFixtureRoot" }
+    $root = (Resolve-Path -LiteralPath $DisposableFixtureRoot).Path
+    $marker = Join-Path $root '.git-rustle-benchmark-fixtures'
+    if (!(Test-Path -LiteralPath $marker) -or [IO.File]::ReadAllText($marker) -cne 'disposable git-rustle todo fixtures') { throw 'Missing disposable todo fixture root marker' }
+    $path = Join-Path $root "$Label-$Scenario-$Sample"
+    if (Test-Path -LiteralPath $path) { throw "Retaining existing disposable fixture: $path" }
+    New-Item -ItemType Directory -Path $path | Out-Null
+    $dates = @{};foreach($name in 'GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_OPTIONAL_LOCKS'){ $dates[$name]=[Environment]::GetEnvironmentVariable($name,'Process') }
+    try {
+        $env:GIT_OPTIONAL_LOCKS='0'
+        Fixture-Git $path @('init','-b','main') | Out-Null
+        Fixture-Git $path @('config','user.name','Benchmark') | Out-Null
+        Fixture-Git $path @('config','user.email','benchmark@example.invalid') | Out-Null
+        Fixture-Git $path @('config','commit.gpgsign','false') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $path '.git/git-rustle-todos-fixture'),'disposable todos benchmark fixture')
+        foreach($n in 1..2){
+            $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE="2026-10-19T00:00:0${n}Z"
+            [IO.File]::WriteAllText((Join-Path $path 'tracked.txt'),"commit $n`n")
+            Fixture-Git $path @('add','tracked.txt') | Out-Null
+            Fixture-Git $path @('commit','-m',"Fixture commit $n") | Out-Null
+        }
+        if($Scenario -eq 'todo-graph'){
+            Fixture-Git $path @('switch','-c','newer') | Out-Null
+            $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE='2026-10-19T00:00:03Z'
+            [IO.File]::WriteAllText((Join-Path $path 'newer.txt'),"newer graph node`n")
+            Fixture-Git $path @('add','newer.txt') | Out-Null
+            Fixture-Git $path @('commit','-m','Newer branch above HEAD') | Out-Null
+            Fixture-Git $path @('switch','main') | Out-Null
+        }
+        if($Scenario -like 'stash-*'){
+            foreach($n in 1..3){
+                [IO.File]::WriteAllText((Join-Path $path 'tracked.txt'),"stashed $n`n")
+                [IO.File]::WriteAllText((Join-Path $path "untracked-$n.txt"),"untracked stash $n`n")
+                Fixture-Git $path @('stash','push','-u','-m',"Benchmark stash $n") | Out-Null
+            }
+        }else{
+            [IO.File]::WriteAllText((Join-Path $path 'tracked.txt'),"staged`n")
+            Fixture-Git $path @('add','tracked.txt') | Out-Null
+            [IO.File]::AppendAllText((Join-Path $path 'tracked.txt'),"unstaged`n")
+            [IO.File]::WriteAllText((Join-Path $path 'untracked.txt'),"untracked`n")
+        }
+        return $path
+    } finally { foreach($name in $dates.Keys){ [Environment]::SetEnvironmentVariable($name,$dates[$name],'Process') } }
+}
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
+    if ($ToolsDiscoveryFixtureRoot) {
+        $root = (Resolve-Path -LiteralPath $ToolsDiscoveryFixtureRoot).Path
+        $marker = '.git-rustle-tools-list-fixture'
+        $markerText = 'disposable external tools list fixture'
+        if (!(Test-Path -LiteralPath (Join-Path $root $marker)) -or [IO.File]::ReadAllText((Join-Path $root $marker)) -cne $markerText) { throw 'Missing disposable tools-list fixture marker' }
+        $fixture = Join-Path $root "$label-$scenario-$sample"
+        if (Test-Path -LiteralPath $fixture) { throw "Retaining existing first-scan fixture: $fixture" }
+        $env:LOCALAPPDATA = Join-Path $fixture 'app-data'
+        $code = Join-Path $fixture 'installations/vscode'
+        $araxis = Join-Path $fixture 'installations/araxis'
+        foreach ($directory in @($env:LOCALAPPDATA,(Join-Path $code 'resources/app/out'),$araxis)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+        [IO.File]::WriteAllText((Join-Path $env:LOCALAPPDATA $marker),$markerText)
+        [IO.File]::WriteAllBytes((Join-Path $code 'Code.exe'),[byte[]]@())
+        [IO.File]::WriteAllBytes((Join-Path $araxis 'Compare.exe'),[byte[]]@())
+        [IO.File]::WriteAllText((Join-Path $code 'resources/app/out/cli.js'),'fixture only; never executed')
+        $env:GIT_RUSTLE_TOOL_DISCOVERY_ROOTS = @($code,$araxis) -join [IO.Path]::PathSeparator
+    }
     # The last viewport's author worker can finish after the 120th frame.
     # Keep the process alive for the final-state assertion; measured intervals
     # still end at desktop scroll done, before this settling period.
@@ -32,20 +111,52 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         New-Item -ItemType Directory -Force $cache | Out-Null
         Copy-Item -Path (Join-Path $ImageCacheSeed '*.bin') -Destination $cache -Force
     }
-    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
+    if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     $log = Join-Path $OutputDirectory "$label-$scenario-$sample.txt"
     $env:GIT_RUSTLE_SCENARIO = $scenario
     $env:GIT_RUSTLE_FRAME_SAMPLES = Join-Path $OutputDirectory "$label-$scenario-$sample-frames.json"
     $env:GIT_RUSTLE_DUMP = Join-Path $OutputDirectory "$label-$scenario-$sample-state.txt"
+    $fixture = $scenario -in @('todo-graph','stash-panel','stash-apply','stash-delete','ref-storage')
+    $launchRepository = if($fixture){ New-DisposableFixture $scenario $label $sample }else{$Repository}
+    $beforeFixture = if($fixture){ Fixture-State $launchRepository }else{$null}
+    if($fixture){[pscustomobject]@{scenario=$scenario;sample=$sample;repository=$launchRepository;before=$beforeFixture}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $OutputDirectory "$label-$scenario-$sample-fixture-before.json")}
     # These are the actual visible UI frames under test; a hidden GPUI window
     # does not reliably receive presentation callbacks.
-    $p = Start-Process -FilePath $exe -ArgumentList @('"' + $Repository + '"') -WindowStyle Normal -RedirectStandardError $log -PassThru
+    $p = Start-Process -FilePath $exe -ArgumentList @('"' + $launchRepository + '"') -WindowStyle Normal -RedirectStandardError $log -PassThru
     if (-not $p.WaitForExit(60000)) { Stop-Process -Id $p.Id; throw "Timeout: $log" }
     $p.Refresh()
-    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
+    if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
+    if($scenario -in @('todo-graph','branch-sort','graph-hover','stash-panel','stash-apply','stash-delete','external-tools','ref-storage') -and $state -notmatch 'todos_verified=true'){
+        throw "Todo scenario did not verify its completed frame: $log"
+    }
+    if($scenario -in @('todo-graph','branch-sort','graph-hover','stash-panel','stash-apply','stash-delete','external-tools','ref-storage') -and $state -notmatch 'todos_checks=[1-9][0-9]*'){
+        throw "Todo scenario did not record functional checks: $log"
+    }
+    if($ToolsDiscoveryFixtureRoot -and $scenario-eq'external-tools'){
+        if($state-notmatch'todos_tool_list_verified=true'){throw "Extended tool-list actions were not verified: $log"}
+        $configPath=Join-Path $env:LOCALAPPDATA 'git-rustle/tools.json'
+        $config=Get-Content -LiteralPath $configPath -Raw|ConvertFrom-Json
+        if(!$config.scanned-or@($config.tools).Count-ne2-or@($config.tools.id|Sort-Object -Unique).Count-ne2-or@($config.tools|Where-Object name -EQ 'Benchmark saved tool').Count){throw "Expected persisted one-time scan and only original2tools after remove: $log"}
+        Copy-Item -LiteralPath $configPath -Destination (Join-Path $OutputDirectory "$label-$scenario-$sample-tools.json")
+        [pscustomobject]@{appData=$env:LOCALAPPDATA;roots=$env:GIT_RUSTLE_TOOL_DISCOVERY_ROOTS;scanned=$config.scanned;entries=@($config.tools).Count;ids=@($config.tools.id)}|ConvertTo-Json -Depth 4|Set-Content (Join-Path $OutputDirectory "$label-$scenario-$sample-tools-fixture.json")
+    }
+    if($fixture){
+        $afterFixture=Fixture-State $launchRepository
+        [pscustomobject]@{scenario=$scenario;sample=$sample;repository=$launchRepository;before=$beforeFixture;after=$afterFixture}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $OutputDirectory "$label-$scenario-$sample-fixture.json")
+        if($beforeFixture.head -cne $afterFixture.head -or $beforeFixture.branch -cne $afterFixture.branch -or $beforeFixture.refs -cne $afterFixture.refs){throw "Fixture HEAD/branches changed: $log"}
+        if($scenario -eq 'stash-apply'){
+            if($afterFixture.stashes.Count -ne 3 -or (($beforeFixture.stashes -join "`n") -cne ($afterFixture.stashes -join "`n")) -or !$afterFixture.status){throw "Stash apply must retain all3 entries and produce pending changes: $log"}
+        }elseif($scenario -eq 'stash-delete'){
+            if($afterFixture.stashes.Count -ne 2 -or (($beforeFixture.stashes[1..2] -join "`n") -cne ($afterFixture.stashes -join "`n")) -or $afterFixture.status){throw "Stash delete must remove only the selected newest entry: $log"}
+        }else{
+            if($beforeFixture.index -cne $afterFixture.index -or $beforeFixture.status -cne $afterFixture.status -or (ConvertTo-Json -InputObject @($beforeFixture.files) -Compress) -cne (ConvertTo-Json -InputObject @($afterFixture.files) -Compress)){throw "Fixture index/worktree changed unexpectedly: $log"}
+        }
+        if($scenario -eq 'stash-panel' -and $afterFixture.stashes.Count -ne 3){throw "Stash panel must retain3 entries: $log"}
+        if($scenario -eq 'ref-storage' -and (Fixture-Git $launchRepository @('rev-parse','--show-ref-format')) -cne 'reftable'){throw "Reference conversion did not finish: $log"}
+    }
     if ($scenario -eq 'filter-visuals' -and
         $state -notmatch 'filter_visual_verified=true filter_visual_states=7 branch_owner_verified=true head_badge_painted=true') {
         throw "Filter focus/blur, branch author matches or HEAD paint were not verified: $log"
@@ -118,6 +229,8 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
+        { $_ -in 'todo-graph','stash-panel','stash-apply','stash-delete','external-tools','ref-storage' } { 'desktop scenario frame' }
+        { $_ -in 'branch-sort','graph-hover' } { 'desktop scroll done' }
         { $_ -in 'filter-visuals','general-settings' } { 'desktop scenario frame' }
         'general-tabs' { 'desktop scroll done' }
         { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop scenario frame' }
@@ -157,6 +270,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
+        { $_ -in 'todo-graph','stash-panel','stash-apply','stash-delete','external-tools','ref-storage' } { 'desktop scenario requested' }
         'filter-visuals' { 'desktop filter requested' }
         'general-settings' { 'general settings requested' }
         { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop improvement requested' }
@@ -178,9 +292,16 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'remote-diff' { 'remote diff requested' }
         'remote-pair' { 'remote diff requested' }
     }
-    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','general-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available','provider-scroll','toolbar-counts')
+    $scrolling = $scenario -in @('scroll','graph-resize','files-scroll','diff-scroll','diff-pan','search-scroll','wrap-scroll','tabs','settings-tabs','general-tabs','checkout-dialog','status-panels','request-edit','request-tabs','request-clear','avatar-scroll','avatar-reuse-scroll','update-available','provider-scroll','toolbar-counts','branch-sort','graph-hover')
     $frames = if ($scrolling) { @(Get-Content $env:GIT_RUSTLE_FRAME_SAMPLES -Raw | ConvertFrom-Json) } else { @() }
     if ($scrolling -and $frames.Count -ne 120) { throw 'Expected 120 measured frames' }
+    $todoHandler = if($state -match 'todo_handler_ms=(\[[^\]\r\n]*\])'){@($Matches[1]|ConvertFrom-Json)}else{@()}
+    if($scenario -in @('branch-sort','graph-hover')){
+        if($state -notmatch 'todos_frames=120' -or $todoHandler.Count -ne 120){throw "Expected120 actual todo handlers and rendered frames: $log"}
+        $boundsPath=[IO.Path]::ChangeExtension($env:GIT_RUSTLE_FRAME_SAMPLES,'todos-bounds.json')
+        $observations=@(Get-Content -LiteralPath $boundsPath -Raw|ConvertFrom-Json)
+        if($observations.Count -ne 120 -or @($observations.frame|Sort-Object -Unique).Count -ne 120 -or @($observations|Where-Object{$_.bounds.Count -ne 4 -or $_.bounds[2] -le 0 -or $_.bounds[3] -le 0}).Count){throw "Expected120 nonempty todo paint observations: $log"}
+    }
     $toolbarHandler = if ($state -match 'toolbar_handler_ms=(\[[^\]\r\n]*\])') { @($Matches[1] | ConvertFrom-Json) } else { @() }
     $generalMetrics = if ($scenario -eq 'general-settings') {
         $checks = if ($state -match 'general_checks_ms=(\[[^\]\r\n]*\])') { @($Matches[1] | ConvertFrom-Json) } else { @() }
@@ -188,11 +309,29 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         if ($state -notmatch 'general_cache_clear_frame_ms=Some\(([\d.]+)\)') { throw 'Missing cache-clear-to-frame duration' }
         [pscustomobject]@{currentCheckMs=$checks[0];availableCheckMs=$checks[1];errorCheckMs=$checks[2];cacheClearFrameMs=[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}
     } else { $null }
+    $toolListMetrics = if ($ToolsDiscoveryFixtureRoot -and $scenario -eq 'external-tools') {
+        $intervals = [ordered]@{
+            firstScanMs=@('external tools initialization requested','external tools initialization ready')
+            configureMs=@('tools list configure requested','tools list configure painted')
+            saveMs=@('tools list save requested','tools list saved frame')
+            selectionMs=@('tools list selection requested','tools list selected frame')
+            removeMs=@('tools list remove requested','tools list removed frame')
+            pickerMs=@('tools diff picker requested','tools diff picker painted')
+        }
+        $values=[ordered]@{}
+        foreach($field in $intervals.Keys){
+            $pair=$intervals[$field]
+            if(!$marks.ContainsKey($pair[0])-or!$marks.ContainsKey($pair[1])){throw "Missing first-scan/list interval $field in $log"}
+            $values[$field]=$marks[$pair[1]]-$marks[$pair[0]]
+            if($values[$field]-lt0){throw "Reversed first-scan/list interval $field"}
+        }
+        [pscustomobject]$values
+    } else { $null }
     if ($scenario -eq 'toolbar-counts' -and $toolbarHandler.Count -ne 24) { throw 'Expected 24 toolbar state-transition CPU samples' }
     $syntax = @($marks.Keys | Where-Object { $_.StartsWith('diff syntax ready (') } | Sort-Object)[0]
     $syntaxMs = if ($syntax -and $marks.ContainsKey('file diff requested')) { $marks[$syntax] - $marks['file diff requested'] } else { $null }
     $presentedMs = if ($marks.ContainsKey('file diff requested')) { $marks['desktop scenario frame'] - $marks['file diff requested'] } else { $null }
-    [pscustomobject]@{generalMetrics=$generalMetrics;toolbarHandlerMs=$toolbarHandler;syntaxReadyMs=$syntaxMs;scenarioFrameAfterRequestMs=$presentedMs;binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}
+    [pscustomobject]@{toolListMetrics=$toolListMetrics;todoHandlerMs=$todoHandler;generalMetrics=$generalMetrics;toolbarHandlerMs=$toolbarHandler;syntaxReadyMs=$syntaxMs;scenarioFrameAfterRequestMs=$presentedMs;binary=$label;scenario=$scenario;sample=$sample;readySinceMainMs=$marks[$end];workerMs=if($start){$marks[$end]-$marks[$start]}else{$null};frameIntervalsMs=$frames;wrapLayoutMs=if($text -match "wrap layout ([\d.]+) ms"){[double]::Parse($Matches[1],[cultureinfo]::InvariantCulture)}else{$null}}
 }
 try {
     $env:GIT_RUSTLE_TIMING='1'; $env:GIT_RUSTLE_AUTOQUIT='100'

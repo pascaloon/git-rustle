@@ -5,6 +5,7 @@ pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};
 pub mod integration;
+pub mod target;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -437,7 +438,7 @@ impl<'a> Client<'a> {
         Some(bytes)
     }
 
-    pub fn avatar(&self, url: &str) -> Option<Vec<u8>> {
+    pub(crate) fn cached_avatar(&self, url: &str) -> Option<Vec<u8>> {
         if !safe_image_url(url) {
             return None;
         }
@@ -460,6 +461,16 @@ impl<'a> Client<'a> {
             {
                 let _ = std::fs::remove_file(path);
             }
+            return Some(bytes);
+        }
+        None
+    }
+
+    pub fn avatar(&self, url: &str) -> Option<Vec<u8>> {
+        if !safe_image_url(url) {
+            return None;
+        }
+        if let Some(bytes) = self.cached_avatar(url) {
             return Some(bytes);
         }
         // Image hosts receive no provider token, cookies or redirect credentials.

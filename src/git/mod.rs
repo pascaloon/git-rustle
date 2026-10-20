@@ -2,7 +2,7 @@
 //! streaming history walk, and on-demand commit details.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,7 @@ use crate::model::History;
 pub mod checkout;
 pub mod command;
 pub mod operations;
+pub mod refs;
 pub mod worktree;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -80,6 +81,9 @@ pub struct RefSnapshot {
     pub tips: Vec<ObjectId>,
     /// Stable hash over all (name, id) pairs and HEAD; identifies a graph.
     pub fingerprint: u64,
+    /// Exact upstream branch identities, keyed by remote. Built once on the
+    /// worker so branch rendering/search never reads configuration.
+    pub tracking: BTreeMap<String, HashSet<String>>,
 }
 
 impl RefSnapshot {
@@ -103,6 +107,9 @@ impl RefSnapshot {
 }
 
 pub fn snapshot_refs(repo: &gix::Repository) -> Result<RefSnapshot> {
+    if refs::is_reftable(repo) {
+        return snapshot_reftable(repo);
+    }
     let mut snap = RefSnapshot::default();
     let mut seen_tips: HashSet<ObjectId> = HashSet::new();
 
@@ -173,6 +180,101 @@ pub fn snapshot_refs(repo: &gix::Repository) -> Result<RefSnapshot> {
         });
     }
 
+    snapshot_tracking(repo, &mut snap);
+    snap.fingerprint = fingerprint(&snap);
+    Ok(snap)
+}
+
+fn snapshot_tracking(repo: &gix::Repository, snap: &mut RefSnapshot) {
+    let config = repo.config_snapshot();
+    let config = config.plumbing();
+    for reference in &snap.refs {
+        if reference.kind != RefKind::Branch
+            && !(reference.kind == RefKind::Head
+                && snap.head_branch.as_ref() == Some(&reference.name))
+        {
+            continue;
+        }
+        let section = Some(reference.name.as_bytes().as_bstr());
+        let Some(remote) = config.string_by("branch", section, "remote") else {
+            continue;
+        };
+        let Some(merge) = config.string_by("branch", section, "merge") else {
+            continue;
+        };
+        let Some(name) = merge.strip_prefix(b"refs/heads/") else {
+            continue;
+        };
+        if remote == b".".as_bstr() {
+            continue;
+        }
+        snap.tracking
+            .entry(remote.to_str_lossy().into_owned())
+            .or_default()
+            .insert(name.to_str_lossy().into_owned());
+    }
+}
+
+fn snapshot_reftable(repo: &gix::Repository) -> Result<RefSnapshot> {
+    let head = refs::head(repo)?;
+    let mut snap = RefSnapshot {
+        head_id: head.id,
+        head_branch: head.branch,
+        ..Default::default()
+    };
+    let mut seen = HashSet::new();
+    if let Some(id) = snap.head_id {
+        seen.insert(id);
+        snap.tips.push(id);
+    }
+    for reference in refs::raw_refs(repo)? {
+        let Some(id) = reference.id else { continue };
+        let (name, kind) = if let Some(name) = reference.name.strip_prefix("refs/heads/") {
+            (
+                name.to_owned(),
+                if snap.head_branch.as_deref() == Some(name) && snap.head_id == Some(id) {
+                    RefKind::Head
+                } else {
+                    RefKind::Branch
+                },
+            )
+        } else if let Some(name) = reference.name.strip_prefix("refs/remotes/") {
+            (name.to_owned(), RefKind::Remote)
+        } else if let Some(name) = reference.name.strip_prefix("refs/tags/") {
+            (name.to_owned(), RefKind::Tag)
+        } else if reference.name == "refs/stash"
+            || reference.name.starts_with("refs/notes/")
+            || reference.name.starts_with("refs/rustle/")
+        {
+            continue;
+        } else {
+            (reference.name, RefKind::Other)
+        };
+        // Peel tag objects through gitoxide; nested tags must reach their final
+        // object just as the files iterator's peeled() path does.
+        let id = if kind == RefKind::Tag {
+            match repo.find_object(id).and_then(|o| o.peel_tags_to_end()) {
+                Ok(object) => object.id,
+                Err(_) => continue,
+            }
+        } else {
+            id
+        };
+        if seen.insert(id) {
+            snap.tips.push(id);
+        }
+        snap.refs.push(RefEntry { name, id, kind });
+    }
+    if snap.head_branch.is_none()
+        && let Some(id) = snap.head_id
+    {
+        snap.refs.push(RefEntry {
+            name: "HEAD".into(),
+            id,
+            kind: RefKind::Head,
+        });
+    }
+    snapshot_tracking(repo, &mut snap);
     snap.fingerprint = fingerprint(&snap);
     Ok(snap)
 }
@@ -190,6 +292,14 @@ fn fingerprint(snap: &RefSnapshot) -> u64 {
         .collect();
     pairs.sort();
     pairs.hash(&mut h);
+    // Hash upstreams in a stable order; configuration-only changes must update
+    // the branch availability metadata too.
+    for (remote, names) in &snap.tracking {
+        remote.hash(&mut h);
+        let mut names: Vec<_> = names.iter().collect();
+        names.sort();
+        names.hash(&mut h);
+    }
     h.finish()
 }
 

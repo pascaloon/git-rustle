@@ -316,6 +316,8 @@ pub struct Engine {
     pub operation_status: String,
     pub operation_error: bool,
     pub operation_busy: bool,
+    /// A merge editor or explicit ref-storage conversion owns repository writes.
+    pub repository_edit_busy: bool,
     pub operation_epoch: u64,
     operation_request: Option<git::operations::Request>,
     operations_initialized: bool,
@@ -354,21 +356,53 @@ pub struct Engine {
     activity_busy: bool,
     local_activity_done: Option<u64>,
     auto_remote: bool,
+    remote_scoped_request: bool,
     first_frame_at: Option<Instant>,
 }
 impl Engine {
     pub fn no_cache(&self) -> bool {
         self.no_cache
     }
-    pub fn request_operation(&mut self, request: git::operations::Request) {
-        if !self.operation_busy
+    pub fn request_operation(&mut self, request: git::operations::Request) -> bool {
+        if !self.repository_edit_busy
+            && !self.operation_busy
             && self.operation_request.is_none()
             && !self.app.pending.busy
             && !self.app.branches.busy
             && !self.app.settings.saving
         {
             self.operation_request = Some(request);
+            true
+        } else {
+            false
         }
+    }
+    pub fn begin_repository_edit(&mut self) -> bool {
+        if self.repository_edit_busy
+            || self.operation_busy
+            || self.operation_request.is_some()
+            || self.app.pending.busy
+            || self.app.pending.request.is_some()
+            || self.app.branches.busy
+            || self.app.checkout_request.is_some()
+            || self.app.settings.saving
+            || self.repo.is_none()
+        {
+            return false;
+        }
+        self.repository_edit_busy = true;
+        true
+    }
+
+    pub fn end_repository_edit(&mut self) {
+        self.repository_edit_busy = false;
+        // Never replay a shortcut queued against the pre-editor repository state.
+        self.app.pending.request = None;
+        self.app.checkout_request = None;
+        self.app.want_refresh = true;
+        self.app.pending.want_refresh = true;
+        self.operation_request
+            .get_or_insert(git::operations::Request::Inspect);
     }
     pub fn repository_path(&self) -> String {
         self.repository_root()
@@ -377,6 +411,9 @@ impl Engine {
     }
     pub fn repository_root(&self) -> Option<&Path> {
         self.repo.as_ref().map(|r| r.workdir().unwrap_or(r.path()))
+    }
+    pub fn reference_storage_reftable(&self) -> bool {
+        self.repo.as_ref().is_some_and(git::refs::is_reftable)
     }
     pub fn landing(&self) -> bool {
         self.repo_seen && self.repo.is_none()
@@ -453,6 +490,7 @@ impl Engine {
             operation_status: String::new(),
             operation_error: false,
             operation_busy: false,
+            repository_edit_busy: false,
             operation_epoch: 0,
             operation_request: None,
             operations_initialized: false,
@@ -492,6 +530,7 @@ impl Engine {
             activity_busy: false,
             local_activity_done: None,
             auto_remote: false,
+            remote_scoped_request: false,
             first_frame_at: None,
         }
     }
@@ -502,13 +541,21 @@ impl Engine {
         self.advance(message);
         self.advance(None);
     }
+
+    pub fn set_provider_search_labels(
+        &mut self,
+        labels: std::collections::HashMap<gix::ObjectId, Vec<String>>,
+    ) -> bool {
+        self.app.set_provider_search_labels(labels)
+    }
     fn advance(&mut self, message: Option<Msg>) {
         if self.first_frame && self.repo.is_some() && !self.operations_initialized {
             self.operations_initialized = true;
             self.operation_request
                 .get_or_insert(git::operations::Request::Inspect);
         }
-        if !self.operation_busy
+        if !self.repository_edit_busy
+            && !self.operation_busy
             && !self.app.pending.busy
             && !self.app.branches.busy
             && !self.app.settings.saving
@@ -543,7 +590,8 @@ impl Engine {
             app.branches.want_refresh.get_or_insert(false);
         }
         if let Some(r) = self.repo.as_ref() {
-            if !self.operation_busy
+            if !self.repository_edit_busy
+                && !self.operation_busy
                 && !app.settings.saving
                 && !app.pending.busy
                 && !app.branches.busy
@@ -566,6 +614,7 @@ impl Engine {
                 });
             }
             if self.first_frame
+                && !self.repository_edit_busy
                 && !self.operation_busy
                 && !app.pending.busy
                 && !app.branches.busy
@@ -637,7 +686,8 @@ impl Engine {
                 });
             }
         }
-        if !self.operation_busy
+        if !self.repository_edit_busy
+            && !self.operation_busy
             && !app.pending.busy
             && !app.branches.busy
             && let Some(r) = self.repo.as_ref()
@@ -651,7 +701,8 @@ impl Engine {
                 let _ = tx.send_blocking(Msg::Settings(session, settings::execute(&path, request)));
             });
         }
-        if !app.settings.saving
+        if !self.repository_edit_busy
+            && !app.settings.saving
             && (app.want_refresh
                 || app.branches.want_refresh.is_some()
                 || app.checkout_request.is_some())
@@ -687,6 +738,7 @@ impl Engine {
                 let tx = tx.clone();
                 let path = path.clone();
                 let local_only = !app.branches.open;
+                self.remote_scoped_request = local_only;
                 timing.mark("remote discovery requested");
                 thread::spawn(move || {
                     remote::discover(&path, &git_dir, force, no_cache, local_only, |event| {
@@ -1155,10 +1207,7 @@ impl Engine {
                             app.branches.loading = false;
                             app.branches.last_check = Some(Instant::now());
                             // If b was opened during the startup head check, finish with a full listing.
-                            if app.branches.open
-                                && app.branches.errors.is_empty()
-                                && app.branches.remotes.values().any(|u| u.scoped)
-                            {
+                            if app.branches.open && self.remote_scoped_request {
                                 app.branches.want_refresh = Some(false);
                             }
                             timing.mark("remote discovery done");
@@ -1370,6 +1419,27 @@ impl Engine {
                 .mark(format!("first frame ({} rows)", self.app.history.len()));
         }
     }
+    /// Optional application setup waits until the initial repository refresh is idle.
+    pub fn external_tools_idle(&self) -> bool {
+        self.autoquit_ready(Duration::ZERO)
+            && !self.operation_busy
+            && !self.repository_edit_busy
+            && self.operation_request.is_none()
+            && !self.app.pending.busy
+            && !self.app.pending.loading
+            && !self.app.branches.busy
+            && !self.app.settings.saving
+            && !self.app.search.busy
+            && !self.refreshing
+            && !self.app.want_refresh
+            && !self.app.want_rewalk
+            && !self.app.branches.loading
+            && self.app.branches.want_refresh.is_none()
+            && !self.preview_busy
+            && !self.preview_wanted
+            && !self.activity_busy
+    }
+
     pub fn autoquit_ready(&self, delay: Duration) -> bool {
         if self.recents_loading {
             return false;
@@ -1490,6 +1560,38 @@ mod tests {
         }
     }
     #[test]
+    fn external_tool_setup_waits_for_initial_and_queued_repository_refreshes() {
+        let dir = fixture();
+        let mut e = Engine::new(dir.path().into(), true, Instant::now());
+        assert!(!e.external_tools_idle());
+        until(&mut e, Engine::external_tools_idle);
+
+        e.app.want_refresh = true;
+        assert!(!e.external_tools_idle());
+        e.tick(None);
+        assert!(!e.external_tools_idle());
+        until(&mut e, Engine::external_tools_idle);
+
+        e.app.branches.want_refresh = Some(true);
+        assert!(!e.external_tools_idle());
+        e.tick(None);
+        assert!(!e.external_tools_idle());
+        until(&mut e, Engine::external_tools_idle);
+    }
+
+    #[test]
+    fn external_tool_setup_can_run_on_landing_without_worktree_status() {
+        let dir = fixture();
+        let mut e = Engine::new(dir.path().join("does-not-exist"), true, Instant::now());
+        until(&mut e, |e| e.landing() && e.external_tools_idle());
+        assert!(!e.app.pending.known);
+        e.operation_busy = true;
+        assert!(!e.external_tools_idle());
+        e.operation_busy = false;
+        assert!(e.external_tools_idle());
+    }
+
+    #[test]
     fn desktop_engine_load_search_diff_refresh_and_stale_result() {
         let dir = fixture();
         let mut e = Engine::new(dir.path().into(), true, Instant::now());
@@ -1527,6 +1629,161 @@ mod tests {
             !e.refreshing && !e.app.want_refresh && !e.app.is_walking()
         });
         assert_eq!(e.app.history.len(), 2);
+    }
+
+    fn quiet_engine(path: &Path) -> Engine {
+        let mut engine = Engine::new(path.into(), true, Instant::now());
+        until(&mut engine, |e| {
+            e.app.history.complete
+                && e.app.pending.known
+                && !e.app.pending.loading
+                && e.operations_initialized
+                && !e.operation_busy
+                && e.operation_request.is_none()
+                && e.app.branches.last_check.is_some()
+                && !e.app.branches.loading
+                && e.app.branches.want_refresh.is_none()
+                && !e.refreshing
+        });
+        engine
+    }
+
+    #[test]
+    fn scoped_discovery_upgrades_after_partial_failure_once_and_ignores_stale_done() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.open = true;
+        e.app.branches.remotes.clear();
+        e.remote_generation += 1;
+        let generation = e.remote_generation;
+        e.remote_scoped_request = true;
+        e.app.branches.loading = true;
+        // Hold dispatch briefly to inspect the actual event handler's intent.
+        e.repository_edit_busy = true;
+        e.tick(Some(Msg::Remote(
+            generation,
+            remote::Event::Status("fixture HTTP 502".into()),
+        )));
+        e.tick(Some(Msg::Remote(generation - 1, remote::Event::Done)));
+        assert!(
+            e.app.branches.loading,
+            "stale Done cannot end the current discovery"
+        );
+        assert!(e.app.branches.want_refresh.is_none());
+        e.tick(Some(Msg::Remote(generation, remote::Event::Done)));
+        assert!(!e.app.branches.errors.is_empty() && e.app.branches.remotes.is_empty());
+        assert_eq!(e.app.branches.want_refresh, Some(false));
+        e.repository_edit_busy = false;
+        e.tick(None);
+        assert_eq!(e.remote_generation, generation + 1);
+        assert!(
+            !e.remote_scoped_request,
+            "the upgrade must request the full listing"
+        );
+        until(&mut e, |e| {
+            !e.app.branches.loading && e.app.branches.want_refresh.is_none()
+        });
+        assert_eq!(e.remote_generation, generation + 1);
+        // A failed full request remains available for explicit retry, without
+        // an automatic loop while the Branches tab stays open.
+        let generation = e.remote_generation;
+        e.repository_edit_busy = true;
+        e.app.branches.loading = true;
+        e.tick(Some(Msg::Remote(
+            generation,
+            remote::Event::Status("fixture full-list failure".into()),
+        )));
+        e.tick(Some(Msg::Remote(generation, remote::Event::Done)));
+        assert!(e.app.branches.want_refresh.is_none());
+        e.repository_edit_busy = false;
+        e.tick(None);
+        assert_eq!(e.remote_generation, generation);
+        assert!(!e.app.branches.loading);
+    }
+
+    #[test]
+    fn repository_edit_holds_writes_and_discards_stale_shortcuts_before_refresh() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        let head = e.app.head_id().unwrap();
+        let epoch = e.operation_epoch;
+        assert!(e.begin_repository_edit());
+        assert!(!e.begin_repository_edit());
+        assert!(!e.request_operation(git::operations::Request::Create {
+            name: "must-not-exist".into(),
+            target: head.to_string()
+        }));
+        e.app.pending.request = Some(crate::pending::Request {
+            head: Some(head),
+            branch: Some("main".into()),
+            new_branch: "must-not-exist".into(),
+            description: "stale commit intent".into(),
+            files: Vec::new(),
+        });
+        e.app.checkout_request = Some(crate::checkout::Request::Commit {
+            id: e.app.history.commits[1].id,
+            remote: None,
+        });
+        e.app.want_refresh = true;
+        for _ in 0..4 {
+            e.tick(None);
+        }
+        assert!(!e.operation_busy && !e.app.pending.busy && !e.app.branches.busy && !e.refreshing);
+        assert_eq!(e.operation_epoch, epoch);
+        assert_eq!(e.app.head_id(), Some(head));
+        assert!(e.app.pending.request.is_some() && e.app.checkout_request.is_some());
+        e.end_repository_edit();
+        assert!(e.app.pending.request.is_none() && e.app.checkout_request.is_none());
+        assert!(matches!(
+            e.operation_request,
+            Some(git::operations::Request::Inspect)
+        ));
+        until(&mut e, |e| {
+            e.operation_epoch != epoch
+                && !e.operation_busy
+                && !e.refreshing
+                && !e.app.want_refresh
+                && !e.app.pending.loading
+                && !e.app.pending.want_refresh
+        });
+        assert_eq!(e.app.head_id(), Some(head));
+        assert_eq!(
+            git::refs::head(e.repo.as_ref().unwrap())
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("main")
+        );
+        assert!(
+            !git::refs::raw_refs(e.repo.as_ref().unwrap())
+                .unwrap()
+                .iter()
+                .any(|r| r.name == "refs/heads/must-not-exist")
+        );
+    }
+
+    #[test]
+    fn reference_conversion_refreshes_cached_engine_backend_without_restart() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        let head = e.app.head_id();
+        assert!(!e.reference_storage_reftable());
+        assert!(e.begin_repository_edit());
+        git::refs::migrate_reftable(dir.path()).unwrap();
+        assert!(
+            !e.reference_storage_reftable(),
+            "old gix handle remains cached until refresh"
+        );
+        e.end_repository_edit();
+        until(&mut e, |e| {
+            e.reference_storage_reftable()
+                && !e.refreshing
+                && !e.app.want_refresh
+                && !e.operation_busy
+        });
+        assert_eq!(e.app.head_id(), head);
+        assert_eq!(e.app.history.len(), 2);
+        assert!(e.operations.labels.is_empty());
     }
 
     fn remote_diff_after_local_refresh(pair: bool) -> f64 {

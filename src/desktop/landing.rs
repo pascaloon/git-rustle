@@ -4,12 +4,20 @@ use std::path::PathBuf;
 
 impl Desktop {
     pub(super) fn open_repository(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.engine.repository_edit_busy {
+            self.notice = "Finish the repository operation before opening another folder.".into();
+            cx.notify();
+            return;
+        }
         if self.composer.as_ref().is_some_and(|c| c.busy()) {
             self.notice = "Waiting for the request to finish…".into();
             cx.notify();
             return;
         }
         self.engine = self.engine.open_directory(path);
+        self.graph_hover = Default::default();
+        self.ref_storage = Default::default();
+        self.stashes = Default::default();
         self.opening_directory = true;
         self.notice.clear();
         cx.notify();

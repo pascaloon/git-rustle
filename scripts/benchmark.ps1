@@ -9,6 +9,7 @@ param(
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\comparison"
 )
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/benchmark-processes.ps1"
 $Repository = (Resolve-Path -LiteralPath $Repository).Path
 $Baseline = (Resolve-Path -LiteralPath $Baseline).Path
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
@@ -19,7 +20,7 @@ foreach ($name in @('GIT_RUSTLE_TIMING', 'GIT_RUSTLE_AUTOQUIT', 'GIT_RUSTLE_KEYS
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
-    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
+    if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     $log = Join-Path $OutputDirectory "$label-$mode-$sample.txt"
     $runArgs = @('"' + $Repository + '"')
     if ($mode -eq 'uncached') { $runArgs += '--no-cache' }
@@ -30,7 +31,7 @@ function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
         throw "Benchmark exceeded two minutes: $log"
     }
     $process.Refresh()
-    if ($RejectCompetingBuilds -and @(Get-Process rustc,cargo,cl,link -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
+    if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     if ($process.ExitCode -ne 0) { throw "Benchmark failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $frame = [regex]::Match($text, '([\d.]+) ms  first frame')

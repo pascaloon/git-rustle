@@ -119,11 +119,13 @@ fn fixture_check(api: &str, path: &std::path::Path) -> Result<update::Checked, S
 impl Desktop {
     pub(super) fn restart_busy(&self) -> bool {
         self.composer.as_ref().is_some_and(|c| c.busy())
+            || self.engine.repository_edit_busy
             || self.engine.operation_busy
             || self.engine.recents_loading
             || self.engine.app.pending.busy
             || self.engine.app.branches.busy
             || self.engine.app.settings.saving
+            || self.tools_config_busy()
             || self.picking_directory
     }
 

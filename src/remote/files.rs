@@ -416,6 +416,30 @@ pub fn file(
             "Remote submodule change (checkout to inspect objects)".into(),
         ));
     }
+    let (old, new) = contents(repo, change, source)?;
+    if old.len() > 8 * 1024 * 1024 || new.len() > 8 * 1024 * 1024 {
+        return Ok(FileDiff::message("File too large to diff".into()));
+    }
+    if old
+        .iter()
+        .take(8000)
+        .chain(new.iter().take(8000))
+        .any(|&b| b == 0)
+    {
+        return Ok(FileDiff::message("Binary files differ".into()));
+    }
+    Ok(crate::diff::sidebyside::build(&old, &new))
+}
+
+/// Exact provider bytes for external tools, including binary data.
+pub fn contents(
+    repo: &gix::Repository,
+    change: &FileChange,
+    source: &RemoteFile,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if source.submodule {
+        return Err("External diff does not support remote submodule objects.".into());
+    }
     let mut client = Session::new(repo, &source.remote, source.no_cache)?;
     let mut old_client = source
         .old_remote
@@ -478,18 +502,7 @@ pub fn file(
     } else {
         Vec::new()
     };
-    if old.len() > 8 * 1024 * 1024 || new.len() > 8 * 1024 * 1024 {
-        return Ok(FileDiff::message("File too large to diff".into()));
-    }
-    if old
-        .iter()
-        .take(8000)
-        .chain(new.iter().take(8000))
-        .any(|&b| b == 0)
-    {
-        return Ok(FileDiff::message("Binary files differ".into()));
-    }
-    Ok(crate::diff::sidebyside::build(&old, &new))
+    Ok((old, new))
 }
 
 #[cfg(test)]

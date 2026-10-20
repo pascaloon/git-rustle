@@ -10,10 +10,16 @@ pub struct Association {
 
 pub type Index = BTreeMap<String, Vec<Association>>;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub web_url: Option<String>,
     pub avatar: Option<String>,
+}
+
+pub enum SummaryEvent {
+    Project(Project),
+    Image(Vec<u8>),
+    Requests(Index),
 }
 
 fn project_avatar_url(remote: &Remote, web: Option<&str>, avatar: &str) -> Option<String> {
@@ -57,17 +63,22 @@ fn project_avatar_key(endpoint: &str, token: Option<&str>, avatar: &str) -> Stri
 
 /// GitHub exposes an owner's avatar; GitLab exposes a project avatar.
 impl Client<'_> {
-    pub fn project(&mut self, force: bool) -> Result<Project, String> {
+    pub fn cached_project(&self) -> Option<Project> {
         let key = if self.remote.provider == Provider::Gitlab {
             "project-icon-v2"
         } else {
             "project-icon-v1"
         };
-        if !force && let Some(mut project) = self.read::<Project>(key, 86400) {
-            project.web_url = project.web_url.filter(|u| safe_web_url(u));
-            project.avatar = project
-                .avatar
-                .and_then(|u| project_avatar_url(self.remote, project.web_url.as_deref(), &u));
+        let mut project = self.read::<Project>(key, 86400)?;
+        project.web_url = project.web_url.filter(|u| safe_web_url(u));
+        project.avatar = project
+            .avatar
+            .and_then(|u| project_avatar_url(self.remote, project.web_url.as_deref(), &u));
+        Some(project)
+    }
+
+    pub fn project(&mut self, force: bool) -> Result<Project, String> {
+        if !force && let Some(project) = self.cached_project() {
             return Ok(project);
         }
         let response = self.get(root(self.remote))?;
@@ -84,12 +95,82 @@ impl Client<'_> {
                 .and_then(|u| project_avatar_url(self.remote, web_url.as_deref(), u)),
             web_url,
         };
-        self.write(key, &project);
+        self.write(
+            if self.remote.provider == Provider::Gitlab {
+                "project-icon-v2"
+            } else {
+                "project-icon-v1"
+            },
+            &project,
+        );
         Ok(project)
+    }
+
+    pub fn cached_project_avatar(&self, project: &Project) -> Option<Vec<u8>> {
+        let avatar = project.avatar.as_deref()?;
+        if self.remote.provider == Provider::Gitlab {
+            let endpoint = format!("{}/avatar", root(self.remote));
+            let key = project_avatar_key(&endpoint, self.token.as_deref(), avatar);
+            if let Some(bytes) = self.photo_cache().and_then(|cache| cache.image(&key)) {
+                return Some(bytes);
+            }
+        }
+        self.cached_avatar(avatar)
+    }
+
+    /// Deliver disk-cached header data before any provider-list HTTP wait. The
+    /// callback can stop work after a repository switch; images also have their
+    /// own clear-generation check supplied by the desktop worker.
+    pub fn summary_stream(
+        &mut self,
+        force: bool,
+        images: impl Fn() -> bool,
+        mut emit: impl FnMut(SummaryEvent) -> bool,
+    ) {
+        let cached = self.cached_project();
+        let mut cached_image = false;
+        if let Some(project) = cached.as_ref() {
+            if !emit(SummaryEvent::Project(project.clone())) {
+                return;
+            }
+            if images()
+                && let Some(bytes) = self.cached_project_avatar(project)
+            {
+                cached_image = true;
+                if !emit(SummaryEvent::Image(bytes)) {
+                    return;
+                }
+            }
+        }
+        let project = if force || cached.is_none() {
+            self.project(force).ok().or_else(|| cached.clone())
+        } else {
+            cached.clone()
+        };
+        if let Some(project) = project {
+            if cached.as_ref() != Some(&project) && !emit(SummaryEvent::Project(project.clone())) {
+                return;
+            }
+            if images()
+                && (!cached_image
+                    || cached.as_ref().and_then(|p| p.avatar.as_ref()) != project.avatar.as_ref())
+                && let Some(bytes) = self.project_avatar(&project)
+                && !emit(SummaryEvent::Image(bytes))
+            {
+                return;
+            }
+        }
+        // A failed list still removes stale open-request badges, as before.
+        emit(SummaryEvent::Requests(
+            self.open_requests(force).unwrap_or_default(),
+        ));
     }
 
     pub fn project_avatar(&mut self, project: &Project) -> Option<Vec<u8>> {
         let avatar = project.avatar.as_deref()?;
+        if let Some(bytes) = self.cached_project_avatar(project) {
+            return Some(bytes);
+        }
         if self.remote.provider != Provider::Gitlab {
             return self.avatar(avatar);
         }
@@ -457,13 +538,15 @@ mod tests {
 
     #[test]
     fn gitlab_avatar_redirect_never_forwards_token_and_can_use_public_cache() {
+        use std::io::{BufRead, Write};
         let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         target.set_nonblocking(true).unwrap();
         let location = format!(
             "Location: http://{}/stolen\r\n",
             target.local_addr().unwrap()
         );
-        let (url, server) = raw_server(vec![(302, location, Vec::new())]);
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", api.local_addr().unwrap());
         let dir = tempfile::tempdir().unwrap();
         let remote = fixture(Provider::Gitlab, &url, dir.path());
         let mut client = client(dir.path(), &remote);
@@ -472,17 +555,199 @@ mod tests {
             web_url: None,
             avatar: Some("https://public.example/p.png".into()),
         };
-        client.write(
-            &format!("image-{}", project.avatar.as_deref().unwrap()),
-            &PROJECT_PHOTO,
-        );
+        let photos = super::super::PhotoCache::at(dir.path().join("photos"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = api.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            // Make a public cache entry available only after the API request;
+            // an existing entry now correctly bypasses this request entirely.
+            assert!(photos.store_image("https://public.example/p.png", PROJECT_PHOTO));
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request
+        });
         assert_eq!(
             client.project_avatar(&project).as_deref(),
             Some(PROJECT_PHOTO)
         );
-        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-only")
+        );
         assert!(
             matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn gitlab_project_icon_reopens_from_disk_offline_and_remains_private_and_clearable() {
+        let (url, server) = raw_server(vec![(200, String::new(), PROJECT_PHOTO.to_vec())]);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(Provider::Gitlab, &url, dir.path());
+        let project = Project {
+            web_url: Some("https://code.example/project".into()),
+            avatar: Some("https://private.example/icon.png".into()),
+        };
+        {
+            let mut first = client(dir.path(), &remote);
+            first.no_cache = false;
+            first.write("project-icon-v2", &project);
+            assert_eq!(
+                first.project_avatar(&project).as_deref(),
+                Some(PROJECT_PHOTO)
+            );
+        }
+        assert_eq!(server.join().unwrap().len(), 1);
+        let mut reopened = client(dir.path(), &remote);
+        reopened.no_cache = false;
+        assert_eq!(reopened.cached_project().unwrap(), project);
+        assert_eq!(
+            reopened.cached_project_avatar(&project).as_deref(),
+            Some(PROJECT_PHOTO)
+        );
+        reopened.token = Some("different-account".into());
+        assert!(reopened.cached_project_avatar(&project).is_none());
+        reopened.token = Some("fixture-only".into());
+        reopened.photo_cache().unwrap().clear().unwrap();
+        assert!(reopened.cached_project_avatar(&project).is_none());
+    }
+
+    #[test]
+    fn cached_project_icon_is_streamed_while_request_listing_is_still_blocked() {
+        use std::io::{BufRead, Write};
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", api.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(Provider::Gitlab, &url, dir.path());
+        let project = Project {
+            web_url: Some("https://code.example/project".into()),
+            avatar: Some("https://private.example/icon.png".into()),
+        };
+        let mut source = client(dir.path(), &remote);
+        source.no_cache = false;
+        source.write("project-icon-v2", &project);
+        let key = project_avatar_key(
+            &format!("{}/avatar", root(&remote)),
+            source.token.as_deref(),
+            project.avatar.as_deref().unwrap(),
+        );
+        assert!(
+            source
+                .photo_cache()
+                .unwrap()
+                .store_image(&key, PROJECT_PHOTO)
+        );
+        let (release, wait) = std::sync::mpsc::channel();
+        let (requested, request) = std::sync::mpsc::channel();
+        let (events, delivered) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let (mut stream, _) = api.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                requested.send(first).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                )
+                .unwrap();
+            });
+            let worker = scope.spawn(move || {
+                source.summary_stream(false, || true, |event| events.send(event).is_ok())
+            });
+            assert!(matches!(
+                delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+                SummaryEvent::Project(_)
+            ));
+            match delivered.recv_timeout(Duration::from_secs(5)).unwrap() {
+                SummaryEvent::Image(bytes) => assert_eq!(bytes, PROJECT_PHOTO),
+                _ => panic!("cached image must arrive before listing"),
+            }
+            assert!(
+                request
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .contains("/merge_requests?")
+            );
+            assert!(
+                delivered.try_recv().is_err(),
+                "request list is still held by fixture"
+            );
+            release.send(()).unwrap();
+            assert!(
+                matches!(delivered.recv_timeout(Duration::from_secs(5)).unwrap(),SummaryEvent::Requests(index) if index.is_empty())
+            );
+            worker.join().unwrap();
+            server.join().unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "fresh provider client reopening cached GitLab header without HTTP"]
+    fn benchmark_project_icon_reopen() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let remote = fixture(
+            Provider::Gitlab,
+            &format!("http://{}", listener.local_addr().unwrap()),
+            dir.path(),
+        );
+        let project = Project {
+            web_url: Some("https://code.example/project".into()),
+            avatar: Some("https://private.example/icon.png".into()),
+        };
+        let mut seed = client(dir.path(), &remote);
+        seed.no_cache = false;
+        seed.write("project-icon-v2", &project);
+        let key = project_avatar_key(
+            &format!("{}/avatar", root(&remote)),
+            seed.token.as_deref(),
+            project.avatar.as_deref().unwrap(),
+        );
+        assert!(seed.photo_cache().unwrap().store_image(&key, PROJECT_PHOTO));
+        for sample in -1..15 {
+            let start = std::time::Instant::now();
+            let mut reopened = client(dir.path(), &remote);
+            reopened.no_cache = false;
+            let cached = reopened.cached_project().unwrap();
+            let image = reopened.cached_project_avatar(&cached).unwrap();
+            let reopen_cached_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert_eq!(cached, project);
+            assert_eq!(image, PROJECT_PHOTO);
+            if sample >= 0 {
+                println!(
+                    "{}",
+                    json!({"sample":sample,"reopen_cached_ms":reopen_cached_ms})
+                );
+            }
+        }
+        assert!(
+            matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
         );
     }
 
