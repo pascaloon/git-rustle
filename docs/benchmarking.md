@@ -10,6 +10,56 @@ Additional scenario-specific scripts and their setup requirements are listed in
 
 ## GPUI desktop (current implementation)
 
+### Conflict inspection and live refresh
+
+After preserving exact application and test baselines, use the focused runner
+with final optimized binaries:
+
+```powershell
+.\scripts\benchmark-conflicts.ps1 -Repository $benchRepo `
+  -Baseline $baselineExe -BaselineHarness $baselineTestExe `
+  -Candidate $candidateExe -CandidateHarness $candidateTestExe -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'suite')
+```
+
+Shared controls cover fresh warm/uncached startup, graph scroll/search-scroll and
+the existing `git::operations::tests::benchmark_stashes` worker. New native cases
+bundle merge/rebase/stash conflict opening, both commit columns and actual details,
+whole-file Incoming confirmation, an unsaved draft preserved across an external
+edit, rejected stale Save, explicit Reload and built-in editor save, then an
+external file write/index stage observed by the watcher and enabled Continue. A separate
+merge case verifies the painted Abort warning and real Abort. Backend correctness
+tests cover operation-specific abort semantics. Each launch creates a clean
+three-file divergent fixture; real operation actions establish the conflict and
+recovery journal before the measured inspection intervals. The exact marker is
+`.git/git-rustle-conflicts-fixture`, containing
+`disposable conflict benchmark fixture`. Local hooks/signing/editors are disabled;
+no real external editor or public remote is used.
+
+One warm-up plus 15 retained launches per group gives 192 native executions and
+three component invocations for the default matrix. The candidate
+`git::operations::tests::benchmark_conflict_refresh` separately measures initial
+metadata, **20** unchanged worker probes, changed-file refresh and conflict preview.
+These include real bounded repository I/O; `idle_20_ms` is the whole 20-probe batch,
+not one poll or an artificial wait. Native marks retain each operation through
+verified paint; watcher latency includes its normal scheduling cadence. New
+interactions have candidate-only costs, not an invalid comparison against missing
+baseline behavior. Shared frame intervals and per-launch means remain separate.
+The native validation window is intentionally visible because its actual GPUI
+presentation is required for the paint assertions; background helpers stay hidden.
+Rejected-save disk verification runs outside its named request-to-paint and Reload
+intervals. The combined request-to-final-frame interval includes all workflow
+checks and watcher waits; separate medians must not be added together.
+
+The runner isolates app-data/temp, rejects competing builds, and retains raw
+samples plus source/binary/shared-fixture integrity. The companion
+`summarize-conflicts.ps1` validates groups and classifies every metric: strict joint
+5%/1ms worker/startup gates and 5%/0.10ms frame gates at median and p95. Preserve all
+crossings and bounded repeats; keep previous unresolved findings outside this
+scope explicit. Local fixtures and native paint callbacks do not establish all
+repository scales, employer-network access, physical pointer input or display
+scanout. Fresh measurements are required after any implementation change.
+
 ### Saved external-tool list
 
 For the persistent tool list, one-time background discovery and Diff picker, use

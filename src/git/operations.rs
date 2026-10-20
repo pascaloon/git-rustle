@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
+pub mod conflicts;
 pub mod stashes;
 
 #[derive(Clone, Debug)]
@@ -22,6 +23,10 @@ pub enum Request {
     OnBranch {
         branch: String,
         head: String,
+        request: Box<Request>,
+    },
+    OnConflict {
+        identity: String,
         request: Box<Request>,
     },
     PushReviewed(PushPreview),
@@ -60,6 +65,7 @@ pub enum Request {
     ReadConflict(String),
     SaveConflict {
         path: String,
+        identity: String,
         original: String,
         edited: String,
     },
@@ -70,13 +76,13 @@ pub enum Request {
 }
 impl Request {
     pub fn changes_repository(&self) -> bool {
-        if let Self::OnBranch { request, .. } = self {
+        if let Self::OnBranch { request, .. } | Self::OnConflict { request, .. } = self {
             return request.changes_repository();
         }
         !self.is_read_only() && !matches!(self, Self::ClearHistory)
     }
     pub fn is_read_only(&self) -> bool {
-        if let Self::OnBranch { request, .. } = self {
+        if let Self::OnBranch { request, .. } | Self::OnConflict { request, .. } = self {
             return request.is_read_only();
         }
         matches!(
@@ -87,6 +93,12 @@ impl Request {
                 | Self::Plan(_)
                 | Self::ReadConflict(_)
         )
+    }
+    fn inner(&self) -> &Self {
+        match self {
+            Self::OnBranch { request, .. } | Self::OnConflict { request, .. } => request.inner(),
+            request => request,
+        }
     }
 }
 #[derive(Clone, Debug)]
@@ -107,10 +119,20 @@ pub struct Plan {
 pub struct Conflict {
     pub kind: String,
     pub files: Vec<String>,
+    pub identity: String,
+    pub fingerprint: u64,
+    pub incoming_label: String,
+    pub local_label: String,
+    pub incoming: Vec<conflicts::Summary>,
+    pub local: Vec<conflicts::Summary>,
+    pub commits_truncated: bool,
+    pub metadata_error: Option<String>,
+    pub states: Vec<conflicts::FileState>,
 }
 #[derive(Clone, Debug)]
 pub struct ConflictPreview {
     pub path: String,
+    pub identity: String,
     pub ours: String,
     pub theirs: String,
     pub original: Option<String>,
@@ -624,6 +646,7 @@ impl Context {
                 }
                 .into(),
                 files: files.into_iter().collect(),
+                ..Default::default()
             }))
         }
     }
@@ -1351,18 +1374,27 @@ fn read_conflict(context: &Context, path: &str) -> Result<ConflictPreview> {
     let file = context.root.join(path);
     let original = fs::symlink_metadata(&file)
         .ok()
-        .filter(|m| m.is_file() && m.len() <= 2 * 1024 * 1024)
+        .filter(|m| {
+            m.is_file() && m.len() <= 2 * 1024 * 1024 && conflicts::inside_worktree(context, &file)
+        })
         .and_then(|_| fs::read(&file).ok())
         .filter(|b| !b.contains(&0))
         .and_then(|b| String::from_utf8(b).ok());
     Ok(ConflictPreview {
         path: path.into(),
+        identity: conflicts::operation_identity(context)?,
         ours: side(2)?,
         theirs: side(3)?,
         original,
     })
 }
-fn save_conflict(context: &Context, path: &str, original: &str, edited: &str) -> Result<String> {
+fn save_conflict(
+    context: &Context,
+    path: &str,
+    identity: &str,
+    original: &str,
+    edited: &str,
+) -> Result<String> {
     if edited
         .lines()
         .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "=======")
@@ -1370,6 +1402,9 @@ fn save_conflict(context: &Context, path: &str, original: &str, edited: &str) ->
         return Err("Conflict markers remain. Remove them before saving the resolution.".into());
     }
     let current = read_conflict(context, path)?;
+    if current.identity != identity {
+        return Err("The active operation changed. Reopen this conflict before saving.".into());
+    }
     if current.original.as_deref() != Some(original) {
         return Err("The file changed outside this editor. Reload it before saving.".into());
     }
@@ -1407,6 +1442,48 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
         let context = Context::new(root)?;
         let _lock = RepositoryLock::new(&context.common.join("rustle-operation.lock"))?;
         let mut journal = context.load()?;
+        if let Request::OnConflict { identity, request } = &request {
+            if !matches!(
+                request.as_ref(),
+                Request::Resolve { .. } | Request::Continue | Request::Skip | Request::Abort
+            ) {
+                return Err("This action does not support conflict confirmation.".into());
+            }
+            if !conflicts::operation_identity(&context).is_ok_and(|current| current == *identity) {
+                // Return the current view without rewriting the journal when
+                // an obsolete confirmation is rejected.
+                view = View {
+                    labels: journal
+                        .entries
+                        .iter()
+                        .map(|entry| entry.label.clone())
+                        .collect(),
+                    cursor: journal.cursor,
+                    boundary: journal.boundary.clone(),
+                    conflict: conflicts::read(&context, None)?,
+                    interactive_rebase: context.git.join("rebase-merge/interactive").exists(),
+                    ..Default::default()
+                };
+                return Err(
+                    "The active operation changed. Review the current conflict before continuing."
+                        .into(),
+                );
+            }
+        }
+        // Retain this operation's displayed paths across the mutation, even if
+        // another repository evicts its entry from the bounded metadata cache.
+        let previous_conflict = if matches!(
+            request.inner(),
+            Request::Resolve { .. }
+                | Request::SaveConflict { .. }
+                | Request::Continue
+                | Request::Skip
+                | Request::Abort
+        ) {
+            conflicts::read(&context, None)?
+        } else {
+            None
+        };
         let mut loaded_plan = None;
         let mut preview = None;
         let mut push = None;
@@ -1429,6 +1506,9 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
                     execute_inner(&context, &mut journal, request, &mut loaded_plan)
                 }
             }
+            Request::OnConflict { request, .. } => {
+                execute_inner(&context, &mut journal, request, &mut loaded_plan)
+            }
             Request::PreviewPush => preview_push(&context.root).map(|p| {
                 push = Some(p);
                 "Push review ready.".into()
@@ -1440,9 +1520,10 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
             }),
             Request::SaveConflict {
                 path,
+                identity,
                 original,
                 edited,
-            } => save_conflict(&context, path, original, edited),
+            } => save_conflict(&context, path, identity, original, edited),
             _ => execute_inner(&context, &mut journal, &request, &mut loaded_plan),
         };
         let save = context.save(&journal);
@@ -1451,7 +1532,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
             labels: journal.entries.iter().map(|e| e.label.clone()).collect(),
             cursor: journal.cursor,
             boundary: journal.boundary.clone(),
-            conflict: context.conflict()?,
+            conflict: conflicts::read(&context, previous_conflict.as_ref())?,
             interactive_rebase: context.git.join("rebase-merge/interactive").exists(),
             plan: loaded_plan,
             push,

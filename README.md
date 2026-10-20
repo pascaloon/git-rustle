@@ -86,8 +86,8 @@ interior pixels. The icon generator retains the resulting alpha channel.
   commit to merge, rebase, or rename/delete its local branches.
 - **Interactive rebase from here…** prepares an editable commit plan from the
   graph menu. Its tab appears only for an open plan or active interactive rebase.
-  Reorder, reword, squash, fixup, edit and drop are supported. **Conflicts** guides paused operations with
-  version comparison, text editing, staging, Continue, Skip and Abort.
+  Reorder, reword, squash, fixup, edit and drop are supported. **Conflicts** opens
+  the resolution workspace for paused operations.
 - **Undo / redo history** in the bottom-right status bar lists recoverable states.
   Double-click a state to move backward or forward. Commit and checkout share
   this history; pushes and outside repository changes invalidate earlier states.
@@ -147,6 +147,33 @@ repositories are supported. Git identity, signing and hooks apply. Hooks that
 stage unchecked paths are rejected. Conflicts and ongoing merge/rebase/cherry-pick
 operations must be resolved first. Failures preserve the draft for retry. Closing
 the window waits for an active commit, checkout or settings save to finish.
+
+### Conflicts
+
+The Conflicts workspace shows **Incoming** commits on the left and **Local**
+commits beside them, using the graph's commit rows. Select a commit to inspect its
+message, author, dates and changed files in the shared inspector on the right.
+During a rebase, Incoming is the current base and Local is the commit being replayed.
+
+Below the commit columns, select a conflicting file to load its versions and
+builtin result editor. File contents load only for the selected file. **Use
+incoming…** and **Use local…** confirm a whole-file replacement and stage it.
+For text files, edit the result and choose **Save and mark resolved**. **Mark file
+resolved** stages the existing working-tree file. Binary, large and non-text files
+can use a whole version or an external application; configured merge tools are
+optional.
+
+The workspace automatically detects external file and index changes; no Refresh
+button is needed. Unsaved editor drafts survive file switches and external
+changes. Saving checks the original file and operation identity, rejecting stale
+edits rather than overwriting outside changes. **Discard draft & reload** explicitly
+replaces a stale draft with the current file.
+
+The bottom action bar keeps **Abort…** immediately beside **Continue**. Continue
+remains disabled until all conflicts are resolved and staged. **Skip commit…**
+is available for operations that support it. A conflicted stash apply keeps its
+stash entry; **Finish applying stash** completes the resolution, while Abort
+retains recovered untracked files.
 
 ### Remotes
 

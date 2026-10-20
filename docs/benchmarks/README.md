@@ -15,6 +15,16 @@ before timing, and run suites sequentially on an unlocked desktop.
 
 ## Additional scenario scripts
 
+[`benchmark-conflicts.ps1`](../../scripts/benchmark-conflicts.ps1) bundles shared
+startup/graph-frame controls and a preserved stash-operation worker with marked
+merge/rebase/stash conflict UI workflows. It verifies actual commit/details
+selection, resolution/save, external index edits observed by the watcher,
+Continue and an Abort warning/action. Its companion
+[`summarize-conflicts.ps1`](../../scripts/summarize-conflicts.ps1) retains named
+operation intervals, candidate metadata/idle-probe costs and all shared gates.
+See the [workflow](../benchmarking.md#conflict-inspection-and-live-refresh) for
+fixture ownership, timing boundaries and limitations.
+
 [`benchmark-tools-list.ps1`](../../scripts/benchmark-tools-list.ps1) focuses on
 saved external-tool entries, one-time discovery and the Diff picker. It compares
 startup/Diff/General controls and the existing launch worker, uses marked fresh

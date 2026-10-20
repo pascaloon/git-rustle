@@ -37,6 +37,8 @@ pub(super) enum Action {
     CancelClear,
     ClearHistory,
     SaveConflict,
+    SelectConflictFile(String),
+    ReloadConflict,
 }
 pub(super) struct Panel {
     pub tab: Option<Tab>,
@@ -64,9 +66,8 @@ pub(super) struct Panel {
     dialog_error: Option<String>,
     epoch: u64,
     conflict_open: bool,
-    confirmation: Option<(Request, String)>,
-    resolution: Entity<InputState>,
-    resolution_source: Option<(String, String)>,
+    pub(super) confirmation: Option<(Request, String)>,
+    pub(super) conflicts: Option<super::conflicts::State>,
     tag_scenario_target: Option<gix::ObjectId>,
     tag_scenario_head: Option<gix::ObjectId>,
     tag_scenario_submitted: bool,
@@ -152,8 +153,7 @@ impl Panel {
             epoch: 0,
             conflict_open: false,
             confirmation: None,
-            resolution: cx.new(|cx| InputState::new(window, cx).multi_line(true)),
-            resolution_source: None,
+            conflicts: None,
             tag_scenario_target: None,
             tag_scenario_head: None,
             tag_scenario_submitted: false,
@@ -268,6 +268,7 @@ impl Desktop {
             .unwrap_or_else(|| "detached HEAD".into())
     }
     pub(super) fn sync_operations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_conflicts(window, cx);
         if self.operations.epoch == self.engine.operation_epoch {
             return;
         }
@@ -324,17 +325,6 @@ impl Desktop {
             && !self.engine.operations.interactive_rebase
         {
             self.operations.tab = None;
-        }
-        if let Some(preview) = &self.engine.operations.preview
-            && let Some(text) = &preview.original
-        {
-            let identity = (preview.path.clone(), text.clone());
-            if self.operations.resolution_source.as_ref() != Some(&identity) {
-                self.operations
-                    .resolution
-                    .update(cx, |s, cx| s.set_value(text.clone(), window, cx));
-                self.operations.resolution_source = Some(identity);
-            }
         }
         cx.notify();
     }
@@ -490,16 +480,9 @@ impl Desktop {
                 }
                 request
             }
-            Action::SaveConflict => {
-                self.operations
-                    .resolution_source
-                    .as_ref()
-                    .map(|(path, original)| Request::SaveConflict {
-                        path: path.clone(),
-                        original: original.clone(),
-                        edited: self.operations.resolution.read(cx).value().to_string(),
-                    })
-            }
+            Action::SaveConflict => self.conflict_save_request(cx),
+            Action::SelectConflictFile(path) => self.select_conflict_file(path, window, cx),
+            Action::ReloadConflict => self.reload_conflict_file(),
             Action::Pull => Some(Request::Pull),
             Action::ShowConflicts => {
                 self.operations.tab = Some(Tab::Conflicts);
@@ -614,18 +597,25 @@ impl Desktop {
                     Request::Skip => "Skip this commit? Its changes will be omitted.".into(),
                     Request::Resolve { path, choice } => format!(
                         "Replace all of {path} with {} and stage it? A deleted side removes the file.",
-                        if matches!(choice, Resolution::Ours) {
-                            "ours"
+                        if matches!(choice, Resolution::Ours)
+                            == self
+                                .engine
+                                .operations
+                                .conflict
+                                .as_ref()
+                                .is_some_and(|c| c.kind == "Rebase")
+                        {
+                            "the incoming version"
                         } else {
-                            "theirs"
+                            "the local version"
                         }
                     ),
                     _ => unreachable!(),
                 };
-                self.operations.confirmation = Some((request, text));
+                self.operations.confirmation = Some((self.bind_conflict_request(request), text));
                 None
             }
-            Action::Run(request) => Some(request),
+            Action::Run(request) => Some(self.bind_conflict_request(request)),
         };
         if let Some(request) = request {
             if self
@@ -639,8 +629,13 @@ impl Desktop {
             }
             let refresh_stashes =
                 matches!(&request, Request::ApplyStash(_) | Request::DropStash(_));
-            if self.engine.request_operation(request) && refresh_stashes {
-                self.stash_mutation_started();
+            let read_conflict = matches!(&request, Request::ReadConflict(_));
+            if self.engine.request_operation(request) {
+                if refresh_stashes {
+                    self.stash_mutation_started();
+                }
+            } else if read_conflict {
+                self.defer_conflict_read();
             }
             self.engine.tick(None);
         }
@@ -657,6 +652,9 @@ impl Desktop {
             .into_any_element()
     }
     pub(super) fn operations_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.operations.tab == Some(Tab::Conflicts) {
+            return self.conflicts_content(cx);
+        }
         if self.operations.tab == Some(Tab::Rebase) && !self.engine.operations.interactive_rebase {
             return self.rebase_content(cx);
         }
@@ -666,87 +664,18 @@ impl Desktop {
             .overflow_y_scroll()
             .p_6()
             .gap_4();
-        match self.operations.tab {
-            Some(Tab::Rebase) => {
-                content = content.child(
-                    row()
-                        .child(icon("graph"))
-                        .child(div().text_size(px(22.)).child("Interactive rebase")),
-                );
-                if self.engine.operations.interactive_rebase {
-                    content = content.child(caption("Rebase is in progress. Resolve or amend the current commit, then continue."))
+        if let Some(Tab::Rebase) = self.operations.tab {
+            content = content.child(
+                row()
+                    .child(icon("graph"))
+                    .child(div().text_size(px(22.)).child("Interactive rebase")),
+            );
+            if self.engine.operations.interactive_rebase {
+                content = content.child(caption("Rebase is in progress. Resolve or amend the current commit, then continue."))
                         .child(self.op_button("rebase-progress", "Open rebase progress", Action::ShowConflicts, cx));
-                } else {
-                    unreachable!("draft rebase uses its own virtualized layout");
-                }
+            } else {
+                unreachable!("draft rebase uses its own virtualized layout");
             }
-            Some(Tab::Conflicts) => {
-                if let Some(conflict) = &self.engine.operations.conflict {
-                    content = content.child(div().text_size(px(22.)).child(format!("{} in progress", conflict.kind)))
-                        .child(caption("1. Resolve each file.  2. Mark edited files resolved.  3. Continue when none remain."))
-                        .child(caption(if conflict.kind == "Rebase" { "During rebase: ours is the new base plus replayed commits; theirs is the commit being replayed." } else { "Ours is your current branch; theirs is the incoming version." }))
-                        .child(caption("Edit files in your usual editor. Choosing an entire side replaces and stages it, including binary files and deletions."))
-                        .child(row().child(self.op_button("conflict-refresh", "Refresh files", Action::Run(Request::Inspect), cx))
-                            .when(conflict.kind != "Unmerged index", |r| r.child(self.op_button("conflict-continue", if conflict.kind == "Stash apply" { "Finish applying stash" } else { "Continue" }, Action::Run(Request::Continue), cx)))
-                            .when(matches!(conflict.kind.as_str(), "Rebase" | "Cherry-pick" | "Revert"), |r| r.child(self.op_button("conflict-skip", "Skip commit…", Action::Run(Request::Skip), cx)))
-                            .when(conflict.kind != "Unmerged index", |r| r.child(self.op_button("conflict-abort", "Abort…", Action::Run(Request::Abort), cx))))
-                        .child(caption(format!("{} unresolved files", conflict.files.len())));
-                    content = content
-                        .children(self.tools_notice())
-                        .child(self.conflict_list(cx));
-                    if conflict.files.is_empty() {
-                        content = content.child(caption("No unresolved files. Continue to finish or reach the next rebase step."));
-                    }
-                    if let Some(preview) = &self.engine.operations.preview {
-                        content = content
-                            .child(div().text_size(px(18.)).child(preview.path.clone()))
-                            .child(
-                                row()
-                                    .items_start()
-                                    .child(
-                                        column().flex_1().gap_2().child("Ours").child(
-                                            div()
-                                                .id("conflict-ours")
-                                                .h(px(160.))
-                                                .overflow_y_scroll()
-                                                .p_3()
-                                                .bg(rgb(PANEL))
-                                                .child(preview.ours.clone()),
-                                        ),
-                                    )
-                                    .child(
-                                        column().flex_1().gap_2().child("Theirs").child(
-                                            div()
-                                                .id("conflict-theirs")
-                                                .h(px(160.))
-                                                .overflow_y_scroll()
-                                                .p_3()
-                                                .bg(rgb(PANEL))
-                                                .child(preview.theirs.clone()),
-                                        ),
-                                    ),
-                            );
-                        if preview.original.is_some() {
-                            content = content
-                                .child("Resolved result")
-                                .child(Input::new(&self.operations.resolution).h(px(220.)))
-                                .child(self.op_button(
-                                    "save-resolution",
-                                    "Save and mark resolved",
-                                    Action::SaveConflict,
-                                    cx,
-                                ));
-                        } else {
-                            content = content.child(caption(
-                                "Use a whole side or your external editor for this file.",
-                            ));
-                        }
-                    }
-                } else {
-                    content = content.child("No operation is waiting for conflict resolution.");
-                }
-            }
-            _ => {}
         }
         content.into_any_element()
     }
@@ -1043,91 +972,6 @@ impl Desktop {
             }
         }
     }
-    fn conflict_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self
-            .engine
-            .operations
-            .conflict
-            .as_ref()
-            .map_or(0, |c| c.files.len());
-        uniform_list(
-            "conflict-files",
-            count,
-            cx.processor(|v, range: std::ops::Range<usize>, _, cx| {
-                let mut rows = Vec::new();
-                let Some(conflict) = &v.engine.operations.conflict else {
-                    return rows;
-                };
-                for i in range {
-                    let path = &conflict.files[i];
-                    let read_path = path.clone();
-                    let mut buttons = row().child(
-                        div()
-                            .id(("inspect-conflict", i))
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(CONTROL))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .child("Compare / edit")
-                            .on_click(cx.listener(move |v, _, w, cx| {
-                                v.operation_action(
-                                    Action::Run(Request::ReadConflict(read_path.clone())),
-                                    w,
-                                    cx,
-                                )
-                            })),
-                    );
-                    buttons = buttons.child(v.tools_merge_button(path, cx));
-                    for (j, (label, choice)) in [
-                        ("Use ours…", Resolution::Ours),
-                        ("Use theirs…", Resolution::Theirs),
-                        ("Mark edited file resolved", Resolution::Mark),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let path = path.clone();
-                        buttons = buttons.child(
-                            div()
-                                .id(("resolve", i * 3 + j))
-                                .px_3()
-                                .py_2()
-                                .bg(rgb(CONTROL))
-                                .rounded_md()
-                                .cursor_pointer()
-                                .child(label)
-                                .on_click(cx.listener(move |v, _, w, cx| {
-                                    v.operation_action(
-                                        Action::Run(Request::Resolve {
-                                            path: path.clone(),
-                                            choice: choice.clone(),
-                                        }),
-                                        w,
-                                        cx,
-                                    )
-                                })),
-                        );
-                    }
-                    rows.push(
-                        column()
-                            .p_3()
-                            .gap_2()
-                            .bg(rgb(PANEL))
-                            .rounded_md()
-                            .child(path.clone())
-                            .child(buttons)
-                            .h(px(88.))
-                            .into_any_element(),
-                    );
-                }
-                rows
-            }),
-        )
-        .h(px((count.min(4) * 88) as f32))
-        .w_full()
-        .into_any_element()
-    }
     pub(super) fn operations_overlay(&self, cx: &Context<Self>) -> Option<AnyElement> {
         if let Some(dialog) = self.operations.dialog {
             let op = &self.operations;
@@ -1324,6 +1168,7 @@ impl Desktop {
                         column()
                             .relative()
                             .children(self.todo_probe(7))
+                            .children(self.conflicts_probe(9))
                             .w(px(600.))
                             .p_6()
                             .gap_4()

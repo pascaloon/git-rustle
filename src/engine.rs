@@ -31,6 +31,17 @@ pub(crate) enum Msg {
     Refreshed(Box<git::Result<(gix::Repository, git::RefSnapshot)>>),
     Checkout(Result<String, String>, bool),
     Details(gix::ObjectId, Result<git::CommitDetails, String>),
+    ConflictRefresh(
+        u64,
+        String,
+        Result<
+            (
+                git::operations::conflicts::Refresh,
+                Option<git::operations::ConflictPreview>,
+            ),
+            String,
+        >,
+    ),
     Cache(Option<cache::Cached>),
     Repo(Box<git::Result<(gix::Repository, git::RefSnapshot)>>),
     Batch(u32, History),
@@ -319,6 +330,9 @@ pub struct Engine {
     /// A merge editor or explicit ref-storage conversion owns repository writes.
     pub repository_edit_busy: bool,
     pub operation_epoch: u64,
+    pub conflict_refresh_error: Option<String>,
+    conflict_refresh_busy: bool,
+    conflict_refresh_at: Instant,
     operation_request: Option<git::operations::Request>,
     operations_initialized: bool,
     rx: Receiver<Msg>,
@@ -492,6 +506,9 @@ impl Engine {
             operation_busy: false,
             repository_edit_busy: false,
             operation_epoch: 0,
+            conflict_refresh_error: None,
+            conflict_refresh_busy: false,
+            conflict_refresh_at: Instant::now(),
             operation_request: None,
             operations_initialized: false,
             app,
@@ -549,6 +566,40 @@ impl Engine {
         self.app.set_provider_search_labels(labels)
     }
     fn advance(&mut self, message: Option<Msg>) {
+        if !self.operation_busy
+            && self.operation_request.is_none()
+            && !self.app.pending.busy
+            && !self.app.branches.busy
+            && !self.conflict_refresh_busy
+            && self.conflict_refresh_at.elapsed() >= Duration::from_millis(500)
+            && let (Some(conflict), Some(repo)) = (&self.operations.conflict, &self.repo)
+        {
+            let previous = conflict.clone();
+            let identity = previous.identity.clone();
+            let epoch = self.operation_epoch;
+            let selected = self.operations.preview.as_ref().map(|p| p.path.clone());
+            let root = repo.workdir().unwrap_or(repo.git_dir()).to_path_buf();
+            let tx = self.tx.clone();
+            self.conflict_refresh_busy = true;
+            self.conflict_refresh_at = Instant::now();
+            thread::spawn(move || {
+                let result = (|| {
+                    use git::operations::conflicts::{self, Refresh};
+                    let refreshed = conflicts::refresh(&root, &previous)?;
+                    let preview = if let (Refresh::Changed(Some(current)), Some(path)) =
+                        (&refreshed, selected)
+                        && current.identity == identity
+                        && current.files.contains(&path)
+                    {
+                        conflicts::read_preview(&root, &path, &identity).ok()
+                    } else {
+                        None
+                    };
+                    Ok((refreshed, preview))
+                })();
+                let _ = tx.send_blocking(Msg::ConflictRefresh(epoch, identity, result));
+            });
+        }
         if self.first_frame && self.repo.is_some() && !self.operations_initialized {
             self.operations_initialized = true;
             self.operation_request
@@ -816,7 +867,7 @@ impl Engine {
             }
         }
         // Object reads stay off the event thread, including on cache hits.
-        if let (Some(r), Some(id)) = (self.repo.as_ref(), app.selected_id())
+        if let (Some(r), Some(id)) = (self.repo.as_ref(), app.details_id())
             && app.details.as_ref().map(|d| d.id) != Some(id)
             && self.details_requested != Some(id)
         {
@@ -1028,6 +1079,47 @@ impl Engine {
                 Msg::OperationsView(view) => {
                     self.operations = *view;
                     self.operation_epoch = self.operation_epoch.wrapping_add(1);
+                }
+                Msg::ConflictRefresh(epoch, identity, result) => {
+                    self.conflict_refresh_busy = false;
+                    if epoch != self.operation_epoch
+                        || self.operation_busy
+                        || self.operation_request.is_some()
+                        || self
+                            .operations
+                            .conflict
+                            .as_ref()
+                            .is_none_or(|c| c.identity != identity)
+                    {
+                        continue;
+                    }
+                    match result {
+                        Ok((git::operations::conflicts::Refresh::Unchanged, _)) => {
+                            if self.conflict_refresh_error.take().is_some() {
+                                app.needs_redraw = true;
+                            }
+                        }
+                        Ok((git::operations::conflicts::Refresh::Changed(conflict), preview)) => {
+                            if conflict.is_none() {
+                                self.operation_request
+                                    .get_or_insert(git::operations::Request::Inspect);
+                            }
+                            self.operations.conflict = conflict.map(|conflict| *conflict);
+                            self.operations.preview = preview;
+                            self.conflict_refresh_error = None;
+                            self.operation_epoch = self.operation_epoch.wrapping_add(1);
+                            app.want_refresh = true;
+                            app.pending.want_refresh = true;
+                            app.needs_redraw = true;
+                            timing.mark("conflict external changes ready");
+                        }
+                        Err(error) => {
+                            if self.conflict_refresh_error.as_ref() != Some(&error) {
+                                self.conflict_refresh_error = Some(error);
+                                app.needs_redraw = true;
+                            }
+                        }
+                    }
                 }
                 Msg::Search(result) => {
                     let done = result.done;
@@ -1254,11 +1346,11 @@ impl Engine {
                     // A completed read must not suppress a later read of the same
                     // commit after Pending changes has cleared the details view.
                     if self.details_requested == Some(id)
-                        && (result.is_ok() || app.selected_id() != Some(id))
+                        && (result.is_ok() || app.details_id() != Some(id))
                     {
                         self.details_requested = None;
                     }
-                    if app.selected_id() == Some(id) {
+                    if app.details_id() == Some(id) {
                         match result {
                             Ok(details) => app.details = Some(details),
                             Err(error) => app.checkout_notice = Some(Err(error)),
@@ -2172,5 +2264,228 @@ mod tests {
         e.app.install_pending(Ok(snapshot));
         assert!(!e.app.pending.selected);
         assert_eq!(e.app.selected_id(), selected);
+    }
+
+    #[test]
+    fn conflict_commit_inspector_reads_outside_graph_and_search_without_moving_pending_selection() {
+        let dir = fixture();
+        let git = |args: &[&str]| {
+            String::from_utf8(crate::git::command::checked(dir.path(), args).unwrap())
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let parent = gix::ObjectId::from_hex(git(&["rev-parse", "HEAD"]).as_bytes()).unwrap();
+        git(&["switch", "-c", "outside"]);
+        std::fs::write(dir.path().join("file.txt"), "outside inspector contents\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Outside graph"]);
+        let outside = gix::ObjectId::from_hex(git(&["rev-parse", "HEAD"]).as_bytes()).unwrap();
+        git(&["switch", "main"]);
+        git(&["branch", "-D", "outside"]);
+        std::fs::write(dir.path().join("file.txt"), "pending work preserved\n").unwrap();
+        let mut e = quiet_engine(dir.path());
+        until(&mut e, |e| {
+            e.app.pending.selected
+                && e.app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|changes| changes.loaded)
+        });
+        assert!(e.app.history.index_of(&outside).is_none());
+        e.app.search.text.value = "m: definitely-no-match-inspector".into();
+        e.app.search.changed();
+        until(&mut e, |e| {
+            e.app
+                .search
+                .result
+                .as_ref()
+                .is_some_and(|result| result.done)
+                && e.app.graph_len() == 0
+        });
+        // Search navigation intentionally leaves Pending changes. Select it
+        // again so inspection exercises both states at the same time.
+        e.app.pending.selected = true;
+        e.app.sync_details_changes();
+        assert!(e.app.pending.selected);
+        let original_selected = e.app.selected;
+        let search = e.app.search.text.value.clone();
+        e.app.inspect_commit(Some((outside, Some(parent))));
+        until(&mut e, |e| {
+            e.app
+                .details
+                .as_ref()
+                .is_some_and(|details| details.id == outside)
+                && e.app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|changes| changes.loaded)
+        });
+        assert!(e.app.pending.selected);
+        assert_eq!(e.app.selected, original_selected);
+        assert_eq!(e.app.graph_len(), 0);
+        assert_eq!(
+            e.app.details.as_ref().unwrap().message.trim(),
+            "Outside graph"
+        );
+        let changes = e.app.details_changes.as_ref().unwrap();
+        assert_eq!(changes.old, Some(parent));
+        assert_eq!(changes.new, outside);
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(changes.files[0].path, "file.txt");
+        let changes_key = changes.key;
+        let stale = git::commit_details(e.repo.as_ref().unwrap(), &parent).unwrap();
+        e.tick(Some(Msg::Details(parent, Ok(stale))));
+        assert_eq!(e.app.details.as_ref().unwrap().id, outside);
+        e.app.open_diff();
+        assert!(matches!(&e.app.mode, app::Mode::Diff(view) if view.changes.key == changes_key));
+        until(
+            &mut e,
+            |e| matches!(&e.app.mode, app::Mode::Diff(view) if view.diff.is_some()),
+        );
+        if let app::Mode::Diff(view) = &e.app.mode {
+            let diff = view.diff.as_ref().unwrap();
+            assert_eq!(diff.source[0].as_ref(), b"second\n");
+            assert_eq!(diff.source[1].as_ref(), b"outside inspector contents\n");
+        }
+        e.app.close_diff();
+        e.app.inspect_commit(None);
+        let stale = git::commit_details(e.repo.as_ref().unwrap(), &outside).unwrap();
+        e.tick(Some(Msg::Details(outside, Ok(stale))));
+        assert!(e.app.details.is_none());
+        assert!(e.app.inspected_id().is_none());
+        assert!(e.app.pending.selected);
+        assert_eq!(e.app.selected, original_selected);
+        assert_eq!(e.app.search.text.value, search);
+        assert_eq!(e.app.graph_len(), 0);
+        assert!(matches!(e.app.mode, app::Mode::Graph));
+        e.app.clear_search();
+        until(&mut e, |e| !e.app.search.active());
+        until(&mut e, |e| {
+            e.app
+                .details_changes
+                .as_ref()
+                .is_some_and(|changes| changes.loaded && changes.checked.is_some())
+        });
+        assert_eq!(
+            std::fs::read(dir.path().join("file.txt")).unwrap(),
+            b"pending work preserved\n"
+        );
+        assert_eq!(e.app.history.len(), 2);
+        assert!(e.app.pending.selected);
+    }
+
+    #[test]
+    fn conflict_monitor_rejects_stale_epoch_and_operation_identity_replies() {
+        use git::operations::{Conflict, ConflictPreview, conflicts::Refresh};
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.repository_edit_busy = true;
+        e.conflict_refresh_at = Instant::now();
+        e.operations.conflict = Some(Conflict {
+            kind: "Merge".into(),
+            identity: "current-operation".into(),
+            files: vec!["file.txt".into()],
+            ..Default::default()
+        });
+        e.operations.preview = Some(ConflictPreview {
+            path: "file.txt".into(),
+            identity: "current-operation".into(),
+            ours: "local".into(),
+            theirs: "incoming".into(),
+            original: Some("draft baseline".into()),
+        });
+        let epoch = e.operation_epoch;
+        e.tick(Some(Msg::ConflictRefresh(
+            epoch.wrapping_sub(1),
+            "current-operation".into(),
+            Ok((Refresh::Changed(None), None)),
+        )));
+        assert_eq!(e.operation_epoch, epoch);
+        assert!(e.operations.conflict.is_some());
+        assert_eq!(
+            e.operations.preview.as_ref().unwrap().original.as_deref(),
+            Some("draft baseline")
+        );
+        assert!(e.operation_request.is_none());
+        e.tick(Some(Msg::ConflictRefresh(
+            epoch,
+            "previous-operation".into(),
+            Ok((Refresh::Changed(None), None)),
+        )));
+        assert_eq!(e.operation_epoch, epoch);
+        assert_eq!(
+            e.operations.conflict.as_ref().unwrap().identity,
+            "current-operation"
+        );
+        assert!(e.operations.preview.is_some());
+        assert!(e.operation_request.is_none());
+    }
+
+    #[test]
+    fn external_conflict_abort_automatically_reconciles_the_journal_once() {
+        use git::operations::{Request, conflicts::Refresh};
+        let dir = fixture();
+        let git = |args: &[&str]| crate::git::command::checked(dir.path(), args).unwrap();
+        git(&["switch", "-c", "topic"]);
+        std::fs::write(dir.path().join("file.txt"), "incoming conflict\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Incoming conflict"]);
+        git(&["switch", "main"]);
+        std::fs::write(dir.path().join("file.txt"), "local conflict\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Local conflict"]);
+        let mut e = quiet_engine(dir.path());
+        assert!(e.request_operation(Request::Merge("topic".into())));
+        until(&mut e, |e| {
+            e.operations.conflict.is_some()
+                && !e.operation_busy
+                && !e.app.pending.loading
+                && !e.app.pending.want_refresh
+                && !e.refreshing
+                && !e.app.want_refresh
+                && !e.app.is_walking()
+                && !e.conflict_refresh_busy
+        });
+        let identity = e.operations.conflict.as_ref().unwrap().identity.clone();
+        let epoch = e.operation_epoch;
+        e.timing.enabled = true;
+        e.timing.marks.clear();
+        git(&["merge", "--abort"]);
+        e.conflict_refresh_at = Instant::now() - Duration::from_secs(1);
+        until(&mut e, |e| {
+            e.operations.conflict.is_none()
+                && !e.operation_busy
+                && e.operation_request.is_none()
+                && !e.conflict_refresh_busy
+                && e.operation_epoch > epoch
+        });
+        let count = |e: &Engine| {
+            e.timing
+                .marks
+                .iter()
+                .filter(|(label, _)| label == "git operation requested")
+                .count()
+        };
+        assert_eq!(
+            count(&e),
+            1,
+            "external end must enqueue one recovery inspection"
+        );
+        let finished_epoch = e.operation_epoch;
+        e.tick(Some(Msg::ConflictRefresh(
+            epoch,
+            identity,
+            Ok((Refresh::Changed(None), None)),
+        )));
+        assert_eq!(e.operation_epoch, finished_epoch);
+        assert_eq!(count(&e), 1);
+        assert!(e.operation_request.is_none());
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join(".git/rustle-operations/journal.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(journal["pending"].is_null());
+        e.timing.enabled = false;
     }
 }

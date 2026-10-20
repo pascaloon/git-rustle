@@ -139,6 +139,146 @@ fn stash_conflict_finish_and_abort_remain_recoverable() {
 }
 
 #[test]
+fn stash_abort_checks_packed_detached_and_reftable_heads_without_moving_the_commit() {
+    for layout in ["packed", "detached", "reftable"] {
+        let (f, stash) = stash_fixture(true);
+        match layout {
+            "packed" => {
+                f.git(&["pack-refs", "--all", "--prune"]);
+                assert!(!f.root().join(".git/refs/heads/main").exists());
+            }
+            "detached" => {
+                f.git(&["switch", "--detach"]);
+            }
+            "reftable" => {
+                f.git(&["refs", "migrate", "--ref-format=reftable"]);
+            }
+            _ => unreachable!(),
+        }
+        let head = f.git(&["rev-parse", "HEAD^{commit}"]);
+        let branch = f.git(&["branch", "--show-current"]);
+        let stopped = execute(f.root(), Request::ApplyStash(stash.clone()));
+        assert!(stopped.result.is_err());
+        assert_eq!(stopped.view.conflict.unwrap().kind, "Stash apply");
+        let aborted = f.run(Request::Abort);
+        assert!(aborted.conflict.is_none(), "{layout}");
+        assert_eq!(f.git(&["rev-parse", "HEAD^{commit}"]), head, "{layout}");
+        assert_eq!(f.git(&["branch", "--show-current"]), branch, "{layout}");
+        assert_eq!(
+            fs::read(f.root().join("file.txt")).unwrap(),
+            b"new committed contents\n"
+        );
+        assert!(f.root().join("stash-only.txt").exists());
+        assert_eq!(stashes::list(f.root()).unwrap(), vec![stash]);
+    }
+}
+
+#[test]
+fn stash_abort_refuses_an_externally_changed_head_without_resetting_files_or_index() {
+    let (f, stash) = stash_fixture(true);
+    assert!(
+        execute(f.root(), Request::ApplyStash(stash))
+            .result
+            .is_err()
+    );
+    let other = f.git(&["rev-parse", "HEAD~1"]);
+    f.git(&["update-ref", "refs/heads/main", &other]);
+    let index = fs::read(f.root().join(".git/index")).unwrap();
+    let contents = fs::read(f.root().join("file.txt")).unwrap();
+    let error = execute(f.root(), Request::Abort).result.unwrap_err();
+    assert!(
+        error.contains("HEAD changed outside the stash apply"),
+        "{error}"
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), other);
+    assert_eq!(fs::read(f.root().join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), contents);
+    assert!(f.root().join(".git/rustle-operations/stash-apply").exists());
+}
+
+#[test]
+fn stash_abort_fails_closed_for_missing_or_non_commit_detached_head() {
+    for missing in [false, true] {
+        let (f, stash) = stash_fixture(true);
+        assert!(
+            execute(f.root(), Request::ApplyStash(stash))
+                .result
+                .is_err()
+        );
+        let invalid = if missing {
+            "1111111111111111111111111111111111111111".to_string()
+        } else {
+            f.git(&["hash-object", "-w", "file.txt"])
+        };
+        let head = format!("{invalid}\n");
+        f.write(".git/HEAD", &head);
+        let index = fs::read(f.root().join(".git/index")).unwrap();
+        let contents = fs::read(f.root().join("file.txt")).unwrap();
+        assert!(execute(f.root(), Request::Abort).result.is_err());
+        assert_eq!(
+            fs::read_to_string(f.root().join(".git/HEAD")).unwrap(),
+            head
+        );
+        assert_eq!(fs::read(f.root().join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), contents);
+        assert!(f.root().join(".git/rustle-operations/stash-apply").exists());
+    }
+}
+
+#[test]
+fn stash_abort_rejects_malformed_commit_payload_at_the_checkpoint_head_id() {
+    let (f, stash) = stash_fixture(true);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    assert!(
+        execute(f.root(), Request::ApplyStash(stash))
+            .result
+            .is_err()
+    );
+    let malformed = command::run(
+        f.root(),
+        &[
+            "hash-object",
+            "--literally",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+        ],
+        Some(b"malformed commit body\n"),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(malformed.status.success());
+    let malformed = std::str::from_utf8(&malformed.stdout).unwrap().trim();
+    let object = |id: &str| f.root().join(".git/objects").join(&id[..2]).join(&id[2..]);
+    let destination = object(&head);
+    // Corrupt only this disposable fixture's loose object while keeping HEAD's
+    // exact ID unchanged, so an ID-only comparison cannot detect the problem.
+    #[cfg(windows)]
+    {
+        let mut permissions = fs::metadata(&destination).unwrap().permissions();
+        // Windows read-only flag only; the Unix case below sets an owner-only mode.
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&destination, permissions).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::copy(object(malformed), destination).unwrap();
+    let index = fs::read(f.root().join(".git/index")).unwrap();
+    let contents = fs::read(f.root().join("file.txt")).unwrap();
+    let head_ref = fs::read(f.root().join(".git/HEAD")).unwrap();
+    assert!(execute(f.root(), Request::Abort).result.is_err());
+    assert_eq!(fs::read(f.root().join(".git/HEAD")).unwrap(), head_ref);
+    assert_eq!(fs::read(f.root().join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), contents);
+    assert!(f.root().join(".git/rustle-operations/stash-apply").exists());
+}
+
+#[test]
 fn stash_apply_refuses_dirty_tree_without_changing_it() {
     let (f, stash) = stash_fixture(false);
     f.write("file.txt", "local edits\n");
@@ -965,6 +1105,7 @@ fn resolution_editor_rejects_stale_content_and_preserves_manual_result() {
             f.root(),
             Request::SaveConflict {
                 path: "file.txt".into(),
+                identity: read.identity,
                 original: read.original.unwrap(),
                 edited: "overwrite".into()
             }
@@ -978,11 +1119,466 @@ fn resolution_editor_rejects_stale_content_and_preserves_manual_result() {
         .unwrap();
     f.run(Request::SaveConflict {
         path: "file.txt".into(),
+        identity: read.identity,
         original: read.original.unwrap(),
         edited: "combined\n".into(),
     });
     f.run(Request::Continue);
     assert_eq!(f.git(&["show", "HEAD:file.txt"]), "combined");
+}
+
+#[test]
+fn conflict_merge_metadata_and_automatic_file_refresh_do_not_stage_or_write_the_journal() {
+    let f = Fixture::new();
+    f.conflict();
+    let main = f.git(&["rev-parse", "main"]);
+    let topic = f.git(&["rev-parse", "topic"]);
+    let view = execute(f.root(), Request::Merge("topic".into())).view;
+    let conflict = view.conflict.unwrap();
+    assert_eq!(conflict.local[0].id.to_string(), main);
+    assert_eq!(conflict.incoming[0].id.to_string(), topic);
+    assert_eq!(conflict.local[0].subject, "main");
+    assert_eq!(conflict.incoming[0].author_name, "Rustle Test");
+    assert!(!conflict.incoming[0].parents.is_empty());
+    assert!(conflict.metadata_error.is_none());
+    assert!(conflict.states[0].exists && conflict.states[0].unmerged);
+    let journal_path = f.root().join(".git/rustle-operations/journal.json");
+    let journal = fs::read(&journal_path).unwrap();
+    let index = fs::read(f.root().join(".git/index")).unwrap();
+    assert!(matches!(
+        conflicts::refresh(f.root(), &conflict).unwrap(),
+        conflicts::Refresh::Unchanged
+    ));
+    f.write("file.txt", "manually resolved without staging\n");
+    let conflicts::Refresh::Changed(Some(changed)) =
+        conflicts::refresh(f.root(), &conflict).unwrap()
+    else {
+        panic!("file edit must refresh")
+    };
+    assert_eq!(changed.identity, conflict.identity);
+    assert_eq!(changed.files, ["file.txt"]);
+    assert!(changed.states[0].edited && changed.states[0].unmerged);
+    assert_eq!(fs::read(&journal_path).unwrap(), journal);
+    assert_eq!(fs::read(f.root().join(".git/index")).unwrap(), index);
+    f.git(&["add", "file.txt"]);
+    let conflicts::Refresh::Changed(Some(staged)) = conflicts::refresh(f.root(), &changed).unwrap()
+    else {
+        panic!("index edit must refresh")
+    };
+    assert!(staged.files.is_empty());
+    assert_eq!(staged.states.len(), 1);
+    assert!(!staged.states[0].unmerged);
+    assert!(matches!(
+        conflicts::refresh(f.root(), &staged).unwrap(),
+        conflicts::Refresh::Unchanged
+    ));
+    f.git(&["merge", "--abort"]);
+    assert!(matches!(
+        conflicts::refresh(f.root(), &staged).unwrap(),
+        conflicts::Refresh::Changed(None)
+    ));
+}
+
+#[test]
+fn conflict_rebase_and_stash_summaries_describe_actual_index_sides() {
+    let f = Fixture::new();
+    f.conflict();
+    let local = f.git(&["rev-parse", "main"]);
+    let incoming = f.git(&["rev-parse", "topic"]);
+    let conflict = execute(f.root(), Request::Rebase("topic".into()))
+        .view
+        .conflict
+        .unwrap();
+    assert_eq!(conflict.kind, "Rebase");
+    assert_eq!(conflict.local[0].id.to_string(), local);
+    assert_eq!(conflict.incoming[0].id.to_string(), incoming);
+    assert!(conflict.local_label.contains("replayed"));
+    assert!(conflict.incoming_label.contains("base"));
+    let preview = conflicts::read_preview(f.root(), "file.txt", &conflict.identity).unwrap();
+    assert_eq!(preview.ours, "topic\n");
+    assert_eq!(preview.theirs, "main\n");
+    assert_eq!(preview.identity, conflict.identity);
+    f.run(Request::Abort);
+    let (f, stash) = stash_fixture(true);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let conflict = execute(f.root(), Request::ApplyStash(stash.clone()))
+        .view
+        .conflict
+        .unwrap();
+    assert_eq!(conflict.kind, "Stash apply");
+    assert_eq!(conflict.incoming[0].id.to_string(), stash.oid);
+    assert_eq!(conflict.local[0].id.to_string(), head);
+    assert!(conflict.incoming_label.contains("Stashed"));
+    let preview = conflicts::read_preview(f.root(), "file.txt", &conflict.identity).unwrap();
+    assert_eq!(preview.ours, "new committed contents\n");
+    assert_eq!(preview.theirs, "stashed contents\n");
+}
+
+#[test]
+fn conflict_operation_identity_rejects_stale_editor_even_when_file_bytes_match() {
+    let f = Fixture::new();
+    f.conflict();
+    execute(f.root(), Request::Merge("topic".into()));
+    let preview = f
+        .run(Request::ReadConflict("file.txt".into()))
+        .preview
+        .unwrap();
+    let original = preview.original.unwrap();
+    // Preserve the displayed bytes while substituting a different operation's
+    // incoming commit; a text-only stale guard would accept the old editor.
+    let old = f.git(&["rev-parse", "topic~1"]);
+    f.write(".git/MERGE_HEAD", &format!("{old}\n"));
+    let error = execute(
+        f.root(),
+        Request::SaveConflict {
+            path: "file.txt".into(),
+            identity: preview.identity.clone(),
+            original: original.clone(),
+            edited: "wrong context\n".into(),
+        },
+    )
+    .result
+    .unwrap_err();
+    assert!(error.contains("operation changed"), "{error}");
+    assert_eq!(
+        fs::read_to_string(f.root().join("file.txt")).unwrap(),
+        original
+    );
+    assert!(!f.git(&["ls-files", "-u"]).is_empty());
+    assert!(conflicts::read_preview(f.root(), "file.txt", &preview.identity).is_err());
+}
+
+#[test]
+fn conflict_binary_and_deletion_states_remain_safe_whole_side_resolutions() {
+    let f = Fixture::new();
+    f.git(&["switch", "-c", "topic"]);
+    fs::write(f.root().join("file.txt"), b"topic\0bytes").unwrap();
+    f.commit("binary topic");
+    f.git(&["switch", "main"]);
+    fs::write(f.root().join("file.txt"), b"local\0bytes").unwrap();
+    f.commit("binary local");
+    let conflict = execute(f.root(), Request::Merge("topic".into()))
+        .view
+        .conflict
+        .unwrap();
+    assert!(conflict.states[0].exists && conflict.states[0].unmerged);
+    let preview = conflicts::read_preview(f.root(), "file.txt", &conflict.identity).unwrap();
+    assert!(preview.original.is_none());
+    assert!(preview.ours.contains("Binary"));
+    f.run(Request::Resolve {
+        path: "file.txt".into(),
+        choice: Resolution::Theirs,
+    });
+    assert_eq!(
+        fs::read(f.root().join("file.txt")).unwrap(),
+        b"topic\0bytes"
+    );
+    let current = f.run(Request::Inspect).conflict.unwrap();
+    assert!(current.files.is_empty());
+    assert!(!current.states[0].unmerged);
+}
+
+#[test]
+fn large_conflict_worktree_file_stays_unmerged_and_supports_bounded_selected_preview() {
+    let f = Fixture::new();
+    f.conflict();
+    assert!(
+        !command::run(
+            f.root(),
+            &["merge", "--no-edit", "topic"],
+            None,
+            Duration::from_secs(30)
+        )
+        .unwrap()
+        .status
+        .success()
+    );
+    let large = vec![b'x'; 3 * 1024 * 1024];
+    fs::write(f.root().join("file.txt"), &large).unwrap();
+    let context = Context::new(f.root()).unwrap();
+    let conflict = conflicts::read(&context, None).unwrap().unwrap();
+    assert_eq!(conflict.files, ["file.txt"]);
+    assert!(conflict.states[0].exists && conflict.states[0].unmerged);
+    let preview = conflicts::read_preview(f.root(), "file.txt", &conflict.identity).unwrap();
+    assert!(
+        preview.original.is_none(),
+        "large working text must not enter the editor"
+    );
+    assert_eq!(preview.ours, "main\n");
+    assert_eq!(preview.theirs, "topic\n");
+    assert!(
+        execute(
+            f.root(),
+            Request::SaveConflict {
+                path: "file.txt".into(),
+                identity: conflict.identity,
+                original: String::new(),
+                edited: "accidental overwrite\n".into(),
+            }
+        )
+        .result
+        .is_err()
+    );
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), large);
+    assert!(!f.git(&["ls-files", "-u"]).is_empty());
+    f.run(Request::Resolve {
+        path: "file.txt".into(),
+        choice: Resolution::Theirs,
+    });
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"topic\n");
+    assert!(f.git(&["ls-files", "-u"]).is_empty());
+}
+
+#[test]
+fn conflict_cherry_pick_and_revert_summaries_identify_the_requested_change() {
+    for revert in [false, true] {
+        let f = Fixture::new();
+        f.conflict();
+        let target = if revert {
+            let id = f.git(&["rev-parse", "HEAD"]);
+            f.write("file.txt", "later local contents\n");
+            f.commit("later local");
+            id
+        } else {
+            f.git(&["rev-parse", "topic"])
+        };
+        let verb = if revert { "revert" } else { "cherry-pick" };
+        assert!(
+            !command::run(
+                f.root(),
+                &[verb, "--no-edit", &target],
+                None,
+                Duration::from_secs(30)
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        let conflict = f.run(Request::Inspect).conflict.unwrap();
+        assert_eq!(conflict.kind, if revert { "Revert" } else { "Cherry-pick" });
+        assert_eq!(conflict.incoming[0].id.to_string(), target);
+        assert_eq!(
+            conflict.local[0].id.to_string(),
+            f.git(&["rev-parse", "HEAD"])
+        );
+        assert!(
+            conflict
+                .incoming_label
+                .contains(if revert { "inverse" } else { "cherry-picked" })
+        );
+        let preview = conflicts::read_preview(f.root(), "file.txt", &conflict.identity).unwrap();
+        assert_eq!(preview.theirs, if revert { "base\n" } else { "topic\n" });
+    }
+}
+
+#[test]
+fn conflict_commit_ranges_are_capped_and_report_truncation() {
+    let f = Fixture::new();
+    let base = f.git(&["rev-parse", "HEAD"]);
+    let mut input = String::new();
+    // Deliberately older than the base commit: plain rev-list date pruning can
+    // otherwise misclassify that shared ancestor as a local-only commit.
+    for n in 1..=105 {
+        let subject = format!("incoming {n:03}\n");
+        input += &format!(
+            "commit refs/heads/topic\nmark :{n}\nauthor Rustle Test <test@example.invalid> 1700000000 +0000\ncommitter Rustle Test <test@example.invalid> 1700000000 +0000\ndata {}\n{subject}from {}\n\n",
+            subject.len(),
+            if n == 1 {
+                base.clone()
+            } else {
+                format!(":{}", n - 1)
+            }
+        );
+    }
+    let imported = command::run(
+        f.root(),
+        &["fast-import", "--quiet"],
+        Some(input.as_bytes()),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    // A stopped merge can have staged resolutions and therefore no unmerged
+    // index entries; the operation marker still supplies its bounded ranges.
+    let topic = f.git(&["rev-parse", "topic"]);
+    f.write(".git/MERGE_HEAD", &format!("{topic}\n"));
+    let conflict = f.run(Request::Inspect).conflict.unwrap();
+    assert!(
+        conflict.metadata_error.is_none(),
+        "{:?}",
+        conflict.metadata_error
+    );
+    assert_eq!(conflict.incoming.len(), 100);
+    assert!(conflict.commits_truncated);
+    assert!(conflict.local.is_empty());
+    assert_eq!(conflict.incoming[0].subject, "incoming 105");
+}
+
+#[test]
+fn frozen_conflict_actions_reject_replaced_operation_without_touching_repository_or_journal() {
+    let f = Fixture::new();
+    f.conflict();
+    let conflict = execute(f.root(), Request::Merge("topic".into()))
+        .view
+        .conflict
+        .unwrap();
+    let base = f.git(&["rev-parse", "topic~1"]);
+    f.write(".git/MERGE_HEAD", &format!("{base}\n"));
+    let journal_path = f.root().join(".git/rustle-operations/journal.json");
+    let journal = fs::read(&journal_path).unwrap();
+    let journal_mtime = fs::metadata(&journal_path).unwrap().modified().unwrap();
+    let index = fs::read(f.root().join(".git/index")).unwrap();
+    let bytes = fs::read(f.root().join("file.txt")).unwrap();
+    let head = f.git(&["rev-parse", "HEAD"]);
+    for request in [
+        Request::Resolve {
+            path: "file.txt".into(),
+            choice: Resolution::Ours,
+        },
+        Request::Resolve {
+            path: "file.txt".into(),
+            choice: Resolution::Theirs,
+        },
+        Request::Resolve {
+            path: "file.txt".into(),
+            choice: Resolution::Mark,
+        },
+        Request::Abort,
+        Request::Continue,
+        Request::Skip,
+    ] {
+        let outcome = execute(
+            f.root(),
+            Request::OnConflict {
+                identity: conflict.identity.clone(),
+                request: Box::new(request),
+            },
+        );
+        assert!(
+            outcome
+                .view
+                .conflict
+                .as_ref()
+                .is_some_and(|current| current.identity != conflict.identity)
+        );
+        let error = outcome.result.unwrap_err();
+        assert!(error.contains("operation changed"), "{error}");
+        assert_eq!(fs::read(f.root().join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), bytes);
+        assert_eq!(fs::read(&journal_path).unwrap(), journal);
+        assert_eq!(
+            fs::metadata(&journal_path).unwrap().modified().unwrap(),
+            journal_mtime
+        );
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+    }
+}
+
+#[test]
+fn frozen_conflict_identity_changes_when_same_merge_pair_is_aborted_and_restarted() {
+    let f = Fixture::new();
+    f.conflict();
+    let old = execute(f.root(), Request::Merge("topic".into()))
+        .view
+        .conflict
+        .unwrap();
+    f.git(&["merge", "--abort"]);
+    assert!(
+        !command::run(
+            f.root(),
+            &["merge", "--no-edit", "topic"],
+            None,
+            Duration::from_secs(30)
+        )
+        .unwrap()
+        .status
+        .success()
+    );
+    let context = Context::new(f.root()).unwrap();
+    let current = conflicts::read(&context, None).unwrap().unwrap();
+    assert_ne!(old.identity, current.identity);
+    let error = execute(
+        f.root(),
+        Request::OnConflict {
+            identity: old.identity,
+            request: Box::new(Request::Abort),
+        },
+    )
+    .result
+    .unwrap_err();
+    assert!(error.contains("operation changed"), "{error}");
+    assert!(f.root().join(".git/MERGE_HEAD").exists());
+    // Supported actions still dispatch when their reviewed context matches.
+    f.run(Request::OnConflict {
+        identity: current.identity,
+        request: Box::new(Request::Resolve {
+            path: "file.txt".into(),
+            choice: Resolution::Theirs,
+        }),
+    });
+    assert!(f.git(&["ls-files", "-u"]).is_empty());
+}
+
+#[test]
+#[ignore = "explicit conflict metadata and automatic refresh worker measurement"]
+fn benchmark_conflict_refresh() {
+    use std::time::Instant;
+    for sample in -1..15 {
+        let f = Fixture::new();
+        f.conflict();
+        // Produce the stopped Git operation without pre-populating metadata.
+        assert!(
+            !command::run(
+                f.root(),
+                &["merge", "--no-edit", "topic"],
+                None,
+                Duration::from_secs(30)
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        let context = Context::new(f.root()).unwrap();
+        let start = Instant::now();
+        let conflict = conflicts::read(&context, None).unwrap().unwrap();
+        let metadata_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert!(conflict.metadata_error.is_none());
+        assert_eq!(conflict.local.len(), 1);
+        assert_eq!(conflict.incoming.len(), 1);
+        let start = Instant::now();
+        for _ in 0..20 {
+            assert!(matches!(
+                conflicts::refresh(f.root(), &conflict).unwrap(),
+                conflicts::Refresh::Unchanged
+            ));
+        }
+        let idle_20_ms = start.elapsed().as_secs_f64() * 1000.;
+        f.write("file.txt", "external resolution\n");
+        let start = Instant::now();
+        let conflicts::Refresh::Changed(Some(changed)) =
+            conflicts::refresh(f.root(), &conflict).unwrap()
+        else {
+            panic!("edit missing")
+        };
+        let changed_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert!(changed.states[0].edited && changed.states[0].unmerged);
+        assert_eq!(changed.files, ["file.txt"]);
+        let start = Instant::now();
+        let preview = conflicts::read_preview(f.root(), "file.txt", &changed.identity).unwrap();
+        let preview_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert_eq!(preview.original.as_deref(), Some("external resolution\n"));
+        assert!(!f.git(&["ls-files", "-u"]).is_empty());
+        if sample >= 0 {
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"metadata_ms":metadata_ms,"idle_20_ms":idle_20_ms,"changed_ms":changed_ms,"preview_ms":preview_ms})
+            );
+        }
+    }
 }
 
 #[test]
@@ -1147,10 +1743,20 @@ fn rebase_skip_and_modify_delete_resolution() {
     f.git(&["switch", "main"]);
     let out = execute(f.root(), Request::Merge("deleted".into()));
     assert!(out.view.conflict.is_some());
-    f.run(Request::Resolve {
-        path: "file.txt".into(),
-        choice: Resolution::Theirs,
-    });
+    let resolved = f
+        .run(Request::Resolve {
+            path: "file.txt".into(),
+            choice: Resolution::Theirs,
+        })
+        .conflict
+        .unwrap();
+    assert!(resolved.files.is_empty());
+    assert!(
+        resolved
+            .states
+            .iter()
+            .any(|state| state.path == "file.txt" && !state.exists && !state.unmerged)
+    );
     f.run(Request::Continue);
     assert!(!f.root().join("file.txt").exists());
 }

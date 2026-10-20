@@ -83,6 +83,8 @@ pub struct App {
     pub scroll: usize,
     pub focus: Focus,
     pub details: Option<CommitDetails>,
+    /// A workflow inspector can inspect a commit outside the graph's loaded range.
+    inspection: Option<(ObjectId, Option<ObjectId>)>,
     pub details_scroll: usize,
     pub details_lines: usize,
 
@@ -141,6 +143,7 @@ impl App {
             scroll: 0,
             focus: Focus::List,
             details: None,
+            inspection: None,
             details_scroll: 0,
             details_lines: 0,
             right_width: 0,
@@ -167,6 +170,25 @@ impl App {
             return None;
         }
         self.history.commits.get(self.selected).map(|c| c.id)
+    }
+
+    pub fn inspected_id(&self) -> Option<ObjectId> {
+        self.inspection.map(|(id, _)| id)
+    }
+
+    pub fn details_id(&self) -> Option<ObjectId> {
+        self.inspected_id().or_else(|| self.selected_id())
+    }
+
+    pub fn inspect_commit(&mut self, target: Option<(ObjectId, Option<ObjectId>)>) {
+        if self.inspection == target {
+            return;
+        }
+        self.inspection = target;
+        self.details = None;
+        self.details_changes = None;
+        self.sync_details_changes();
+        self.needs_redraw = true;
     }
 
     pub fn clear_search(&mut self) {
@@ -540,6 +562,11 @@ impl App {
 
     /// First parent of a commit in the loaded history.
     pub fn parent_of(&self, id: &ObjectId) -> Option<ObjectId> {
+        if let Some((inspected, parent)) = self.inspection
+            && inspected == *id
+        {
+            return parent;
+        }
         let i = self.history.index_of(id)?;
         self.history.parents(i).first().copied()
     }
@@ -598,7 +625,7 @@ impl App {
 
     /// Keep `details_changes` pointed at the selected commit.
     pub fn sync_details_changes(&mut self) {
-        if self.pending.selected {
+        if self.inspection.is_none() && self.pending.selected {
             if matches!(self.mode, Mode::Diff(_)) {
                 return;
             }
@@ -611,7 +638,7 @@ impl App {
             }
             return;
         }
-        let Some(id) = self.selected_id() else { return };
+        let Some(id) = self.details_id() else { return };
         if self.details_changes.as_ref().map(|c| c.new) == Some(id) {
             return;
         }
@@ -634,7 +661,11 @@ impl App {
             .parked_diff
             .as_mut()
             .map_or_else(Vec::new, |v| v.pending());
-        if matches!(self.mode, Mode::Graph) && self.search.active() && self.graph_len() == 0 {
+        if self.inspection.is_none()
+            && matches!(self.mode, Mode::Graph)
+            && self.search.active()
+            && self.graph_len() == 0
+        {
             return requests;
         }
         requests.extend(match &mut self.mode {
@@ -652,7 +683,11 @@ impl App {
 
     /// The change set currently on screen (view or details panel).
     pub fn active_changes_mut(&mut self) -> Option<&mut ChangeSet> {
-        if matches!(self.mode, Mode::Graph) && self.search.active() && self.graph_len() == 0 {
+        if self.inspection.is_none()
+            && matches!(self.mode, Mode::Graph)
+            && self.search.active()
+            && self.graph_len() == 0
+        {
             return None;
         }
         match &mut self.mode {
@@ -679,6 +714,10 @@ impl App {
     /// `d`: diff the two marked commits (older on the left), or with fewer
     /// marks the marked/selected commit against its parent.
     pub fn open_diff(&mut self) {
+        if let Some(id) = self.inspected_id() {
+            self.open_parent_diff(id);
+            return;
+        }
         if self.pending.selected {
             self.sync_details_changes();
             self.remember_pending_checks();

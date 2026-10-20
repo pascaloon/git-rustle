@@ -18,6 +18,9 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod commit_row;
+mod conflicts;
+mod conflicts_bench;
 mod external_tools;
 mod filter_bench;
 mod general_bench;
@@ -176,6 +179,7 @@ struct Desktop {
     graph_hover: hover::State,
     todo_bench: todo_bench::State,
     ghost_checkout_bench: ghost_checkout_bench::State,
+    conflicts_bench: conflicts_bench::State,
     picking_directory: bool,
     opening_directory: bool,
     engine: Engine,
@@ -784,6 +788,7 @@ impl Desktop {
                                 }
                                 Some("general-settings" | "general-tabs") => v.general_scenario_start(window, cx),
                                 Some("ghost-checkout-existing" | "ghost-checkout-new") => v.ghost_checkout_start(cx),
+                                Some("conflicts-merge" | "conflicts-rebase" | "conflicts-stash" | "conflicts-abort") => v.conflicts_start(cx),
                                 Some("filter-visuals") => v.filter_scenario_start(window, cx),
                                 Some("todo-graph" | "branch-sort" | "graph-hover" | "stash-panel" | "stash-apply" | "stash-delete" | "external-tools" | "ref-storage") => v.todo_scenario_start(window, cx),
                                 Some("toolbar-counts") => v.toolbar_scenario_start(window, cx),
@@ -1055,6 +1060,7 @@ impl Desktop {
             graph_hover: Default::default(),
             todo_bench: Default::default(),
             ghost_checkout_bench: Default::default(),
+            conflicts_bench: Default::default(),
             picking_directory: false,
             opening_directory: false,
             engine,
@@ -1114,6 +1120,9 @@ impl Desktop {
         }
     }
     fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operations.tab != Some(Tab::Conflicts) {
+            self.engine.app.inspect_commit(None);
+        }
         self.sync_request_repository();
         let app = &self.engine.app;
         if app.pending.description.value != self.draft_text {
@@ -1157,7 +1166,7 @@ impl Desktop {
         let details = app
             .details
             .as_ref()
-            .filter(|d| Some(d.id) == app.selected_id());
+            .filter(|d| Some(d.id) == app.details_id());
         let id = details.map(|d| d.id);
         if id != self.detail_id {
             self.detail_id = id;
@@ -1180,6 +1189,9 @@ impl Desktop {
         self.diff_path.update(cx, |s, cx| s.set(path, "", cx));
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.operations.tab != Some(Tab::Conflicts) {
+            self.engine.app.inspect_commit(None);
+        }
         self.engine.app.needs_redraw = true;
         self.engine.tick(None);
         cx.notify();
@@ -1508,7 +1520,7 @@ impl Desktop {
             }
             Action::Commit => app.request_commit(),
             Action::CopySha1 => {
-                if let Some(id) = app.selected_id() {
+                if let Some(id) = app.details_id() {
                     cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
                 }
             }
@@ -1541,6 +1553,7 @@ impl Desktop {
                         }
                         if let Some(v) = app.diff_view_mut() {
                             v.show(Some(file));
+                            self.operations.tab = None;
                         }
                         self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
                     }
@@ -2004,17 +2017,7 @@ impl Desktop {
                                     v.selected_commits
                                         .contains(app.history.commits[i].id, app.selected_id())
                                 });
-                        let mut r = row()
-                            .id(("commit", row_index))
-                            .w_full()
-                            .h(px(32.))
-                            .px_2()
-                            // Keep dates clear of the 16px overlay scrollbar, even on hover.
-                            .pr(px(24.))
-                            .gap_2()
-                            .bg(rgb(if selected { SELECTED } else { BG }))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
+                        let mut r = Self::commit_row_shell(("commit", row_index), selected, false)
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
@@ -2081,145 +2084,40 @@ impl Desktop {
                                 rec.node_lane as usize
                             };
                             let hovered = v.graph_hover.row(row_index);
-                            r = r
-                                .child(
-                                    div()
-                                        .relative()
-                                        .w(px(graph_width))
-                                        .h_full()
-                                        .flex_shrink_0()
-                                        .child(graph_canvas(cells, flags, hovered, graph_width))
-                                        .when(node_lane as f32 * 14. < graph_width, |graph| {
-                                            graph.child(
-                                                div()
-                                                    .id(("commit-node-hover", row_index))
-                                                    .absolute()
-                                                    .left(px(node_lane as f32 * 14. - 1.))
-                                                    .top(px(8.))
-                                                    .size(px(16.))
-                                                    .on_hover(cx.listener(
-                                                        move |v, entered: &bool, _, cx| {
-                                                            v.hover_commit(row_index, *entered, cx);
-                                                        },
-                                                    )),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(76.))
-                                        .font_family("Cascadia Mono")
-                                        .flex_shrink_0()
-                                        .text_color(rgb(if ghost { MUTED } else { ACCENT }))
-                                        .child(
-                                            v.matches.styled(rec.id.to_hex_with_len(8).to_string()),
-                                        ),
-                                );
-                            if app.head_id() == Some(rec.id) {
-                                r = r.child(
-                                    row()
-                                        .id(("head-badge", row_index))
-                                        .relative()
-                                        .h(px(22.))
-                                        .gap_1()
-                                        .px_2()
-                                        .rounded_full()
-                                        .flex_shrink_0()
-                                        .bg(rgb(ACCENT))
-                                        .text_color(rgb(BG))
-                                        .text_size(px(12.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .children(v.filter_head_probe())
-                                        .child(icon("head").size(px(14.)).text_color(rgb(BG)))
-                                        .child("HEAD")
-                                        .tooltip(|window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(
-                                                "Current checkout (HEAD)",
-                                            )
-                                            .build(window, cx)
-                                        }),
-                                );
-                            }
-                            if let Some(labels) = app.labels.get(&rec.id) {
-                                for (label_index, label) in labels
-                                    .iter()
-                                    .filter(|label| label.name != "HEAD")
-                                    .take(3)
-                                    .enumerate()
-                                {
-                                    let remote = label.kind == crate::git::RefKind::Remote;
-                                    let color = if remote { REMOTE_TEXT } else { SEARCH_TEXT };
-                                    r = r
-                                        .child(
-                                            row()
-                                                .id(("ref-badge", label_index))
-                                                .tooltip({
-                                                    let name = label.name.clone();
-                                                    move |w, cx| {
-                                                        gpui_component::tooltip::Tooltip::new(
-                                                            name.clone(),
-                                                        )
-                                                        .build(w, cx)
-                                                    }
-                                                })
-                                                .gap_1()
-                                                .rounded_sm()
-                                                .px_1()
-                                                .flex_shrink_0()
-                                                .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
-                                                .text_color(rgb(color))
-                                                .max_w(px(170.))
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .when(label.remote_only, |badge| {
-                                                    badge.child(
-                                                        icon("cloud")
-                                                            .size(px(14.))
-                                                            .text_color(rgb(color)),
-                                                    )
-                                                })
-                                                .child(v.matches.styled(label.name.clone())),
+                            r = r.child(
+                                div()
+                                    .relative()
+                                    .w(px(graph_width))
+                                    .h_full()
+                                    .flex_shrink_0()
+                                    .child(graph_canvas(cells, flags, hovered, graph_width))
+                                    .when(node_lane as f32 * 14. < graph_width, |graph| {
+                                        graph.child(
+                                            div()
+                                                .id(("commit-node-hover", row_index))
+                                                .absolute()
+                                                .left(px(node_lane as f32 * 14. - 1.))
+                                                .top(px(8.))
+                                                .size(px(16.))
+                                                .on_hover(cx.listener(
+                                                    move |v, entered: &bool, _, cx| {
+                                                        v.hover_commit(row_index, *entered, cx);
+                                                    },
+                                                )),
                                         )
-                                        .children(v.provider_badge(label.kind, &label.name, cx));
-                                }
-                            }
-                            r = r
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_color(rgb(if ghost { MUTED } else { TEXT }))
-                                        .child(v.matches.styled(app.history.subject(i).to_owned())),
-                                )
-                                .child(
-                                    row()
-                                        .w(px(150.))
-                                        .flex_shrink_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_color(rgb(MUTED))
-                                        .child(requests::avatar(
-                                            v.avatars
-                                                .image(&rec.id)
-                                                .or(v.avatars.scenario_image.as_ref()),
-                                            app.history.author(i),
-                                            22.,
-                                        ))
-                                        .child(v.matches.styled(app.history.author(i).to_owned())),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(62.))
-                                        .flex_shrink_0()
-                                        .text_right()
-                                        .text_size(px(12.))
-                                        .text_color(rgb(MUTED))
-                                        .child(crate::ui::time::format_relative(
-                                            rec.commit_time,
-                                            crate::ui::time::now_unix(),
-                                        )),
-                                );
+                                    }),
+                            );
+                            r = v.commit_row_contents(
+                                r,
+                                rec.id,
+                                ghost,
+                                app.history.subject(i),
+                                app.history.author(i),
+                                rec.commit_time,
+                                row_index,
+                                false,
+                                cx,
+                            );
                         } else {
                             let head = app
                                 .pending
@@ -2567,6 +2465,9 @@ impl Desktop {
             })
     }
     fn details(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.details_panel(false, cx)
+    }
+    fn details_panel(&self, workflow: bool, cx: &mut Context<Self>) -> AnyElement {
         let app = &self.engine.app;
         let mut panel = column()
             .w(px(self.pane_width))
@@ -2574,8 +2475,10 @@ impl Desktop {
             .h_full()
             .bg(rgb(BG))
             .border_l_1()
-            .border_color(rgb(INSPECTOR_LINE));
-        if app.pending.selected {
+            .border_color(rgb(INSPECTOR_LINE))
+            .relative()
+            .children(workflow.then(|| self.conflicts_probe(7)).flatten());
+        if !workflow && app.pending.selected {
             panel = panel.child(
                 column()
                     .p_4()
@@ -2652,7 +2555,7 @@ impl Desktop {
                                 .px_4()
                                 .py_3()
                                 .when(self.detail_id.is_none(), |s| {
-                                    s.child(caption(if app.selected_id().is_some() {
+                                    s.child(caption(if app.details_id().is_some() {
                                         "Loading commit details…"
                                     } else {
                                         "Select a commit to inspect its details"
@@ -3292,6 +3195,9 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if let Some(ready) = self.conflicts_ready() {
+            return ready;
+        }
         if let Some(ready) = self.ghost_checkout_ready() {
             return ready;
         }
@@ -3429,7 +3335,7 @@ impl Desktop {
                 .as_ref()
                 .map_or(0, |c| c.files.len()),
             format_args!(
-                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "footer_panel={:?}\nupdate_available={} update_dialog={}\n{}\n{}\n{}\n{}\nimage_cache_bytes={} image_cache_images={} image_cache_busy={} image_cache_cleared={}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 self.status_panel,
                 self.updates.available.is_some(),
                 self.updates.open,
@@ -3447,6 +3353,7 @@ impl Desktop {
                 self.general_scenario_summary(),
                 self.todo_scenario_summary(),
                 self.ghost_checkout_summary(),
+                self.conflicts_summary(),
             ),
         )
     }
@@ -3510,6 +3417,7 @@ impl Render for Desktop {
         self.general_scenario_schedule(window, cx);
         self.todo_scenario_schedule(window, cx);
         self.ghost_checkout_schedule(window, cx);
+        self.conflicts_schedule(window, cx);
         let app = &self.engine.app;
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
@@ -3662,6 +3570,7 @@ impl Render for Desktop {
                     v.general_scenario_assert();
                     v.todo_scenario_assert();
                     v.ghost_checkout_assert();
+                    v.conflicts_assert();
                     if matches!(v.scenario.as_deref(), Some("tag-dialog" | "tag-create")) {
                         v.tag_scenario_assert(v.scenario.as_deref() == Some("tag-create"));
                     }

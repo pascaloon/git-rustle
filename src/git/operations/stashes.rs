@@ -85,7 +85,18 @@ pub(super) fn unresolved(context: &Context) -> Result<Vec<String>> {
 
 pub(super) fn finish(context: &Context, pending: &Pending, abort: bool) -> Result<()> {
     if abort {
-        if revision(&context.root, "HEAD")? != pending.before.head {
+        // A fresh handle observes externally changed symbolic/packed or
+        // detached HEAD. Native peeling retains HEAD^{commit} semantics while
+        // avoiding a subprocess on the common files reference backend.
+        let repo = super::super::open(&context.root).map_err(err)?;
+        let head = if super::super::refs::is_reftable(&repo) {
+            revision(&context.root, "HEAD")?
+        } else {
+            let commit = repo.head_commit().map_err(err)?;
+            commit.decode().map_err(err)?;
+            commit.id.to_string()
+        };
+        if head != pending.before.head {
             return Err("HEAD changed outside the stash apply. Restore it before aborting.".into());
         }
         // Git's merge reset refuses overlapping edits; no hard-reset fallback.
