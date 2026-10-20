@@ -259,7 +259,16 @@ fn executable_key(path: &Path) -> String {
     parts.join("\\")
 }
 fn same_application(a: &Entry, b: &Entry) -> bool {
-    same_executable(&a.executable, &b.executable)
+    if same_executable(&a.executable, &b.executable) {
+        return true;
+    }
+    // Discovery resolves Windows short names and junctions. Resolve saved paths
+    // here in the one-time worker too, without changing custom paths/arguments
+    // or adding filesystem work to the UI's same_executable comparison.
+    match (a.executable.canonicalize(), b.executable.canonicalize()) {
+        (Ok(a), Ok(b)) => same_executable(&a, &b),
+        _ => false,
+    }
 }
 /// Compare Windows path spelling without filesystem access or changing saved paths.
 pub fn same_executable(a: &Path, b: &Path) -> bool {
@@ -941,6 +950,65 @@ mod tests {
             Path::new(r"C:\TOOLS\Code.exe"),
             Path::new(r"C:\TOOLS\Compare.exe")
         ));
+    }
+    #[test]
+    fn discovery_preserves_custom_tools_through_directory_aliases() {
+        struct Alias(PathBuf);
+        impl Drop for Alias {
+            fn drop(&mut self) {
+                #[cfg(windows)]
+                let result = fs::remove_dir(&self.0);
+                #[cfg(not(windows))]
+                let result = fs::remove_file(&self.0);
+                result.expect("remove only the fixture directory alias");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-install");
+        installation(&real);
+        let alias_path = dir.path().join("alias-install");
+        #[cfg(windows)]
+        {
+            let output = Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&alias_path)
+                .arg(&real)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction creation: {output:?}");
+        }
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(&real, &alias_path).unwrap();
+        let alias = Alias(alias_path.clone());
+        let mut customized = custom("Keep my VS Code settings");
+        customized.executable = alias_path.join("Code.exe");
+        assert!(!same_executable(
+            &customized.executable,
+            &real.join("Code.exe")
+        ));
+        let path = dir.path().join("tools.json");
+        save_at(
+            &path,
+            &Config {
+                scanned: false,
+                tools: vec![customized.clone()],
+            },
+        )
+        .unwrap();
+        let result = initialize_at(&path, || detect_in(std::slice::from_ref(&real))).unwrap();
+        assert_eq!(result.tools.len(), 2);
+        assert_eq!(result.tools[0], customized);
+        assert_eq!(result.tools[1].preset, Preset::Araxis);
+        assert_eq!(load_at(&path).unwrap(), result);
+        let other = dir.path().join("other-install");
+        installation(&other);
+        assert!(!same_application(
+            &customized,
+            &presets(other.join("Code.exe"), Preset::VsCode)
+        ));
+        drop(alias);
+        assert!(real.join("Code.exe").is_file());
+        assert!(real.join("resources/app/out/cli.js").is_file());
     }
     fn helper(merge: bool) -> Tool {
         let mut arguments = vec![
