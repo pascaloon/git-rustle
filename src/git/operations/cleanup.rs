@@ -195,7 +195,10 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
     });
     Ok(result)
 }
-fn validate_plan(context: &Context, plan: &Plan) -> Result<()> {
+// Receipts exist only after a successful atomic, expected-OID leased push.
+// Keep URL and OID in the identity so no other stale plan gains an exemption.
+type CompletedDeletes = HashSet<(String, String, String, String)>;
+fn validate_plan(context: &Context, plan: &Plan, completed: &CompletedDeletes) -> Result<()> {
     if plan.branches.is_empty() || plan.branches.len() > MAX_BATCH {
         return Err("Select 1–256 branches for a cleanup batch.".into());
     }
@@ -243,7 +246,22 @@ fn validate_plan(context: &Context, plan: &Plan) -> Result<()> {
         }
         if let Some((remote, branch)) = &candidate.tracking {
             let name = format!("{remote}/{branch}");
-            if tracking_tips.get(name.as_str()) != Some(&expected) {
+            let current = tracking_tips.get(name.as_str());
+            // Git may itself remove a tracking ref after pushing its deletion.
+            // An existing ref at another OID must still stop local deletion.
+            let removed_by_completed_push = current.is_none()
+                && plan.delete_remotes
+                && candidate.remote.as_ref().is_some_and(|copy| {
+                    copy.name == *remote
+                        && copy.branch == *branch
+                        && completed.contains(&(
+                            copy.name.clone(),
+                            copy.branch.clone(),
+                            copy.url.clone(),
+                            candidate.oid.clone(),
+                        ))
+                });
+            if current != Some(&expected) && !removed_by_completed_push {
                 return Err(format!("Tracking ref {name} changed. Analyze again."));
             }
         }
@@ -264,7 +282,11 @@ fn validate_plan(context: &Context, plan: &Plan) -> Result<()> {
     Ok(())
 }
 pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
-    validate_plan(context, plan)?;
+    apply_with_post_push(context, plan, || {})
+}
+fn apply_with_post_push(context: &Context, plan: &Plan, after_push: impl FnOnce()) -> Result<()> {
+    let mut completed = CompletedDeletes::new();
+    validate_plan(context, plan, &completed)?;
     let mut groups = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
     if plan.delete_remotes {
         for candidate in &plan.branches {
@@ -302,10 +324,16 @@ pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
             }
             command::checked(&context.root, &owned.iter().map(String::as_str).collect::<Vec<_>>())
                 .map_err(|e| format!("Remote cleanup stopped at {name}: {e}. Earlier remote groups may have completed; local branches were retained."))?;
+            completed.extend(
+                branches
+                    .iter()
+                    .map(|(branch, oid)| (name.clone(), branch.clone(), url.clone(), oid.clone())),
+            );
         }
     }
+    after_push();
     // Recheck after any network wait. Expected-OID deletions are one transaction.
-    validate_plan(context, plan).map_err(|e| {
+    validate_plan(context, plan, &completed).map_err(|e| {
         if groups.is_empty() {
             e
         } else {
@@ -576,6 +604,114 @@ mod tests {
         );
     }
     #[test]
+    fn cleanup_remote_delete_with_unmapped_tracking_ref_succeeds() {
+        let f = Fixture::new();
+        // This fetch mapping does not let push update origin/fixes/task-123.
+        f.git(&[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/unrelated:refs/remotes/origin/unrelated",
+        ]);
+        let branch = f.candidate("fixes/task-123");
+        let outcome = f.run(Plan {
+            branches: vec![branch],
+            delete_remotes: true,
+        });
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        for (root, reference) in [
+            (&f.root, "refs/heads/fixes/task-123"),
+            (&f.root, "refs/remotes/origin/fixes/task-123"),
+            (&f.bare, "refs/heads/fixes/task-123"),
+        ] {
+            assert!(command::checked(root, &["show-ref", "--verify", reference]).is_err());
+        }
+    }
+    #[test]
+    fn post_push_tracking_validation_accepts_only_exact_completed_deletion() {
+        let f = Fixture::new();
+        let branch = f.candidate("fixes/task-123");
+        let plan = Plan {
+            branches: vec![branch.clone()],
+            delete_remotes: true,
+        };
+        let context = Context::new(&f.root).unwrap();
+        let remote = branch.remote.as_ref().unwrap();
+        let reference = "refs/remotes/origin/fixes/task-123";
+        let receipt = (
+            remote.name.clone(),
+            remote.branch.clone(),
+            remote.url.clone(),
+            branch.oid.clone(),
+        );
+        let empty = CompletedDeletes::new();
+        validate_plan(&context, &plan, &empty).unwrap();
+        // Produce the receipt only after a real successful leased deletion.
+        f.git(&[
+            "push",
+            "--atomic",
+            &format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                remote.branch, branch.oid
+            ),
+            "--",
+            &remote.url,
+            &format!(":refs/heads/{}", remote.branch),
+        ]);
+        let completed = CompletedDeletes::from([receipt.clone()]);
+        // Deterministically cover both Git behaviors regardless of the host Git.
+        f.git(&["update-ref", reference, &branch.oid]);
+        validate_plan(&context, &plan, &completed).unwrap();
+        f.git(&["update-ref", "-d", reference, &branch.oid]);
+        assert!(
+            validate_plan(&context, &plan, &empty).is_err(),
+            "missing before any completed push must remain stale"
+        );
+        validate_plan(&context, &plan, &completed).unwrap();
+        for wrong in [
+            (
+                "other".into(),
+                receipt.1.clone(),
+                receipt.2.clone(),
+                receipt.3.clone(),
+            ),
+            (
+                receipt.0.clone(),
+                "other".into(),
+                receipt.2.clone(),
+                receipt.3.clone(),
+            ),
+            (
+                receipt.0.clone(),
+                receipt.1.clone(),
+                "different-url".into(),
+                receipt.3.clone(),
+            ),
+            (
+                receipt.0.clone(),
+                receipt.1.clone(),
+                receipt.2.clone(),
+                "different-oid".into(),
+            ),
+        ] {
+            assert!(validate_plan(&context, &plan, &CompletedDeletes::from([wrong])).is_err());
+        }
+        let local_only = Plan {
+            delete_remotes: false,
+            ..plan.clone()
+        };
+        assert!(validate_plan(&context, &local_only, &completed).is_err());
+        let old = f.candidate("old/local");
+        f.git(&["update-ref", reference, &old.oid]);
+        assert!(
+            validate_plan(&context, &plan, &completed).is_err(),
+            "moved tracking refs must never be exempted"
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
+            branch.oid
+        );
+    }
+    #[test]
     fn cleanup_remote_change_rejects_before_any_local_deletion() {
         let f = Fixture::new();
         let branch = f.candidate("fixes/task-123");
@@ -653,6 +789,73 @@ mod tests {
                 "{}",
                 serde_json::json!({"sample":sample,"analysisMs":analyze_ms,"deleteMs":delete_ms,"repackMs":start.elapsed().as_secs_f64()*1000.})
             );
+        }
+    }
+    #[test]
+    #[ignore = "one warmup and fifteen leased remote/local cleanup samples per fetch mapping"]
+    fn benchmark_cleanup_remote() {
+        for mapping in ["configured", "nonmatching"] {
+            for sample in -1..15 {
+                let f = Fixture::new();
+                // Normalize the configured URL and pushed URL identically; let
+                // installed Git determine whether it updates tracking refs.
+                f.git(&[
+                    "config",
+                    "remote.origin.url",
+                    &f.bare.to_string_lossy().replace('\\', "/"),
+                ]);
+                if mapping == "nonmatching" {
+                    f.git(&[
+                        "config",
+                        "remote.origin.fetch",
+                        "+refs/heads/unrelated:refs/remotes/origin/unrelated",
+                    ]);
+                }
+                let branch = f.candidate("fixes/task-123");
+                let plan = Plan {
+                    branches: vec![branch.clone()],
+                    delete_remotes: true,
+                };
+                let context = Context::new(&f.root).unwrap();
+                let mut probe = Duration::ZERO;
+                let mut tracking_removed = false;
+                let start = std::time::Instant::now();
+                apply_with_post_push(&context, &plan, || {
+                    let start = std::time::Instant::now();
+                    let repo = super::super::super::open(&f.root).unwrap();
+                    let refs = super::super::super::snapshot_refs(&repo).unwrap();
+                    let tracking = refs.refs.iter().find(|r| {
+                        r.kind == super::super::super::RefKind::Remote
+                            && r.name == "origin/fixes/task-123"
+                    });
+                    tracking_removed = tracking.is_none();
+                    if let Some(tracking) = tracking {
+                        assert_eq!(tracking.id.to_string(), branch.oid);
+                    }
+                    probe = start.elapsed();
+                })
+                .unwrap();
+                let total = start.elapsed();
+                assert!(
+                    command::checked(
+                        &f.root,
+                        &["show-ref", "--verify", "refs/heads/fixes/task-123"]
+                    )
+                    .is_err()
+                );
+                assert!(
+                    command::checked(
+                        &f.bare,
+                        &["show-ref", "--verify", "refs/heads/fixes/task-123"]
+                    )
+                    .is_err()
+                );
+                assert!(f.git(&["status", "--porcelain"]).is_empty());
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"mapping":mapping,"trackingRemovedAfterPush":tracking_removed,"totalMs":total.as_secs_f64()*1000.,"postPushProbeMs":probe.as_secs_f64()*1000.,"mutationMs":total.saturating_sub(probe).as_secs_f64()*1000.})
+                );
+            }
         }
     }
 }

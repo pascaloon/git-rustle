@@ -112,7 +112,7 @@ try{
             if($test-eq'branches::tests::benchmark_browser'-and!$Repository){throw 'Shared browser worker needs Repository'}
             foreach($role in 'baseline','candidate'){$exe=if($role-eq'baseline'){$BaselineHarness}else{$CandidateHarness};Harness $exe $test (Join-Path $directory "$role-$($test-replace'::','-').txt")}
         }}
-        foreach($test in 'branches::hierarchy_tests::benchmark_branch_projection','git::operations::cleanup::tests::benchmark_cleanup'){Harness $CandidateHarness $test (Join-Path $directory "candidate-$($test-replace'::','-').txt")}
+        foreach($test in 'branches::hierarchy_tests::benchmark_branch_projection','git::operations::cleanup::tests::benchmark_cleanup','git::operations::cleanup::tests::benchmark_cleanup_remote'){Harness $CandidateHarness $test (Join-Path $directory "candidate-$($test-replace'::','-').txt")}
     }
     if('Screenshots'-in$Stages){$directory=New-Stage 'screenshots';foreach($scenario in 'branches-hierarchy','cleanup-review'){Native $scenario 0 $directory $true|ConvertTo-Json -Depth 5|Set-Content (Join-Path $directory "$scenario.json")}}
     $after=@(Get-ChildItem src,scripts -Recurse -File|Sort-Object FullName|ForEach-Object{[pscustomobject]@{path=$_.FullName;sha256=(Get-FileHash $_.FullName).Hash}})

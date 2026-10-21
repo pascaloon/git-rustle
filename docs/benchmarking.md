@@ -1332,3 +1332,11 @@ Measure `diff-scroll` as well as the new query operations. Keep cold-cache setup
 warmups and capture-only launches distinct. Record raw samples, medians/p95,
 fixture scale, binary hashes and any regressions in the run's Markdown report.
 New workflows have candidate-only absolute timings; do not invent a baseline.
+
+Cleanup's `benchmark_cleanup_remote` also measures real leased remote deletion
+and the local ref transaction with configured and nonmatching fetch mappings.
+It records whether Git removed the tracking ref after push, rather than assuming
+the behavior from a version number. Keep its total wall time, observation-probe
+time and derived mutation interval distinct; the probe can affect scheduling.
+This component excludes the outer recovery journal, which the native cleanup
+scenario includes. Validate against the CI Git version when changing these guards.
