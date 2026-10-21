@@ -7,6 +7,25 @@ write generated results to unique ignored `target/bench/<run>` directories.
 Additional scenario-specific scripts and their setup requirements are listed in
 [the benchmark helper guide](benchmarks/README.md).
 
+## Default unattended validation
+
+Follow [the repository agent instructions](../AGENTS.md): use automated actions,
+disposable fixtures and paint assertions without Computer Use or interaction with
+the user's desktop. Native GPUI launches must use
+[`benchmark-native-process.ps1`](../scripts/benchmark-native-process.ps1), which
+keeps rendering enabled on a private, non-current Windows desktop without
+switching the input desktop. Inspect scenario scripts before running them and
+adapt any legacy visible-window launch to this helper first. If isolation fails,
+report the gap and continue independent checks; do not fall back to an interactive
+window. This default also applies to reproduction recipes recorded in older
+reports. Compare baseline and candidate under the same desktop conditions and
+disclose that private-desktop paints exclude physical input and display scanout.
+
+For visual changes, also follow [the app screenshot workflow](app-screenshots.md).
+`scripts/screenshot-app.ps1` captures only the isolated app window for image
+review. Run it separately from timing suites: screenshot capture synchronizes
+rendering and its durations are not performance samples.
+
 ### Stable graph order and selected paths
 
 Compare warm/uncached startup and normal/searched scrolling against the preserved
@@ -76,8 +95,10 @@ not one poll or an artificial wait. Native marks retain each operation through
 verified paint; watcher latency includes its normal scheduling cadence. New
 interactions have candidate-only costs, not an invalid comparison against missing
 baseline behavior. Shared frame intervals and per-launch means remain separate.
-The native validation window is intentionally visible because its actual GPUI
-presentation is required for the paint assertions; background helpers stay hidden.
+The legacy conflict runner opens a window on the current desktop. Adapt its
+native launch to the private-desktop helper before running it unattended; GPUI
+paint assertions require rendering, not presentation on the user's desktop.
+Background helpers stay hidden.
 Rejected-save disk verification runs outside its named request-to-paint and Reload
 intervals. The combined request-to-final-frame interval includes all workflow
 checks and watcher waits; separate medians must not be added together.
@@ -438,12 +459,13 @@ cargo test --release engine::tests::benchmark_desktop_mutations -- `
   --ignored --exact --nocapture
 ```
 
-`-NativeCandidate` launches the GPUI window normally; the baseline console stays
+`-NativeCandidate` selects native GPUI measurement; the baseline console stays
 hidden. For comparisons between two GPUI builds, also pass `-NativeBaseline`
-to `benchmark.ps1` and `benchmark-remote-preview.ps1`. Hiding the native window
-prevents a meaningful GPU frame measurement.
-Keep the desktop unlocked and the app visible. Native windows appear briefly for
-each sample. Do not compare a minimized/occluded GPU window with a visible one.
+to `benchmark.ps1` and `benchmark-remote-preview.ps1`. Ensure both native launches
+use the private-desktop helper, adapting legacy runners before use. Keep rendering
+enabled there: hiding or minimizing the native window can suppress meaningful
+GPU frame measurements. Do not mix current-desktop and private-desktop samples
+in a baseline/candidate comparison.
 The standard startup script retains one warm-up and 15 alternating measured
 launches per binary/cache mode. The preview fixture must be fresh enough for its
 five-minute branch/tag caches; generate it only after builds finish.

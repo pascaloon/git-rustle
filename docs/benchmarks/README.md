@@ -9,9 +9,17 @@ Generated results and historical reports are excluded from version control;
 previous results can be recovered from Git history.
 
 Run commands from the repository root. Store new binaries, fixtures, provenance,
-samples, logs, screenshots and `report.md` under a unique `target/bench/<run>`
+samples, logs and `report.md` under a unique `target/bench/<run>`
 directory. Preserve the baseline before making application changes, finish builds
-before timing, and run suites sequentially on an unlocked desktop.
+before timing, and run suites sequentially. Follow the
+[default unattended validation workflow](../benchmarking.md#default-unattended-validation):
+native UI checks use the private-desktop helper and automated paint assertions.
+Adapt older visible-window runners before use; do not interact with the user's
+desktop or request manual UI testing by default.
+
+For actual image review, use [isolated app screenshots](../app-screenshots.md).
+The screenshot runner creates disposable fixtures and records PNGs and metadata
+under `target/bench`; keep those runs separate from performance measurements.
 
 ## Additional scenario scripts
 
