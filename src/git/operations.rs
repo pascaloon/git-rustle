@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
+pub mod cleanup;
 pub mod conflicts;
 pub mod stashes;
 
@@ -18,6 +19,8 @@ pub enum Request {
     Inspect,
     ListStashes,
     CreateStash(Option<String>),
+    Cleanup(cleanup::Plan),
+    OptimizeStorage,
     ApplyStash(stashes::Stash),
     DropStash(stashes::Stash),
     PreviewPush,
@@ -81,7 +84,7 @@ impl Request {
         if let Self::OnBranch { request, .. } | Self::OnConflict { request, .. } = self {
             return request.changes_repository();
         }
-        !self.is_read_only() && !matches!(self, Self::ClearHistory)
+        !self.is_read_only() && !matches!(self, Self::ClearHistory | Self::OptimizeStorage)
     }
     pub fn is_read_only(&self) -> bool {
         if let Self::OnBranch { request, .. } | Self::OnConflict { request, .. } = self {
@@ -1554,7 +1557,15 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
     })();
     Outcome {
         view,
-        refresh_remotes: result.is_ok() && matches!(request, Request::PushReviewed(_)),
+        refresh_remotes: result.is_ok()
+            && matches!(
+                request,
+                Request::PushReviewed(_)
+                    | Request::Cleanup(cleanup::Plan {
+                        delete_remotes: true,
+                        ..
+                    })
+            ),
         result,
         refresh_repository: request.changes_repository(),
     }
@@ -1591,6 +1602,14 @@ fn execute_inner(
     loaded_plan: &mut Option<Plan>,
 ) -> Result<String> {
     match request {
+        Request::OptimizeStorage => {
+            if journal.pending.is_some() || context.conflict()?.is_some() {
+                return Err(
+                    "Finish or abort the active operation before optimizing storage.".into(),
+                );
+            }
+            return cleanup::optimize(context);
+        }
         Request::ClearHistory => {
             if journal.pending.is_some() || context.conflict()?.is_some() {
                 return Err("Finish or abort the active operation before clearing history.".into());
@@ -1719,6 +1738,15 @@ fn execute_inner(
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
         Request::CreateStash(_) => "Stash pending changes".into(),
+        Request::Cleanup(plan) => format!(
+            "Cleanup {} local branches{}",
+            plan.branches.len(),
+            if plan.delete_remotes {
+                " and reviewed remote copies"
+            } else {
+                ""
+            }
+        ),
         Request::ApplyStash(stash) => format!("Apply stash {}", stash.subject),
         Request::DropStash(stash) => format!("Delete stash {}", stash.subject),
         Request::CreateTag { name, .. } => format!("Create tag {name}"),
@@ -1742,6 +1770,7 @@ fn execute_inner(
     let result: Result<()> = (|| {
         match request {
             Request::CreateStash(message) => stashes::create(context, message.as_deref())?,
+            Request::Cleanup(plan) => cleanup::apply(context, plan)?,
             Request::ApplyStash(stash) => stashes::apply(context, stash)?,
             Request::DropStash(stash) => stashes::drop_stash(context, stash)?,
             Request::Create { name, target } => {

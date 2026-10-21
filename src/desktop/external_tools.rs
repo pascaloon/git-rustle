@@ -62,14 +62,189 @@ pub(super) struct State {
     picker: Option<Picker>,
     message: String,
     error: bool,
+    icons: std::collections::HashMap<PathBuf, Option<Arc<Image>>>,
+    icon_paths: Vec<PathBuf>,
+    icon_generation: u64,
+    icons_pending: bool,
+    icon_scenario_started: bool,
+    general_requested: bool,
+    icon_paints:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, Bounds<Pixels>>>>,
 }
 impl Desktop {
+    fn refresh_tool_icons(&mut self, force: bool, cx: &mut Context<Self>) {
+        let mut paths: Vec<_> = self
+            .tools
+            .config
+            .tools
+            .iter()
+            .chain(&self.tools.draft.tools)
+            .map(|entry| entry.executable.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if !force && paths == self.tools.icon_paths {
+            return;
+        }
+        self.tools.icon_paths = paths.clone();
+        self.tools.icon_generation = self.tools.icon_generation.wrapping_add(1);
+        let generation = self.tools.icon_generation;
+        self.tools.icons_pending = true;
+        cx.spawn(async move |view, cx| {
+            let icons: std::collections::HashMap<PathBuf, Option<Arc<Image>>> = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            let image = tools::icons::load(&path);
+                            (path, image)
+                        })
+                        .collect()
+                })
+                .await;
+            let _ = view.update(cx, |v, cx| {
+                if v.tools.icon_generation != generation {
+                    return;
+                }
+                for image in v.tools.icons.values().flatten() {
+                    if !icons
+                        .values()
+                        .flatten()
+                        .any(|current| current.id() == image.id())
+                    {
+                        image.clone().remove_asset(cx);
+                    }
+                }
+                v.tools.icons = icons;
+                v.tools.icons_pending = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn tool_icon(&self, path: &std::path::Path) -> AnyElement {
+        let image = match self.tools.icons.get(path).and_then(Option::as_ref) {
+            Some(image) => img(image.clone())
+                .size(px(20.))
+                .flex_shrink_0()
+                .into_any_element(),
+            None => icon("tool").size(px(20.)).into_any_element(),
+        };
+        if !matches!(
+            self.scenario.as_deref(),
+            Some("tool-icons" | "tool-icons-diff")
+        ) {
+            return image;
+        }
+        let paints = self.tools.icon_paints.clone();
+        let path = path.to_path_buf();
+        div()
+            .relative()
+            .size(px(20.))
+            .flex_shrink_0()
+            .child(image)
+            .child(
+                canvas(
+                    move |bounds, _, _| bounds,
+                    move |bounds, _, _, _| {
+                        paints.borrow_mut().insert(path.clone(), bounds);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn tools_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tools.general_requested && !self.engine.app.settings.busy {
+            self.tools.general_requested = false;
+            if self.engine.app.settings.open {
+                self.action(
+                    super::Action::SettingsTab(crate::settings::GENERAL_PAGE),
+                    window,
+                    cx,
+                );
+                cx.notify();
+            }
+        }
+        if !matches!(
+            self.scenario.as_deref(),
+            Some("tool-icons" | "tool-icons-diff")
+        ) || self.tools.icon_scenario_started
+            || !self.tools.loaded
+            || self.tools_config_busy()
+        {
+            return;
+        }
+        self.tools.icon_scenario_started = true;
+        self.tools.icon_paints.borrow_mut().clear();
+        self.engine.mark("desktop scenario requested");
+        if self.scenario.as_deref() == Some("tool-icons-diff") {
+            self.action(super::Action::Diff, window, cx);
+        } else {
+            self.tools_action(Action::Configure, window, cx);
+        }
+    }
+
+    pub(super) fn tools_icons_scenario_ready(
+        &self,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> bool {
+        if !self.tools.icon_scenario_started
+            || !self.tools.loaded
+            || self.tools.icons_pending
+            || (self.scenario.as_deref() == Some("tool-icons") && !self.tools.open)
+        {
+            return false;
+        }
+        let actual = self.tools.icons.values().flatten().count();
+        if actual == 0 || self.tools.icons.len() < 2 || actual == self.tools.icons.len() {
+            return false;
+        }
+        for entry in &self.tools.config.tools {
+            let paints = self.tools.icon_paints.borrow();
+            let Some(bounds) = paints.get(&entry.executable) else {
+                return false;
+            };
+            assert!(
+                bounds.size.width >= px(19.) && bounds.size.height >= px(19.),
+                "tool icon must have actual layout space"
+            );
+            if let Some(image) = self
+                .tools
+                .icons
+                .get(&entry.executable)
+                .and_then(Option::as_ref)
+                && image.clone().get_render_image(window, cx).is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn tools_icons_scenario_summary(&self) -> String {
+        format!(
+            "tool_icons_actual={} tool_icons_fallback={} tool_icons_painted={}",
+            self.tools.icons.values().flatten().count(),
+            self.tools
+                .icons
+                .values()
+                .filter(|image| image.is_none())
+                .count(),
+            self.tools.icon_paints.borrow().len()
+        )
+    }
     pub(super) fn tools_ready(&self) -> bool {
         self.tools.open
             && self.tools.loaded
             && self.tools.inputs.is_some()
             && !self.tools.loading
             && !self.tools.error
+            && !self.tools.icons_pending
     }
     pub(super) fn tools_uninitialized(&self) -> bool {
         !self.tools.open && self.tools.inputs.is_none()
@@ -78,7 +253,7 @@ impl Desktop {
         !self.tools.attempted
     }
     pub(super) fn tools_config_busy(&self) -> bool {
-        self.tools.loading || self.tools.saving
+        self.tools.loading || self.tools.saving || self.tools.icons_pending
     }
     pub(super) fn tools_startup_begin(&mut self) -> bool {
         if self.tools.attempted || self.tools.loading || self.tools.saving {
@@ -246,6 +421,7 @@ impl Desktop {
                 self.tools.error = true;
             }
         }
+        self.refresh_tool_icons(true, cx);
         cx.notify();
     }
     pub(super) fn tools_action(
@@ -266,11 +442,14 @@ impl Desktop {
             self.capture_tools_editor(cx);
             self.tools.picker = None;
             self.action(super::Action::Settings, window, cx);
-            self.action(
-                super::Action::SettingsTab(crate::settings::GENERAL_PAGE),
-                window,
-                cx,
-            );
+            self.tools.general_requested = self.engine.app.settings.busy;
+            if !self.tools.general_requested {
+                self.action(
+                    super::Action::SettingsTab(crate::settings::GENERAL_PAGE),
+                    window,
+                    cx,
+                );
+            }
             self.tools.open = true;
             self.load_tools(window, cx);
             if self.tools.loaded {
@@ -352,6 +531,7 @@ impl Desktop {
                                 v.tools.config = config.clone();
                                 v.tools.draft = config;
                                 v.tools_publish_choices();
+                                v.refresh_tool_icons(true, cx);
                                 v.populate_tools(window, cx);
                                 v.tools.message = "External tools saved.".into();
                             }
@@ -365,6 +545,7 @@ impl Desktop {
             Action::Diff(id, change) => self.launch_tool(&id, Some(change), None, cx),
             Action::Merge(id, path) => self.launch_tool(&id, None, Some(path), cx),
         }
+        self.refresh_tool_icons(false, cx);
         cx.notify();
     }
     fn launch_tool(
@@ -439,10 +620,60 @@ impl Desktop {
         change: &diff::FileChange,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.tools_picker(Some(change.clone()), None, cx)
+        self.tools_launch_controls(Some(change.clone()), None, cx)
     }
     pub(super) fn tools_merge_button(&self, path: &str, cx: &mut Context<Self>) -> AnyElement {
-        self.tools_picker(None, Some(path.to_owned()), cx)
+        self.tools_launch_controls(None, Some(path.to_owned()), cx)
+    }
+    fn tools_launch_controls(
+        &self,
+        change: Option<diff::FileChange>,
+        path: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let merging = path.is_some();
+        let choices = if merging {
+            &self.tools.merge_choices
+        } else {
+            &self.tools.diff_choices
+        };
+        let mut controls = row().gap_1();
+        if let Some(choices) = choices {
+            for (index, (id, name)) in choices.iter().take(4).enumerate() {
+                let Some(entry) = self.tools.config.entry(id) else {
+                    continue;
+                };
+                let action = if let Some(path) = &path {
+                    Action::Merge(id.clone(), path.clone())
+                } else {
+                    Action::Diff(id.clone(), change.clone().unwrap())
+                };
+                let button_id: SharedString =
+                    format!("quick-tool-{}-{index}", path.as_deref().unwrap_or("diff")).into();
+                controls = controls.child(
+                    Button::new(button_id)
+                        .xsmall()
+                        .ghost()
+                        .child(self.tool_icon(&entry.executable))
+                        .tooltip(format!(
+                            "{} with {}",
+                            if merging { "Merge" } else { "Compare" },
+                            name
+                        ))
+                        .disabled(
+                            self.tools.busy
+                                || self.tools.loading
+                                || (merging && self.engine.operation_busy),
+                        )
+                        .on_click(
+                            cx.listener(move |v, _, w, cx| v.tools_action(action.clone(), w, cx)),
+                        ),
+                );
+            }
+        }
+        controls
+            .child(self.tools_picker(change, path, cx))
+            .into_any_element()
     }
     fn tools_picker(
         &self,
@@ -524,11 +755,19 @@ impl Desktop {
                 let probe = weak.upgrade().and_then(|v| v.read(cx).todo_probe(13));
                 let mut menu = column().relative().w(px(260.)).gap_1().children(probe);
                 for (index, (id, name)) in choices.as_ref().unwrap().iter().enumerate() {
+                    let tool_icon = weak.upgrade().map(|view| {
+                        let view = view.read(cx);
+                        view.tools
+                            .config
+                            .entry(id)
+                            .map(|entry| view.tool_icon(&entry.executable))
+                            .unwrap_or_else(|| icon("tool").into_any_element())
+                    });
                     let (weak, id, selected) = (weak.clone(), id.clone(), selected.clone());
                     menu = menu.child(
                         Button::new(("external-tool-choice", index))
                             .ghost()
-                            .label(name.clone())
+                            .child(row().gap_2().children(tool_icon).child(name.clone()))
                             .on_click(move |_, window, cx| {
                                 let _ = weak.update(cx, |v, cx| {
                                     let action = match &selected {
@@ -595,7 +834,13 @@ impl Desktop {
             let id = entry.id.clone();
             panel = panel.child(
                 Button::new(("tool-entry", i))
-                    .label(entry.name.clone())
+                    .child(
+                        row()
+                            .gap_2()
+                            .child(self.tool_icon(&entry.executable))
+                            .child(entry.name.clone()),
+                    )
+                    .tooltip(entry.executable.display().to_string())
                     .selected(self.tools.selected.as_ref() == Some(&entry.id))
                     .disabled(locked)
                     .on_click(cx.listener(move |v, _, w, cx| {

@@ -24,8 +24,28 @@ impl Target {
     }
 }
 
+/// A local branch has one configured upstream, or one unambiguous fallback.
+/// Keep the ordinary unpaired row pointer-sized and allocation-free.
+#[derive(Default)]
+pub struct PairedRemote(Option<Box<Target>>);
+impl std::ops::Deref for PairedRemote {
+    type Target = [Target];
+    fn deref(&self) -> &[Target] {
+        self.0.as_deref().map(std::slice::from_ref).unwrap_or(&[])
+    }
+}
+impl PairedRemote {
+    fn insert(&mut self, target: Target) {
+        assert!(
+            self.0.is_none(),
+            "a local branch can pair with only one upstream"
+        );
+        self.0 = Some(Box::new(target));
+    }
+}
 pub struct Entry {
     pub target: Target,
+    pub paired_remotes: PairedRemote,
     pub current: bool,
     /// A real local branch exists by exact name or tracks this remote branch.
     pub local_available: bool,
@@ -114,6 +134,100 @@ pub fn local_activity(
         .collect()
 }
 
+#[derive(Clone, Debug)]
+pub enum TreeRow {
+    Folder {
+        path: String,
+        name: String,
+        depth: usize,
+        count: usize,
+    },
+    Branch {
+        visible: usize,
+        name: String,
+        depth: usize,
+    },
+}
+#[derive(Default)]
+struct Folder {
+    children: BTreeMap<String, Folder>,
+    leaves: Vec<(usize, String)>,
+    count: usize,
+}
+fn merge_remote_rows(entries: &mut Vec<Entry>, refs: Option<&RefSnapshot>) {
+    if !entries.iter().any(|e| e.target.remote.is_some()) {
+        return;
+    }
+    let locals: HashMap<_, _> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.target.remote.is_none())
+        .map(|(index, e)| (e.target.name.clone(), index))
+        .collect();
+    let mut exact = HashMap::<(String, String, String), usize>::new();
+    for (name, &index) in &locals {
+        if let Some((remote, branch)) = refs.and_then(|r| r.upstreams.get(name)) {
+            let key = (
+                remote.clone(),
+                branch.clone(),
+                entries[index].target.sha.clone(),
+            );
+            let chosen = exact.entry(key).or_insert(index);
+            if entries[index].current && !entries[*chosen].current
+                || entries[index].current == entries[*chosen].current
+                    && entries[index].target.name < entries[*chosen].target.name
+            {
+                *chosen = index;
+            }
+        }
+    }
+    let mut fallback_count = HashMap::<usize, usize>::new();
+    for entry in entries.iter().filter(|e| e.target.remote.is_some()) {
+        if let Some(&index) = locals.get(&entry.target.name)
+            && !refs.is_some_and(|r| r.upstreams.contains_key(&entry.target.name))
+            && entries[index].target.sha == entry.target.sha
+        {
+            *fallback_count.entry(index).or_default() += 1;
+        }
+    }
+    let mut pairs = Vec::new();
+    for (remote_index, entry) in entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.target.remote.is_some())
+    {
+        let key = (
+            entry.target.remote.clone().unwrap(),
+            entry.target.name.clone(),
+            entry.target.sha.clone(),
+        );
+        let local = exact.get(&key).copied().or_else(|| {
+            locals.get(&entry.target.name).copied().filter(|index| {
+                fallback_count.get(index) == Some(&1)
+                    && entries[*index].target.sha == entry.target.sha
+            })
+        });
+        if let Some(local) = local {
+            pairs.push((local, remote_index));
+        }
+    }
+    let mut removed = HashSet::new();
+    for (local, remote) in pairs {
+        let target = entries[remote].target.clone();
+        entries[local].search.push(' ');
+        entries[local]
+            .search
+            .push_str(&target.label().to_lowercase());
+        entries[local].paired_remotes.insert(target);
+        removed.insert(remote);
+    }
+    let mut index = 0;
+    entries.retain(|_| {
+        let keep = !removed.contains(&index);
+        index += 1;
+        keep
+    });
+}
 #[derive(Default)]
 pub struct Browser {
     pub open: bool,
@@ -140,6 +254,10 @@ pub struct Browser {
     pub remotes: BTreeMap<String, remote::Update>,
     pub last_check: Option<std::time::Instant>,
     pub sort: Sort,
+    pub hierarchy: bool,
+    pub tree_rows: Vec<TreeRow>,
+    pub collapsed: HashSet<String>,
+    pub matching_count: usize,
 }
 
 impl Browser {
@@ -210,6 +328,7 @@ impl Browser {
                     (target.remote.clone(), target.name.clone()),
                     Entry {
                         target,
+                        paired_remotes: PairedRemote::default(),
                         current,
                         local_available: true,
                         search,
@@ -255,6 +374,7 @@ impl Browser {
                     (target.remote.clone(), target.name.clone()),
                     Entry {
                         target,
+                        paired_remotes: PairedRemote::default(),
                         current: false,
                         local_available: false,
                         search,
@@ -285,6 +405,7 @@ impl Browser {
                 .or_else(|| by_sha.get(e.target.sha.as_str()).copied())
                 .cloned();
         }
+        merge_remote_rows(&mut self.entries, refs);
         self.sort_entries();
         self.filter();
         if self.follow_top {
@@ -367,7 +488,7 @@ impl Browser {
 
     pub fn filter(&mut self) {
         let q = self.query.to_lowercase();
-        self.visible = self
+        let filtered: Vec<usize> = self
             .entries
             .iter_mut()
             .enumerate()
@@ -384,10 +505,105 @@ impl Browser {
                 e.author_search.contains(&q).then_some(i)
             })
             .collect();
+        self.matching_count = filtered.len();
+        if self.hierarchy {
+            self.build_tree(filtered);
+        } else {
+            self.visible = filtered;
+            self.tree_rows.clear();
+        }
         self.selected = self.selected.min(self.visible.len().saturating_sub(1));
         self.ensure_visible();
     }
 
+    pub fn set_hierarchy(&mut self, hierarchy: bool) {
+        let keep = self.chosen().map(|e| e.target.clone());
+        self.hierarchy = hierarchy;
+        self.filter();
+        if let Some(keep) = keep
+            && let Some(index) = self
+                .visible
+                .iter()
+                .position(|&i| self.entries[i].target == keep)
+        {
+            self.selected = index;
+        }
+        self.ensure_visible();
+    }
+    pub fn toggle_folder(&mut self, path: String) {
+        if !self.collapsed.remove(&path) {
+            self.collapsed.insert(path);
+        }
+        self.filter();
+    }
+    fn build_tree(&mut self, filtered: Vec<usize>) {
+        let mut root = Folder::default();
+        for index in filtered {
+            let label = self.entries[index].target.label();
+            let parts: Vec<_> = label.splitn(33, '/').collect();
+            let mut folder = &mut root;
+            folder.count += 1;
+            for part in &parts[..parts.len().saturating_sub(1)] {
+                folder = folder.children.entry((*part).to_string()).or_default();
+                folder.count += 1;
+            }
+            folder
+                .leaves
+                .push((index, parts.last().unwrap_or(&"").to_string()));
+        }
+        self.visible.clear();
+        self.tree_rows.clear();
+        fn emit(
+            node: Folder,
+            path: &str,
+            depth: usize,
+            collapsed: &HashSet<String>,
+            searching: bool,
+            visible: &mut Vec<usize>,
+            rows: &mut Vec<TreeRow>,
+        ) {
+            for (name, child) in node.children {
+                let path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}/{name}")
+                };
+                rows.push(TreeRow::Folder {
+                    path: path.clone(),
+                    name,
+                    depth,
+                    count: child.count,
+                });
+                if searching || !collapsed.contains(&path) {
+                    emit(child, &path, depth + 1, collapsed, searching, visible, rows);
+                }
+            }
+            for (index, name) in node.leaves {
+                rows.push(TreeRow::Branch {
+                    visible: visible.len(),
+                    name,
+                    depth,
+                });
+                visible.push(index);
+            }
+        }
+        emit(
+            root,
+            "",
+            0,
+            &self.collapsed,
+            !self.query.is_empty(),
+            &mut self.visible,
+            &mut self.tree_rows,
+        );
+    }
+    pub fn display_count(&self) -> usize {
+        if self.hierarchy {
+            self.tree_rows.len()
+        } else {
+            self.visible.len()
+        }
+    }
     pub fn chosen(&self) -> Option<&Entry> {
         self.visible.get(self.selected).map(|&i| &self.entries[i])
     }
@@ -602,12 +818,32 @@ mod tests {
             browser
                 .entries
                 .iter()
-                .find(|e| e.target.label() == name)
+                .find(|e| {
+                    e.target.label() == name || e.paired_remotes.iter().any(|r| r.label() == name)
+                })
                 .unwrap()
                 .local_available
         };
         assert!(available("local-work") && available("same"));
         assert!(available("origin/same") && available("origin/tracked"));
+        let same = browser
+            .entries
+            .iter()
+            .find(|e| e.target.label() == "same")
+            .unwrap();
+        assert_eq!(
+            same.paired_remotes
+                .iter()
+                .map(Target::label)
+                .collect::<Vec<_>>(),
+            ["origin/same"]
+        );
+        assert!(
+            !browser
+                .entries
+                .iter()
+                .any(|e| e.target.label() == "origin/same")
+        );
         assert!(!available("origin/remote-only") && !available("origin/Same"));
         assert!(
             browser
@@ -992,13 +1228,29 @@ mod tests {
         });
         browser.query = "shared AUTHOR".into();
         browser.rebuild(Some(&refs));
-        assert_eq!(browser.visible.len(), 2);
+        assert_eq!(browser.visible.len(), 1);
+        let paired = browser.chosen().unwrap();
+        assert_eq!(paired.target.name, "feature/ui");
+        assert!(paired.target.remote.is_none());
+        assert_eq!(
+            paired
+                .paired_remotes
+                .iter()
+                .map(Target::label)
+                .collect::<Vec<_>>(),
+            ["origin/feature/ui"]
+        );
         assert!(
             browser
                 .visible
                 .iter()
                 .all(|&i| browser.entries[i].activity.as_ref().unwrap().author == "Shared Author")
         );
+        let primary = browser.chosen().unwrap().target.clone();
+        browser.query = "origin/feature/ui".into();
+        browser.filter();
+        assert_eq!(browser.visible.len(), 1);
+        assert_eq!(browser.chosen().unwrap().target, primary);
     }
 
     #[test]
@@ -1241,7 +1493,21 @@ mod tests {
             );
             crate::ui::branches::draw(&mut browser, &mut screen, "test", 1000);
             let text: String = screen.test_cells().iter().map(|c| c.ch).collect();
-            assert!(text.contains("origin/busy"));
+            // The local primary row owns its exact same-tip remote alias. The
+            // terminal renderer shows the primary label; native rows show both.
+            assert!(text.contains("busy"));
+            assert_eq!(browser.visible.len(), 1);
+            let paired = browser.chosen().unwrap();
+            assert!(paired.target.remote.is_none());
+            assert_eq!(paired.target.name, "busy");
+            assert_eq!(
+                paired
+                    .paired_remotes
+                    .iter()
+                    .map(Target::label)
+                    .collect::<Vec<_>>(),
+                ["origin/busy"]
+            );
             assert!(!text.contains("cached") && !text.contains("stale") && !text.contains("live"));
         }
     }
@@ -1334,5 +1600,207 @@ mod tests {
         assert_eq!(browser.chosen().unwrap().target.name, "b");
         browser.update(update(&[]), None);
         assert!(browser.entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::*;
+    use crate::git::RefEntry;
+    fn refs() -> RefSnapshot {
+        let id = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        RefSnapshot {
+            refs: [
+                ("fixes/task-123", RefKind::Branch),
+                ("fixes/other", RefKind::Branch),
+                ("topic", RefKind::Branch),
+                ("origin/renamed", RefKind::Remote),
+            ]
+            .into_iter()
+            .map(|(name, kind)| RefEntry {
+                name: name.into(),
+                id,
+                kind,
+            })
+            .collect(),
+            upstreams: BTreeMap::from([(
+                "fixes/task-123".into(),
+                ("origin".into(), "renamed".into()),
+            )]),
+            ..RefSnapshot::default()
+        }
+    }
+    #[test]
+    fn exact_upstream_same_tip_coalesces_but_distinct_branches_stay_visible() {
+        let refs = refs();
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        assert_eq!(browser.entries.len(), 3);
+        let local = browser
+            .entries
+            .iter()
+            .find(|e| e.target.name == "fixes/task-123")
+            .unwrap();
+        assert!(local.target.remote.is_none());
+        assert_eq!(local.paired_remotes.len(), 1);
+        browser.query = "origin/renamed".into();
+        browser.filter();
+        assert_eq!(browser.visible.len(), 1);
+        assert_eq!(browser.chosen().unwrap().target.name, "fixes/task-123");
+    }
+    #[test]
+    fn paired_alias_is_pointer_sized_and_multiple_tracking_locals_prefer_current() {
+        assert_eq!(
+            std::mem::size_of::<PairedRemote>(),
+            std::mem::size_of::<usize>()
+        );
+        assert!(PairedRemote::default().is_empty());
+        let mut refs = refs();
+        refs.upstreams
+            .insert("topic".into(), ("origin".into(), "renamed".into()));
+        refs.head_branch = Some("topic".into());
+        refs.head_id = Some(refs.refs[0].id);
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        let paired: Vec<_> = browser
+            .entries
+            .iter()
+            .filter(|e| !e.paired_remotes.is_empty())
+            .collect();
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].target.name, "topic");
+        assert!(paired[0].current);
+        assert_eq!(paired[0].paired_remotes[0].label(), "origin/renamed");
+        assert!(
+            browser
+                .entries
+                .iter()
+                .any(|e| e.target.name == "fixes/task-123" && e.paired_remotes.is_empty())
+        );
+    }
+    #[test]
+    fn configured_upstream_pairs_once_and_competing_remote_stays_independent() {
+        let mut refs = refs();
+        refs.refs.push(RefEntry {
+            name: "other/renamed".into(),
+            id: refs.refs[0].id,
+            kind: RefKind::Remote,
+        });
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        let local = browser
+            .entries
+            .iter()
+            .find(|e| e.target.name == "fixes/task-123")
+            .unwrap();
+        assert_eq!(local.paired_remotes.len(), 1);
+        assert_eq!(local.paired_remotes[0].label(), "origin/renamed");
+        assert!(
+            browser
+                .entries
+                .iter()
+                .any(|e| e.target.label() == "other/renamed" && e.paired_remotes.is_empty())
+        );
+    }
+    #[test]
+    fn shared_upstream_noncurrent_owner_is_lexical_regardless_of_ref_order() {
+        let mut refs = refs();
+        refs.upstreams
+            .insert("topic".into(), ("origin".into(), "renamed".into()));
+        let mut browser = Browser::default();
+        for _ in 0..2 {
+            browser.rebuild(Some(&refs));
+            let paired: Vec<_> = browser
+                .entries
+                .iter()
+                .filter(|e| !e.paired_remotes.is_empty())
+                .collect();
+            assert_eq!(paired.len(), 1);
+            assert_eq!(paired[0].target.name, "fixes/task-123");
+            assert!(!paired[0].current);
+            refs.refs.reverse();
+        }
+    }
+    #[test]
+    fn changed_upstream_tip_and_ambiguous_fallback_are_not_coalesced() {
+        let mut refs = refs();
+        refs.refs.last_mut().unwrap().id =
+            ObjectId::from_hex(b"2222222222222222222222222222222222222222").unwrap();
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        assert_eq!(browser.entries.len(), 4);
+        refs.upstreams.clear();
+        refs.refs.last_mut().unwrap().name = "origin/topic".into();
+        refs.refs.last_mut().unwrap().id = refs.refs[0].id;
+        refs.refs.push(RefEntry {
+            name: "other/topic".into(),
+            id: refs.refs[0].id,
+            kind: RefKind::Remote,
+        });
+        browser.rebuild(Some(&refs));
+        assert_eq!(browser.entries.len(), 5);
+    }
+    #[test]
+    fn hierarchy_collapses_keyboard_rows_and_search_reveals_matching_children() {
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs()));
+        browser.set_hierarchy(true);
+        assert_eq!(browser.visible.len(), 3);
+        assert!(
+            browser
+                .tree_rows
+                .iter()
+                .any(|r| matches!(r,TreeRow::Folder{path,..} if path=="fixes"))
+        );
+        browser.toggle_folder("fixes".into());
+        assert_eq!(browser.visible.len(), 1);
+        browser.query = "task-123".into();
+        browser.filter();
+        assert_eq!(browser.visible.len(), 1);
+        assert_eq!(browser.chosen().unwrap().target.name, "fixes/task-123");
+        browser.query.clear();
+        browser.filter();
+        assert_eq!(browser.visible.len(), 1);
+        browser.set_hierarchy(false);
+        assert_eq!(browser.visible.len(), 3);
+    }
+    #[test]
+    #[ignore = "one warmup and fifteen cached branch projection samples per size"]
+    fn benchmark_branch_projection() {
+        for entries in [1000, 10000] {
+            let id = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+            let mut refs = RefSnapshot::default();
+            for i in 0..entries {
+                let name = format!("team-{}/task-{i}", i % 20);
+                refs.refs.push(RefEntry {
+                    name: name.clone(),
+                    id,
+                    kind: RefKind::Branch,
+                });
+                refs.refs.push(RefEntry {
+                    name: format!("origin/{name}"),
+                    id,
+                    kind: RefKind::Remote,
+                });
+                refs.upstreams.insert(name.clone(), ("origin".into(), name));
+            }
+            for sample in -1..15 {
+                let mut browser = Browser::default();
+                let start = std::time::Instant::now();
+                browser.rebuild(Some(&refs));
+                let merge_ms = start.elapsed().as_secs_f64() * 1000.;
+                assert_eq!(browser.entries.len(), entries);
+                let start = std::time::Instant::now();
+                browser.set_hierarchy(true);
+                let hierarchy_ms = start.elapsed().as_secs_f64() * 1000.;
+                let start = std::time::Instant::now();
+                browser.toggle_folder("team-0".into());
+                let collapse_ms = start.elapsed().as_secs_f64() * 1000.;
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"entries":entries,"mergeMs":merge_ms,"hierarchyMs":hierarchy_ms,"collapseMs":collapse_ms})
+                );
+            }
+        }
     }
 }

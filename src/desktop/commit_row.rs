@@ -63,16 +63,42 @@ impl Desktop {
                         ),
                 );
         }
+        let node_lane = if app.search.active() {
+            app.search
+                .result
+                .as_ref()
+                .and_then(|r| r.graph.get(row_index))
+                .map_or(0, |row| row.1 as usize)
+        } else {
+            app.history_index(row_index)
+                .and_then(|index| app.history.commits.get(index))
+                .map_or(0, |record| record.node_lane as usize)
+        };
+        let on_path = self.graph_selected_path.node_on_path(row_index, node_lane);
         r = r.child(
             div()
                 .w(px(76.))
+                .relative()
+                .children(self.graph_feature_probe(row_index, 0))
                 .font_family("Cascadia Mono")
                 .flex_shrink_0()
-                .text_color(rgb(if ghost { MUTED } else { ACCENT }))
+                .when(on_path, |s| {
+                    s.bg(rgb(TEXT)).text_color(rgb(BG)).rounded_sm()
+                })
+                .when(!on_path, |s| {
+                    s.text_color(rgb(if ghost { MUTED } else { ACCENT }))
+                })
                 .child(self.matches.styled(id.to_hex_with_len(8).to_string())),
         );
+        let mut middle = row()
+            .relative()
+            .children(self.graph_feature_probe(row_index, 1))
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden();
+        let mut badges = row().max_w(relative(0.65)).min_w_0().overflow_hidden();
         if app.head_id() == Some(id) {
-            r = r.child(
+            badges = badges.child(
                 row()
                     .id(("head-badge", row_index))
                     .relative()
@@ -103,7 +129,7 @@ impl Desktop {
             {
                 let remote = label.kind == crate::git::RefKind::Remote;
                 let color = if remote { REMOTE_TEXT } else { SEARCH_TEXT };
-                r = r
+                badges = badges
                     .child(
                         row()
                             .id(("ref-badge", label_index))
@@ -127,21 +153,26 @@ impl Desktop {
                             })
                             .child(self.matches.styled(label.name.clone())),
                     )
-                    .children(self.provider_badge(label.kind, &label.name, cx));
+                    .children(self.provider_badge(id, label.kind, &label.name, cx));
             }
         }
+        middle = middle.child(badges).child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(rgb(if ghost { MUTED } else { TEXT }))
+                .child(self.matches.styled(subject.to_owned())),
+        );
         r = r
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(rgb(if ghost { MUTED } else { TEXT }))
-                    .child(self.matches.styled(subject.to_owned())),
-            )
+            .child(middle)
             .child(
                 row()
                     .w(px(150.))
+                    .relative()
+                    .children(self.graph_feature_probe(row_index, 2))
                     .flex_shrink_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
@@ -153,12 +184,22 @@ impl Desktop {
                         author,
                         22.,
                     ))
-                    .child(self.matches.styled(author.to_owned())),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_ellipsis()
+                            .child(self.matches.styled(author.to_owned())),
+                    ),
             )
             .child(
                 div()
                     .w(px(62.))
+                    .relative()
+                    .children(self.graph_feature_probe(row_index, 3))
                     .flex_shrink_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
                     .text_right()
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))

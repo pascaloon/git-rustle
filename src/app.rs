@@ -768,6 +768,11 @@ impl App {
         }
     }
 
+    pub fn open_commit_pair(&mut self, old: ObjectId, new: ObjectId) {
+        let changes = self.new_changes(Some(old), new);
+        self.show_view(changes, None);
+    }
+
     fn show_view(&mut self, changes: ChangeSet, cursor: Option<TreeCursor>) {
         self.parked_diff = None;
         let id = self.next_view_id;
@@ -1232,13 +1237,14 @@ impl App {
         let sha = id.to_string();
         // The browser is lazy and may never have been opened in this session.
         self.branches.rebuild(self.refs.as_ref());
-        let mut branches = self
+        let branches = self
             .branches
             .entries
             .iter()
             .filter(|e| e.target.sha == sha)
             .map(|e| e.target.clone())
             .collect::<Vec<_>>();
+        let mut branches = crate::checkout::branch_choices(branches, self.refs.as_ref());
         let current = self.refs.as_ref().and_then(|r| r.head_branch.as_ref());
         branches.sort_by_key(|t| (t.remote.is_some(), current != Some(&t.name), t.label()));
         let mut choices = branches
@@ -1251,10 +1257,19 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
-        choices.push(crate::checkout::Request::Commit {
-            id,
-            remote: self.ghost_sources.get(&id).cloned(),
-        });
+        if choices.is_empty() {
+            choices.push(crate::checkout::Request::Commit {
+                id,
+                remote: self.ghost_sources.get(&id).cloned(),
+            });
+        } else if choices.len() == 1 {
+            if !self.pending.busy && self.pending.request.is_none() {
+                self.checkout_confirmation = None;
+                self.checkout_request = choices.pop();
+                self.needs_redraw = true;
+            }
+            return;
+        }
         self.confirm_checkout(choices);
     }
 
@@ -2583,7 +2598,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(app.checkout_request.is_none());
         let dialog = app.checkout_confirmation.as_ref().unwrap();
-        assert_eq!(dialog.choices.len(), 4);
+        assert_eq!(dialog.choices.len(), 2);
         assert!(
             matches!(dialog.chosen(),Request::Branch(t) if t.name == "main" && t.remote.is_none())
         );
@@ -2636,6 +2651,37 @@ mod tests {
         assert!(app.checkout_confirmation.is_none());
         app.handle_key(key(KeyCode::Enter));
         assert!(app.checkout_confirmation.is_none()); // already queued
+    }
+
+    #[test]
+    fn graph_single_local_with_renamed_upstream_dispatches_without_detached_popup() {
+        let mut app = app_with(1);
+        let id = app.selected_id().unwrap();
+        let mut refs = RefSnapshot {
+            refs: vec![
+                crate::git::RefEntry {
+                    name: "local-topic".into(),
+                    id,
+                    kind: RefKind::Branch,
+                },
+                crate::git::RefEntry {
+                    name: "origin/server-topic".into(),
+                    id,
+                    kind: RefKind::Remote,
+                },
+            ],
+            ..Default::default()
+        };
+        refs.upstreams.insert(
+            "local-topic".into(),
+            ("origin".into(), "server-topic".into()),
+        );
+        app.set_refs(refs);
+        app.confirm_commit_checkout(id);
+        assert!(app.checkout_confirmation.is_none());
+        assert!(
+            matches!(app.checkout_request,Some(crate::checkout::Request::Branch(ref target)) if target.name=="local-topic" && target.remote.is_none())
+        );
     }
 
     #[test]
@@ -2717,23 +2763,16 @@ mod tests {
         );
         app.ghost_sources.insert(id, remote.clone());
         app.confirm_commit_checkout(id);
-        assert!(
-            matches!(app.checkout_confirmation.as_ref().unwrap().chosen(),
+        assert!(matches!(app.checkout_request.as_ref().unwrap(),
             Request::FetchBranch(t) if t.name == "topic/nested"
                 && t.remote.as_deref() == Some("origin")
                 && t.url.as_deref() == Some(remote.url.as_str())
-                && t.sha == sha)
-        );
-        crate::ui::checkout::draw(
-            app.checkout_confirmation.as_mut().unwrap(),
-            &mut crate::term::Screen::new(120, 30),
-        );
-        // A refresh while the confirmation is open cannot downgrade the choice
-        // to an ordinary switch or retarget the branch's original remote.
+                && t.sha == sha));
+        assert!(app.checkout_confirmation.is_none());
+        // A refresh cannot downgrade or retarget the already-frozen request.
         app.branches.remotes.clear();
         app.ghosts.clear();
         app.ghost_sources.clear();
-        app.handle_key(key(KeyCode::Enter));
         assert!(matches!(&app.checkout_request,
             Some(Request::FetchBranch(t)) if t.sha == sha
                 && t.url.as_deref() == Some(remote.url.as_str())));
@@ -2753,7 +2792,7 @@ mod tests {
         );
         app.confirm_commit_checkout(id);
         assert!(matches!(
-            app.checkout_confirmation.as_ref().unwrap().chosen(),
+            app.checkout_request.as_ref().unwrap(),
             Request::Branch(_)
         ));
     }

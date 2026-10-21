@@ -27,6 +27,7 @@ public static class WindowCapture {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PrintWindow(IntPtr window,IntPtr dc,uint flags);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr window,StringBuilder text,int capacity);
     [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessageW(IntPtr window,uint message,IntPtr wparam,IntPtr lparam);
     public static IntPtr OpenPrivateDesktop(string name) {
         if(InputDesktop()==name) throw new InvalidOperationException("Refusing input desktop");
@@ -79,6 +80,10 @@ public static class WindowCapture {
         Verify(window,pid,desktop);
         // Lifecycle only: no mouse, keyboard, foreground activation or desktop switch.
         if(!PostMessageW(window,0x0010,IntPtr.Zero,IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot close captured application");
+    }
+    public static string Title(IntPtr window,int pid,string desktop) {
+        Verify(window,pid,desktop);
+        var text=new StringBuilder(2048);GetWindowTextW(window,text,text.Capacity);return text.ToString();
     }
 }
 }
@@ -133,6 +138,7 @@ public static class WindowCapture {
             desktop = $request.desktop; inputDesktop = [GitRustle.Bench.WindowCapture]::InputDesktop()
             processId = $request.processId; processStartTimeUtcTicks = $request.processStartTimeUtcTicks
             windowHandle = $window.ToInt64().ToString(); width = $width; height = $height
+            windowTitle = [GitRustle.Bench.WindowCapture]::Title($window,$request.processId,$request.desktop)
             dpi = [GitRustle.Bench.WindowCapture]::GetDpiForWindow($window); captureMs = $clock.Elapsed.TotalMilliseconds
             pixelValidation = @{ passed = $true; sampledPixels = $sampleCount; uniqueColors = $colors.Count; sentinelSamples = $sentinelSamples; dominantFraction = $dominantFraction }
             sha256 = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash

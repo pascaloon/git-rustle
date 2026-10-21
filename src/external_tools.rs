@@ -1,4 +1,5 @@
 //! Explicit executable launches; input copies live until the editor's wait process exits.
+pub mod icons;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

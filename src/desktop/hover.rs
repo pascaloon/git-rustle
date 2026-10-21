@@ -33,6 +33,7 @@ pub(super) struct State {
     // Selection traces once per anchor/graph revision. Scrolling copies only
     // the requested viewport; hover retains its strictly viewport-only trace.
     selection: Option<Box<State>>,
+    selected_ids: Vec<gix::ObjectId>,
 }
 
 impl State {
@@ -156,7 +157,22 @@ impl State {
         });
         if flat {
             let flags = self.flat.get_or_insert_with(FlatFlags::default);
-            flags.trace(range.len(), anchor - range.start, |offset| {
+            let selected: std::collections::HashSet<_> =
+                self.selected_ids.iter().copied().collect();
+            let mut anchors: Vec<_> = if selected.is_empty() && app.pending.selected {
+                vec![app.pending.row()]
+            } else {
+                range
+                    .clone()
+                    .filter(|&row| {
+                        app.history_index(row)
+                            .and_then(|index| app.history.commits.get(index))
+                            .is_some_and(|record| selected.contains(&record.id))
+                    })
+                    .collect()
+            };
+            anchors.iter_mut().for_each(|row| *row -= range.start);
+            flags.trace_many(range.len(), &anchors, |offset| {
                 let row = range.start + offset;
                 if pending.is_some_and(|p| p.0 == row) {
                     let (lane, cells, parent) = pending_geometry.as_ref()?;
@@ -231,10 +247,28 @@ impl State {
         self.key = Some(key);
     }
 
+    #[cfg(test)]
     pub fn select(&mut self, app: &crate::app::App, range: Range<usize>) {
+        self.select_many(
+            app,
+            range,
+            &app.selected_id().into_iter().collect::<Vec<_>>(),
+        );
+    }
+
+    pub fn select_many(
+        &mut self,
+        app: &crate::app::App,
+        range: Range<usize>,
+        ids: &[gix::ObjectId],
+    ) {
         let row = app.graph_selected();
         let identity = Self::identity_at(app, row);
         let cached = self.selection.get_or_insert_with(Box::default);
+        if cached.selected_ids != ids {
+            cached.selected_ids = ids.to_vec();
+            cached.key = None;
+        }
         if cached.anchor != Some(row) || cached.identity != identity {
             cached.anchor = Some(row);
             cached.identity = identity;
@@ -256,6 +290,13 @@ impl State {
             *flag |= selected;
         }
         flags
+    }
+
+    pub fn node_on_path(&self, row: usize, lane: usize) -> bool {
+        row.checked_sub(self.first)
+            .and_then(|index| self.flags.get(index))
+            .and_then(|flags| flags.get(lane))
+            .is_some_and(|flag| flag & crate::graph::hover::GLYPH != 0)
     }
 
     pub fn row(&self, index: usize) -> Vec<u8> {
@@ -377,6 +418,59 @@ mod tests {
         assert_eq!(state.diagnostics().0, 2);
     }
 
+    #[test]
+    fn multiple_selected_tracks_union_without_highlighting_unselected_parallel_nodes() {
+        let mut app = fixture();
+        app.pending.selected = false;
+        let mut state = State::default();
+        state.select_many(&app, 0..app.graph_len(), &[id(6), id(5)]);
+        for index in [0, 1] {
+            let row = index + usize::from(index >= app.pending.row());
+            assert!(state.node_on_path(row, app.history.commits[index].node_lane as usize));
+        }
+        state.select_many(&app, 0..app.graph_len(), &[id(6)]);
+        let other = 1 + usize::from(1 >= app.pending.row());
+        assert!(!state.node_on_path(other, app.history.commits[1].node_lane as usize));
+        state.select_many(&app, 0..app.graph_len(), &[]);
+        assert_eq!(state.diagnostics().1, 0);
+    }
+
+    #[test]
+    #[ignore = "one warmup and fifteen multi-path selection/scroll samples at 100k rows"]
+    fn benchmark_multi_selected_paths() {
+        let mut app = fixture();
+        let record = app.history.commits[0];
+        app.history.commits.resize(100_000, record);
+        for (index, record) in app.history.commits.iter_mut().enumerate() {
+            let mut bytes = [0_u8; 20];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            record.id = gix::ObjectId::from_bytes_or_panic(&bytes);
+        }
+        app.pending.snapshot.files.clear();
+        app.pending.selected = false;
+        for count in [1, 4, 16] {
+            for sample in -1..15 {
+                let ids: Vec<_> = (0..count)
+                    .map(|index| app.history.commits[index * 6193].id)
+                    .collect();
+                let mut state = State::default();
+                let start = std::time::Instant::now();
+                state.select_many(&app, 0..80, &ids);
+                let selection_ms = start.elapsed().as_secs_f64() * 1000.;
+                let start = std::time::Instant::now();
+                for step in 0..1000 {
+                    let first = step * 37;
+                    state.select_many(&app, first..first + 80, &ids);
+                    std::hint::black_box(state.row(first));
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"selected":count,"historyRows":100000,"selectionMs":selection_ms,"scrollMs":start.elapsed().as_secs_f64()})
+                );
+            }
+        }
+    }
+
     fn fixture() -> App {
         let mut app = App::new();
         let mut layout = Layout::new();
@@ -434,6 +528,11 @@ mod tests {
         let mut app = fixture();
         let record = app.history.commits[0];
         app.history.commits.resize(100_000, record);
+        for (index, record) in app.history.commits.iter_mut().enumerate() {
+            let mut bytes = [0_u8; 20];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            record.id = gix::ObjectId::from_bytes_or_panic(&bytes);
+        }
         app.pending.snapshot.files.clear();
         app.pending.selected = false;
         let mut selected = State::default();

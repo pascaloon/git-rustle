@@ -55,7 +55,7 @@ own hooks and authentication remain in effect; prompts cannot block the UI.
 
 ## Stashes
 
-Open **Stashes** in the graph to list saved entries. The list loads on request;
+Open the **Stashes** tab to list saved entries. The list loads on request;
 Refresh picks up changes made in another Git client. **Apply…** requires a clean
 working tree, restores the selected stash and keeps its saved entry. The selected
 object stays fixed even if another stash is pushed before confirmation.
@@ -243,3 +243,25 @@ local bare remotes and check the resulting risk state; they do not publish anyth
 Older executables only implement the original operations/rebase/history scenarios.
 Compare graph scrolling and startup with the preserved release too. These are
 action-handler-to-frame timings, not physical pointer or network latency.
+
+## Branch cleanup and storage
+
+**Cleanup** analyzes local references in a background worker. Matching copies
+have the same object ID as their cached upstream; fetch first when fresher remote
+information is needed. This is not evidence that a branch is merged or its
+commits are disposable. A second section lists branches without a matching
+remote whose last commit is at least six calendar months old. This date is not a
+branch creation date or the last time it was checked out.
+
+Current branches in any worktree are excluded. Main, master and known remote
+HEAD/default branch names start unchecked. Review the selected names and frozen
+object IDs before deleting. Remote deletion is a separate opt-in: the worker
+rechecks the remote URL and current server ref, then uses an expected-OID lease
+and an atomic push within each remote. Multiple remote groups can partially
+succeed; the result reports failures. Remote deletion cannot be reversed by
+local Undo. Recovery preserves local references and objects.
+
+**Optimize storage** repacks redundant object copies, retaining unreachable
+objects and recovery history. It does not force-expire reflogs or immediately
+prune unique commits. The result reports Git's object-storage KiB before and
+after, including an increase when applicable; savings are not guaranteed.

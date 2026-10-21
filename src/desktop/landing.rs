@@ -16,8 +16,12 @@ impl Desktop {
         }
         self.engine = self.engine.open_directory(path);
         self.graph_hover = Default::default();
+        // View IDs restart for each repository. Drop search results and cancel
+        // their worker before a new repository can reuse an old view ID.
+        self.diff_find = Default::default();
         self.ref_storage = Default::default();
         self.stashes = Default::default();
+        self.cleanup = Default::default();
         self.opening_directory = true;
         self.notice.clear();
         cx.notify();

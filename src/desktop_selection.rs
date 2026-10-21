@@ -22,6 +22,11 @@ impl Commits {
             .clone()
             .unwrap_or_else(|| focused.into_iter().collect())
     }
+    pub fn count(&self, focused: Option<gix::ObjectId>) -> usize {
+        self.explicit
+            .as_ref()
+            .map_or(usize::from(focused.is_some()), Vec::len)
+    }
     pub fn contains(&self, id: gix::ObjectId, focused: Option<gix::ObjectId>) -> bool {
         self.explicit
             .as_ref()

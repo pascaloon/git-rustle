@@ -6,6 +6,7 @@
 
 pub mod changes;
 pub mod filetree;
+pub mod search;
 pub mod sidebyside;
 pub mod syntax;
 
@@ -88,6 +89,10 @@ pub fn external_contents(
         };
         if side.kind == EntryKind::Commit {
             return Ok(format!("Subproject commit {}\n", side.id).into_bytes());
+        }
+        // Avoid materializing oversized historical objects just to reject them.
+        if repo.find_header(side.id)?.size() > MAX_BLOB as u64 {
+            return Err("External diff file exceeds 8 MiB".into());
         }
         let mut buf = Vec::new();
         let data = repo.objects.find_blob(&side.id, &mut buf)?.data;

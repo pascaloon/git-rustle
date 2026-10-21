@@ -20,6 +20,10 @@ impl Providers {
     }
 
     pub fn apply(&self, config: &mut Configuration) {
+        // A repository's explicit API installation remains authoritative.
+        if config.api_url.as_ref().is_some_and(|url| !url.is_empty()) {
+            return;
+        }
         let provider = match config.provider.as_deref() {
             Some("github") => Some(Provider::Github),
             Some("gitlab") => Some(Provider::Gitlab),
@@ -42,6 +46,44 @@ impl Providers {
         if let Some(provider) = provider
             && let Some(base) = self.url(provider)
         {
+            let Some(transport) = Remote::parse(&config.name, &config.url, Some(provider.key()))
+            else {
+                return;
+            };
+            let same_host = url::Url::parse(&transport.endpoint)
+                .ok()
+                .zip(url::Url::parse(base).ok())
+                .is_some_and(|(transport, api)| {
+                    transport.host_str() == api.host_str()
+                        && (url::Url::parse(&config.url)
+                            .ok()
+                            .is_none_or(|url| !matches!(url.scheme(), "http" | "https"))
+                            || transport.port_or_known_default() == api.port_or_known_default())
+                });
+            if !same_host {
+                return;
+            }
+            if config.project.is_none()
+                && url::Url::parse(&config.url)
+                    .ok()
+                    .is_some_and(|url| matches!(url.scheme(), "https" | "http"))
+                && let Ok(api) = url::Url::parse(base)
+            {
+                let suffix = match provider {
+                    Provider::Github => "/api/v3",
+                    Provider::Gitlab => "/api/v4",
+                };
+                if let Some(prefix) = api
+                    .path()
+                    .strip_suffix(suffix)
+                    .filter(|prefix| !prefix.is_empty())
+                    && let Some(project) = transport
+                        .project
+                        .strip_prefix(&format!("{}/", prefix.trim_matches('/')))
+                {
+                    config.project = Some(project.into());
+                }
+            }
             config.provider = Some(provider.key().into());
             config.api_url = Some(base.into());
         }
@@ -102,7 +144,15 @@ impl Draft {
             .unwrap_or(default_url(provider))
             .to_string();
         Ok(Self {
-            has_token: crate::credentials::read(&url)?.is_some(),
+            has_token: crate::credentials::read(&url)?
+                .or(crate::credentials::legacy_shared(
+                    &url,
+                    match provider {
+                        Provider::Github => "repos",
+                        Provider::Gitlab => "projects",
+                    },
+                )?)
+                .is_some(),
             saved_url: url.clone(),
             url,
             ..Self::default()
@@ -141,6 +191,13 @@ impl Draft {
 pub fn save(provider: Provider, draft: &Draft) -> Result<String, String> {
     save_file(&file()?, provider, draft, |base| {
         if draft.forget {
+            crate::credentials::delete_legacy(
+                &draft.saved_url,
+                match provider {
+                    Provider::Github => "repos",
+                    Provider::Gitlab => "projects",
+                },
+            )?;
             crate::credentials::delete(&draft.saved_url)
         } else if !draft.token.is_empty() {
             crate::credentials::write(base, &draft.token)
@@ -193,18 +250,200 @@ fn save_file(
 
 /// Only reuse user-wide secrets within the configured API installation.
 pub fn token(remote: &Remote) -> Result<Option<String>, String> {
-    let Some((base, _)) = remote.endpoint.split_once(match remote.provider {
-        Provider::Github => "/repos/",
-        Provider::Gitlab => "/projects/",
-    }) else {
+    token_with(
+        remote,
+        crate::credentials::read,
+        crate::credentials::legacy_shared,
+    )
+}
+
+fn token_with(
+    remote: &Remote,
+    read: impl FnOnce(&str) -> Result<Option<String>, String>,
+    legacy: impl FnOnce(&str, &str) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    let Some(base) = credential_base(remote) else {
         return Ok(None);
     };
-    crate::credentials::read(base)
+    if let Some(token) = read(base)? {
+        return Ok(Some(token));
+    }
+    legacy(
+        base,
+        match remote.provider {
+            Provider::Github => "repos",
+            Provider::Gitlab => "projects",
+        },
+    )
+}
+
+pub fn credential_base(remote: &Remote) -> Option<&str> {
+    remote
+        .endpoint
+        .rsplit_once(match remote.provider {
+            Provider::Github => "/repos/",
+            Provider::Gitlab => "/projects/",
+        })
+        .map(|(base, _)| base)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injected_store_shares_tokens_by_api_installation_and_prefers_explicit_global_account() {
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/one.git",
+            Some("gitlab"),
+        )
+        .unwrap();
+        for project in ["team%2Fone", "team%2Ftwo"] {
+            remote.endpoint = format!(
+                "https://example.invalid/gitlab/api/v4/projects/{project}/repository/branches"
+            );
+            let token = token_with(
+                &remote,
+                |base| {
+                    assert_eq!(base, "https://example.invalid/gitlab/api/v4");
+                    Ok(Some("fake-global".into()))
+                },
+                |_, _| panic!("explicit account must bypass legacy lookup"),
+            )
+            .unwrap();
+            assert_eq!(token.as_deref(), Some("fake-global"));
+            let token = token_with(
+                &remote,
+                |_| Ok(None),
+                |base, segment| {
+                    assert_eq!(base, "https://example.invalid/gitlab/api/v4");
+                    assert_eq!(segment, "projects");
+                    Ok(Some("fake-legacy".into()))
+                },
+            )
+            .unwrap();
+            assert_eq!(token.as_deref(), Some("fake-legacy"));
+        }
+        remote.endpoint =
+            "https://other.invalid/api/v4/projects/team%2Fone/repository/branches".into();
+        assert!(
+            token_with(
+                &remote,
+                |base| Ok((base == "https://example.invalid/gitlab/api/v4")
+                    .then(|| "wrong-server".into())),
+                |_, _| Ok(None)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            token_with(
+                &remote,
+                |_| Err("credential access denied".into()),
+                |_, _| Ok(None)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_project_token_is_shared_across_clones_without_crossing_installations() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!(
+            "https://example.invalid/{}/api/v4",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let a = format!("{base}/projects/team%2Fone/repository/branches");
+        let b = format!("{base}/projects/team%2Ftwo/repository/branches");
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for key in &self.0 {
+                    let _ = crate::credentials::delete(key);
+                }
+            }
+        }
+        let _cleanup = Cleanup(vec![a.clone(), b.clone(), base.clone()]);
+        if !crate::credentials::write_fixture(&a, "synthetic-legacy-shared-token") {
+            return;
+        }
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/two.git",
+            Some("gitlab"),
+        )
+        .unwrap();
+        remote.endpoint = b.clone();
+        assert_eq!(
+            token(&remote).unwrap().as_deref(),
+            Some("synthetic-legacy-shared-token")
+        );
+        remote.endpoint = format!("{base}/other/projects/team%2Ftwo/repository/branches");
+        assert!(token(&remote).unwrap().is_none());
+        remote.endpoint = b.clone();
+        crate::credentials::write(&b, "different-account").unwrap();
+        assert!(
+            token(&remote).unwrap().is_none(),
+            "ambiguous legacy accounts must not be shared"
+        );
+        crate::credentials::write(&base, "explicit-global-token").unwrap();
+        assert_eq!(
+            token(&remote).unwrap().as_deref(),
+            Some("explicit-global-token")
+        );
+        crate::credentials::delete_legacy(&base, "projects").unwrap();
+        assert!(crate::credentials::read(&a).unwrap().is_none());
+        assert!(crate::credentials::read(&b).unwrap().is_none());
+    }
+
+    #[test]
+    fn global_provider_does_not_redirect_an_unrelated_server_or_explicit_installation() {
+        let providers = Providers {
+            gitlab: Some("https://company.example/gitlab/api/v4".into()),
+            ..Default::default()
+        };
+        let mut public = Configuration {
+            name: "origin".into(),
+            url: "https://gitlab.com/team/project.git".into(),
+            ..Default::default()
+        };
+        providers.apply(&mut public);
+        assert!(
+            public
+                .remote()
+                .unwrap()
+                .endpoint
+                .starts_with("https://gitlab.com/api/v4/")
+        );
+        let mut explicit = Configuration {
+            name: "origin".into(),
+            url: "https://company.example/team/project.git".into(),
+            provider: Some("gitlab".into()),
+            api_url: Some("https://company.example/second/api/v4".into()),
+            ..Default::default()
+        };
+        providers.apply(&mut explicit);
+        assert_eq!(
+            explicit.api_url.as_deref(),
+            Some("https://company.example/second/api/v4")
+        );
+        let mut prefixed = Configuration {
+            name: "origin".into(),
+            url: "https://company.example/gitlab/team/project.git".into(),
+            ..Default::default()
+        };
+        providers.apply(&mut prefixed);
+        assert_eq!(prefixed.remote().unwrap().project, "team/project");
+        let mut other_port = Configuration {
+            name: "origin".into(),
+            url: "https://company.example:8443/team/project.git".into(),
+            provider: Some("gitlab".into()),
+            ..Default::default()
+        };
+        providers.apply(&mut other_port);
+        assert!(other_port.api_url.is_none());
+    }
 
     #[test]
     fn saved_token_is_shared_by_projects_but_scoped_to_the_api_installation() {
@@ -220,7 +459,9 @@ mod tests {
             }
         }
         let _cleanup = Cleanup(base.clone());
-        crate::credentials::write(&base, "synthetic-global-token").unwrap();
+        if !crate::credentials::write_fixture(&base, "synthetic-global-token") {
+            return;
+        }
         let providers = Providers {
             gitlab: Some(base.clone()),
             ..Default::default()

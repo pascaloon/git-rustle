@@ -14,6 +14,7 @@ use gix::prelude::FindExt;
 use crate::graph::layout::Layout;
 use crate::model::History;
 
+pub mod branch_base;
 pub mod checkout;
 pub mod command;
 pub mod operations;
@@ -84,6 +85,8 @@ pub struct RefSnapshot {
     /// Exact upstream branch identities, keyed by remote. Built once on the
     /// worker so branch rendering/search never reads configuration.
     pub tracking: BTreeMap<String, HashSet<String>>,
+    /// Exact local branch -> (remote, remote branch), including local `.` upstreams.
+    pub upstreams: BTreeMap<String, (String, String)>,
 }
 
 impl RefSnapshot {
@@ -202,6 +205,13 @@ fn snapshot_tracking(repo: &gix::Repository, snap: &mut RefSnapshot) {
         let Some(name) = merge.strip_prefix(b"refs/heads/") else {
             continue;
         };
+        snap.upstreams.insert(
+            reference.name.clone(),
+            (
+                remote.to_str_lossy().into_owned(),
+                name.to_str_lossy().into_owned(),
+            ),
+        );
         if remote == b".".as_bstr() {
             continue;
         }
@@ -293,6 +303,7 @@ fn fingerprint(snap: &RefSnapshot) -> u64 {
         names.sort();
         names.hash(&mut h);
     }
+    snap.upstreams.hash(&mut h);
     h.finish()
 }
 

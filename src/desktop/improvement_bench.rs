@@ -217,8 +217,8 @@ impl Desktop {
                 let id = app.history.commits[index].id;
                 if app.labels.get(&id).is_some_and(|labels| {
                     labels.iter().any(|label| {
-                        label.kind == crate::git::RefKind::Branch
-                            && label.name.starts_with("benchmark/")
+                        label.kind == crate::git::RefKind::Remote
+                            && label.name.starts_with("origin/benchmark/")
                     })
                 }) {
                     dense += 1;
@@ -278,6 +278,7 @@ impl Desktop {
                 );
             }
             Some("provider-scroll") => {
+                self.assert_provider_scenario();
                 assert!(self.provider_scenario_ready(window, cx));
                 assert_eq!(self.frame_samples.len(), 121);
                 assert!(self.viewport_rows[0] > 0);
@@ -291,6 +292,7 @@ impl Desktop {
                 );
             }
             Some("provider-menu") => {
+                self.assert_provider_scenario();
                 assert!(self.provider_scenario_ready(window, cx));
                 assert!(self.context_menu.is_some());
                 assert!(

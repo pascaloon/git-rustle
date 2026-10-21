@@ -31,6 +31,33 @@ pub fn format_absolute(secs: i64, offset: i32) -> String {
     )
 }
 
+/// Six calendar months before a UTC instant, clamping month-end days.
+pub fn six_months_before(secs: i64) -> i64 {
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let months = year * 12 + i64::from(month) - 1 - 6;
+    let year = months.div_euclid(12);
+    let month = months.rem_euclid(12) + 1;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let last = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    let day = i64::from(day).min(last);
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) * 86_400 + secs.rem_euclid(86_400)
+}
 /// Compact relative age: `now`, `5m`, `3h`, `2d`, `3w`, `4mo`, `2y`.
 pub fn format_relative(secs: i64, now: i64) -> String {
     let delta = now - secs;
@@ -107,5 +134,17 @@ mod tests {
         assert_eq!(format_relative(1000, 1000 + 3 * 3600), "3h");
         assert_eq!(format_relative(1000, 1000 + 40 * 86_400), "1mo");
         assert_eq!(format_relative_long(1000, 1000 + 86_400), "1 day ago");
+    }
+    #[test]
+    fn calendar_cleanup_cutoff_clamps_month_ends() {
+        // 2024-08-31 and 2025-08-31, UTC.
+        assert_eq!(
+            format_absolute(six_months_before(1_725_062_400), 0),
+            "2024-02-29 00:00 +0000"
+        );
+        assert_eq!(
+            format_absolute(six_months_before(1_756_598_400), 0),
+            "2025-02-28 00:00 +0000"
+        );
     }
 }

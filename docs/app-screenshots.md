@@ -17,7 +17,7 @@ From the repository root:
 ```
 
 The output directory must be new. Defaults cover graph, branches, settings, diff,
-and the populated stash panel. Each view gets a fresh disposable Git fixture,
+and the populated Stashes tab. Each view gets a fresh disposable Git fixture,
 isolated application data and Git configuration, and a separate native app
 process. Fixtures contain six commits, two branches, a tag, three stashes and
 pending files. There are no remotes, hooks or signing prompts. The runner waits
@@ -113,3 +113,10 @@ Run the focused integration checks after changing these helpers:
 They exercise two real views, decode PNGs, check metadata and fixture preservation,
 and reject exited processes, existing output, non-private desktops and stale PID
 identities. They do not replace inspecting images or the functional test suite.
+
+The capture metadata also records the owned app's native window title through
+`GetWindowTextW`, after the same PID and private-desktop ownership checks. This
+validates project titles even though the PNG deliberately excludes window chrome.
+The feature-specific runners listed in [benchmarking](benchmarking.md) extend
+capture coverage to hierarchy, cleanup, multi-selection, diff search, pipelines
+and external-tool icons. Their screenshot runs remain separate from timing.

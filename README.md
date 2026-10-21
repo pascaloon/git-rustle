@@ -57,11 +57,22 @@ interior pixels. The icon generator retains the resulting alpha channel.
   reference history. Detached commits outside that history appear after it;
   **HEAD** still locates them. The selected and hovered branch paths have a thin
   light outline, preserving their branch colors.
+- Ctrl+click selects several commits. Each selected branch path keeps its light
+  outline, and SHA labels on those paths have a light background. Selected commit
+  details stack as expandable cards; open a card to load its full message and
+  metadata.
+- **Checkout** opens the local branch directly when a commit has one logical
+  branch. Its matching upstream is an alias; distinct branches still show a
+  chooser. Commits without branches retain detached-checkout confirmation.
+- **Diff against branch base** compares the selected commit with its merge base
+  against the remote default branch, or `main`/`master` when available. If no
+  default is known, choose a base branch. The comparison uses the common ancestor,
+  so changes added independently to the base branch are excluded.
 - Right-click a graph row for **Diff commit** and **Checkout…**. Ctrl+click
   toggles additional commits; the context menu compares exactly two selected
   commits and disables Checkout for multiple selections. Double-click opens a
   commit against its first parent. A normal click returns to a single selection.
-- **Git Graph**, **Branches**, **Diff** and **Settings** are tabs. The Diff tab
+- **Git Graph**, **Branches**, **Stashes**, **Cleanup**, **Diff** and **Settings** are tabs. The Diff tab
   appears after opening a diff and retains its file and scroll position when
   switching tabs. A newly opened comparison replaces the previous diff.
 - Click folders to fold them and files to open their side-by-side diff. File and
@@ -81,9 +92,15 @@ interior pixels. The icon generator retains the resulting alpha channel.
   Large/generated files and unsupported formats keep plain text. See
   [syntax highlighting](docs/syntax-highlighting.md) for coverage and limits.
 - **Branches** opens the activity-sorted, filterable branch browser.
+  Switch between List and Hierarchy to group slash-separated branch names into
+  folders. A local branch and its upstream share a row when their tips match.
   Double-click a branch to locate its tip or load a remote-only preview.
-- **Checkout…** opens an explicit choice dialog. Clicking a branch or detached
-  commit choice performs that checkout. **Cancel** performs no Git operation.
+- **Cleanup** analyzes local branches matching their upstream and local-only
+  branches whose last commit is at least six months old. Review author/date and
+  selections before deleting; current/worktree branches are excluded and default
+  branches start unchecked. Remote deletion is separately opted into and cannot
+  be undone locally. **Optimize storage** consolidates objects while retaining
+  recovery and unreachable commits, and reports Git's measured storage change.
 - **Refresh** reloads refs/status and revalidates remote data.
 - **Pull**, **Push**, and **New branch** live in the graph toolbar. Push reviews
   the current branch with a green, orange or red safety shield. Right-click a
@@ -97,8 +114,14 @@ interior pixels. The icon generator retains the resulting alpha channel.
   this history; pushes and outside repository changes invalidate earlier states.
   See [Git operations and recovery](docs/git-operations.md) for safety boundaries,
   supported repository types and benchmark commands.
-- **Settings → General** contains image-cache reset controls and **Check for
-  updates**. The Project, GitLab and GitHub sections configure provider API access.
+- **Settings → General** contains the website/release links, image-cache reset
+  controls and **Check for updates**. External tools show their executable icons
+  here and as quick launch buttons in diff/conflict views. The Project, GitLab and
+  GitHub sections configure provider API access; GitLab tokens are shared across
+  repositories on the same API installation.
+- Remote/server branch labels show merge requests once and the latest branch-head
+  pipeline status: gray pending, blue running, green success, yellow warning or
+  red failure, with distinct icons and status tooltips.
 - The shell's folder and terminal icons open the repository in Explorer or
   Windows Terminal. Windows Terminal must be installed for its launcher.
 
@@ -106,6 +129,14 @@ The former terminal navigation keys are not bound in the desktop. Normal text
 editing, selection, clipboard and input-method behavior remain available in fields.
 
 ### Search
+
+Ctrl+F focuses the current graph, branch or diff search. Escape clears an active
+filter; in Diff, another Escape returns to the graph. Diff search matches filenames
+and both versions' full text in a cancellable background worker. Results include
+line previews and jump to displayed hunks; unchanged context outside the hunks
+remains available in the preview. Binary/unavailable files and contents exceeding
+8 MiB per side or the 64 MiB index budget are filename-only. The window title
+includes the open project name.
 
 Type in the search field to filter history. Matching is case-insensitive and
 accepts contiguous fragments inside words. All space-separated terms must match
@@ -153,9 +184,9 @@ Click elsewhere or press Escape to cancel. Undo / redo history can recover the
 discarded contents.
 
 Right-click the pending graph row and choose **Stash changes…** to open the
-Stashes panel. Enter an optional name and click **Stash changes** to save staged,
+Stashes tab. Enter an optional name and click **Stash changes** to save staged,
 unstaged and untracked files. Apply keeps the stash entry; Delete removes it and
-can be recovered through Undo / redo history. The panel follows external stash
+can be recovered through Undo / redo history. The tab follows external stash
 changes and the global Refresh action.
 
 A branch name creates and switches to a new branch from HEAD; existing names are

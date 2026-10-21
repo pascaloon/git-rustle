@@ -629,8 +629,13 @@ impl Desktop {
             }
             let refresh_stashes =
                 matches!(&request, Request::ApplyStash(_) | Request::DropStash(_));
+            let cleanup_mutation =
+                matches!(&request, Request::Cleanup(_) | Request::OptimizeStorage);
             let read_conflict = matches!(&request, Request::ReadConflict(_));
             if self.engine.request_operation(request) {
+                if cleanup_mutation {
+                    self.cleanup_mutation_started();
+                }
                 if refresh_stashes {
                     self.stash_mutation_started();
                 }
@@ -1168,6 +1173,7 @@ impl Desktop {
                         column()
                             .relative()
                             .children(self.todo_probe(7))
+                            .children(self.branch_cleanup_probe(6))
                             .children(self.conflicts_probe(9))
                             .w(px(600.))
                             .p_6()

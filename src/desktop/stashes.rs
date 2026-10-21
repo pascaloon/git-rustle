@@ -1,9 +1,10 @@
-//! Lazy stash sidebar. Git access stays on the serialized worker.
+//! Lazy stash tab. Git access stays on the serialized worker.
 use super::*;
 use crate::git::operations::{Request, stashes::Stash};
 
 #[derive(Clone)]
 pub(super) enum Action {
+    Open,
     Toggle,
     Create,
     Save,
@@ -86,15 +87,26 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) {
         match action {
+            Action::Open => {
+                self.stashes.open = true;
+                self.invalidate_stashes();
+                self.request_stashes();
+            }
             Action::Toggle => {
-                self.stashes.open = !self.stashes.open;
-                if self.stashes.open {
-                    self.invalidate_stashes();
-                    self.request_stashes();
-                }
+                self.action(
+                    super::Action::Tab(if self.stashes.open {
+                        Tab::Graph
+                    } else {
+                        Tab::Stashes
+                    }),
+                    window,
+                    cx,
+                );
             }
             Action::Create => {
-                self.stashes.open = true;
+                if !self.stashes.open {
+                    self.action(super::Action::Tab(Tab::Stashes), window, cx);
+                }
                 self.stashes.composing = true;
                 if self.stashes.name.is_none() {
                     let name = cx
@@ -311,10 +323,9 @@ impl Desktop {
             column()
                 .relative()
                 .children(self.todo_probe(2))
-                .w(px(340.))
+                .w_full()
                 .h_full()
-                .flex_shrink_0()
-                .border_r_1()
+                .flex_1()
                 .border_color(rgb(LINE))
                 .child(
                     row()

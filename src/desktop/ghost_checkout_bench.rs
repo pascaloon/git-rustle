@@ -326,9 +326,10 @@ impl Desktop {
                         v.action(Action::Select(row, false), window, cx);
                         v.engine.mark("desktop scenario requested");
                         v.engine.mark("ghost checkout requested");
+                        v.engine.mark("ghost checkout confirmed");
                         v.action(Action::Checkout, window, cx);
-                        assert!(v.engine.app.checkout_confirmation.is_some());
-                        v.ghost_checkout_bench.run.as_mut().unwrap().phase = 2;
+                        assert!(v.engine.app.checkout_confirmation.is_none());
+                        v.ghost_checkout_bench.run.as_mut().unwrap().phase = 3;
                         cx.notify();
                     });
                 })

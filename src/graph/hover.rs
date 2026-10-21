@@ -22,10 +22,19 @@ pub struct FlatFlags {
     flags: Vec<u8>,
 }
 impl FlatFlags {
+    #[cfg(test)]
     pub fn trace<'a>(
         &mut self,
         count: usize,
         anchor: usize,
+        row_at: impl Fn(usize) -> Option<Row<'a>>,
+    ) {
+        self.trace_many(count, &[anchor], row_at);
+    }
+    pub fn trace_many<'a>(
+        &mut self,
+        count: usize,
+        anchors: &[usize],
         row_at: impl Fn(usize) -> Option<Row<'a>>,
     ) {
         self.offsets.clear();
@@ -38,7 +47,9 @@ impl FlatFlags {
         }
         self.flags.clear();
         self.flags.resize(total, 0);
-        follow(count, anchor, row_at, self);
+        for &anchor in anchors {
+            follow(count, anchor, &row_at, self);
+        }
     }
     pub fn row(&self, index: usize) -> &[u8] {
         let Some(pair) = self.offsets.get(index..index.saturating_add(2)) else {
@@ -151,6 +162,45 @@ mod tests {
 
     fn id(n: u8) -> gix::ObjectId {
         gix::ObjectId::from_bytes_or_panic(&[n; 20])
+    }
+
+    #[test]
+    fn multi_anchor_flat_flags_equal_the_union_of_independent_paths() {
+        let mut layout = Layout::new();
+        let definitions = [
+            (6, vec![4]),
+            (5, vec![3]),
+            (4, vec![2]),
+            (3, vec![1]),
+            (2, vec![1]),
+            (1, vec![]),
+        ];
+        let geometry: Vec<_> = definitions
+            .iter()
+            .map(|(n, parents)| {
+                layout.push(&id(*n), &parents.iter().map(|n| id(*n)).collect::<Vec<_>>())
+            })
+            .collect();
+        let rows: Vec<_> = geometry
+            .iter()
+            .zip(&definitions)
+            .map(|(row, (_, parents))| Row {
+                cells: &row.cells,
+                node_lane: row.node_lane as usize,
+                has_parents: !parents.is_empty(),
+            })
+            .collect();
+        let left = trace(&rows, 0);
+        let right = trace(&rows, 1);
+        let mut flat = FlatFlags::default();
+        flat.trace_many(rows.len(), &[0, 1], |index| rows.get(index).copied());
+        for row in 0..rows.len() {
+            for col in 0..rows[row].cells.len() {
+                assert_eq!(flat.row(row)[col], left[row][col] | right[row][col]);
+            }
+        }
+        flat.trace_many(rows.len(), &[], |index| rows.get(index).copied());
+        assert!((0..rows.len()).all(|row| flat.row(row).iter().all(|flag| *flag == 0)));
     }
 
     #[test]

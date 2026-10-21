@@ -28,6 +28,26 @@ rendering and its durations are not performance samples.
 
 ### Stable graph order and selected paths
 
+The next graph feature bundle adds `scripts/benchmark-graph-features.ps1`. Supply
+the final candidate and a fresh ignored output directory; its default matrix
+retains one warm-up plus 15 samples for `graph-multiselect`, `multi-details`,
+`dense-labels`, `checkout-simple`, and `diff-base`. It builds clean disposable
+main/topic fixtures, invokes real handlers, awaits loaded workers and relevant
+GPUI paints, checks column bounds and index/worktree/ref postconditions, and
+launches through the private desktop helper. `-Screenshots` runs a separate
+single capture per view; inspect those PNGs rather than treating pixel checks as
+visual review. The candidate-only intervals measure request through verified
+frame and include worker dispatch and final frame scheduling. They are not a
+comparison against the former confirmation workflow.
+
+Also run `desktop::hover::tests::benchmark_multi_selected_paths` (100k records,
+80-row viewport, 1/4/16 anchors), `checkout::tests::benchmark_branch_choices`
+(1k/10k logical branches), and `git::branch_base::tests::benchmark_branch_base`.
+The latter uses `GIT_RUSTLE_BENCH_REPO` and optional full hexadecimal
+`GIT_RUSTLE_BENCH_BASE_COMMIT`, recording target preparation, actual merge-base
+lookup and resulting tree diff separately. Measure startup and normal/searched
+scrolling against the preserved application baseline as shared controls.
+
 Compare warm/uncached startup and normal/searched scrolling against the preserved
 application baseline. Run `benchmark-desktop.ps1 -Scenarios graph-hover
 -RequireSelectedPath` with the usual repository, binary, sample and output
@@ -1271,3 +1291,44 @@ Keep all crossings and diagnostic repeats visible. The native figures include
 real action delivery and verified GPUI paint, excluding physical pointer/display
 scanout; local disposable fixtures do not establish all graph/worktree scales or
 employer-network behavior.
+
+## October feature batch: hierarchy, cleanup, pipelines and diff search
+
+Build final application and test executables before timing; never benchmark while
+Cargo, rustc or a linker is running. Preserve both baseline executables first.
+Use fresh subdirectories beneath the same ignored run directory for:
+
+- `benchmark-graph-features.ps1`: real checkout, merge-base diff, multi-selection,
+  expandable details and dense badges. Run once with `-Samples 15` and separately
+  with `-Screenshots`.
+- `benchmark-branch-cleanup.ps1`: hierarchy and paired branch rows, cleanup review
+  and explicit leased deletion against a disposable local bare remote. Supply
+  candidate/baseline test harnesses and a read-only repository for component
+  comparisons. Use `-Stages Native,Components,Screenshots`.
+- `benchmark-ui-features.ps1`: filename/content search, rapid query replacement,
+  selected-result navigation, Escape through real GPUI key dispatch, modal
+  precedence and General links. Screenshot metadata verifies the actual native
+  project title. Use `-Samples 15`, then a separate `-Screenshots` run.
+- [Provider/tool measurements](benchmarks/provider-tools.md): remote-only and
+  deduplicated request badges, five pipeline states and actual executable icons
+  in settings and the diff toolbar. These fixtures never launch external tools.
+- Existing `benchmark-stash-workflows.ps1`: stash open/create/apply/delete and
+  preservation of unrelated work; candidate now uses a full tab, so native
+  sidebar-versus-tab frame costs are not identical visual workloads.
+
+Diff search's ignored `diff::search::tests::benchmark_worker_cold_hot` records one
+warmup plus 15 actual cold I/O/index and warm query samples on 32 changed files.
+`benchmark_search` isolates a cached 100,000-line scan. The native search fixture
+uses 16 changed 500-line files; input-to-completion intervals include the 65 ms
+input debounce and worker notification/frame scheduling. Its scheduler pauses
+while queries run so artificial frame polling cannot hide missed wakeups. An
+8 MiB per-side read limit, 64 MiB retained text index, 1,000-result limit and
+cancellation bound the work. Historical object sizes are checked before loading.
+Report retained-cache bounds separately from temporary decoding allocations.
+
+Run preserved baseline/candidate startup and graph scroll/search-scroll controls
+on the same larger repository using `benchmark.ps1` and `benchmark-desktop.ps1`.
+Measure `diff-scroll` as well as the new query operations. Keep cold-cache setup,
+warmups and capture-only launches distinct. Record raw samples, medians/p95,
+fixture scale, binary hashes and any regressions in the run's Markdown report.
+New workflows have candidate-only absolute timings; do not invent a baseline.

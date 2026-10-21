@@ -17,6 +17,16 @@ impl AssetSource for Assets {
             _ => path.strip_prefix("rustle/").unwrap_or(""),
         };
         let body = match name {
+            "pipeline-pending" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>",
+            "pipeline-running" => "<circle cx='12' cy='12' r='9'/><path d='m10 8 6 4-6 4z'/>",
+            "pipeline-success" => "<circle cx='12' cy='12' r='9'/><path d='m7 12 3 3 7-7'/>",
+            "pipeline-warning" => "<path d='M12 3 2 21h20zM12 9v5m0 3h.01'/>",
+            "pipeline-failed" => "<circle cx='12' cy='12' r='9'/><path d='m8 8 8 8m0-8-8 8'/>",
+            "stash" => "<path d='M3 5h18v4H3zM5 9v12h14V9M9 13h6'/>",
+            "broom" => "<path d='m16 3-5 10m-5-1 9 4-3 6-10-5zm0 3-2 3m5-2-2 3'/>",
+            "tool" => {
+                "<rect x='3' y='3' width='18' height='18' rx='3'/><path d='m10 8-4 4 4 4m4-8 4 4-4 4'/>"
+            }
             "shield-check" => {
                 "<path d='M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z'/><path d='m8 12 3 3 5-6'/>"
             }

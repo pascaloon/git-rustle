@@ -467,10 +467,13 @@ pub fn save(path: &Path, draft: &Draft) -> Result<String, String> {
     let config = draft.validated()?;
     let remote = config.remote()?;
     save_config(path, &config, || {
+        let base =
+            crate::provider_settings::credential_base(&remote).ok_or("Invalid API installation")?;
         if draft.forget {
+            crate::credentials::delete(base)?;
             crate::credentials::delete(&remote.endpoint)
         } else if !draft.token.is_empty() {
-            crate::credentials::write(&remote.endpoint, &draft.token)
+            crate::credentials::write(base, &draft.token)
         } else {
             Ok(())
         }
