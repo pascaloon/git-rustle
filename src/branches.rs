@@ -385,7 +385,8 @@ impl Browser {
             }
         }
         self.entries = entries.into_values().collect();
-        let mut by_sha: HashMap<&str, &Activity> = HashMap::new();
+        let mut by_sha: HashMap<&str, &Activity> =
+            HashMap::with_capacity(self.activity_cache.len());
         for (target, activity) in &self.activity_cache {
             let keep = by_sha.entry(&target.sha).or_insert(activity);
             if activity.recent > keep.recent {

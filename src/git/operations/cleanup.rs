@@ -2,8 +2,9 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Section {
+    FetchedOnly,
     Matching,
     OldLocal,
 }
@@ -24,6 +25,7 @@ pub struct Candidate {
     pub protected: bool,
     pub upstream: Option<(String, String)>,
     pub tracking: Option<(String, String)>,
+    pub tracking_oid: Option<String>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Analysis {
@@ -35,7 +37,6 @@ pub struct Analysis {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub branches: Vec<Candidate>,
-    pub delete_remotes: bool,
 }
 
 fn checked_out(root: &Path) -> Result<HashSet<String>> {
@@ -46,15 +47,50 @@ fn checked_out(root: &Path) -> Result<HashSet<String>> {
         .map(|name| std::str::from_utf8(name).map(str::to_owned).map_err(err))
         .collect()
 }
-fn push_url(root: &Path, remote: &str) -> Result<String> {
-    let text = output(root, &["remote", "get-url", "--push", "--all", remote])?;
+fn fetch_url(root: &Path, remote: &str) -> Result<String> {
+    let text = output(root, &["remote", "get-url", "--all", remote])?;
     let urls: Vec<_> = text.lines().filter(|s| !s.is_empty()).collect();
     if urls.len() != 1 {
-        return Err(format!(
-            "{remote} has multiple push URLs; remote deletion is unavailable."
-        ));
+        return Err(format!("{remote}: expected one fetch URL"));
     }
     Ok(urls[0].into())
+}
+struct Server {
+    url: String,
+    heads: HashMap<String, String>,
+    default: Option<String>,
+}
+fn advertise(root: &Path, remote: &str, timeout: Duration) -> Result<Server> {
+    let url = fetch_url(root, remote)?;
+    let out = command::run(
+        root,
+        &["ls-remote", "--symref", "--", &url, "HEAD", "refs/heads/*"],
+        None,
+        timeout,
+    )?;
+    if !out.status.success() {
+        return Err(command::clean(&String::from_utf8_lossy(&out.stderr)));
+    }
+    let mut heads = HashMap::new();
+    let mut default = None;
+    for line in std::str::from_utf8(&out.stdout).map_err(err)?.lines() {
+        let Some((value, name)) = line.split_once('\t') else {
+            return Err("Malformed remote advertisement".into());
+        };
+        if name == "HEAD" {
+            if let Some(branch) = value.strip_prefix("ref: refs/heads/") {
+                default = Some(branch.into());
+            }
+        } else if let Some(branch) = name.strip_prefix("refs/heads/") {
+            gix::ObjectId::from_hex(value.as_bytes()).map_err(err)?;
+            heads.insert(branch.into(), value.into());
+        }
+    }
+    Ok(Server {
+        url,
+        heads,
+        default,
+    })
 }
 pub fn storage_kib(root: &Path) -> Result<u64> {
     let text = output(root, &["count-objects", "-v"])?;
@@ -70,14 +106,42 @@ pub fn storage_kib(root: &Path) -> Result<u64> {
     Ok(total)
 }
 pub fn cutoff(now: i64) -> i64 {
-    crate::ui::time::six_months_before(now)
+    crate::ui::time::one_year_before(now)
 }
 pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
     let repo = super::super::open(root).map_err(err)?;
     let refs = super::super::snapshot_refs(&repo).map_err(err)?;
-    let checked = checked_out(root)?;
     let raw = super::super::refs::raw_refs(&repo)?;
+    let checked = checked_out(root)?;
+    let mut result = Analysis {
+        storage_kib: storage_kib(root)?,
+        ..Analysis::default()
+    };
+    let remote_names = output(root, &["remote"])?;
+    let started = std::time::Instant::now();
+    let mut servers = HashMap::new();
+    for remote in remote_names.lines().filter(|s| !s.is_empty()) {
+        let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
+        let verification = if remaining.is_zero() {
+            Err("Remote verification time budget exhausted".into())
+        } else {
+            advertise(root, remote, remaining.min(Duration::from_secs(5)))
+        };
+        match verification {
+            Ok(server) => {
+                servers.insert(remote.to_string(), server);
+            }
+            Err(e) => result.warnings.push(format!(
+                "{remote}: verification unavailable; affected branches excluded. {e}"
+            )),
+        }
+    }
     let mut protected = HashSet::from(["main".to_string(), "master".to_string()]);
+    for server in servers.values() {
+        if let Some(name) = &server.default {
+            protected.insert(name.clone());
+        }
+    }
     for reference in &raw {
         if reference.name.ends_with("/HEAD")
             && let Some(target) = &reference.symbolic
@@ -85,94 +149,114 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
                 .strip_prefix("refs/remotes/")
                 .and_then(|r| r.split_once('/'))
         {
-            protected.insert(name.to_string());
+            protected.insert(name.into());
         }
     }
-    let remote_refs: HashMap<_, _> = refs
-        .refs
+    // Preserve namespaces: the graph snapshot intentionally deduplicates display
+    // labels and must not determine cleanup's exact reference identities.
+    let local_entries: Vec<_> = raw
         .iter()
-        .filter(|r| r.kind == super::super::RefKind::Remote)
+        .filter(|r| r.symbolic.is_none())
         .filter_map(|r| {
-            r.name
-                .split_once('/')
-                .map(|(remote, branch)| ((remote.to_string(), branch.to_string()), r.id))
+            Some(super::super::RefEntry {
+                name: r.name.strip_prefix("refs/heads/")?.into(),
+                id: r.id?,
+                kind: super::super::RefKind::Branch,
+            })
         })
         .collect();
-    let mut by_name = HashMap::<&str, Vec<(&(String, String), &gix::ObjectId)>>::new();
-    for (key, oid) in &remote_refs {
-        by_name.entry(&key.1).or_default().push((key, oid));
+    let mut configured: Vec<_> = remote_names.lines().collect();
+    configured.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    let cached: HashMap<_, _> = raw
+        .iter()
+        .filter(|r| r.symbolic.is_none())
+        .filter_map(|r| {
+            let short = r.name.strip_prefix("refs/remotes/")?;
+            let remote = configured.iter().find(|name| {
+                short
+                    .strip_prefix(**name)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })?;
+            Some((
+                (remote.to_string(), short[remote.len() + 1..].to_string()),
+                r.id?,
+            ))
+        })
+        .collect();
+    let locals: HashSet<_> = local_entries.iter().map(|r| r.name.clone()).collect();
+    let associated: HashSet<_> = refs.upstreams.values().cloned().collect();
+    let mut by_name = HashMap::<&str, Vec<(String, String)>>::new();
+    for (remote, server) in &servers {
+        for branch in server.heads.keys() {
+            by_name
+                .entry(branch)
+                .or_default()
+                .push((remote.clone(), branch.clone()));
+        }
     }
-    let mut urls = HashMap::<String, Option<String>>::new();
+    let mut owners = HashMap::<&(String, String), Vec<&str>>::new();
+    for (name, key) in &refs.upstreams {
+        owners.entry(key).or_default().push(name);
+    }
+    let server_names: HashSet<_> = servers.values().flat_map(|s| s.heads.keys()).collect();
     let mut details = HashMap::new();
-    let mut result = Analysis {
-        storage_kib: storage_kib(root)?,
-        ..Analysis::default()
-    };
-    for reference in refs.refs.iter().filter(|r| {
-        r.kind == super::super::RefKind::Branch
-            || (r.kind == super::super::RefKind::Head && refs.head_branch.as_ref() == Some(&r.name))
-    }) {
+    for reference in &local_entries {
         if checked.contains(&format!("refs/heads/{}", reference.name)) {
             result.excluded_worktrees += 1;
             continue;
         }
-        let upstream = refs.upstreams.get(&reference.name);
+        let upstream = refs.upstreams.get(&reference.name).cloned();
         let identity = upstream
-            .filter(|(remote, _)| remote != ".")
+            .as_ref()
+            .filter(|(r, _)| r != ".")
             .cloned()
             .or_else(|| {
                 if upstream.is_some() {
                     return None;
                 }
-                let matches: Vec<_> = by_name
-                    .get(reference.name.as_str())
-                    .into_iter()
-                    .flatten()
-                    .filter(|(_, oid)| **oid == reference.id)
-                    .map(|(key, _)| (key.0.clone(), key.1.clone()))
-                    .collect();
+                let matches = by_name.get(reference.name.as_str())?;
                 (matches.len() == 1).then(|| matches[0].clone())
             });
-        let matching = identity
-            .as_ref()
-            .is_some_and(|key| remote_refs.get(key) == Some(&reference.id));
-        let has_remote_copy = identity
-            .as_ref()
-            .is_some_and(|key| remote_refs.contains_key(key))
-            || by_name.contains_key(reference.name.as_str());
-        if !matching && has_remote_copy {
+        let oid = reference.id.to_string();
+        // A shared upstream is retained: deleting it would break another local branch.
+        let shared = identity.as_ref().is_some_and(|key| {
+            owners
+                .get(key)
+                .is_some_and(|names| names.iter().any(|name| *name != reference.name))
+                || (key.1 != reference.name && locals.contains(&key.1))
+        });
+        let matching = !shared
+            && identity
+                .as_ref()
+                .is_some_and(|(r, b)| servers.get(r).is_some_and(|s| s.heads.get(b) == Some(&oid)));
+        let absent = servers.len() == remote_names.lines().filter(|s| !s.is_empty()).count()
+            && !server_names.contains(&reference.name)
+            && !identity
+                .as_ref()
+                .is_some_and(|(r, b)| servers.get(r).is_none_or(|s| s.heads.contains_key(b)))
+            && upstream.as_ref().is_none_or(|(r, _)| r != ".");
+        if !matching && !absent {
             continue;
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = details.entry(reference.id) {
-            entry.insert(super::super::commit_details(&repo, &reference.id).map_err(err)?);
+        if let std::collections::hash_map::Entry::Vacant(e) = details.entry(reference.id) {
+            e.insert(super::super::commit_details(&repo, &reference.id).map_err(err)?);
         }
         let tip = &details[&reference.id];
         if !matching && tip.commit_time > cutoff(now) {
             continue;
         }
-        let tracking = if matching { identity.clone() } else { None };
-        let mut remote = None;
-        if matching && let Some((name, branch)) = identity {
-            let url = urls
-                .entry(name.clone())
-                .or_insert_with(|| match push_url(root, &name) {
-                    Ok(url) => Some(url),
-                    Err(error) => {
-                        result.warnings.push(error);
-                        None
-                    }
-                });
-            if let Some(url) = url {
-                remote = Some(RemoteCopy {
-                    name,
-                    branch,
-                    url: url.clone(),
-                });
-            }
-        }
+        let remote = if matching {
+            identity.as_ref().map(|(r, b)| RemoteCopy {
+                name: r.clone(),
+                branch: b.clone(),
+                url: servers[r].url.clone(),
+            })
+        } else {
+            None
+        };
         result.candidates.push(Candidate {
             name: reference.name.clone(),
-            oid: reference.id.to_string(),
+            oid,
             author: command::clean(&tip.author_name),
             time: tip.commit_time,
             section: if matching {
@@ -181,241 +265,204 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
                 Section::OldLocal
             },
             protected: protected.contains(&reference.name)
-                || tracking
+                || identity
                     .as_ref()
-                    .is_some_and(|(_, branch)| protected.contains(branch)),
+                    .is_some_and(|(_, b)| protected.contains(b)),
             remote,
-            upstream: upstream.cloned(),
-            tracking,
+            upstream,
+            tracking_oid: if matching {
+                identity
+                    .as_ref()
+                    .and_then(|key| cached.get(key))
+                    .map(ToString::to_string)
+            } else {
+                None
+            },
+            tracking: if matching { identity } else { None },
         });
     }
-    result.candidates.sort_by(|a, b| {
-        (a.section != Section::Matching, &a.name).cmp(&(b.section != Section::Matching, &b.name))
-    });
+    for ((r, b), id) in &cached {
+        if associated.contains(&(r.clone(), b.clone())) || locals.contains(b) {
+            continue;
+        }
+        let Some(server) = servers.get(r) else {
+            continue;
+        };
+        if server.heads.get(b) != Some(&id.to_string()) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(e) = details.entry(*id) {
+            e.insert(super::super::commit_details(&repo, id).map_err(err)?);
+        }
+        let tip = &details[id];
+        result.candidates.push(Candidate {
+            name: format!("{r}/{b}"),
+            oid: id.to_string(),
+            author: command::clean(&tip.author_name),
+            time: tip.commit_time,
+            section: Section::FetchedOnly,
+            remote: Some(RemoteCopy {
+                name: r.clone(),
+                branch: b.clone(),
+                url: server.url.clone(),
+            }),
+            protected: protected.contains(b),
+            upstream: None,
+            tracking_oid: Some(id.to_string()),
+            tracking: Some((r.clone(), b.clone())),
+        });
+    }
+    let alias_targets: HashSet<_> = raw.iter().filter_map(|r| r.symbolic.as_deref()).collect();
+    for candidate in &mut result.candidates {
+        let local = format!("refs/heads/{}", candidate.name);
+        let tracking = candidate
+            .tracking
+            .as_ref()
+            .map(|(r, b)| format!("refs/remotes/{r}/{b}"));
+        candidate.protected |= (candidate.section != Section::FetchedOnly
+            && alias_targets.contains(local.as_str()))
+            || tracking
+                .as_ref()
+                .is_some_and(|name| alias_targets.contains(name.as_str()));
+    }
+    result
+        .candidates
+        .sort_by(|a, b| (a.section, &a.name).cmp(&(b.section, &b.name)));
     Ok(result)
 }
-// Receipts exist only after a successful atomic, expected-OID leased push.
-// Keep URL and OID in the identity so no other stale plan gains an exemption.
-type CompletedDeletes = HashSet<(String, String, String, String)>;
-fn validate_plan(context: &Context, plan: &Plan, completed: &CompletedDeletes) -> Result<()> {
+pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
     if plan.branches.is_empty() {
         return Err("Select at least one branch for cleanup.".into());
     }
-    let checked = checked_out(&context.root)?;
-    let repo = super::super::open(&context.root).map_err(err)?;
-    let refs = super::super::snapshot_refs(&repo).map_err(err)?;
-    let tips: HashMap<_, _> = refs
-        .refs
+    let frozen_config = fs::read(context.common.join("config")).map_err(err)?;
+    let fresh = analyze(&context.root, crate::ui::time::now_unix())?;
+    let candidates: HashMap<_, _> = fresh
+        .candidates
         .iter()
-        .filter(|r| {
-            matches!(
-                r.kind,
-                super::super::RefKind::Branch | super::super::RefKind::Head
-            )
-        })
-        .map(|r| (r.name.as_str(), r.id))
+        .map(|c| ((c.section, c.name.as_str()), c))
         .collect();
-    let tracking_tips: HashMap<_, _> = refs
-        .refs
-        .iter()
-        .filter(|r| r.kind == super::super::RefKind::Remote)
-        .map(|r| (r.name.as_str(), r.id))
-        .collect();
-    let mut urls = HashMap::new();
+    let mut deletions = BTreeMap::new();
     let mut names = HashSet::new();
     for candidate in &plan.branches {
-        // The fresh Git snapshot below validates reference membership without
-        // spawning check-ref-format once per selected branch.
-        if candidate.name.is_empty() || candidate.name.starts_with('-') || candidate.name == "HEAD"
-        {
-            return Err("Enter a valid branch name".into());
+        if !names.insert((candidate.section, candidate.name.as_str())) {
+            return Err("Duplicate cleanup entry".into());
         }
-        if !names.insert(&candidate.name) {
-            return Err("Duplicate cleanup branch.".into());
-        }
-        if checked.contains(&format!("refs/heads/{}", candidate.name)) {
+        let current = candidates
+            .get(&(candidate.section, candidate.name.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "{} changed or could not be verified. Analyze again.",
+                    candidate.name
+                )
+            })?;
+        if current.protected {
             return Err(format!(
-                "{} is now checked out in a worktree. Analyze again.",
+                "{} is protected and cannot be cleaned up.",
                 candidate.name
             ));
         }
-        let expected = gix::ObjectId::from_hex(candidate.oid.as_bytes()).map_err(err)?;
-        if tips.get(candidate.name.as_str()) != Some(&expected)
-            || refs.upstreams.get(&candidate.name) != candidate.upstream.as_ref()
+        if current.oid != candidate.oid
+            || current.upstream != candidate.upstream
+            || current.tracking != candidate.tracking
+            || current.tracking_oid != candidate.tracking_oid
+            || current.remote != candidate.remote
         {
             return Err(format!(
                 "{} changed since analysis. Analyze again.",
                 candidate.name
             ));
         }
-        if let Some((remote, branch)) = &candidate.tracking {
-            let name = format!("{remote}/{branch}");
-            let current = tracking_tips.get(name.as_str());
-            // Git may itself remove a tracking ref after pushing its deletion.
-            // An existing ref at another OID must still stop local deletion.
-            let removed_by_completed_push = current.is_none()
-                && plan.delete_remotes
-                && candidate.remote.as_ref().is_some_and(|copy| {
-                    copy.name == *remote
-                        && copy.branch == *branch
-                        && completed.contains(&(
-                            copy.name.clone(),
-                            copy.branch.clone(),
-                            copy.url.clone(),
-                            candidate.oid.clone(),
-                        ))
-                });
-            if current != Some(&expected) && !removed_by_completed_push {
-                return Err(format!("Tracking ref {name} changed. Analyze again."));
-            }
+        if candidate.section != Section::FetchedOnly {
+            deletions.insert(
+                format!("refs/heads/{}", candidate.name),
+                candidate.oid.clone(),
+            );
         }
-        if plan.delete_remotes
-            && let Some(remote) = &candidate.remote
+        if let (Some((r, b)), Some(oid)) = (&candidate.tracking, &candidate.tracking_oid) {
+            deletions.insert(format!("refs/remotes/{r}/{b}"), oid.clone());
+        }
+    }
+    // Recheck after all network waits, before the atomic expected-OID transaction.
+    let checked = checked_out(&context.root)?;
+    let repo = super::super::open(&context.root).map_err(err)?;
+    let refs = super::super::snapshot_refs(&repo).map_err(err)?;
+    let final_raw = super::super::refs::raw_refs(&repo)?;
+    let final_locals: HashSet<_> = final_raw
+        .iter()
+        .filter_map(|r| r.name.strip_prefix("refs/heads/"))
+        .collect();
+    let mut owners = HashMap::<&(String, String), Vec<&str>>::new();
+    for (name, key) in &refs.upstreams {
+        owners.entry(key).or_default().push(name);
+    }
+    for reference in &final_raw {
+        if reference
+            .symbolic
+            .as_ref()
+            .is_some_and(|target| deletions.contains_key(target))
         {
-            let current = if let Some(url) = urls.get(&remote.name) {
-                url
-            } else {
-                let url = push_url(&context.root, &remote.name)?;
-                urls.entry(remote.name.clone()).or_insert(url)
-            };
-            if current != &remote.url {
-                return Err(format!("{} was reconfigured. Analyze again.", remote.name));
-            }
+            return Err(format!(
+                "{} is referenced by symbolic alias {}. Retain it or reconfigure the alias first.",
+                reference.symbolic.as_ref().unwrap(),
+                reference.name
+            ));
         }
     }
-    Ok(())
-}
-pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
-    apply_with_post_push(context, plan, || {})
-}
-fn apply_with_post_push(context: &Context, plan: &Plan, after_push: impl FnOnce()) -> Result<()> {
-    let mut completed = CompletedDeletes::new();
-    validate_plan(context, plan, &completed)?;
-    let mut groups = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
-    if plan.delete_remotes {
-        for candidate in &plan.branches {
-            if let Some(remote) = &candidate.remote {
-                groups
-                    .entry((remote.name.clone(), remote.url.clone()))
-                    .or_default()
-                    .insert(remote.branch.clone(), candidate.oid.clone());
+    let mut urls = HashMap::new();
+    for candidate in &plan.branches {
+        if candidate.section != Section::FetchedOnly
+            && (checked.contains(&format!("refs/heads/{}", candidate.name))
+                || refs.upstreams.get(&candidate.name) != candidate.upstream.as_ref())
+        {
+            return Err(format!(
+                "{} changed or is checked out. Analyze again.",
+                candidate.name
+            ));
+        }
+        if let Some(copy) = &candidate.remote {
+            if !urls.contains_key(&copy.name) {
+                urls.insert(copy.name.clone(), fetch_url(&context.root, &copy.name)?);
+            }
+            if urls[&copy.name] != copy.url {
+                return Err(format!("{} was reconfigured. Analyze again.", copy.name));
             }
         }
-        // Fetch each remote advertisement once, independently of selection size.
-        for ((_, url), branches) in &groups {
-            let advertisement = output(&context.root, &["ls-remote", "--heads", "--", url])?;
-            let tips: HashMap<_, _> = advertisement
-                .lines()
-                .filter_map(|line| line.split_once('\t'))
-                .map(|(oid, name)| (name, oid))
-                .collect();
-            for (branch, oid) in branches {
-                if tips.get(format!("refs/heads/{branch}").as_str()) != Some(&oid.as_str()) {
-                    return Err(format!(
-                        "Remote branch {branch} changed. Fetch and analyze again."
-                    ));
-                }
-            }
-        }
-        for ((name, url), branches) in &groups {
-            for chunk in remote_chunks(branches, url)? {
-                let mut owned = vec!["push".to_string(), "--atomic".into()];
-                for (branch, oid) in &chunk {
-                    owned.push(format!("--force-with-lease=refs/heads/{branch}:{oid}"));
-                }
-                owned.extend(["--".into(), url.clone()]);
-                for (branch, _) in &chunk {
-                    owned.push(format!(":refs/heads/{branch}"));
-                }
-                command::checked(&context.root, &owned.iter().map(String::as_str).collect::<Vec<_>>())
-                    .map_err(|e| format!("Remote cleanup stopped at {name}: {e}. Earlier remote groups or chunks may have completed; local branches were retained."))?;
-                completed.extend(
-                    chunk.into_iter().map(|(branch, oid)| {
-                        (name.clone(), branch.clone(), url.clone(), oid.clone())
-                    }),
-                );
-            }
+        if let Some(key) = &candidate.tracking
+            && (owners.get(key).is_some_and(|names| {
+                names.iter().any(|name| {
+                    candidate.section == Section::FetchedOnly || *name != candidate.name
+                })
+            }) || ((candidate.section == Section::FetchedOnly || key.1 != candidate.name)
+                && final_locals.contains(key.1.as_str())))
+        {
+            return Err("Another local branch now tracks this remote ref. Analyze again.".into());
         }
     }
-    after_push();
-    // Recheck after any network wait. Expected-OID deletions are one transaction.
-    validate_plan(context, plan, &completed).map_err(|e| {
-        if groups.is_empty() {
-            e
-        } else {
-            format!("{e} Remote deletions may have completed; local branches were retained.")
-        }
-    })?;
+    if fs::read(context.common.join("config")).map_err(err)? != frozen_config {
+        return Err("Repository configuration changed during verification. Analyze again.".into());
+    }
     let mut input = String::from("start\n");
     for candidate in &plan.branches {
-        input += &format!("delete refs/heads/{} {}\n", candidate.name, candidate.oid);
+        if let Some((remote, branch)) = &candidate.tracking
+            && candidate.tracking_oid.is_none()
+        {
+            input += &format!(
+                "verify refs/remotes/{remote}/{branch} {}\n",
+                "0".repeat(candidate.oid.len())
+            );
+        }
+    }
+    for (name, oid) in deletions {
+        input += &format!("delete {name} {oid}\n");
     }
     input += "prepare\ncommit\n";
     run(
         &context.root,
-        &["update-ref", "--stdin"],
+        &["update-ref", "--no-deref", "--stdin"],
         Some(input.as_bytes()),
         &[],
     )?;
-    if plan.delete_remotes {
-        // One guarded stdin transaction avoids thousands of child processes.
-        // Missing tracking refs were already validated against push receipts.
-        let repo = super::super::open(&context.root).map_err(err)?;
-        let refs = super::super::snapshot_refs(&repo).map_err(err)?;
-        let tips: HashMap<_, _> = refs
-            .refs
-            .iter()
-            .filter(|r| r.kind == super::super::RefKind::Remote)
-            .map(|r| (r.name.as_str(), r.id.to_string()))
-            .collect();
-        let mut input = String::from("start\n");
-        let mut seen = HashSet::new();
-        for candidate in &plan.branches {
-            if let Some(remote) = &candidate.remote {
-                let name = format!("{}/{}", remote.name, remote.branch);
-                if tips.get(name.as_str()) == Some(&candidate.oid) && seen.insert(name.clone()) {
-                    input += &format!("delete refs/remotes/{name} {}\n", candidate.oid);
-                }
-            }
-        }
-        input += "prepare\ncommit\n";
-        // A racing tracking-ref update keeps the cache rather than overwriting it.
-        let _ = run(
-            &context.root,
-            &["update-ref", "--stdin"],
-            Some(input.as_bytes()),
-            &[],
-        );
-    }
     Ok(())
-}
-// Bound UTF-16 arguments below Windows' 32k process command-line limit.
-type RemoteChunk<'a> = Vec<(&'a String, &'a String)>;
-fn remote_chunks<'a>(
-    branches: &'a BTreeMap<String, String>,
-    url: &str,
-) -> Result<Vec<RemoteChunk<'a>>> {
-    const LIMIT: usize = 20_000;
-    let base = url.encode_utf16().count() + 128;
-    let mut chunks = Vec::new();
-    let mut chunk = Vec::new();
-    let mut size = base;
-    for (branch, oid) in branches {
-        let cost = branch.encode_utf16().count() * 2 + oid.len() + 96;
-        if base + cost > LIMIT {
-            return Err("Remote URL or branch name exceeds the safe command-line size.".into());
-        }
-        if size + cost > LIMIT && !chunk.is_empty() {
-            chunks.push(std::mem::take(&mut chunk));
-            size = base;
-        }
-        size += cost;
-        chunk.push((branch, oid));
-    }
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-    Ok(chunks)
 }
 pub(super) fn optimize(context: &Context) -> Result<String> {
     let before = storage_kib(&context.root)?;
@@ -503,92 +550,125 @@ mod tests {
             execute(&self.root, Request::Cleanup(plan))
         }
     }
+
     #[test]
-    fn cleanup_more_than_a_thousand_branches_is_atomic_and_recoverable() {
+    fn cleanup_matching_preserves_stale_cache_oid_through_undo_and_accepts_missing_cache() {
         let f = Fixture::new();
-        let oid = f.git(&["rev-parse", "refs/heads/old/local"]);
-        let mut input = String::from("start\n");
-        for index in 0..1100 {
-            input += &format!("create refs/heads/large-cleanup/{index:04} {oid}\n");
-        }
-        input += "prepare\ncommit\n";
-        run(
-            &f.root,
-            &["update-ref", "--stdin"],
-            Some(input.as_bytes()),
-            &[],
-        )
-        .unwrap();
-        let branches: Vec<_> = analyze(&f.root, crate::ui::time::now_unix())
-            .unwrap()
-            .candidates
-            .into_iter()
-            .filter(|c| c.name.starts_with("large-cleanup/"))
-            .collect();
-        assert_eq!(branches.len(), 1100);
-        let outcome = f.run(Plan {
-            branches,
-            delete_remotes: false,
-        });
-        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let old = f.candidate("old/local");
+        f.git(&["update-ref", "refs/remotes/origin/fixes/task-123", &old.oid]);
+        let branch = f.candidate("fixes/task-123");
+        assert_eq!(branch.section, Section::Matching);
+        assert_eq!(branch.tracking_oid.as_deref(), Some(old.oid.as_str()));
+        let server = refs_at(&f.bare);
         assert!(
-            f.git(&[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads/large-cleanup/"
-            ])
-            .is_empty()
+            f.run(Plan {
+                branches: vec![branch.clone()]
+            })
+            .result
+            .is_ok()
         );
-        assert_eq!(f.git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
         assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
         assert_eq!(
-            f.git(&[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads/large-cleanup/"
-            ])
-            .lines()
-            .count(),
-            1100
+            f.git(&["rev-parse", "refs/remotes/origin/fixes/task-123"]),
+            old.oid
         );
-        assert!(execute(&f.root, Request::MoveTo(1)).result.is_ok());
+        assert_eq!(refs_at(&f.bare), server);
+        f.git(&["update-ref", "-d", "refs/remotes/origin/fixes/task-123"]);
+        let branch = f.candidate("fixes/task-123");
+        assert!(branch.tracking_oid.is_none());
         assert!(
-            f.git(&[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads/large-cleanup/"
-            ])
-            .is_empty()
-        );
-        assert!(f.git(&["status", "--porcelain"]).is_empty());
-        assert!(
-            !output(&f.bare, &["rev-parse", "refs/heads/fixes/task-123"])
-                .unwrap()
-                .is_empty()
+            f.run(Plan {
+                branches: vec![branch]
+            })
+            .result
+            .is_ok()
         );
     }
     #[test]
-    fn cleanup_server_batch_above_former_limit_keeps_local_transaction_and_leases() {
+    fn cleanup_namespace_collisions_tags_and_symbolic_alias_are_safe() {
         let f = Fixture::new();
-        let oid = f.git(&["rev-parse", "HEAD"]);
-        let mut local = String::from("start\n");
-        let mut server = String::from("start\n");
-        for index in 0..300 {
-            let name = format!("large-remote/{index:04}");
-            local += &format!(
-                "create refs/heads/{name} {oid}\ncreate refs/remotes/origin/{name} {oid}\n"
-            );
-            server += &format!("create refs/heads/{name} {oid}\n");
+        f.git(&["push", "-q", "origin", "main:refs/heads/topic"]);
+        f.git(&["branch", "origin/topic", "main"]);
+        f.git(&["tag", "fixes/task-123", "old/local"]);
+        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+        assert!(
+            analysis
+                .candidates
+                .iter()
+                .any(|c| c.section == Section::FetchedOnly && c.name == "origin/topic")
+        );
+        assert_eq!(
+            analysis
+                .candidates
+                .iter()
+                .filter(|c| c.name == "fixes/task-123")
+                .count(),
+            1
+        );
+        let matched = f.candidate("fixes/task-123");
+        f.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/alias",
+            "refs/remotes/origin/fixes/task-123",
+        ]);
+        assert!(
+            f.run(Plan {
+                branches: vec![matched]
+            })
+            .result
+            .is_err()
+        );
+        assert!(f.git(&["rev-parse", "refs/heads/fixes/task-123"]).len() > 10);
+        assert!(
+            f.run(Plan {
+                branches: vec![f.candidate("master")]
+            })
+            .result
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_reftable_restores_cached_and_local_refs() {
+        let f = Fixture::new();
+        super::super::super::refs::migrate_reftable(&f.root).unwrap();
+        let candidate = f.candidate("fixes/task-123");
+        let server = refs_at(&f.bare);
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate.clone()]
+            })
+            .result
+            .is_ok()
+        );
+        assert!(
+            command::checked(
+                &f.root,
+                &["show-ref", "--verify", "refs/remotes/origin/fixes/task-123"]
+            )
+            .is_err()
+        );
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        for reference in [
+            "refs/heads/fixes/task-123",
+            "refs/remotes/origin/fixes/task-123",
+        ] {
+            assert_eq!(f.git(&["rev-parse", reference]), candidate.oid);
         }
-        local += "prepare\ncommit\n";
+        assert_eq!(refs_at(&f.bare), server);
+    }
+    #[test]
+    fn cleanup_fetched_batch_over_256_preserves_server_and_recovers() {
+        let f = Fixture::new();
+        let oid = f.git(&["rev-parse", "main"]);
+        let mut server = String::from("start\n");
+        let mut cached = String::from("start\n");
+        for i in 0..300 {
+            server += &format!("create refs/heads/fetched-batch/{i:04} {oid}\n");
+            cached += &format!("create refs/remotes/origin/fetched-batch/{i:04} {oid}\n");
+        }
         server += "prepare\ncommit\n";
-        run(
-            &f.root,
-            &["update-ref", "--stdin"],
-            Some(local.as_bytes()),
-            &[],
-        )
-        .unwrap();
+        cached += "prepare\ncommit\n";
         run(
             &f.bare,
             &["update-ref", "--stdin"],
@@ -596,535 +676,361 @@ mod tests {
             &[],
         )
         .unwrap();
+        run(
+            &f.root,
+            &["update-ref", "--stdin"],
+            Some(cached.as_bytes()),
+            &[],
+        )
+        .unwrap();
+        let before = refs_at(&f.bare);
         let branches: Vec<_> = analyze(&f.root, crate::ui::time::now_unix())
             .unwrap()
             .candidates
             .into_iter()
-            .filter(|c| c.name.starts_with("large-remote/"))
-            .collect();
-        assert_eq!(branches.len(), 300);
-        let result = f.run(Plan {
-            branches,
-            delete_remotes: true,
-        });
-        assert!(result.result.is_ok(), "{:?}", result.result);
-        for (root, prefix) in [
-            (&f.root, "refs/heads/large-remote/"),
-            (&f.root, "refs/remotes/origin/large-remote/"),
-            (&f.bare, "refs/heads/large-remote/"),
-        ] {
-            assert!(
-                output(root, &["for-each-ref", "--format=%(refname)", prefix])
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
-        assert_eq!(
-            f.git(&[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads/large-remote/"
-            ])
-            .lines()
-            .count(),
-            300
-        );
-        assert!(
-            output(
-                &f.bare,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/heads/large-remote/"
-                ]
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-    #[test]
-    fn cleanup_remote_chunks_bound_arguments_without_losing_any_selection() {
-        let branches: BTreeMap<_, _> = (0..1500)
-            .map(|i| {
-                (
-                    format!("features/{i:04}/{}", "long".repeat(20)),
-                    "a".repeat(40),
-                )
+            .filter(|c| {
+                c.section == Section::FetchedOnly && c.name.starts_with("origin/fetched-batch/")
             })
             .collect();
-        let chunks = remote_chunks(&branches, "local-origin.git").unwrap();
-        assert!(chunks.len() > 1);
-        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 1500);
-        for chunk in chunks {
+        assert_eq!(branches.len(), 300);
+        assert!(f.run(Plan { branches }).result.is_ok());
+        assert!(
+            f.git(&["for-each-ref", "refs/remotes/origin/fetched-batch/"])
+                .is_empty()
+        );
+        assert_eq!(refs_at(&f.bare), before);
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        assert_eq!(
+            f.git(&["for-each-ref", "refs/remotes/origin/fetched-batch/"])
+                .lines()
+                .count(),
+            300
+        );
+    }
+    fn refs_at(root: &Path) -> String {
+        output(root, &["for-each-ref", "--format=%(refname) %(objectname)"]).unwrap()
+    }
+    #[test]
+    fn cleanup_three_sections_preserve_server_and_recover_both_ref_types() {
+        let f = Fixture::new();
+        let oid = f.git(&["rev-parse", "main"]);
+        f.git(&["push", "-q", "origin", "main:refs/heads/fetched-only"]);
+        let fetched = f.candidate("origin/fetched-only");
+        assert_eq!(fetched.section, Section::FetchedOnly);
+        let matched = f.candidate("fixes/task-123");
+        assert_eq!(matched.section, Section::Matching);
+        let old = f.candidate("old/local");
+        assert_eq!(old.section, Section::OldLocal);
+        let before = refs_at(&f.root);
+        let server = refs_at(&f.bare);
+        fs::write(f.root.join("unrelated.txt"), "preserved").unwrap();
+        let outcome = f.run(Plan {
+            branches: vec![fetched, matched, old],
+        });
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        for reference in [
+            "refs/remotes/origin/fetched-only",
+            "refs/heads/fixes/task-123",
+            "refs/remotes/origin/fixes/task-123",
+            "refs/heads/old/local",
+        ] {
             assert!(
-                chunk
-                    .iter()
-                    .map(|(b, oid)| b.encode_utf16().count() * 2 + oid.len() + 96)
-                    .sum::<usize>()
-                    + 128
-                    + "local-origin.git".len()
-                    <= 20_000
+                command::checked(&f.root, &["show-ref", "--verify", reference]).is_err(),
+                "{reference}"
             );
         }
+        assert_eq!(refs_at(&f.bare), server);
+        assert_eq!(
+            fs::read_to_string(f.root.join("unrelated.txt")).unwrap(),
+            "preserved"
+        );
+        let after = refs_at(&f.root);
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        // Recovery pins are implementation refs, so compare only ordinary refs.
+        let ordinary = |text: String| {
+            text.lines()
+                .filter(|line| !line.starts_with("refs/rustle/"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordinary(refs_at(&f.root)), ordinary(before));
+        assert!(execute(&f.root, Request::MoveTo(1)).result.is_ok());
+        assert_eq!(ordinary(refs_at(&f.root)), ordinary(after));
+        assert_eq!(refs_at(&f.bare), server);
+        assert_eq!(f.git(&["rev-parse", "main"]), oid);
     }
     #[test]
-    fn cleanup_analysis_classifies_dates_protection_and_worktree_exclusions() {
+    fn cleanup_server_stale_missing_and_offline_refs_are_not_matching() {
         let f = Fixture::new();
-        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
-        assert_eq!(analysis.excluded_worktrees, 1);
+        let plan = Plan {
+            branches: vec![f.candidate("fixes/task-123")],
+        };
+        let old = f.git(&["rev-parse", "old/local"]);
+        command::checked(&f.bare, &["update-ref", "refs/heads/fixes/task-123", &old]).unwrap();
+        assert!(f.run(plan).result.is_err());
         assert!(
-            analysis
+            !analyze(&f.root, crate::ui::time::now_unix())
+                .unwrap()
                 .candidates
                 .iter()
-                .all(|c| !c.author.is_empty() && c.time > 0)
+                .any(|c| c.name == "fixes/task-123")
         );
-        assert!(f.candidate("master").protected);
-        assert_eq!(f.candidate("fixes/task-123").section, Section::Matching);
-        assert_eq!(f.candidate("old/local").section, Section::OldLocal);
-        let worktree = f._dir.path().join("pinned");
-        f.git(&["worktree", "add", worktree.to_str().unwrap(), "old/local"]);
+        command::checked(&f.bare, &["update-ref", "-d", "refs/heads/fixes/task-123"]).unwrap();
+        assert!(
+            !analyze(&f.root, crate::ui::time::now_unix())
+                .unwrap()
+                .candidates
+                .iter()
+                .any(|c| c.name == "fixes/task-123")
+        );
+        f.git(&[
+            "config",
+            "remote.origin.url",
+            f._dir.path().join("offline.git").to_str().unwrap(),
+        ]);
         let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
-        assert_eq!(analysis.excluded_worktrees, 2);
-        assert!(!analysis.candidates.iter().any(|c| c.name == "old/local"));
+        assert!(!analysis.warnings.is_empty());
+        assert!(analysis.candidates.is_empty());
     }
     #[test]
-    fn cleanup_branch_validation_ignores_same_named_tag() {
+    fn cleanup_shared_upstream_same_name_worktrees_and_reconfiguration_are_safe() {
         let f = Fixture::new();
         let branch = f.candidate("fixes/task-123");
-        f.git(&["tag", "fixes/task-123", "old/local"]);
+        f.git(&["branch", "alias", "fixes/task-123"]);
+        f.git(&["config", "branch.alias.remote", "origin"]);
+        f.git(&["config", "branch.alias.merge", "refs/heads/fixes/task-123"]);
+        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+        assert!(!analysis.candidates.iter().any(|c| c.name == "alias"
+            || c.name == "fixes/task-123"
+            || c.name == "origin/fixes/task-123"));
         assert!(
             f.run(Plan {
-                branches: vec![branch],
-                delete_remotes: false
+                branches: vec![branch]
+            })
+            .result
+            .is_err()
+        );
+        let old = f.candidate("old/local");
+        let worktree = f._dir.path().join("pinned");
+        f.git(&["worktree", "add", worktree.to_str().unwrap(), "old/local"]);
+        assert!(
+            f.run(Plan {
+                branches: vec![old]
+            })
+            .result
+            .is_err()
+        );
+        assert_eq!(
+            analyze(&f.root, crate::ui::time::now_unix())
+                .unwrap()
+                .excluded_worktrees,
+            2
+        );
+    }
+    #[test]
+    fn cleanup_old_local_boundary_and_unfetched_server_counterpart() {
+        let f = Fixture::new();
+        let old = f.candidate("old/local");
+        // At the exact one-year boundary this branch qualifies; one second newer does not.
+        let anniversary = old.time + 366 * 86400; // 2000-01-01 -> 2001-01-01
+        assert_eq!(cutoff(anniversary), old.time);
+        assert!(
+            analyze(&f.root, anniversary)
+                .unwrap()
+                .candidates
+                .iter()
+                .any(|c| c.name == "old/local")
+        );
+        assert!(
+            !analyze(&f.root, anniversary - 1)
+                .unwrap()
+                .candidates
+                .iter()
+                .any(|c| c.name == "old/local")
+        );
+        command::checked(&f.bare, &["update-ref", "refs/heads/old/local", &old.oid]).unwrap();
+        let verified = f.candidate("old/local");
+        assert_eq!(verified.section, Section::Matching);
+        assert!(verified.tracking_oid.is_none());
+    }
+    #[test]
+    fn cleanup_changed_url_or_oid_rejects_frozen_plan_and_keeps_other_refs() {
+        let f = Fixture::new();
+        let matched = f.candidate("fixes/task-123");
+        let old = f.candidate("old/local");
+        f.git(&["update-ref", "refs/remotes/origin/fixes/task-123", &old.oid]);
+        assert!(
+            f.run(Plan {
+                branches: vec![matched, old.clone()]
+            })
+            .result
+            .is_err()
+        );
+        assert_eq!(f.git(&["rev-parse", "old/local"]), old.oid);
+        f.git(&[
+            "update-ref",
+            "refs/remotes/origin/fixes/task-123",
+            &f.git(&["rev-parse", "main"]),
+        ]);
+        let matched = f.candidate("fixes/task-123");
+        f.git(&[
+            "config",
+            "remote.origin.url",
+            f.bare.to_str().unwrap().trim_end_matches("origin.git"),
+        ]);
+        assert!(
+            f.run(Plan {
+                branches: vec![matched]
+            })
+            .result
+            .is_err()
+        );
+    }
+    fn large_branches(f: &Fixture, count: usize) {
+        let oid = f.git(&["rev-parse", "old/local"]);
+        let mut input = String::from("start\n");
+        for i in 0..count {
+            input += &format!("create refs/heads/large-cleanup/{i:04} {oid}\n");
+        }
+        input += "prepare\ncommit\n";
+        run(
+            &f.root,
+            &["update-ref", "--no-deref", "--stdin"],
+            Some(input.as_bytes()),
+            &[],
+        )
+        .unwrap();
+    }
+    #[test]
+    fn cleanup_more_than_256_is_atomic_recoverable_and_preserves_server() {
+        let f = Fixture::new();
+        large_branches(&f, 300);
+        let server = refs_at(&f.bare);
+        let branches: Vec<_> = analyze(&f.root, crate::ui::time::now_unix())
+            .unwrap()
+            .candidates
+            .into_iter()
+            .filter(|c| c.name.starts_with("large-cleanup/"))
+            .collect();
+        assert_eq!(branches.len(), 300);
+        assert!(f.run(Plan { branches }).result.is_ok());
+        assert!(
+            f.git(&["for-each-ref", "refs/heads/large-cleanup/"])
+                .is_empty()
+        );
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        assert_eq!(
+            f.git(&["for-each-ref", "refs/heads/large-cleanup/"])
+                .lines()
+                .count(),
+            300
+        );
+        assert_eq!(refs_at(&f.bare), server);
+    }
+    #[test]
+    fn cleanup_protects_default_names_and_optimize_retains_recovery() {
+        let f = Fixture::new();
+        assert!(f.candidate("master").protected);
+        let branch = f.candidate("fixes/task-123");
+        let dangling = f.git(&["commit-tree", "HEAD^{tree}", "-m", "preserve"]);
+        assert!(
+            f.run(Plan {
+                branches: vec![branch.clone()]
             })
             .result
             .is_ok()
         );
-        assert!(
-            !f.git(&[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads/fixes/task-123"
-            ])
-            .contains("refs/heads/")
-        );
-        assert!(
-            f.git(&[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/tags/fixes/task-123"
-            ])
-            .contains("refs/tags/")
-        );
-    }
-    #[test]
-    fn protected_upstream_stays_unchecked_when_remote_deletion_is_unavailable() {
-        let f = Fixture::new();
-        f.git(&["branch", "release-alias", "master"]);
-        f.git(&["config", "branch.release-alias.remote", "origin"]);
-        f.git(&["config", "branch.release-alias.merge", "refs/heads/master"]);
-        f.git(&["config", "--add", "remote.origin.pushurl", "first.invalid"]);
-        f.git(&["config", "--add", "remote.origin.pushurl", "second.invalid"]);
-        let candidate = f.candidate("release-alias");
-        assert!(candidate.protected);
-        assert!(candidate.remote.is_none());
-        assert_eq!(candidate.tracking, Some(("origin".into(), "master".into())));
-    }
-    #[test]
-    fn cleanup_local_batch_is_recoverable_and_keeps_remote_and_worktree() {
-        let f = Fixture::new();
-        let branch = f.candidate("fixes/task-123");
-        let old = f.candidate("old/local");
-        let before = fs::read(f.root.join("file.txt")).unwrap();
-        let outcome = f.run(Plan {
-            branches: vec![branch.clone(), old.clone()],
-            delete_remotes: false,
-        });
-        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
-        assert!(
-            command::checked(
-                &f.root,
-                &["show-ref", "--verify", "refs/heads/fixes/task-123"]
-            )
-            .is_err()
-        );
-        assert_eq!(
-            output(&f.bare, &["rev-parse", "refs/heads/fixes/task-123"]).unwrap(),
-            branch.oid
-        );
+        assert!(execute(&f.root, Request::OptimizeStorage).result.is_ok());
+        f.git(&["cat-file", "-e", &dangling]);
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
         assert_eq!(
             f.git(&["rev-parse", "refs/remotes/origin/fixes/task-123"]),
             branch.oid
         );
-        assert_eq!(fs::read(f.root.join("file.txt")).unwrap(), before);
-        assert!(f.git(&["status", "--porcelain"]).is_empty());
-        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
-        assert_eq!(
-            f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
-            branch.oid
-        );
-        assert_eq!(f.git(&["rev-parse", "refs/heads/old/local"]), old.oid);
     }
     #[test]
-    fn cleanup_refuses_moved_or_newly_checked_out_branch() {
-        let f = Fixture::new();
-        let old = f.candidate("old/local");
-        f.git(&["branch", "-f", "old/local", "main"]);
-        assert!(
-            f.run(Plan {
-                branches: vec![old],
-                delete_remotes: false
-            })
-            .result
-            .is_err()
-        );
-        let branch = f.candidate("fixes/task-123");
-        let path = f._dir.path().join("new-worktree");
-        f.git(&["worktree", "add", path.to_str().unwrap(), "fixes/task-123"]);
-        assert!(
-            f.run(Plan {
-                branches: vec![branch],
-                delete_remotes: false
-            })
-            .result
-            .is_err()
-        );
-        assert!(
-            !f.git(&["rev-parse", "refs/heads/fixes/task-123"])
-                .is_empty()
-        );
+    #[ignore = "one warmup and fifteen cleanup samples"]
+    fn benchmark_cleanup() {
+        benchmark(0, false);
     }
     #[test]
-    fn cleanup_remote_delete_is_leased_and_local_undo_does_not_recreate_server_branch() {
-        let f = Fixture::new();
-        let branch = f.candidate("fixes/task-123");
-        let outcome = f.run(Plan {
-            branches: vec![branch.clone()],
-            delete_remotes: true,
-        });
-        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
-        assert!(
-            command::checked(
-                &f.bare,
-                &["show-ref", "--verify", "refs/heads/fixes/task-123"]
-            )
-            .is_err()
-        );
-        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
-        assert_eq!(
-            f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
-            branch.oid
-        );
-        assert!(
-            command::checked(
-                &f.bare,
-                &["show-ref", "--verify", "refs/heads/fixes/task-123"]
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn cleanup_remote_delete_with_unmapped_tracking_ref_succeeds() {
-        let f = Fixture::new();
-        // This fetch mapping does not let push update origin/fixes/task-123.
-        f.git(&[
-            "config",
-            "remote.origin.fetch",
-            "+refs/heads/unrelated:refs/remotes/origin/unrelated",
-        ]);
-        let branch = f.candidate("fixes/task-123");
-        let outcome = f.run(Plan {
-            branches: vec![branch],
-            delete_remotes: true,
-        });
-        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
-        for (root, reference) in [
-            (&f.root, "refs/heads/fixes/task-123"),
-            (&f.root, "refs/remotes/origin/fixes/task-123"),
-            (&f.bare, "refs/heads/fixes/task-123"),
-        ] {
-            assert!(command::checked(root, &["show-ref", "--verify", reference]).is_err());
-        }
-    }
-    #[test]
-    fn post_push_tracking_validation_accepts_only_exact_completed_deletion() {
-        let f = Fixture::new();
-        let branch = f.candidate("fixes/task-123");
-        let plan = Plan {
-            branches: vec![branch.clone()],
-            delete_remotes: true,
-        };
-        let context = Context::new(&f.root).unwrap();
-        let remote = branch.remote.as_ref().unwrap();
-        let reference = "refs/remotes/origin/fixes/task-123";
-        let receipt = (
-            remote.name.clone(),
-            remote.branch.clone(),
-            remote.url.clone(),
-            branch.oid.clone(),
-        );
-        let empty = CompletedDeletes::new();
-        validate_plan(&context, &plan, &empty).unwrap();
-        // Produce the receipt only after a real successful leased deletion.
-        f.git(&[
-            "push",
-            "--atomic",
-            &format!(
-                "--force-with-lease=refs/heads/{}:{}",
-                remote.branch, branch.oid
-            ),
-            "--",
-            &remote.url,
-            &format!(":refs/heads/{}", remote.branch),
-        ]);
-        let completed = CompletedDeletes::from([receipt.clone()]);
-        // Deterministically cover both Git behaviors regardless of the host Git.
-        f.git(&["update-ref", reference, &branch.oid]);
-        validate_plan(&context, &plan, &completed).unwrap();
-        f.git(&["update-ref", "-d", reference, &branch.oid]);
-        assert!(
-            validate_plan(&context, &plan, &empty).is_err(),
-            "missing before any completed push must remain stale"
-        );
-        validate_plan(&context, &plan, &completed).unwrap();
-        for wrong in [
-            (
-                "other".into(),
-                receipt.1.clone(),
-                receipt.2.clone(),
-                receipt.3.clone(),
-            ),
-            (
-                receipt.0.clone(),
-                "other".into(),
-                receipt.2.clone(),
-                receipt.3.clone(),
-            ),
-            (
-                receipt.0.clone(),
-                receipt.1.clone(),
-                "different-url".into(),
-                receipt.3.clone(),
-            ),
-            (
-                receipt.0.clone(),
-                receipt.1.clone(),
-                receipt.2.clone(),
-                "different-oid".into(),
-            ),
-        ] {
-            assert!(validate_plan(&context, &plan, &CompletedDeletes::from([wrong])).is_err());
-        }
-        let local_only = Plan {
-            delete_remotes: false,
-            ..plan.clone()
-        };
-        assert!(validate_plan(&context, &local_only, &completed).is_err());
-        let old = f.candidate("old/local");
-        f.git(&["update-ref", reference, &old.oid]);
-        assert!(
-            validate_plan(&context, &plan, &completed).is_err(),
-            "moved tracking refs must never be exempted"
-        );
-        assert_eq!(
-            f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
-            branch.oid
-        );
-    }
-    #[test]
-    fn cleanup_remote_change_rejects_before_any_local_deletion() {
-        let f = Fixture::new();
-        let branch = f.candidate("fixes/task-123");
-        let old = f.candidate("old/local");
-        command::checked(
-            &f.bare,
-            &["update-ref", "refs/heads/fixes/task-123", &old.oid],
-        )
-        .unwrap();
-        assert!(
-            f.run(Plan {
-                branches: vec![branch.clone()],
-                delete_remotes: true
-            })
-            .result
-            .is_err()
-        );
-        assert_eq!(
-            f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
-            branch.oid
-        );
-        assert_eq!(
-            output(&f.bare, &["rev-parse", "refs/heads/fixes/task-123"]).unwrap(),
-            old.oid
-        );
-    }
-    #[test]
-    fn cleanup_repack_preserves_unreachable_objects_and_recovery() {
-        let f = Fixture::new();
-        let branch = f.candidate("fixes/task-123");
-        let dangling = f.git(&["commit-tree", "HEAD^{tree}", "-m", "unreachable preserved"]);
-        assert!(
-            f.run(Plan {
-                branches: vec![branch.clone()],
-                delete_remotes: false
-            })
-            .result
-            .is_ok()
-        );
-        let result = execute(&f.root, Request::OptimizeStorage);
-        assert!(result.result.is_ok(), "{:?}", result.result);
-        f.git(&["cat-file", "-e", &dangling]);
-        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
-        assert_eq!(
-            f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
-            branch.oid
-        );
-    }
-    #[test]
-    #[ignore = "one warmup and fifteen 1500-branch cleanup action samples"]
+    #[ignore = "one warmup and fifteen 1500 branch samples"]
     fn benchmark_cleanup_large() {
+        benchmark(1500, false);
+    }
+    #[test]
+    #[ignore = "one warmup and fifteen 1500 matching local/cache samples"]
+    fn benchmark_cleanup_matching_large() {
+        benchmark(1500, true);
+    }
+    #[test]
+    #[ignore = "one warmup and fifteen remote verification/local cleanup samples"]
+    fn benchmark_cleanup_remote() {
+        benchmark(0, true);
+    }
+    fn benchmark(count: usize, remote: bool) {
         for sample in -1..15 {
             let f = Fixture::new();
-            let oid = f.git(&["rev-parse", "refs/heads/old/local"]);
-            let mut input = String::from("start\n");
-            for index in 0..1500 {
-                input += &format!("create refs/heads/large-cleanup/{index:04} {oid}\n");
+            if count > 0 {
+                large_branches(&f, count);
+                if remote {
+                    let oid = f.git(&["rev-parse", "old/local"]);
+                    let mut heads = String::from("start\n");
+                    let mut cached = String::from("start\n");
+                    for i in 0..count {
+                        heads += &format!("create refs/heads/large-cleanup/{i:04} {oid}\n");
+                        cached +=
+                            &format!("create refs/remotes/origin/large-cleanup/{i:04} {oid}\n");
+                    }
+                    heads += "prepare\ncommit\n";
+                    cached += "prepare\ncommit\n";
+                    run(
+                        &f.bare,
+                        &["update-ref", "--stdin"],
+                        Some(heads.as_bytes()),
+                        &[],
+                    )
+                    .unwrap();
+                    run(
+                        &f.root,
+                        &["update-ref", "--stdin"],
+                        Some(cached.as_bytes()),
+                        &[],
+                    )
+                    .unwrap();
+                }
             }
-            input += "prepare\ncommit\n";
-            run(
-                &f.root,
-                &["update-ref", "--stdin"],
-                Some(input.as_bytes()),
-                &[],
-            )
-            .unwrap();
+            let server = refs_at(&f.bare);
             let start = std::time::Instant::now();
             let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
             let analysis_ms = start.elapsed().as_secs_f64() * 1000.;
-            let branches: Vec<_> = analysis
-                .candidates
-                .into_iter()
-                .filter(|c| c.name.starts_with("large-cleanup/"))
-                .collect();
-            assert_eq!(branches.len(), 1500);
-            let start = std::time::Instant::now();
-            let result = f.run(Plan {
-                branches,
-                delete_remotes: false,
-            });
-            assert!(result.result.is_ok(), "{:?}", result.result);
-            let delete_ms = start.elapsed().as_secs_f64() * 1000.;
-            assert!(
-                f.git(&[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/heads/large-cleanup/"
-                ])
-                .is_empty()
-            );
-            println!(
-                "{}",
-                serde_json::json!({"sample": sample, "branches": 1500, "analysisMs": analysis_ms, "deleteMs": delete_ms})
-            );
-        }
-    }
-    #[test]
-    #[ignore = "one warmup and fifteen disposable cleanup analysis/action samples"]
-    fn benchmark_cleanup() {
-        for sample in -1..15 {
-            let f = Fixture::new();
-            let start = std::time::Instant::now();
-            let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
-            let analyze_ms = start.elapsed().as_secs_f64() * 1000.;
             let branches = analysis
                 .candidates
                 .into_iter()
-                .filter(|c| !c.protected)
+                .filter(|c| {
+                    if count > 0 {
+                        c.name.starts_with("large-cleanup/")
+                    } else if remote {
+                        c.name == "fixes/task-123"
+                    } else {
+                        !c.protected
+                    }
+                })
                 .collect();
             let start = std::time::Instant::now();
-            assert!(
-                f.run(Plan {
-                    branches,
-                    delete_remotes: false
-                })
-                .result
-                .is_ok()
-            );
+            let result = f.run(Plan { branches });
+            assert!(result.result.is_ok(), "{:?}", result.result);
             let delete_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert_eq!(refs_at(&f.bare), server);
+            let start = std::time::Instant::now();
+            assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+            let undo_ms = start.elapsed().as_secs_f64() * 1000.;
             let start = std::time::Instant::now();
             assert!(execute(&f.root, Request::OptimizeStorage).result.is_ok());
             println!(
                 "{}",
-                serde_json::json!({"sample":sample,"analysisMs":analyze_ms,"deleteMs":delete_ms,"repackMs":start.elapsed().as_secs_f64()*1000.})
+                serde_json::json!({"sample":sample,"branches":count,"analysisMs":analysis_ms,"deleteMs":delete_ms,"undoMs":undo_ms,"repackMs":start.elapsed().as_secs_f64()*1000.})
             );
-        }
-    }
-    #[test]
-    #[ignore = "one warmup and fifteen leased remote/local cleanup samples per fetch mapping"]
-    fn benchmark_cleanup_remote() {
-        for mapping in ["configured", "nonmatching"] {
-            for sample in -1..15 {
-                let f = Fixture::new();
-                // Normalize the configured URL and pushed URL identically; let
-                // installed Git determine whether it updates tracking refs.
-                f.git(&[
-                    "config",
-                    "remote.origin.url",
-                    &f.bare.to_string_lossy().replace('\\', "/"),
-                ]);
-                if mapping == "nonmatching" {
-                    f.git(&[
-                        "config",
-                        "remote.origin.fetch",
-                        "+refs/heads/unrelated:refs/remotes/origin/unrelated",
-                    ]);
-                }
-                let branch = f.candidate("fixes/task-123");
-                let plan = Plan {
-                    branches: vec![branch.clone()],
-                    delete_remotes: true,
-                };
-                let context = Context::new(&f.root).unwrap();
-                let mut probe = Duration::ZERO;
-                let mut tracking_removed = false;
-                let start = std::time::Instant::now();
-                apply_with_post_push(&context, &plan, || {
-                    let start = std::time::Instant::now();
-                    let repo = super::super::super::open(&f.root).unwrap();
-                    let refs = super::super::super::snapshot_refs(&repo).unwrap();
-                    let tracking = refs.refs.iter().find(|r| {
-                        r.kind == super::super::super::RefKind::Remote
-                            && r.name == "origin/fixes/task-123"
-                    });
-                    tracking_removed = tracking.is_none();
-                    if let Some(tracking) = tracking {
-                        assert_eq!(tracking.id.to_string(), branch.oid);
-                    }
-                    probe = start.elapsed();
-                })
-                .unwrap();
-                let total = start.elapsed();
-                assert!(
-                    command::checked(
-                        &f.root,
-                        &["show-ref", "--verify", "refs/heads/fixes/task-123"]
-                    )
-                    .is_err()
-                );
-                assert!(
-                    command::checked(
-                        &f.bare,
-                        &["show-ref", "--verify", "refs/heads/fixes/task-123"]
-                    )
-                    .is_err()
-                );
-                assert!(f.git(&["status", "--porcelain"]).is_empty());
-                println!(
-                    "{}",
-                    serde_json::json!({"sample":sample,"mapping":mapping,"trackingRemovedAfterPush":tracking_removed,"totalMs":total.as_secs_f64()*1000.,"postPushProbeMs":probe.as_secs_f64()*1000.,"mutationMs":total.saturating_sub(probe).as_secs_f64()*1000.})
-                );
-            }
         }
     }
 }

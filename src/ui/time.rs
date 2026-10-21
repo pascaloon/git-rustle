@@ -31,10 +31,18 @@ pub fn format_absolute(secs: i64, offset: i32) -> String {
     )
 }
 
+/// One calendar year before a UTC instant, clamping February 29.
+pub fn one_year_before(secs: i64) -> i64 {
+    months_before(secs, 12)
+}
 /// Six calendar months before a UTC instant, clamping month-end days.
+#[cfg(test)]
 pub fn six_months_before(secs: i64) -> i64 {
+    months_before(secs, 6)
+}
+fn months_before(secs: i64, count: i64) -> i64 {
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
-    let months = year * 12 + i64::from(month) - 1 - 6;
+    let months = year * 12 + i64::from(month) - 1 - count;
     let year = months.div_euclid(12);
     let month = months.rem_euclid(12) + 1;
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);

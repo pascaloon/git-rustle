@@ -246,20 +246,28 @@ action-handler-to-frame timings, not physical pointer or network latency.
 
 ## Branch cleanup and storage
 
-**Cleanup** analyzes local references in a background worker. Matching copies
-have the same object ID as their cached upstream; fetch first when fresher remote
-information is needed. This is not evidence that a branch is merged or its
-commits are disposable. A second section lists branches without a matching
-remote whose last commit is at least six calendar months old. This date is not a
+**Cleanup** verifies configured fetch servers in a background worker and groups
+references in three independent trees. **Fetched only** contains cached remote
+refs whose cached tip exactly matches the verified server tip, with no
+corresponding local branch. These entries are selected by default. **Matching**
+contains local branches whose tip exactly matches the
+verified server tip, including when its cached remote ref is stale or missing.
+Deleting a selection removes the local branch and its cached remote ref when
+present. **Old local** contains local branches with no server
+counterpart whose last commit is at least one year old. This date is not a
 branch creation date or the last time it was checked out.
 
-Current branches in any worktree are excluded. Main, master and known remote
-HEAD/default branch names start unchecked. Review the selected names and frozen
-object IDs before deleting. Remote deletion is a separate opt-in: the worker
-rechecks the remote URL and current server ref, then uses an expected-OID lease
-and an atomic push within each remote. Multiple remote groups can partially
-succeed; the result reports failures. Remote deletion cannot be reversed by
-local Undo. Recovery preserves local references and objects.
+Each tree supports folder checkboxes, mixed selection, and Select all/Unselect
+all. Current branches in any worktree are excluded. Main, master and known remote
+HEAD/default branch names are protected: their checkboxes are disabled and they
+cannot be selected. Review the exact local references before deleting; the
+worker rechecks their frozen object IDs. Failed server verification does not authorize
+cleanup based on cached information. Verification uses read-only server
+advertisements, with a five-second limit per remote and a twenty-second total
+budget; it does not fetch objects or update cached refs. Offline or unverified
+remotes exclude affected entries and produce warnings. Cleanup removes only
+local references; it never deletes server branches. Undo restores deleted local and cached remote
+refs, and recovery retains their objects.
 
 **Optimize storage** repacks redundant object copies, retaining unreachable
 objects and recovery history. It does not force-expire reflogs or immediately

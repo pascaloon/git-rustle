@@ -635,7 +635,8 @@ impl Desktop {
             let applied_stash = matches!(&request, Request::ApplyStash(_) | Request::PopStash(_));
             let refresh_stashes = applied_stash || matches!(&request, Request::DropStash(_));
             let cleanup_mutation =
-                matches!(&request, Request::Cleanup(_) | Request::OptimizeStorage);
+                matches!(&request, Request::Cleanup(_) | Request::OptimizeStorage)
+                    || (self.cleanup.open && matches!(&request, Request::MoveTo(_)));
             let read_conflict = matches!(&request, Request::ReadConflict(_));
             if self.engine.request_operation(request) {
                 if cleanup_mutation {
@@ -1183,7 +1184,13 @@ impl Desktop {
                             .border_1()
                             .border_color(rgb(LINE))
                             .child(div().text_size(px(20.)).child("Review Git operation"))
-                            .child(text.clone())
+                            .child(
+                                div()
+                                    .id("operation-review-references")
+                                    .max_h(px(360.))
+                                    .overflow_y_scroll()
+                                    .child(text.clone()),
+                            )
                             .child(
                                 dialog_actions()
                                     .child(self.op_button(

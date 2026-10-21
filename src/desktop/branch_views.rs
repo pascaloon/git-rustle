@@ -513,6 +513,7 @@ impl Desktop {
             }
         } else if phase == 1
             && self.cleanup_scenario_ready()
+            && self.branch_cleanup_painted(0, window)
             && self.branch_cleanup_painted(3, window)
             && self.branch_cleanup_painted(4, window)
             && self.branch_cleanup_painted(5, window)
@@ -522,9 +523,12 @@ impl Desktop {
         {
             let paints = self.branch_views.bench.as_ref().unwrap().paints.borrow();
             let content = paints[3].unwrap().1;
+            let fetched = paints[0].unwrap().1;
             let matching = paints[7].unwrap().1;
             let caution = paints[8].unwrap().1;
             let footer = paints[9].unwrap().1;
+            assert!(fetched.size.height > px(60.));
+            assert!(fetched.bottom() <= matching.top());
             assert!(matching.bottom() <= caution.top());
             assert!(caution.bottom() <= footer.top());
             assert!((footer.bottom() - content.bottom()).abs() <= px(1.));
@@ -532,13 +536,17 @@ impl Desktop {
             assert!((paints[5].unwrap().1.size.height - px(40.)).abs() <= px(1.));
             drop(paints);
             self.cleanup_scenario_assert_defaults();
+            self.cleanup_scenario_exercise_selection(window, cx);
             if name == "cleanup-review" {
-                self.cleanup_scenario_scroll(false, false);
-                self.branch_cleanup_advance(10);
+                self.cleanup_scenario_scroll_fetched(false);
+                self.branch_cleanup_advance(9);
             } else {
                 self.cleanup_action(cleanup::Action::Clear, window, cx);
-                self.cleanup_action(cleanup::Action::Toggle("fixes/task-123".into()), window, cx);
-                self.cleanup_action(cleanup::Action::Remote(true), window, cx);
+                self.cleanup_action(
+                    cleanup::Action::Toggle("refs/heads/fixes/task-123".into()),
+                    window,
+                    cx,
+                );
                 self.cleanup_action(cleanup::Action::Review, window, cx);
                 assert!(
                     self.operations
@@ -546,10 +554,14 @@ impl Desktop {
                         .as_ref()
                         .unwrap()
                         .1
-                        .contains("ALSO DELETE 1")
+                        .contains("refs/remotes/origin/fixes/task-123")
                 );
                 self.branch_cleanup_advance(2);
             }
+        } else if phase == 9 && self.branch_cleanup_painted(0, window) {
+            self.cleanup_scenario_assert_fetched_scroll();
+            self.cleanup_scenario_scroll(false, false);
+            self.branch_cleanup_advance(10);
         } else if phase == 10
             && self.branch_cleanup_painted(7, window)
             && self.branch_cleanup_painted(8, window)
@@ -562,12 +574,24 @@ impl Desktop {
             && self.branch_cleanup_painted(8, window)
         {
             self.cleanup_scenario_assert_scroll(true);
+            self.cleanup_scenario_scroll_fetched(true);
             self.cleanup_scenario_scroll(false, true);
             self.cleanup_scenario_scroll(true, true);
             self.branch_cleanup_advance(12);
         } else if phase == 12
             && self.branch_cleanup_painted(4, window)
             && self.branch_cleanup_painted(5, window)
+        {
+            if name == "cleanup-review"
+                && std::env::var("GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE").as_deref() == Ok("1")
+            {
+                self.cleanup_action(cleanup::Action::Review, window, cx);
+                assert!(self.operations.confirmation.is_some());
+                self.branch_cleanup_advance(13);
+            } else {
+                self.branch_cleanup_finish();
+            }
+        } else if phase == 13 && name == "cleanup-review" && self.branch_cleanup_painted(6, window)
         {
             self.branch_cleanup_finish();
         } else if phase == 2 && self.branch_cleanup_painted(6, window) {
@@ -587,6 +611,24 @@ impl Desktop {
                 self.engine.operation_status
             );
             self.engine.mark("cleanup delete frame");
+            let cursor = self.engine.operations.cursor;
+            self.operation_action(
+                operations::Action::Run(crate::git::operations::Request::MoveTo(cursor - 1)),
+                window,
+                cx,
+            );
+            self.branch_cleanup_advance(4);
+        } else if phase == 4
+            && !self.engine.operation_busy
+            && self.cleanup_scenario_ready()
+            && !self.cleanup_scenario_deleted()
+            && self.branch_cleanup_painted(4, window)
+        {
+            assert!(
+                !self.engine.operation_error,
+                "{}",
+                self.engine.operation_status
+            );
             self.branch_cleanup_finish();
         }
         cx.notify();

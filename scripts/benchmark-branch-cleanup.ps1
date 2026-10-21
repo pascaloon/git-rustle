@@ -5,6 +5,7 @@ param(
     [string]$BaselineHarness,
     [string]$Repository,
     [ValidateRange(1,100)][int]$Samples=15,
+    [switch]$ReviewDialogCapture,
     [ValidateSet('Native','Components','Screenshots')][string[]]$Stages=@('Native','Components')
 )
 $ErrorActionPreference='Stop'
@@ -17,7 +18,7 @@ $allowed=Join-Path $sourceRoot 'target/bench'
 if(!$OutputDirectory.StartsWith($allowed+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'Use workspace target/bench/<run>'}
 New-Item -ItemType Directory -Path $OutputDirectory -Force|Out-Null
 $saved=@{}
-$names=@(@(Get-ChildItem Env:|Where-Object Name -Match '^(GIT_|GIT_RUSTLE_)'|ForEach-Object Name)+@('LOCALAPPDATA','APPDATA','TEMP','TMP','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_BENCH_REPO','GIT_RUSTLE_BENCH_BRANCHES')|Select-Object -Unique)
+$names=@(@(Get-ChildItem Env:|Where-Object Name -Match '^(GIT_|GIT_RUSTLE_)'|ForEach-Object Name)+@('LOCALAPPDATA','APPDATA','TEMP','TMP','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE','GIT_RUSTLE_DUMP','GIT_RUSTLE_BENCH_REPO','GIT_RUSTLE_BENCH_BRANCHES')|Select-Object -Unique)
 foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 function Git([string]$Path,[string[]]$Arguments){$lines=@(& git.exe -C $Path @Arguments 2>&1);if($LASTEXITCODE-ne0){throw "Fixture Git failed: $Arguments $($lines-join' ')"};($lines-join"`n").TrimEnd()}
 function Write-FixtureRefs([string]$Path,[string[]]$Commands){
@@ -58,22 +59,27 @@ function Fixture([string]$Root){
     Git $working @('push','-qu','origin','main','fixes/task-123','master')|Out-Null
     Git $bare @('symbolic-ref','HEAD','refs/heads/main')|Out-Null
     Git $working @('symbolic-ref','refs/remotes/origin/HEAD','refs/remotes/origin/main')|Out-Null
-    # Enough real rows in each independent cleanup list to require scrolling.
+    # Exercise selection/tree work above the former 256 cap in every section.
     $current=Git $working @('rev-parse','HEAD');$old=Git $working @('rev-parse','refs/heads/old/local')
     $localCommands=[Collections.Generic.List[string]]::new();$serverCommands=[Collections.Generic.List[string]]::new()
-    foreach($index in 0..39){
+    foreach($index in 0..499){
         $name='zz-scroll/{0:d3}'-f$index
         $localCommands.Add("create refs/heads/$name $current");$localCommands.Add("create refs/remotes/origin/$name $current")
         $localCommands.Add("create refs/heads/zz-old/{0:d3} $old"-f$index)
+        # Fetched-only rows require verification against the server.
+        $localCommands.Add("create refs/remotes/origin/zz-fetched/{0:d3} $current"-f$index)
+        $serverCommands.Add("create refs/heads/zz-fetched/{0:d3} $current"-f$index)
         $serverCommands.Add("create refs/heads/$name $current")
     }
+    # Stale cached refs must not authorize cleanup.
+    $localCommands.Add("create refs/remotes/origin/zz-stale/missing $old")
     Write-FixtureRefs $working $localCommands.ToArray()
     Write-FixtureRefs $bare $serverCommands.ToArray()
     [IO.File]::WriteAllText((Join-Path $working '.git/git-rustle-cleanup-fixture'),'disposable branch cleanup fixture')
     return $working
 }
 function Fingerprint([string]$Working){
-    [pscustomobject]@{head=(Git $Working @('rev-parse','HEAD'));refs=(Git $Working @('for-each-ref','--format=%(refname) %(objectname)'));status=(Git $Working @('status','--porcelain=v1'));index=(Git $Working @('ls-files','--stage'));file=(Get-FileHash (Join-Path $Working 'file.txt')).Hash;remote=(Git (Join-Path (Split-Path $Working) 'origin.git') @('for-each-ref','--format=%(refname) %(objectname)'))}
+    [pscustomobject]@{head=(Git $Working @('rev-parse','HEAD'));refs=(Git $Working @('for-each-ref','--format=%(refname) %(objectname)','refs/heads','refs/remotes','refs/tags'));status=(Git $Working @('status','--porcelain=v1'));index=(Git $Working @('ls-files','--stage'));file=(Get-FileHash (Join-Path $Working 'file.txt')).Hash;remote=(Git (Join-Path (Split-Path $Working) 'origin.git') @('for-each-ref','--format=%(refname) %(objectname)'))}
 }
 function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture){
     Assert-Idle
@@ -83,6 +89,7 @@ function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture
     New-Item -ItemType Directory -Path (Join-Path $env:LOCALAPPDATA 'git-rustle')|Out-Null
     [IO.File]::WriteAllText((Join-Path $env:LOCALAPPDATA 'git-rustle/tools.json'),'{"scanned":true,"tools":[]}')
     $env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_SCENARIO=$Scenario;$env:GIT_RUSTLE_AUTOQUIT=if($Capture){'60000'}else{'100'}
+    if($Capture -and $ReviewDialogCapture -and $Scenario -eq 'cleanup-review'){$env:GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE='1'}else{Remove-Item Env:GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE -ErrorAction SilentlyContinue}
     if($Capture){$env:GIT_RUSTLE_TRACE='1'}else{Remove-Item Env:GIT_RUSTLE_TRACE -ErrorAction SilentlyContinue}
     $env:GIT_RUSTLE_DUMP=Join-Path $launch 'state.txt';$log=Join-Path $launch 'app.log';$process=$null
     try{
@@ -110,10 +117,8 @@ function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture
         $after=Fingerprint $working
         [pscustomobject]@{before=$before;after=$after;scenario=$Scenario;sample=$Sample;isolatedDesktop=$process.DesktopName}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $launch 'fixture.json')
         foreach($field in 'head','status','index','file'){if($before.$field-cne$after.$field){throw "Unexpected $field mutation: $log"}}
-        if($Scenario-eq'cleanup-delete'){
-            if($after.refs-match'(?m)^refs/heads/fixes/task-123 '-or$after.remote-match'(?m)^refs/heads/fixes/task-123 '){throw 'Expected leased remote and local deletion'}
-            if($after.remote-notmatch'(?m)^refs/heads/master '-or$after.refs-notmatch'(?m)^refs/heads/old/local '){throw 'Cleanup changed unchecked branch'}
-        }elseif($before.refs-cne$after.refs-or$before.remote-cne$after.remote){throw 'Read-only scenario changed refs'}
+        if($before.remote-cne$after.remote){throw 'Cleanup must never change server refs'}
+        if($before.refs-cne$after.refs){throw 'Cleanup must preserve refs or restore them exactly through Undo'}
         $marks=@{};foreach($m in [regex]::Matches($text,'([\d.]+) ms  ([^\r\n]+)')){if(!$marks.ContainsKey($m.Groups[2].Value)){$marks[$m.Groups[2].Value]=[double]::Parse($m.Groups[1].Value,[cultureinfo]::InvariantCulture)}}
         if(!$marks.ContainsKey('branch cleanup requested')-or!$marks.ContainsKey('branch cleanup verified frame')){throw 'Missing measured native marks'}
         [pscustomobject]@{sample=$Sample;scenario=$Scenario;binary='candidate';workerMs=$marks['branch cleanup verified frame']-$marks['branch cleanup requested'];deleteMs=if($Scenario-eq'cleanup-delete'){$marks['cleanup delete frame']-$marks['cleanup delete requested']}else{$null};log=$log;capture=$Capture}
@@ -137,12 +142,12 @@ try{
             if($test-eq'branches::tests::benchmark_browser'-and!$Repository){throw 'Shared browser worker needs Repository'}
             foreach($role in 'baseline','candidate'){$exe=if($role-eq'baseline'){$BaselineHarness}else{$CandidateHarness};Harness $exe $test (Join-Path $directory "$role-$($test-replace'::','-').txt")}
         }}
-        foreach($test in 'branches::hierarchy_tests::benchmark_branch_projection','git::operations::cleanup::tests::benchmark_cleanup','git::operations::cleanup::tests::benchmark_cleanup_remote','git::operations::cleanup::tests::benchmark_cleanup_large'){Harness $CandidateHarness $test (Join-Path $directory "candidate-$($test-replace'::','-').txt")}
+        foreach($test in 'branches::hierarchy_tests::benchmark_branch_projection','git::operations::cleanup::tests::benchmark_cleanup','git::operations::cleanup::tests::benchmark_cleanup_remote','git::operations::cleanup::tests::benchmark_cleanup_large','git::operations::cleanup::tests::benchmark_cleanup_matching_large'){Harness $CandidateHarness $test (Join-Path $directory "candidate-$($test-replace'::','-').txt")}
     }
     if('Screenshots'-in$Stages){$directory=New-Stage 'screenshots';foreach($scenario in 'branches-hierarchy','cleanup-review'){Native $scenario 0 $directory $true|ConvertTo-Json -Depth 5|Set-Content (Join-Path $directory "$scenario.json")}}
     $after=@(Get-ChildItem src,scripts -Recurse -File|Sort-Object FullName|ForEach-Object{[pscustomobject]@{path=$_.FullName;sha256=(Get-FileHash $_.FullName).Hash}})
     if((ConvertTo-Json -InputObject $sourceFiles -Compress)-cne(ConvertTo-Json -InputObject $after -Compress)-or(Get-FileHash $Candidate).Hash-cne$hash){throw 'Source or binary changed during run'}
-    $limitations='Native features are candidate-only absolute costs. Fixtures use local bare remotes; remote deletion is leased and explicitly confirmed. Repack retains recovery/unreachable objects; reported storage is Git-reported KiB, not physical allocated disk bytes. Screenshot launches are excluded from timing. Shared component controls retain baseline/candidate raw logs. These fixtures do not establish network behavior, physical input or display scanout.'
+    $limitations='Native features are candidate-only absolute costs. Fixtures use local bare remotes; every scenario verifies unchanged server refs. Cleanup mutation scenarios restore local and cached remote refs exactly through Undo. Repack retains recovery/unreachable objects; reported storage is Git-reported KiB, not physical allocated disk bytes. Screenshot launches are excluded from timing. Shared component controls retain baseline/candidate raw logs. These fixtures do not establish network behavior, physical input or display scanout.'
     $report=@('# Branch and cleanup measurements','','| Scenario | Samples | Median ms | p95 ms |','|---|---:|---:|---:|')
     $nativeSamples=Join-Path $OutputDirectory 'native/samples.json'
     if(Test-Path -LiteralPath $nativeSamples){

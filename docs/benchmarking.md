@@ -1319,6 +1319,13 @@ employer-network behavior.
 
 ## October feature batch: hierarchy, cleanup, pipelines and diff search
 
+The cleanup native fixture contains 500 fetched-only entries, 500 matching
+pairs, and 500 old-local entries, plus protected and named action targets.
+Section and folder selection, independent scrolling, review, deletion and Undo
+therefore exercise lists larger than the former 256-entry limit.
+Run the `Screenshots` stage separately, then repeat it in a new output directory
+with `-ReviewDialogCapture` to inspect the exact-reference confirmation dialog.
+
 Build final application and test executables before timing; never benchmark while
 Cargo, rustc or a linker is running. Preserve both baseline executables first.
 Use fresh subdirectories beneath the same ignored run directory for:
@@ -1327,7 +1334,7 @@ Use fresh subdirectories beneath the same ignored run directory for:
   expandable details and dense badges. Run once with `-Samples 15` and separately
   with `-Screenshots`.
 - `benchmark-branch-cleanup.ps1`: hierarchy and paired branch rows, cleanup review
-  and explicit leased deletion against a disposable local bare remote. Supply
+  and local/cached-ref deletion with Undo against a disposable local bare remote. Supply
   candidate/baseline test harnesses and a read-only repository for component
   comparisons. Use `-Stages Native,Components,Screenshots`.
 - `benchmark-ui-features.ps1`: filename/content search, rapid query replacement,
@@ -1358,10 +1365,16 @@ warmups and capture-only launches distinct. Record raw samples, medians/p95,
 fixture scale, binary hashes and any regressions in the run's Markdown report.
 New workflows have candidate-only absolute timings; do not invent a baseline.
 
-Cleanup's `benchmark_cleanup_remote` also measures real leased remote deletion
-and the local ref transaction with configured and nonmatching fetch mappings.
-It records whether Git removed the tracking ref after push, rather than assuming
-the behavior from a version number. Keep its total wall time, observation-probe
-time and derived mutation interval distinct; the probe can affect scheduling.
-This component excludes the outer recovery journal, which the native cleanup
-scenario includes. Validate against the CI Git version when changing these guards.
+Cleanup's component benchmarks measure server verification, local and cached-ref
+transactions, and large cleanup batches. Candidate-only
+`benchmark_cleanup_large` covers 1,500 old-local refs;
+`benchmark_cleanup_matching_large` covers 1,500 matching local/cached pairs.
+Both retain analysis, deletion and Undo timings and verify unchanged server
+refs. The native fixture has 500 nested
+rows in each tree, matching/protected branches and a stale cached ref absent
+from the server. Native mutation scenarios verify exact local/cached ref
+restoration through journal Undo, plus unchanged server refs, HEAD, index and
+worktree. Server branches are never deleted. Component benchmarks exclude GPUI
+painting; retain their raw sample fields and fixture dimensions separately from
+the native request-to-paint intervals. Run screenshots separately to inspect
+all three trees, mixed folder checks and section selection controls.

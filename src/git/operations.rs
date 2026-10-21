@@ -1559,15 +1559,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
     })();
     Outcome {
         view,
-        refresh_remotes: result.is_ok()
-            && matches!(
-                request,
-                Request::PushReviewed(_)
-                    | Request::Cleanup(cleanup::Plan {
-                        delete_remotes: true,
-                        ..
-                    })
-            ),
+        refresh_remotes: result.is_ok() && matches!(request, Request::PushReviewed(_)),
         result,
         refresh_repository: request.changes_repository(),
     }
@@ -1740,15 +1732,7 @@ fn execute_inner(
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
         Request::CreateStash(_) => "Stash pending changes".into(),
-        Request::Cleanup(plan) => format!(
-            "Cleanup {} local branches{}",
-            plan.branches.len(),
-            if plan.delete_remotes {
-                " and reviewed remote copies"
-            } else {
-                ""
-            }
-        ),
+        Request::Cleanup(plan) => format!("Cleanup {} branch entries", plan.branches.len()),
         Request::ApplyStash(stash) => format!("Apply stash {}", stash.subject),
         Request::PopStash(stash) => format!("Pop stash {}", stash.subject),
         Request::DropStash(stash) => format!("Delete stash {}", stash.subject),
