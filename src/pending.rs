@@ -6,6 +6,7 @@ use gix::ObjectId;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub fingerprint: u64,
+    pub stash_stamp: Option<u64>,
     pub head: Option<ObjectId>,
     pub branch: Option<String>,
     pub files: Vec<FileChange>,

@@ -13,6 +13,7 @@ impl AssetSource for Assets {
             "icons/circle-x.svg" => "clear",
             "icons/check.svg" => "check",
             "icons/chevron-down.svg" => "down",
+            "icons/loader.svg" => "spinner",
             _ => path.strip_prefix("rustle/").unwrap_or(""),
         };
         let body = match name {
@@ -34,6 +35,7 @@ impl AssetSource for Assets {
             "clear" => "<circle cx='12' cy='12' r='9'/><path d='m9 9 6 6m0-6-6 6'/>",
             "search" => "<circle cx='10' cy='10' r='6'/><path d='m15 15 5 5'/>",
             "refresh" => "<path d='M20 8a8 8 0 1 0 0 8M20 3v5h-5'/>",
+            "spinner" => "<path d='M12 3a9 9 0 1 1-9 9'/>",
             "settings" => {
                 "<path d='m10 3 4 0 1 3 3 1 3 3-2 3 0 3-3 3-3-1-3 1-3-3 0-3-2-3 3-3 3-1z'/><circle cx='12' cy='12' r='3'/>"
             }

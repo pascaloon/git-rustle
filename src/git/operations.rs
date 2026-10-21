@@ -17,6 +17,7 @@ pub mod stashes;
 pub enum Request {
     Inspect,
     ListStashes,
+    CreateStash(Option<String>),
     ApplyStash(stashes::Stash),
     DropStash(stashes::Stash),
     PreviewPush,
@@ -73,6 +74,7 @@ pub enum Request {
     ClearHistory,
     Checkout(crate::checkout::Request),
     Commit(crate::pending::Request),
+    DiscardFile(super::worktree::DiscardRequest),
 }
 impl Request {
     pub fn changes_repository(&self) -> bool {
@@ -158,6 +160,7 @@ pub struct PushPreview {
 #[derive(Clone, Debug, Default)]
 pub struct View {
     pub stashes: Option<Vec<stashes::Stash>>,
+    pub stash_stamp: Option<u64>,
     pub labels: Vec<String>,
     pub cursor: usize,
     pub boundary: String,
@@ -1488,11 +1491,18 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
         let mut preview = None;
         let mut push = None;
         let mut stash_list = None;
+        let mut stash_stamp = None;
         let result = match &request {
-            Request::ListStashes => stashes::list(&context.root).map(|entries| {
-                stash_list = Some(entries);
-                "Stashes loaded.".into()
-            }),
+            Request::ListStashes => {
+                // Read before listing: a later status observation may safely
+                // coalesce only when it identifies this already-read version.
+                let before = super::worktree::stash_stamp(&context.common).ok();
+                stashes::list(&context.root).map(|entries| {
+                    stash_list = Some(entries);
+                    stash_stamp = before;
+                    "Stashes loaded.".into()
+                })
+            }
             Request::OnBranch {
                 branch,
                 head,
@@ -1529,6 +1539,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
         let save = context.save(&journal);
         view = View {
             stashes: stash_list,
+            stash_stamp,
             labels: journal.entries.iter().map(|e| e.label.clone()).collect(),
             cursor: journal.cursor,
             boundary: journal.boundary.clone(),
@@ -1707,6 +1718,7 @@ fn execute_inner(
     }
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
+        Request::CreateStash(_) => "Stash pending changes".into(),
         Request::ApplyStash(stash) => format!("Apply stash {}", stash.subject),
         Request::DropStash(stash) => format!("Delete stash {}", stash.subject),
         Request::CreateTag { name, .. } => format!("Create tag {name}"),
@@ -1718,6 +1730,7 @@ fn execute_inner(
         Request::Interactive { .. } => "Interactive rebase".into(),
         Request::Checkout(target) => format!("Checkout {}", target.label()),
         Request::Commit(_) => "Commit selected changes".into(),
+        Request::DiscardFile(request) => format!("Discard file {}", request.file.path),
         _ => return Err("Unsupported operation".into()),
     };
     context.pin(&before)?;
@@ -1728,6 +1741,7 @@ fn execute_inner(
     context.save(journal)?;
     let result: Result<()> = (|| {
         match request {
+            Request::CreateStash(message) => stashes::create(context, message.as_deref())?,
             Request::ApplyStash(stash) => stashes::apply(context, stash)?,
             Request::DropStash(stash) => stashes::drop_stash(context, stash)?,
             Request::Create { name, target } => {
@@ -1785,6 +1799,9 @@ fn execute_inner(
             }
             Request::Commit(request) => {
                 super::worktree::commit(&context.root, request)?;
+            }
+            Request::DiscardFile(request) => {
+                super::worktree::discard_file(&context.root, request)?;
             }
             _ => unreachable!(),
         }

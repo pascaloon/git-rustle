@@ -6,28 +6,34 @@ param(
     [int]$Samples = 15,
     [switch]$NativeCandidate,
     [switch]$NativeBaseline,
+    # Separate binary caches when cache formats differ between revisions.
+    [string]$IsolatedCacheRoot,
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\comparison"
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/benchmark-processes.ps1"
+. "$PSScriptRoot/benchmark-native-process.ps1"
 $Repository = (Resolve-Path -LiteralPath $Repository).Path
 $Baseline = (Resolve-Path -LiteralPath $Baseline).Path
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $saved = @{}
-foreach ($name in @('GIT_RUSTLE_TIMING', 'GIT_RUSTLE_AUTOQUIT', 'GIT_RUSTLE_KEYS', 'GIT_RUSTLE_DUMP')) {
+foreach ($name in @('GIT_RUSTLE_TIMING', 'GIT_RUSTLE_AUTOQUIT', 'GIT_RUSTLE_KEYS', 'GIT_RUSTLE_DUMP', 'LOCALAPPDATA')) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
+    if ($IsolatedCacheRoot) {
+        $env:LOCALAPPDATA = Join-Path $IsolatedCacheRoot $label
+        New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
+    }
     if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     $log = Join-Path $OutputDirectory "$label-$mode-$sample.txt"
     $runArgs = @('"' + $Repository + '"')
     if ($mode -eq 'uncached') { $runArgs += '--no-cache' }
-    $windowStyle = if (($NativeCandidate -and $label -eq 'candidate') -or ($NativeBaseline -and $label -eq 'baseline')) { 'Normal' } else { 'Hidden' }
-    $process = Start-Process -FilePath $exe -ArgumentList $runArgs -WindowStyle $windowStyle -RedirectStandardError $log -PassThru
+    $process = Start-BenchmarkNativeProcess -FilePath $exe -ArgumentList $runArgs -RedirectStandardError $log
     if (-not $process.WaitForExit(120000)) {
-        Stop-Process -Id $process.Id
+        $process.Kill()
         throw "Benchmark exceeded two minutes: $log"
     }
     $process.Refresh()

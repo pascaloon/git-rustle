@@ -330,6 +330,10 @@ pub struct Engine {
     /// A merge editor or explicit ref-storage conversion owns repository writes.
     pub repository_edit_busy: bool,
     pub operation_epoch: u64,
+    pub stash_epoch: u64,
+    pub stash_revision: u64,
+    pub stash_list_stamp: Option<u64>,
+    stash_stamp: Option<u64>,
     pub conflict_refresh_error: Option<String>,
     conflict_refresh_busy: bool,
     conflict_refresh_at: Instant,
@@ -374,6 +378,21 @@ pub struct Engine {
     first_frame_at: Option<Instant>,
 }
 impl Engine {
+    /// Queued/in-flight refresh work, excluding periodic worktree status probes.
+    pub fn refresh_in_progress(&self) -> bool {
+        self.app.want_refresh
+            || self.refreshing
+            || self.app.want_rewalk
+            || self.app.is_walking()
+            || self.app.branches.want_refresh.is_some()
+            || self.app.branches.loading
+            || self.preview_busy
+            || self.preview_wanted
+    }
+
+    pub fn stash_status_stamp(&self) -> Option<u64> {
+        self.stash_stamp
+    }
     pub fn no_cache(&self) -> bool {
         self.no_cache
     }
@@ -506,6 +525,10 @@ impl Engine {
             operation_busy: false,
             repository_edit_busy: false,
             operation_epoch: 0,
+            stash_epoch: 0,
+            stash_revision: 0,
+            stash_list_stamp: None,
+            stash_stamp: None,
             conflict_refresh_error: None,
             conflict_refresh_busy: false,
             conflict_refresh_at: Instant::now(),
@@ -1047,7 +1070,15 @@ impl Engine {
                     self.operation_status = outcome.result.unwrap_or_else(|e| e);
                     let plan = self.operations.plan.take();
                     let preview = self.operations.preview.take();
+                    if outcome.view.stashes.is_some() {
+                        self.stash_list_stamp = outcome.view.stash_stamp;
+                        self.stash_epoch = self.stash_epoch.wrapping_add(1);
+                    }
+                    let stashes = self.operations.stashes.take();
                     self.operations = outcome.view;
+                    if self.operations.stashes.is_none() {
+                        self.operations.stashes = stashes;
+                    }
                     if self.operations.plan.is_none() {
                         self.operations.plan = plan;
                     }
@@ -1077,7 +1108,11 @@ impl Engine {
                     timing.mark("git operation done");
                 }
                 Msg::OperationsView(view) => {
+                    let stashes = self.operations.stashes.take();
                     self.operations = *view;
+                    if self.operations.stashes.is_none() {
+                        self.operations.stashes = stashes;
+                    }
                     self.operation_epoch = self.operation_epoch.wrapping_add(1);
                 }
                 Msg::ConflictRefresh(epoch, identity, result) => {
@@ -1132,6 +1167,10 @@ impl Engine {
                 Msg::Pending(generation, result) => {
                     if generation == self.pending_generation {
                         if let Ok(snapshot) = &result {
+                            if self.stash_stamp != snapshot.stash_stamp {
+                                self.stash_stamp = snapshot.stash_stamp;
+                                self.stash_revision = self.stash_revision.wrapping_add(1);
+                            }
                             timing.mark(format!(
                                 "pending status ready ({} files)",
                                 snapshot.files.len()
@@ -2112,7 +2151,11 @@ mod tests {
                 && !e.operation_busy
         });
         let head = e.app.head_id().unwrap();
-        let old = e.app.history.commits[1].id;
+        // Equal-time commits can occupy either row when both are ref tips.
+        // Freeze the remote's actual pre-push identity rather than its row.
+        let old =
+            gix::ObjectId::from_hex(git(&["rev-parse", "origin/main"]).trim().as_bytes()).unwrap();
+        assert_ne!(old, head);
         let remote = remote::Remote {
             name: "origin".into(),
             url: remote_path.into(),
@@ -2487,5 +2530,56 @@ mod tests {
         .unwrap();
         assert!(journal["pending"].is_null());
         e.timing.enabled = false;
+    }
+    #[test]
+    fn stash_list_survives_unrelated_recovery_view_and_failed_operations() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("file.txt"), "saved\n").unwrap();
+        crate::git::command::checked(dir.path(), &["stash", "push", "-m", "named stash"]).unwrap();
+        let mut e = quiet_engine(dir.path());
+        assert!(e.request_operation(git::operations::Request::ListStashes));
+        let epoch = e.stash_epoch;
+        until(&mut e, |e| e.stash_epoch != epoch);
+        let entries = e.operations.stashes.clone().unwrap();
+        assert_eq!(entries.len(), 1);
+        let epoch = e.stash_epoch;
+        e.tick(Some(Msg::OperationsView(Box::default())));
+        assert_eq!(
+            e.stash_epoch, epoch,
+            "recovery metadata is not a stash response"
+        );
+        assert_eq!(e.operations.stashes.as_ref(), Some(&entries));
+        assert!(e.request_operation(git::operations::Request::CreateStash(None)));
+        until(&mut e, |e| {
+            !e.operation_busy && e.operation_request.is_none()
+        });
+        assert!(e.operation_error, "empty stash creation must fail visibly");
+        assert_eq!(e.stash_epoch, epoch);
+        assert_eq!(e.operations.stashes.as_ref(), Some(&entries));
+    }
+    #[test]
+    fn unchanged_unknown_stash_metadata_does_not_repeat_invalidation() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        let mut snapshot = e.app.pending.snapshot.clone();
+        snapshot.stash_stamp = None;
+        e.tick(Some(Msg::Pending(
+            e.pending_generation,
+            Ok(snapshot.clone()),
+        )));
+        let revision = e.stash_revision;
+        e.tick(Some(Msg::Pending(
+            e.pending_generation,
+            Ok(snapshot.clone()),
+        )));
+        assert_eq!(e.stash_revision, revision);
+        snapshot.stash_stamp = Some(7);
+        e.tick(Some(Msg::Pending(
+            e.pending_generation,
+            Ok(snapshot.clone()),
+        )));
+        assert_eq!(e.stash_revision, revision + 1);
+        e.tick(Some(Msg::Pending(e.pending_generation, Ok(snapshot))));
+        assert_eq!(e.stash_revision, revision + 1);
     }
 }

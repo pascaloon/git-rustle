@@ -22,7 +22,8 @@ use crate::graph::layout::GraphCell;
 use crate::model::{CommitRec, History, Span};
 
 const MAGIC: &[u8; 4] = b"GRSL";
-const VERSION: u32 = 2;
+// Version 3 uses checkout-independent graph ordering.
+const VERSION: u32 = 3;
 const HEADER_LEN: usize = 48;
 
 /// What was read from disk.

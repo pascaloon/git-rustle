@@ -7,6 +7,37 @@ write generated results to unique ignored `target/bench/<run>` directories.
 Additional scenario-specific scripts and their setup requirements are listed in
 [the benchmark helper guide](benchmarks/README.md).
 
+### Stable graph order and selected paths
+
+Compare warm/uncached startup and normal/searched scrolling against the preserved
+application baseline. Run `benchmark-desktop.ps1 -Scenarios graph-hover
+-RequireSelectedPath` with the usual repository, binary, sample and output
+arguments. The candidate must verify the selected path after a native paint while
+hover repeatedly enters and leaves, retaining the 120-frame measurements.
+The baseline runs its existing hover behavior without the new assertion.
+`desktop::hover::tests::benchmark_selected_path` records one warm-up plus 15
+component samples of selection, hover, scrolling, repeat-frame cache hits and
+flag unions on 100,000 records with 80 visible rows. Each reported interval is the
+mean per paired-frame iteration over 1,000 iterations, excluding native painting.
+`selectionMs` separately measures building the complete selected track once;
+later scroll frames read only visible rows from that cached track, including
+when the selected commit is outside the viewport. Streaming history growth,
+changed reference fingerprints and partial-search geometry invalidate the trace.
+`git::graph_order_tests::benchmark_graph_walk` uses `GIT_RUSTLE_BENCH_REPO` and
+separately reports reference snapshot, first batch and full walk intervals.
+`git::graph_order_tests::benchmark_equal_timestamp_frontier` creates a disposable
+10,000-commit same-second chain and measures its first batch and complete walk.
+Equal-time frontiers are discovered before emitting any row so referenced
+ancestors follow their descendants; this pathological case deliberately measures
+the startup cost of expanding an unusually large timestamp frontier.
+The latter two components establish candidate costs; preserved baseline native
+startup and scrolling remain the shared comparisons. The history-cache version
+changes, so distinguish fresh candidate cache creation from warmed reopening.
+Detached HEAD history unreachable from references is appended after reference
+history to avoid a second ancestry pass; reference-reachable checkout preserves
+existing rows even with equal timestamps or clock skew. This is a display-order
+policy, not a new strict topological-order guarantee.
+
 
 ## GPUI desktop (current implementation)
 
@@ -1155,3 +1186,66 @@ filtered commit rows and selected details, including an empty-result case.
 Do not describe match availability as complete graph latency or use warm queries
 to characterize first-time indexing. Provider/API file-list latency requires a
 separate fixture or explicitly identified live measurement.
+
+### Stash creation and external stash changes
+
+After preserving exact application/test baselines and completing final builds, run
+`scripts/benchmark-stash-workflows.ps1` with `-Repository`, `-Baseline`,
+`-BaselineHarness`, `-Candidate`, `-CandidateHarness`, and a new
+`-OutputDirectory target/bench/<run>/stash` (15 retained native samples by default).
+The runner preserves raw samples, binary/source hashes, fixture before/after
+states and a Markdown report. Shared native scenarios cover panel listing,
+apply-with-retention and deletion. Candidate-only `stash-create` uses the actual
+optional-name form and Save action, verifies the named entry, then observes an
+external unnamed push and external drop through the open panel and final paint.
+Each launch uses a fresh marked repository; the final state has four stashes and
+no pending changes. External mutation scheduling and the ordinary two-second
+status cadence are included in their separate intervals. These are local fixture
+measurements, not physical pointer or scanout measurements.
+
+The existing stash worker comparison measures apply/delete/undo/redo/conflict;
+`git::operations::tests::benchmark_stash_create` adds creation and listing.
+Also compare the existing `git::worktree::tests::benchmark_pending` worker and
+startup against the preserved baseline: external stash detection reuses the
+existing status worker with four bounded metadata probes. No stash-list command
+runs on unchanged status ticks. Treat candidate-only intervals as absolute costs;
+report shared joint median/p95 regressions above 5% and 1 ms, preserving all raw
+crossings and limitations.
+
+### Graph selection, refresh feedback, stash and discard bundle
+
+Use `scripts/benchmark-improvements2.ps1` after final checks/builds, passing
+`-Repository`, the exact preserved `-Baseline` and `-BaselineHarness`, final
+`-Candidate` and `-CandidateHarness`, and a new ignored
+`-OutputDirectory target/bench/<run>/suite`. Default `-Samples 15` retains fifteen
+native launches after one warmup per group. Stages are `Startup`, `History`,
+`Actions`, and `Components`; resume with only unfinished stages. Existing stage
+directories are retained and rejected if selected again.
+
+Startup gives each binary its own cache root because the candidate's topological
+history layout uses cache format v3. Shared history controls cover ordinary and
+searched scrolling, selected-path/hover painting and footer panels; the candidate
+also paints refresh feedback while preserving the project image. Actions invoke
+the marked stash and discard workflows described above. Components compare the
+existing pending-status and hover workers, then measure selected-path caching,
+real reference-history walking, and single-file discard. Stash workers run once
+inside the stash workflow wrapper. Component harnesses retain their own fifteen
+samples regardless of the native `-Samples` setting.
+
+Native startup, history and action launches use
+`scripts/benchmark-native-process.ps1` to create a separate Windows desktop per
+process. Windows paint normally there, but the helper never switches the user's
+input desktop. It redirects stderr and retains the isolated desktop until exit;
+timeouts terminate the process tree before releasing it. These measurements cover
+GPUI paint callbacks on a non-current desktop, excluding interactive desktop
+composition, physical input and display scanout.
+
+The companion `summarize-improvements2.ps1` rebuilds `report.md`, `summary.json`,
+`gates-metrics.json`, `gates-crossings.json`, and `stage-completeness.json` from raw
+outputs without rerunning applications. It preserves dimension groups and checks
+sample completeness. Strict joint gates are 5% plus 1 ms for worker/startup/action
+delivery, and 5% plus 0.10 ms for frames, launch means and in-memory CPU.
+Keep all crossings and diagnostic repeats visible. The native figures include
+real action delivery and verified GPUI paint, excluding physical pointer/display
+scanout; local disposable fixtures do not establish all graph/worktree scales or
+employer-network behavior.

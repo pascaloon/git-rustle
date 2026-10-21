@@ -2,7 +2,7 @@
 //! streaming history walk, and on-demand commit details.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -113,7 +113,7 @@ pub fn snapshot_refs(repo: &gix::Repository) -> Result<RefSnapshot> {
     let mut snap = RefSnapshot::default();
     let mut seen_tips: HashSet<ObjectId> = HashSet::new();
 
-    // HEAD first.
+    // HEAD labels are presentation metadata, not graph ordering seeds.
     let head = repo.head()?;
     snap.head_branch = head
         .referent_name()
@@ -121,9 +121,6 @@ pub fn snapshot_refs(repo: &gix::Repository) -> Result<RefSnapshot> {
     if let Some(id) = head.id() {
         let id = id.detach();
         snap.head_id = Some(id);
-        if seen_tips.insert(id) {
-            snap.tips.push(id);
-        }
     }
 
     let platform = repo.references()?;
@@ -223,10 +220,6 @@ fn snapshot_reftable(repo: &gix::Repository) -> Result<RefSnapshot> {
         ..Default::default()
     };
     let mut seen = HashSet::new();
-    if let Some(id) = snap.head_id {
-        seen.insert(id);
-        snap.tips.push(id);
-    }
     for reference in refs::raw_refs(repo)? {
         let Some(id) = reference.id else { continue };
         let (name, kind) = if let Some(name) = reference.name.strip_prefix("refs/heads/") {
@@ -315,13 +308,12 @@ struct Parsed {
 
 struct QueueEntry {
     time: i64,
-    seq: u64,
     id: ObjectId,
 }
 
 impl PartialEq for QueueEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.time == other.time && self.seq == other.seq
+        self.time == other.time && self.id == other.id
     }
 }
 impl Eq for QueueEntry {}
@@ -332,10 +324,10 @@ impl PartialOrd for QueueEntry {
 }
 impl Ord for QueueEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Newest first; among equal times, the one enqueued first.
+        // Object identity breaks timestamp ties independently of HEAD/ref order.
         self.time
             .cmp(&other.time)
-            .then_with(|| other.seq.cmp(&self.seq))
+            .then_with(|| other.id.cmp(&self.id))
     }
 }
 
@@ -381,8 +373,10 @@ fn subject_of(msg: &[u8]) -> &[u8] {
     msg[..end].trim()
 }
 
-/// Walk all commits reachable from `tips`, newest committer-time first, laying
+/// Walk commits reachable from reference `tips`, newest committer-time first, laying
 /// out the graph as rows and handing them to `emit` in growing batches.
+/// Detached HEAD is a fallback after reference history, so checking out an
+/// already-reachable ancestor cannot change ordering or lane assignment.
 /// `emit` returns `false` to cancel.
 pub fn walk(
     repo: &gix::Repository,
@@ -393,22 +387,20 @@ pub fn walk(
     let mut seen: HashSet<ObjectId> = HashSet::with_capacity(4096);
     let mut pending: HashMap<ObjectId, Parsed> = HashMap::with_capacity(1024);
     let mut queue: BinaryHeap<QueueEntry> = BinaryHeap::with_capacity(1024);
-    let mut seq: u64 = 0;
     let mut layout = Layout::new();
+    let mut check_fallback_head = true;
 
-    let mut enqueue = |id: ObjectId,
-                       seen: &mut HashSet<ObjectId>,
-                       pending: &mut HashMap<ObjectId, Parsed>,
-                       queue: &mut BinaryHeap<QueueEntry>,
-                       buf: &mut Vec<u8>| {
+    let enqueue = |id: ObjectId,
+                   seen: &mut HashSet<ObjectId>,
+                   pending: &mut HashMap<ObjectId, Parsed>,
+                   queue: &mut BinaryHeap<QueueEntry>,
+                   buf: &mut Vec<u8>| {
         if !seen.insert(id) {
             return;
         }
         if let Some(parsed) = parse_commit(repo, &id, buf) {
-            seq += 1;
             queue.push(QueueEntry {
                 time: parsed.commit_time,
-                seq,
                 id,
             });
             pending.insert(id, parsed);
@@ -422,8 +414,93 @@ pub fn walk(
     let mut chunk = History::default();
     let mut batch_size = 64usize;
     let mut graph_parents: Vec<ObjectId> = Vec::new();
+    let mut ready = VecDeque::new();
 
-    while let Some(entry) = queue.pop() {
+    loop {
+        while queue
+            .peek()
+            .is_some_and(|entry| !pending.contains_key(&entry.id))
+        {
+            queue.pop();
+        }
+        if queue.is_empty() && ready.is_empty() && check_fallback_head {
+            check_fallback_head = false;
+            if let Some(head) = refs::head(repo)?.id {
+                enqueue(head, &mut seen, &mut pending, &mut queue, &mut buf);
+            }
+        }
+        if ready.is_empty() {
+            let Some(first) = queue.pop() else { break };
+            let time = first.time;
+            let mut peers = Vec::new();
+            while queue.peek().is_some_and(|entry| entry.time == time) {
+                let entry = queue.pop().unwrap();
+                if pending.contains_key(&entry.id) {
+                    peers.push(entry.id);
+                }
+            }
+            graph_parents.clear();
+            graph_parents.extend_from_slice(&pending[&first.id].parents);
+            for parent in graph_parents.iter().copied() {
+                enqueue(parent, &mut seen, &mut pending, &mut queue, &mut buf);
+            }
+            let equal_parent = graph_parents
+                .iter()
+                .any(|parent| pending.get(parent).is_some_and(|p| p.commit_time == time));
+            if peers.is_empty() && !equal_parent {
+                ready.push_back(first);
+            } else {
+                let mut frontier = HashSet::from([first.id]);
+                let mut discover = vec![first.id];
+                for id in peers {
+                    if frontier.insert(id) {
+                        discover.push(id);
+                    }
+                }
+                // Discover only this timestamp frontier before emitting it. This
+                // prevents a referenced equal-time ancestor from appearing before
+                // its descendant, without delaying startup for unrelated history.
+                while let Some(id) = discover.pop() {
+                    let parents = pending[&id].parents.clone();
+                    for parent in parents {
+                        enqueue(parent, &mut seen, &mut pending, &mut queue, &mut buf);
+                        if pending.get(&parent).is_some_and(|p| p.commit_time == time)
+                            && frontier.insert(parent)
+                        {
+                            discover.push(parent);
+                        }
+                    }
+                }
+                let mut children = HashMap::<ObjectId, usize>::new();
+                for id in &frontier {
+                    for parent in &pending[id].parents {
+                        if frontier.contains(parent) {
+                            *children.entry(*parent).or_default() += 1;
+                        }
+                    }
+                }
+                let mut eligible = BinaryHeap::new();
+                for id in &frontier {
+                    if children.get(id).copied().unwrap_or(0) == 0 {
+                        eligible.push(QueueEntry { time, id: *id });
+                    }
+                }
+                while let Some(entry) = eligible.pop() {
+                    for parent in &pending[&entry.id].parents {
+                        if let Some(count) = children.get_mut(parent) {
+                            *count -= 1;
+                            if *count == 0 {
+                                eligible.push(QueueEntry { time, id: *parent });
+                            }
+                        }
+                    }
+                    ready.push_back(entry);
+                }
+            }
+        }
+        let Some(entry) = ready.pop_front() else {
+            break;
+        };
         let id = entry.id;
         let Some(parsed) = pending.remove(&id) else {
             continue;
@@ -532,4 +609,171 @@ pub fn commit_details(repo: &gix::Repository, id: &ObjectId) -> Result<CommitDet
         }
     }
     Ok(d)
+}
+
+#[cfg(test)]
+mod graph_order_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "one warm-up and 15 pathological same-second 10k-commit walk samples"]
+    fn benchmark_equal_timestamp_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        let mut data = String::new();
+        for n in 0..10_000 {
+            let message = format!("commit {n}");
+            data.push_str(&format!("commit refs/heads/main\ncommitter Graph <graph@example.test> 2000000000 +0000\ndata {}\n{message}\n\n", message.len()));
+        }
+        let output = command::run(
+            dir.path(),
+            &["fast-import", "--quiet"],
+            Some(data.as_bytes()),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        for sample in -1..15 {
+            let repo = open(dir.path()).unwrap();
+            let refs = snapshot_refs(&repo).unwrap();
+            let started = std::time::Instant::now();
+            let mut first_ms = None;
+            let mut count = 0;
+            walk(&repo, &refs.tips, &mut |batch| {
+                first_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.);
+                count += batch.len();
+                true
+            })
+            .unwrap();
+            assert_eq!(count, 10_000);
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"commits":count,
+                "firstBatchMs":first_ms,"walkMs":started.elapsed().as_secs_f64()*1000.})
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "one warm-up and 15 real reference-history walk samples"]
+    fn benchmark_graph_walk() {
+        let path = std::env::var_os("GIT_RUSTLE_BENCH_REPO").expect("benchmark repository");
+        for sample in -1..15 {
+            let repo = open(Path::new(&path)).unwrap();
+            let started = std::time::Instant::now();
+            let refs = snapshot_refs(&repo).unwrap();
+            let refs_ms = started.elapsed().as_secs_f64() * 1000.;
+            let started = std::time::Instant::now();
+            let mut first_ms = None;
+            let mut commits = 0;
+            walk(&repo, &refs.tips, &mut |batch| {
+                first_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.);
+                commits += batch.len();
+                std::hint::black_box(batch);
+                true
+            })
+            .unwrap();
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"commits":commits,
+                "refsMs":refs_ms,"firstBatchMs":first_ms,"walkMs":started.elapsed().as_secs_f64()*1000.})
+            );
+        }
+    }
+
+    #[test]
+    fn equal_time_queue_order_is_independent_of_checkout_tip_order() {
+        let ids: Vec<_> = (1..=6)
+            .map(|n| ObjectId::from_bytes_or_panic(&[n; 20]))
+            .collect();
+        let order = |tips: Vec<ObjectId>| {
+            let mut queue = BinaryHeap::new();
+            for id in tips {
+                queue.push(QueueEntry { time: 42, id });
+            }
+            std::iter::from_fn(|| queue.pop().map(|entry| entry.id)).collect::<Vec<_>>()
+        };
+        let expected = order(ids.clone());
+        for head in 0..ids.len() {
+            let mut tips = ids.clone();
+            tips.rotate_left(head);
+            assert_eq!(order(tips), expected);
+        }
+    }
+    fn git(path: &Path, args: &[&str]) -> String {
+        String::from_utf8(command::checked(path, args).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn checkouts_preserve_rows_and_lanes_with_equal_and_skewed_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-b", "main"]);
+        git(path, &["config", "user.name", "Graph Test"]);
+        git(path, &["config", "user.email", "graph@example.test"]);
+        git(path, &["config", "commit.gpgSign", "false"]);
+        let tree = git(path, &["mktree"]);
+        let make = |name: &str, parent: Option<&str>, time: &str| {
+            let mut args = vec!["commit-tree", &tree, "-m", name];
+            if let Some(parent) = parent {
+                args.extend(["-p", parent]);
+            }
+            let output = command::run_env(
+                path,
+                &args,
+                None,
+                std::time::Duration::from_secs(10),
+                &[
+                    ("GIT_AUTHOR_DATE", std::ffi::OsStr::new(time)),
+                    ("GIT_COMMITTER_DATE", std::ffi::OsStr::new(time)),
+                ],
+            )
+            .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        // Equal-time siblings and a clock-skewed parent must remain stable.
+        let root = make("root", None, "2000000100 +0000");
+        let left = make("left", Some(&root), "2000000000 +0000");
+        let right = make("right", Some(&root), "2000000000 +0000");
+        let middle = make("middle", Some(&left), "2000000000 +0000");
+        let tip = make("tip", Some(&middle), "2000000000 +0000");
+        git(path, &["update-ref", "refs/heads/main", &tip]);
+        git(path, &["update-ref", "refs/heads/ancestor", &left]);
+        git(path, &["update-ref", "refs/heads/other", &right]);
+        let graph = || {
+            let repo = open(path).unwrap();
+            let refs = snapshot_refs(&repo).unwrap();
+            let mut rows = Vec::new();
+            walk(&repo, &refs.tips, &mut |batch| {
+                for (index, record) in batch.commits.iter().enumerate() {
+                    rows.push((record.id, record.node_lane, batch.row_cells(index).to_vec()));
+                }
+                true
+            })
+            .unwrap();
+            rows
+        };
+        let expected = graph();
+        let position = |hex: &str| {
+            let id = ObjectId::from_hex(hex.as_bytes()).unwrap();
+            expected.iter().position(|row| row.0 == id).unwrap()
+        };
+        assert!(position(&tip) < position(&middle));
+        assert!(position(&middle) < position(&left));
+        assert_eq!(expected[position(&tip)].1, expected[position(&middle)].1);
+        assert_eq!(expected[position(&middle)].1, expected[position(&left)].1);
+        for target in ["other", "main", &root, &left, &middle, &tip, &right] {
+            git(path, &["checkout", "--quiet", target]);
+            assert_eq!(graph(), expected, "checkout {target}");
+        }
+        let disconnected = make("disconnected", None, "2000000000 +0000");
+        git(path, &["checkout", "--quiet", "--detach", &disconnected]);
+        let fallback = graph();
+        assert_eq!(&fallback[..expected.len()], expected.as_slice());
+        assert_eq!(fallback.last().unwrap().0.to_string(), disconnected);
+    }
 }

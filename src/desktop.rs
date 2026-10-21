@@ -30,6 +30,7 @@ mod image_cache;
 mod improvement_bench;
 mod landing;
 mod operations;
+mod pending_discard;
 mod provider;
 mod rebase;
 mod ref_storage;
@@ -177,6 +178,7 @@ struct Desktop {
     filter_bench: filter_bench::State,
     general_bench: general_bench::State,
     graph_hover: hover::State,
+    graph_selected_path: hover::State,
     todo_bench: todo_bench::State,
     ghost_checkout_bench: ghost_checkout_bench::State,
     conflicts_bench: conflicts_bench::State,
@@ -201,6 +203,8 @@ struct Desktop {
     graph_scroll: UniformListScrollHandle,
     diff_files_scroll: UniformListScrollHandle,
     context_menu: Option<Point<Pixels>>,
+    pending_discard: Option<pending_discard::Menu>,
+    discard_scenario: pending_discard::Scenario,
     settings_loaded: bool,
     branches_loaded: bool,
     graph_width: f32,
@@ -496,6 +500,22 @@ impl Desktop {
                 enabled_checkout,
             ),
         ];
+        if app.pending.selected {
+            let enabled = !self.external_merge_busy()
+                && !self.engine.operation_busy
+                && !app.pending.busy
+                && !app.branches.busy
+                && !app.settings.saving
+                && app.pending.known
+                && !app.pending.snapshot.files.is_empty()
+                && self.engine.operations.conflict.is_none();
+            items.push((
+                Action::Stashes(Box::new(stashes::Action::Create)),
+                "stash",
+                "Stash changes…".into(),
+                enabled,
+            ));
+        }
         if let Some((action, enabled)) = self.create_tag_action() {
             items.push((action, "tag", "Create tag…".into(), enabled));
         }
@@ -790,7 +810,7 @@ impl Desktop {
                                 Some("ghost-checkout-existing" | "ghost-checkout-new") => v.ghost_checkout_start(cx),
                                 Some("conflicts-merge" | "conflicts-rebase" | "conflicts-stash" | "conflicts-abort") => v.conflicts_start(cx),
                                 Some("filter-visuals") => v.filter_scenario_start(window, cx),
-                                Some("todo-graph" | "branch-sort" | "graph-hover" | "stash-panel" | "stash-apply" | "stash-delete" | "external-tools" | "ref-storage") => v.todo_scenario_start(window, cx),
+                                Some("todo-graph" | "branch-sort" | "graph-hover" | "stash-panel" | "stash-apply" | "stash-delete" | "stash-create" | "external-tools" | "ref-storage") => v.todo_scenario_start(window, cx),
                                 Some("toolbar-counts") => v.toolbar_scenario_start(window, cx),
                                 Some("tag-dialog" | "tag-create") => {
                                     v.tag_scenario_start(v.scenario.as_deref() == Some("tag-create"), window, cx);
@@ -1058,6 +1078,7 @@ impl Desktop {
             filter_bench: Default::default(),
             general_bench: Default::default(),
             graph_hover: Default::default(),
+            graph_selected_path: Default::default(),
             todo_bench: Default::default(),
             ghost_checkout_bench: Default::default(),
             conflicts_bench: Default::default(),
@@ -1082,6 +1103,8 @@ impl Desktop {
             graph_scroll: UniformListScrollHandle::new(),
             diff_files_scroll: UniformListScrollHandle::new(),
             context_menu: None,
+            pending_discard: None,
+            discard_scenario: pending_discard::Scenario::default(),
             settings_loaded: false,
             branches_loaded: false,
             graph_width: 84.,
@@ -1335,6 +1358,7 @@ impl Desktop {
             self.diff_horizontal.set_x(px(0.));
         }
         self.context_menu = None;
+        self.pending_discard = None;
         if let Action::OpenProviderUrl(url) = action {
             if crate::remote::requests::safe_web_url(&url) {
                 cx.open_url(&url);
@@ -1395,7 +1419,8 @@ impl Desktop {
             return;
         }
         if matches!(action, Action::Refresh) {
-            self.invalidate_provider_search_labels();
+            self.refresh_provider();
+            self.invalidate_stashes();
         }
         let app = &mut self.engine.app;
         if matches!(
@@ -2007,6 +2032,7 @@ impl Desktop {
                 v.engine.app.list_rows = range.len().max(1);
                 v.engine.app.scroll = range.start;
                 v.graph_hover.update(&v.engine.app, range.clone());
+                v.graph_selected_path.select(&v.engine.app, range.clone());
                 let app = &v.engine.app;
                 let graph_width = v.graph_width;
                 range
@@ -2083,7 +2109,9 @@ impl Desktop {
                             } else {
                                 rec.node_lane as usize
                             };
-                            let hovered = v.graph_hover.row(row_index);
+                            let hovered = v
+                                .graph_hover
+                                .combined_row(&v.graph_selected_path, row_index);
                             r = r.child(
                                 div()
                                     .relative()
@@ -2150,7 +2178,8 @@ impl Desktop {
                                     lane,
                                     cells,
                                     flags,
-                                    v.graph_hover.row(row_index),
+                                    v.graph_hover
+                                        .combined_row(&v.graph_selected_path, row_index),
                                 ))
                                 .child(format!(
                                     "Pending changes  ·  {} files",
@@ -2361,6 +2390,10 @@ impl Desktop {
                         ))
                         .on_click(cx.listener(move |v, _, window, cx| {
                             v.action(Action::File(node), window, cx)
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |v, event: &MouseDownEvent, _, cx| {
+                            v.open_discard_menu(node, event.position, cx);
+                            cx.stop_propagation();
                         }))
                     })
                     .collect()
@@ -3195,6 +3228,9 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if self.scenario.as_deref() == Some("pending-discard") {
+            return self.discard_scenario.verified;
+        }
         if let Some(ready) = self.conflicts_ready() {
             return ready;
         }
@@ -3418,6 +3454,7 @@ impl Render for Desktop {
         self.todo_scenario_schedule(window, cx);
         self.ghost_checkout_schedule(window, cx);
         self.conflicts_schedule(window, cx);
+        self.discard_scenario_schedule(window, cx);
         let app = &self.engine.app;
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
@@ -3657,6 +3694,11 @@ impl Render for Desktop {
                     cx.stop_propagation();
                     return;
                 }
+                if e.keystroke.key == "escape" && v.pending_discard.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if e.keystroke.key == "escape" && v.context_menu.take().is_some() {
                     cx.notify();
                     cx.stop_propagation();
@@ -3743,6 +3785,7 @@ impl Render for Desktop {
             .children(dialog)
             .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
+            .children(self.discard_menu(window, cx))
             .children(self.update_dialog(cx))
             .children(self.ref_storage_confirmation(cx))
             .into_any_element()
@@ -3855,6 +3898,21 @@ fn paint_graph_node(center: Point<Pixels>, color: Hsla, hollow: bool, window: &m
     ));
 }
 
+fn paint_graph_node_outline(center: Point<Pixels>, window: &mut Window) {
+    let radius = px(GRAPH_NODE_RADIUS + 1.);
+    window.paint_quad(quad(
+        Bounds::new(
+            center - point(radius, radius),
+            size(radius * 2., radius * 2.),
+        ),
+        radius,
+        rgba(0),
+        px(1.),
+        rgb(TEXT),
+        BorderStyle::Solid,
+    ));
+}
+
 fn graph_connects_top(kind: CellKind) -> bool {
     matches!(
         kind,
@@ -3912,36 +3970,45 @@ fn pending_graph_canvas(
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for (i, cell) in cells.iter().enumerate().take((width / 14.) as usize) {
-                let center = graph_node_center(bounds, i);
-                let highlighted = hovered
-                    .get(i)
-                    .is_some_and(|flag| flag & crate::graph::hover::GLYPH != 0);
-                let color = if highlighted {
-                    rgb(TEXT).into()
-                } else {
-                    graph_color(*cell, flags.get(i).copied().unwrap_or(0))
-                };
-                let track_width = px(if highlighted { 3. } else { 2. });
-                if i == lane {
-                    // Stop at the rim so the pending marker stays hollow on every background.
-                    let start = center.y + px(GRAPH_NODE_RADIUS);
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(center.x - track_width / 2., start),
-                            size(track_width, bounds.bottom() - start),
-                        ),
-                        color,
-                    ));
-                    paint_graph_node(center, color, true, window);
-                } else if cell.kind() == CellKind::Vertical {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(center.x - track_width / 2., bounds.top()),
-                            size(track_width, bounds.size.height),
-                        ),
-                        color,
-                    ));
+            for outline in [true, false] {
+                for (i, cell) in cells.iter().enumerate().take((width / 14.) as usize) {
+                    let center = graph_node_center(bounds, i);
+                    let highlighted = hovered
+                        .get(i)
+                        .is_some_and(|flag| flag & crate::graph::hover::GLYPH != 0);
+                    if outline && !highlighted {
+                        continue;
+                    }
+                    let color = if outline {
+                        rgb(TEXT).into()
+                    } else {
+                        graph_color(*cell, flags.get(i).copied().unwrap_or(0))
+                    };
+                    let track_width = px(if outline { 4. } else { 2. });
+                    if i == lane {
+                        // Stop at the rim so the pending marker stays hollow on every background.
+                        let start = center.y + px(GRAPH_NODE_RADIUS);
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(center.x - track_width / 2., start),
+                                size(track_width, bounds.bottom() - start),
+                            ),
+                            color,
+                        ));
+                        if outline {
+                            paint_graph_node_outline(center, window);
+                        } else {
+                            paint_graph_node(center, color, true, window);
+                        }
+                    } else if cell.kind() == CellKind::Vertical {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(center.x - track_width / 2., bounds.top()),
+                                size(track_width, bounds.size.height),
+                            ),
+                            color,
+                        ));
+                    }
                 }
             }
         },
@@ -3960,83 +4027,101 @@ fn graph_canvas(
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for (i, c) in cells.iter().enumerate().take((width / 14.) as usize) {
-                let center = graph_node_center(bounds, i);
-                let x = center.x;
-                let middle = center.y;
-                let hover = hovered.get(i).copied().unwrap_or(0);
-                let highlighted = hover & crate::graph::hover::GLYPH != 0;
-                let base = graph_color(*c, flags.get(i).copied().unwrap_or(0));
-                let color = if highlighted { rgb(TEXT).into() } else { base };
-                let connector = hover & crate::graph::hover::CONNECTOR != 0;
-                let connector_color = if connector { rgb(TEXT).into() } else { base };
-                let vertical_width = px(if highlighted { 3. } else { 2. });
-                let horizontal_width = px(if connector { 3. } else { 2. });
-                let k = c.kind();
-                let top = graph_connects_top(k);
-                let bottom = matches!(
-                    k,
-                    CellKind::Vertical
-                        | CellKind::Node
-                        | CellKind::MergeNode
-                        | CellKind::Cross
-                        | CellKind::StartToRight
-                        | CellKind::StartToLeft
-                        | CellKind::JoinFromLeft
-                        | CellKind::JoinFromRight
-                );
-                if top {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(x - vertical_width / 2., bounds.top()),
-                            size(vertical_width, middle - bounds.top()),
-                        ),
-                        color,
-                    ));
-                }
-                if bottom {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(x - vertical_width / 2., middle),
-                            size(vertical_width, bounds.bottom() - middle),
-                        ),
-                        color,
-                    ));
-                }
-                if matches!(
-                    k,
-                    CellKind::Horizontal
-                        | CellKind::Cross
-                        | CellKind::EndFromRight
-                        | CellKind::StartToRight
-                        | CellKind::JoinFromLeft
-                ) {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(x - px(14.), middle - horizontal_width / 2.),
-                            size(px(14.), horizontal_width),
-                        ),
-                        connector_color,
-                    ));
-                }
-                if matches!(
-                    k,
-                    CellKind::Horizontal
-                        | CellKind::Cross
-                        | CellKind::EndFromLeft
-                        | CellKind::StartToLeft
-                        | CellKind::JoinFromRight
-                ) {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(x, middle - horizontal_width / 2.),
-                            size(px(14.), horizontal_width),
-                        ),
-                        connector_color,
-                    ));
-                }
-                if matches!(k, CellKind::Node | CellKind::MergeNode) {
-                    paint_graph_node(center, color, false, window);
+            for outline in [true, false] {
+                for (i, c) in cells.iter().enumerate().take((width / 14.) as usize) {
+                    let center = graph_node_center(bounds, i);
+                    let x = center.x;
+                    let middle = center.y;
+                    let hover = hovered.get(i).copied().unwrap_or(0);
+                    let highlighted = hover & crate::graph::hover::GLYPH != 0;
+                    let base = graph_color(*c, flags.get(i).copied().unwrap_or(0));
+                    let color = if outline && highlighted {
+                        rgb(TEXT).into()
+                    } else {
+                        base
+                    };
+                    let connector = hover & crate::graph::hover::CONNECTOR != 0;
+                    let connector_color = if outline && connector {
+                        rgb(TEXT).into()
+                    } else {
+                        base
+                    };
+                    let vertical_width = px(if outline { 4. } else { 2. });
+                    let horizontal_width = px(if outline { 4. } else { 2. });
+                    let k = c.kind();
+                    let top = graph_connects_top(k);
+                    let bottom = matches!(
+                        k,
+                        CellKind::Vertical
+                            | CellKind::Node
+                            | CellKind::MergeNode
+                            | CellKind::Cross
+                            | CellKind::StartToRight
+                            | CellKind::StartToLeft
+                            | CellKind::JoinFromLeft
+                            | CellKind::JoinFromRight
+                    );
+                    if top && (!outline || highlighted) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x - vertical_width / 2., bounds.top()),
+                                size(vertical_width, middle - bounds.top()),
+                            ),
+                            color,
+                        ));
+                    }
+                    if bottom && (!outline || highlighted) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x - vertical_width / 2., middle),
+                                size(vertical_width, bounds.bottom() - middle),
+                            ),
+                            color,
+                        ));
+                    }
+                    if (!outline || connector)
+                        && matches!(
+                            k,
+                            CellKind::Horizontal
+                                | CellKind::Cross
+                                | CellKind::EndFromRight
+                                | CellKind::StartToRight
+                                | CellKind::JoinFromLeft
+                        )
+                    {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x - px(14.), middle - horizontal_width / 2.),
+                                size(px(14.), horizontal_width),
+                            ),
+                            connector_color,
+                        ));
+                    }
+                    if (!outline || connector)
+                        && matches!(
+                            k,
+                            CellKind::Horizontal
+                                | CellKind::Cross
+                                | CellKind::EndFromLeft
+                                | CellKind::StartToLeft
+                                | CellKind::JoinFromRight
+                        )
+                    {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x, middle - horizontal_width / 2.),
+                                size(px(14.), horizontal_width),
+                            ),
+                            connector_color,
+                        ));
+                    }
+                    if matches!(k, CellKind::Node | CellKind::MergeNode) {
+                        if outline && highlighted {
+                            paint_graph_node_outline(center, window);
+                        } else if !outline {
+                            paint_graph_node(center, color, false, window);
+                        }
+                    }
                 }
             }
         },

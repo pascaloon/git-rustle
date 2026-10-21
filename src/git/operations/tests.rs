@@ -46,6 +46,56 @@ impl Fixture {
     }
 }
 
+#[test]
+fn discard_file_recovery_restores_exact_index_and_worktree_and_preserves_other_files() {
+    let f = Fixture::new();
+    f.write("other.txt", "other base\n");
+    f.commit("other file");
+    f.write("file.txt", "staged target\n");
+    f.write("other.txt", "staged other\n");
+    f.git(&["add", "."]);
+    f.write("file.txt", "unstaged target\n");
+    f.write("untracked.txt", "untracked preserve\n");
+    let snapshot =
+        super::super::worktree::snapshot(&super::super::open(f.root()).unwrap()).unwrap();
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "file.txt")
+        .unwrap();
+    let request = super::super::worktree::DiscardRequest::new(&snapshot, file);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let original_status = f.git(&["status", "--porcelain=v1"]);
+    f.run(Request::DiscardFile(request));
+    let check_unrelated = || {
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(f.git(&["show", ":other.txt"]), "staged other");
+        assert_eq!(
+            fs::read(f.root().join("other.txt")).unwrap(),
+            b"staged other\n"
+        );
+        assert_eq!(
+            fs::read(f.root().join("untracked.txt")).unwrap(),
+            b"untracked preserve\n"
+        );
+    };
+    check_unrelated();
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"base\n");
+    assert_eq!(f.git(&["show", ":file.txt"]), "base");
+    f.run(Request::MoveTo(0));
+    check_unrelated();
+    assert_eq!(f.git(&["status", "--porcelain=v1"]), original_status);
+    assert_eq!(
+        fs::read(f.root().join("file.txt")).unwrap(),
+        b"unstaged target\n"
+    );
+    assert_eq!(f.git(&["show", ":file.txt"]), "staged target");
+    f.run(Request::MoveTo(1));
+    check_unrelated();
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"base\n");
+    assert_eq!(f.git(&["show", ":file.txt"]), "base");
+}
+
 fn stash_fixture(conflict: bool) -> (Fixture, stashes::Stash) {
     let f = Fixture::new();
     f.write("file.txt", "stashed contents\n");
@@ -2262,4 +2312,102 @@ fn push_destination_preserves_branch_case_and_config_value_boundaries() {
     assert_eq!(review.remote, "publish");
     assert_eq!(review.local_branch, "Topic.MixedCase");
     assert_eq!(review.branch, "Topic.MixedCase");
+}
+
+#[test]
+fn stash_create_named_and_unnamed_are_listed_and_recoverable() {
+    for message in [Some("work in progress".to_string()), None] {
+        let f = Fixture::new();
+        f.write("file.txt", "staged\n");
+        f.git(&["add", "file.txt"]);
+        f.write("file.txt", "staged and unstaged\n");
+        f.write("new.txt", "untracked\n");
+        f.run(Request::CreateStash(message.clone()));
+        let entries = f.run(Request::ListStashes).stashes.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .subject
+                .contains(message.as_deref().unwrap_or("WIP on"))
+        );
+        assert!(f.git(&["status", "--porcelain"]).is_empty());
+        assert!(!f.root().join("new.txt").exists());
+        f.run(Request::MoveTo(0));
+        assert!(stashes::list(f.root()).unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(f.root().join("file.txt")).unwrap(),
+            "staged and unstaged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root().join("new.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert_eq!(f.git(&["show", ":file.txt"]), "staged");
+        f.run(Request::MoveTo(1));
+        assert_eq!(stashes::list(f.root()).unwrap(), entries);
+        assert!(f.git(&["status", "--porcelain"]).is_empty());
+    }
+}
+
+#[test]
+fn stash_listing_survives_named_unnamed_and_external_drop() {
+    let f = Fixture::new();
+    f.write("file.txt", "named\n");
+    f.git(&["stash", "push", "-m", "named stash"]);
+    f.write("file.txt", "unnamed\n");
+    f.git(&["stash", "push"]);
+    let entries = f.run(Request::ListStashes).stashes.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].subject.starts_with("WIP on"));
+    assert!(entries[1].subject.ends_with("named stash"));
+    f.git(&["stash", "drop", "stash@{0}"]);
+    assert_eq!(
+        f.run(Request::ListStashes).stashes.unwrap()[0].oid,
+        entries[1].oid
+    );
+}
+
+#[test]
+#[ignore = "One warmup and fifteen disposable stash creation/list samples"]
+fn benchmark_stash_create() {
+    use std::time::Instant;
+    for sample in 0..16 {
+        let f = Fixture::new();
+        f.write("file.txt", "staged\n");
+        f.git(&["add", "file.txt"]);
+        f.write("file.txt", "unstaged\n");
+        f.write("new.txt", "untracked\n");
+        let started = Instant::now();
+        f.run(Request::CreateStash(Some("benchmark named stash".into())));
+        let create_ms = started.elapsed().as_secs_f64() * 1000.;
+        let started = Instant::now();
+        let entries = f.run(Request::ListStashes).stashes.unwrap();
+        let list_ms = started.elapsed().as_secs_f64() * 1000.;
+        assert_eq!(entries.len(), 1);
+        assert!(f.git(&["status", "--porcelain"]).is_empty());
+        if sample > 0 {
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"create_ms":create_ms,"list_ms":list_ms})
+            );
+        }
+    }
+}
+
+#[test]
+fn stash_list_carries_the_version_read_before_listing() {
+    let f = Fixture::new();
+    f.write("file.txt", "named\n");
+    f.git(&["stash", "push", "-m", "named"]);
+    f.write("file.txt", "unnamed\n");
+    f.git(&["stash", "push"]);
+    let context = Context::new(f.root()).unwrap();
+    let before = super::super::worktree::stash_stamp(&context.common).unwrap();
+    let view = f.run(Request::ListStashes);
+    assert_eq!(view.stash_stamp, Some(before));
+    assert_eq!(view.stashes.unwrap().len(), 2);
+    f.git(&["stash", "drop"]);
+    let view = f.run(Request::ListStashes);
+    assert_ne!(view.stash_stamp, Some(before));
+    assert_eq!(view.stashes.unwrap().len(), 1);
 }

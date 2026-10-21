@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+mod discard;
+pub use discard::{DiscardRequest, discard_file};
 
 fn text(bytes: &[u8]) -> Result<&str, String> {
     std::str::from_utf8(bytes)
@@ -39,7 +41,33 @@ pub fn snapshot(repo: &gix::Repository) -> Result<Snapshot, String> {
             "--ignore-submodules=none",
         ],
     )?;
-    parse_status(root, &bytes)
+    let mut snapshot = parse_status(root, &bytes)?;
+    snapshot.stash_stamp = stash_stamp(repo.common_dir()).ok();
+    Ok(snapshot)
+}
+/// Reuse bounded metadata probes on status/list workers. Only missing files are
+/// an absent stash marker; inaccessible metadata must never identify an empty list.
+pub(crate) fn stash_stamp(common: &Path) -> Result<u64, String> {
+    use std::hash::{Hash, Hasher};
+    let mut stamp = std::collections::hash_map::DefaultHasher::new();
+    for relative in [
+        "logs/refs/stash",
+        "refs/stash",
+        "packed-refs",
+        "reftable/tables.list",
+    ] {
+        relative.hash(&mut stamp);
+        match std::fs::metadata(common.join(relative)) {
+            Ok(meta) => {
+                Some((meta.len(), meta.modified().map_err(|e| e.to_string())?)).hash(&mut stamp);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Option::<(u64, std::time::SystemTime)>::None.hash(&mut stamp);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(stamp.finish())
 }
 fn parse_status(root: &Path, bytes: &[u8]) -> Result<Snapshot, String> {
     use std::hash::{Hash, Hasher};
@@ -605,9 +633,9 @@ pub fn commit(root: &Path, request: &Request) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Fixture(tempfile::TempDir);
+    pub(super) struct Fixture(tempfile::TempDir);
     impl Fixture {
-        fn new(committed: bool) -> Self {
+        pub(super) fn new(committed: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let f = Self(dir);
             f.git(&["init", "-q", "-b", "main"]);
@@ -628,21 +656,21 @@ mod tests {
             }
             f
         }
-        fn root(&self) -> &Path {
+        pub(super) fn root(&self) -> &Path {
             self.0.path()
         }
-        fn git(&self, args: &[&str]) -> String {
+        pub(super) fn git(&self, args: &[&str]) -> String {
             String::from_utf8(command::checked(self.root(), args).unwrap())
                 .unwrap()
                 .trim()
                 .into()
         }
-        fn write(&self, path: &str, value: &str) {
+        pub(super) fn write(&self, path: &str, value: &str) {
             let p = self.root().join(path);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, value).unwrap();
         }
-        fn snapshot(&self) -> Snapshot {
+        pub(super) fn snapshot(&self) -> Snapshot {
             snapshot(&super::super::open(self.root()).unwrap()).unwrap()
         }
         fn request(&self, paths: &[&str]) -> Request {
@@ -1119,6 +1147,29 @@ mod tests {
         println!(
             "1000 files; one warm-up, 15 samples: {}",
             serde_json::to_string(&samples).unwrap()
+        );
+    }
+    #[test]
+    fn clean_status_detects_external_stash_only_changes() {
+        let f = Fixture::new(true);
+        f.write("a.txt", "saved stash\n");
+        f.git(&["stash", "push", "-m", "external named"]);
+        let before = f.snapshot();
+        assert!(before.files.is_empty());
+        f.git(&["stash", "drop"]);
+        let after = f.snapshot();
+        assert!(after.files.is_empty());
+        assert_eq!(before.fingerprint, after.fingerprint);
+        assert_ne!(before.stash_stamp, after.stash_stamp);
+        assert_eq!(after.stash_stamp, f.snapshot().stash_stamp);
+    }
+    #[test]
+    fn stash_metadata_errors_are_unknown_instead_of_absent() {
+        assert!(stash_stamp(Path::new("invalid\0common")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            stash_stamp(dir.path()).is_ok(),
+            "missing stash files are valid"
         );
     }
 }

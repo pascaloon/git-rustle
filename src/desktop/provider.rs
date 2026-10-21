@@ -19,13 +19,20 @@ struct Entry {
     image: Option<Arc<Image>>,
 }
 
+fn same_image(entry: &Entry, bytes: &[u8]) -> bool {
+    entry
+        .image
+        .as_ref()
+        .is_some_and(|image| image.bytes() == bytes)
+}
+
 #[derive(Default)]
 pub(super) struct State {
     path: Option<PathBuf>,
     entries: BTreeMap<String, Entry>,
     upstreams: BTreeMap<String, (String, String)>,
     requested: Vec<Remote>,
-    pending: bool,
+    pub(super) pending: bool,
     refreshed: Option<Instant>,
     session: Arc<AtomicU64>,
     seeded: bool,
@@ -36,6 +43,15 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Keep the last usable presentation while replacing the worker session.
+    fn refresh(&mut self) {
+        self.session.fetch_add(1, AtomicOrdering::AcqRel);
+        self.session = Arc::new(AtomicU64::new(0));
+        self.pending = false;
+        self.refreshed = None;
+        self.force = true;
+    }
+
     /// Reconfiguration/refresh invalidates in-flight results as well as badges.
     pub(super) fn invalidate(&mut self) {
         *self = Self {
@@ -153,6 +169,10 @@ fn prioritize_header_remote(remotes: &mut [Remote]) {
 }
 
 impl Desktop {
+    pub(super) fn refresh_provider(&mut self) {
+        self.provider.refresh();
+    }
+
     pub(super) fn invalidate_provider_search_labels(&mut self) {
         self.provider.invalidate();
         self.engine.set_provider_search_labels(HashMap::new());
@@ -270,9 +290,15 @@ impl Desktop {
                         return false;
                     }
                     v.provider.upstreams = upstreams;
-                    v.provider
-                        .entries
-                        .retain(|name, _| remotes.iter().any(|r| &r.name == name));
+                    v.provider.entries.retain(|name, entry| {
+                        let keep = remotes
+                            .iter()
+                            .any(|r| &r.name == name && r == &entry.remote);
+                        if !keep && let Some(image) = entry.image.take() {
+                            image.remove_asset(cx);
+                        }
+                        keep
+                    });
                     for remote in &remotes {
                         v.provider
                             .entries
@@ -335,14 +361,15 @@ impl Desktop {
                                     entry.project = project;
                                 }
                                 integration::SummaryEvent::Image(bytes) => {
-                                    if session.load(AtomicOrdering::Acquire) == image_generation {
+                                    if session.load(AtomicOrdering::Acquire) == image_generation
+                                        && !same_image(entry, &bytes)
+                                        && let Some(format) = remote::requests::image_format(&bytes)
+                                    {
                                         if let Some(old) = entry.image.take() {
                                             old.remove_asset(cx);
                                         }
                                         entry.image =
-                                            remote::requests::image_format(&bytes).map(|format| {
-                                                Arc::new(Image::from_bytes(format, bytes))
-                                            });
+                                            Some(Arc::new(Image::from_bytes(format, bytes)));
                                         v.engine.mark("provider image delivered");
                                     }
                                 }
@@ -681,11 +708,46 @@ impl Desktop {
                 .and_then(|e| e.image.as_ref())
                 .is_some_and(|image| image.clone().get_render_image(window, cx).is_some())
     }
+
+    pub(super) fn provider_scenario_image(&self) -> Option<Arc<Image>> {
+        self.provider
+            .preferred()
+            .and_then(|entry| entry.image.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Arc, Association, Entry, Instant, Project, RefKind, Remote, State};
+
+    #[test]
+    fn refresh_retains_image_and_badges_but_rejects_old_worker_session() {
+        let mut state = state();
+        let bytes = include_bytes!("../../assets/app-icon.png").to_vec();
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            bytes.clone(),
+        ));
+        state.entries.get_mut("upstream").unwrap().image = Some(image.clone());
+        state.pending = true;
+        state.refreshed = Some(Instant::now());
+        let old_session = state.session.clone();
+        state.refresh();
+        assert!(!Arc::ptr_eq(&old_session, &state.session));
+        assert!(!state.pending);
+        assert!(state.force && state.refreshed.is_none());
+        let entry = state.entries.get("upstream").unwrap();
+        assert!(Arc::ptr_eq(entry.image.as_ref().unwrap(), &image));
+        assert!(super::same_image(entry, &bytes));
+        assert!(!super::same_image(entry, b"different image"));
+        assert_eq!(entry.requests.len(), 10000);
+        assert_eq!(state.upstreams.len(), 1);
+        state.invalidate();
+        assert!(
+            state.entries.is_empty(),
+            "reconfiguration must clear old identity"
+        );
+    }
 
     #[test]
     fn cached_header_remote_is_processed_before_other_request_lists() {

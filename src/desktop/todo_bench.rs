@@ -19,6 +19,8 @@ struct Observation {
     bounds: [f32; 4],
 }
 
+type StashPaints = std::collections::BTreeMap<(usize, u8), (u64, String, Bounds<Pixels>)>;
+
 struct Run {
     name: &'static str,
     phase: u8,
@@ -31,10 +33,13 @@ struct Run {
     target: Option<Target>,
     query: String,
     stash_ids: Vec<String>,
+    stash_diagnostic_logged: bool,
+    stash_paints: Rc<RefCell<StashPaints>>,
     operation_epoch: u64,
     expected_hover: Option<usize>,
     hover_rows_max: usize,
     hover_cells_max: usize,
+    selected_path_checks: usize,
     frame_started: Option<Instant>,
     samples: Vec<f64>,
     handlers: Vec<f64>,
@@ -45,7 +50,7 @@ struct Run {
     tool_ids: Vec<String>,
     tool_custom_id: Option<String>,
     settings_scroll: Option<ScrollHandle>,
-    paints: Rc<RefCell<[Option<Paint>; 14]>>,
+    paints: Rc<RefCell<[Option<Paint>; 15]>>,
 }
 
 #[derive(Default)]
@@ -62,6 +67,7 @@ impl Desktop {
             Some("stash-panel") => "stash-panel",
             Some("stash-apply") => "stash-apply",
             Some("stash-delete") => "stash-delete",
+            Some("stash-create") => "stash-create",
             Some("external-tools") => "external-tools",
             Some("ref-storage") => "ref-storage",
             _ => return,
@@ -69,7 +75,12 @@ impl Desktop {
         assert!(self.todo_bench.run.is_none());
         if matches!(
             name,
-            "todo-graph" | "stash-panel" | "stash-apply" | "stash-delete" | "ref-storage"
+            "todo-graph"
+                | "stash-panel"
+                | "stash-apply"
+                | "stash-delete"
+                | "stash-create"
+                | "ref-storage"
         ) {
             let root = self
                 .engine
@@ -93,10 +104,13 @@ impl Desktop {
             target: None,
             query: String::new(),
             stash_ids: Vec::new(),
+            stash_diagnostic_logged: false,
+            stash_paints: Rc::new(RefCell::new(StashPaints::new())),
             operation_epoch: self.engine.operation_epoch,
             expected_hover: None,
             hover_rows_max: 0,
             hover_cells_max: 0,
+            selected_path_checks: 0,
             frame_started: None,
             samples: Vec::new(),
             handlers: Vec::new(),
@@ -107,7 +121,7 @@ impl Desktop {
             tool_ids: Vec::new(),
             tool_custom_id: None,
             settings_scroll: (name == "external-tools").then(ScrollHandle::new),
-            paints: Rc::new(RefCell::new([None; 14])),
+            paints: Rc::new(RefCell::new([None; 15])),
         }));
         match name {
             "todo-graph" => {
@@ -132,12 +146,16 @@ impl Desktop {
             }
             "graph-hover" => {
                 self.engine.mark("desktop scenario requested");
+                // Startup HEAD can be far below the initial list viewport.
+                // Select through the real handler before measured hover frames.
+                self.action(Action::Select(0, false), window, cx);
+                self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 if let Some(row) = self.graph_hover.anchor {
                     self.hover_commit(row, false, cx);
                 }
                 self.todo_advance(1);
             }
-            "stash-panel" | "stash-apply" | "stash-delete" => {
+            "stash-panel" | "stash-apply" | "stash-delete" | "stash-create" => {
                 assert!(
                     self.stash_entries().is_empty() && !self.stashes.open,
                     "stash listing must remain lazy"
@@ -186,6 +204,80 @@ impl Desktop {
         )
     }
 
+    /// Probe the actual subject and action row, rather than the outer panel.
+    pub(super) fn todo_stash_probe(&self, index: usize, part: u8) -> Option<AnyElement> {
+        let run = self.todo_bench.run.as_ref()?;
+        if !run.name.starts_with("stash-") {
+            return None;
+        }
+        let oid = self.stash_entries().get(index)?.oid.clone();
+        let paints = run.stash_paints.clone();
+        let epoch = run.epoch;
+        Some(
+            canvas(
+                move |bounds, _, _| bounds,
+                move |bounds, _, _, _| {
+                    paints
+                        .borrow_mut()
+                        .insert((index, part), (epoch, oid, bounds));
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into_any_element(),
+        )
+    }
+
+    fn todo_stash_diagnostics(&self, window: &Window) -> String {
+        let Some(run) = &self.todo_bench.run else {
+            return String::new();
+        };
+        let paints = run.paints.borrow();
+        let bounds = |paint: Option<Paint>| {
+            paint.map(|p| serde_json::json!({
+            "epoch":p.epoch,"bounds":[f32::from(p.bounds.origin.x),f32::from(p.bounds.origin.y),f32::from(p.bounds.size.width),f32::from(p.bounds.size.height)]
+        }))
+        };
+        let entries: Vec<_> = run.stash_paints.borrow().iter().map(|((index, part), (epoch, oid, b))|
+            serde_json::json!({"index":index,"part":part,"epoch":epoch,"oid":oid,
+                "bounds":[f32::from(b.origin.x),f32::from(b.origin.y),f32::from(b.size.width),f32::from(b.size.height)]})).collect();
+        serde_json::json!({"phase":run.phase,"epoch":run.epoch,"ready":self.stashes_ready(),
+            "expected":self.stash_entries().iter().map(|s| (&s.selector,&s.oid,&s.subject)).collect::<Vec<_>>(),
+            "viewport":[f32::from(window.viewport_size().width),f32::from(window.viewport_size().height)],
+            "panel":bounds(paints[2]),"list":bounds(paints[14]),"entries":entries,
+            "paint_predicate":self.todo_stash_entries_painted(window)}).to_string()
+    }
+    fn todo_stash_entries_painted(&self, window: &Window) -> bool {
+        let run = self.todo_bench.run.as_ref().unwrap();
+        let Some(panel) = run.paints.borrow()[2] else {
+            return false;
+        };
+        let paints = run.stash_paints.borrow();
+        self.stash_entries()
+            .iter()
+            .take(3)
+            .enumerate()
+            .all(|(index, stash)| {
+                [0, 1].into_iter().all(|part| {
+                    paints
+                        .get(&(index, part))
+                        .is_some_and(|(epoch, oid, bounds)| {
+                            *epoch == run.epoch
+                                && *oid == stash.oid
+                                && bounds.size.width >= px(if part == 0 { 150. } else { 240. })
+                                && bounds.size.height >= px(if part == 0 { 14. } else { 20. })
+                                && bounds.left() >= panel.bounds.left()
+                                && bounds.right() <= panel.bounds.right()
+                                && bounds.top() >= panel.bounds.top()
+                                && bounds.bottom()
+                                    <= panel.bounds.bottom().min(window.viewport_size().height)
+                        })
+                })
+            })
+            && !self.stash_entries().is_empty()
+    }
     fn todo_painted(&self, slot: usize, window: &Window) -> bool {
         let run = self.todo_bench.run.as_ref().unwrap();
         run.paints.borrow()[slot].is_some_and(|paint| {
@@ -221,23 +313,37 @@ impl Desktop {
     }
 
     pub(super) fn todo_scenario_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.todo_bench.run.as_ref().is_some_and(|r| {
+            !r.verified
+                && r.name.starts_with("stash-")
+                && !r.stash_diagnostic_logged
+                && r.started.elapsed() > Duration::from_secs(15)
+        }) {
+            eprintln!("STASH_LAYOUT {}", self.todo_stash_diagnostics(window));
+            self.todo_bench
+                .run
+                .as_mut()
+                .unwrap()
+                .stash_diagnostic_logged = true;
+        }
         let Some(run) = self.todo_bench.run.as_ref().filter(|r| !r.verified) else {
             return;
         };
         assert!(
             run.started.elapsed() < Duration::from_secs(45),
-            "TODO scenario {} stalled phase {} epoch {} checks {}",
+            "TODO scenario {} stalled phase {} epoch {} checks {} stash_layout={}",
             run.name,
             run.phase,
             run.epoch,
-            run.checks
+            run.checks,
+            self.todo_stash_diagnostics(window)
         );
         let (name, phase) = (run.name, run.phase);
         match name {
             "todo-graph" => self.todo_graph_tick(phase, window, cx),
             "branch-sort" => self.todo_sort_tick(phase, window, cx),
             "graph-hover" => self.todo_hover_tick(phase, window, cx),
-            "stash-panel" | "stash-apply" | "stash-delete" => {
+            "stash-panel" | "stash-apply" | "stash-delete" | "stash-create" => {
                 self.todo_stash_tick(name, phase, window, cx)
             }
             "external-tools" => self.todo_tools_tick(phase, window, cx),
@@ -403,6 +509,9 @@ impl Desktop {
                 return;
             }
             assert_eq!(self.graph_hover.diagnostics(), (0, 0));
+            assert!(self.graph_selected_path.diagnostics().1 > 0);
+            // Offscreen continuation and cache reuse have deterministic unit
+            // coverage; list overscan is not a reliable scroll assertion here.
             self.todo_frame_action(window, cx);
             return;
         }
@@ -410,6 +519,16 @@ impl Desktop {
             return;
         }
         self.todo_record_frame(0);
+        // Selection remains painted while hover moves or leaves the graph.
+        let selected = self.engine.app.graph_selected();
+        let selected_visible = selected >= self.engine.app.scroll
+            && selected < self.engine.app.scroll + self.engine.app.list_rows;
+        if selected_visible {
+            assert_eq!(self.graph_selected_path.anchor, Some(selected));
+            assert!(self.graph_selected_path.diagnostics().1 > 0);
+            assert!(self.graph_selected_path.diagnostics().0 <= self.engine.app.list_rows);
+            self.todo_bench.run.as_mut().unwrap().selected_path_checks += 1;
+        }
         let (rows, cells) = self.graph_hover.diagnostics();
         let expected = self.todo_bench.run.as_ref().unwrap().expected_hover;
         assert_eq!(
@@ -495,6 +614,121 @@ impl Desktop {
         });
     }
 
+    fn todo_stash_create_tick(&mut self, phase: u8, window: &mut Window, cx: &mut Context<Self>) {
+        if phase == 1
+            && self.stashes_ready()
+            && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
+        {
+            assert_eq!(self.stash_entries().len(), 3);
+            self.action(
+                Action::Stashes(Box::new(stashes::Action::Create)),
+                window,
+                cx,
+            );
+            self.stashes
+                .name
+                .as_ref()
+                .unwrap()
+                .update(cx, |s, cx| s.set_value("Native named stash", window, cx));
+            let root = self.engine.repository_root().unwrap().to_path_buf();
+            std::thread::spawn(move || {
+                std::fs::write(root.join("tracked.txt"), "native stash tracked\n").unwrap();
+                std::fs::write(
+                    root.join("native-untracked.txt"),
+                    "native stash untracked\n",
+                )
+                .unwrap();
+            });
+            self.todo_bench.run.as_mut().unwrap().checks += 2;
+            self.todo_advance(2);
+        } else if phase == 2 && self.engine.app.pending.exists() && self.todo_painted(2, window) {
+            self.engine.mark("stash create requested");
+            self.action(Action::Stashes(Box::new(stashes::Action::Save)), window, cx);
+            if !self.stashes.composing {
+                self.todo_advance(3);
+            }
+        } else if phase == 3
+            && self.stashes_ready()
+            && self.stash_entries().len() == 4
+            && !self.engine.app.pending.exists()
+            && !self.engine.app.pending.loading
+            && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
+        {
+            assert!(
+                self.stash_entries()[0]
+                    .subject
+                    .contains("Native named stash")
+            );
+            self.engine.mark("stash create frame");
+            self.engine.mark("stash external add requested");
+            let root = self.engine.repository_root().unwrap().to_path_buf();
+            std::thread::spawn(move || {
+                std::fs::write(root.join("tracked.txt"), "external unnamed stash\n").unwrap();
+                crate::git::command::checked(&root, &["stash", "push"]).unwrap();
+            });
+            self.todo_bench.run.as_mut().unwrap().checks += 2;
+            self.todo_advance(4);
+        } else if phase == 4
+            && self.stashes_ready()
+            && self.stash_entries().len() == 5
+            && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
+        {
+            self.engine.mark("stash external add frame");
+            assert!(self.stash_entries()[0].subject.starts_with("WIP on"));
+            assert!(
+                self.stash_entries()[1]
+                    .subject
+                    .contains("Native named stash")
+            );
+            self.engine.mark("stash external drop requested");
+            let root = self.engine.repository_root().unwrap().to_path_buf();
+            std::thread::spawn(move || {
+                crate::git::command::checked(&root, &["stash", "drop", "stash@{0}"]).unwrap();
+            });
+            self.todo_bench.run.as_mut().unwrap().checks += 2;
+            self.todo_advance(5);
+        } else if phase == 5
+            && self.stashes_ready()
+            && self.stash_entries().len() == 4
+            && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
+        {
+            assert!(
+                self.stash_entries()[0]
+                    .subject
+                    .contains("Native named stash")
+            );
+            self.engine.mark("stash external drop frame");
+            self.engine.mark("stash global refresh requested");
+            let epoch = self.stash_scenario_refresh_during_list(window, cx);
+            self.todo_bench.run.as_mut().unwrap().operation_epoch = epoch;
+            self.todo_bench.run.as_mut().unwrap().checks += 4;
+            self.todo_advance(6);
+        } else if phase == 6
+            && self.stashes_ready()
+            && self
+                .engine
+                .stash_epoch
+                .wrapping_sub(self.todo_bench.run.as_ref().unwrap().operation_epoch)
+                >= 2
+            && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
+        {
+            assert_eq!(self.stash_entries().len(), 4);
+            assert!(
+                !self.engine.operation_error,
+                "{}",
+                self.engine.operation_status
+            );
+            self.engine.mark("stash global refresh frame");
+            self.todo_bench.run.as_mut().unwrap().checks += 3;
+            self.todo_finish();
+        }
+    }
+
     fn todo_stash_tick(
         &mut self,
         name: &str,
@@ -502,7 +736,15 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if phase == 1 && self.stashes_ready() && self.todo_painted(2, window) {
+        if name == "stash-create" {
+            self.todo_stash_create_tick(phase, window, cx);
+            return;
+        }
+        if phase == 1
+            && self.stashes_ready()
+            && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
+        {
             assert_eq!(self.stash_entries().len(), 3);
             let ids = self.stash_entries().iter().map(|s| s.oid.clone()).collect();
             self.todo_bench.run.as_mut().unwrap().stash_ids = ids;
@@ -532,6 +774,7 @@ impl Desktop {
             && !self.engine.app.pending.loading
             && self.engine.operation_epoch != self.todo_bench.run.as_ref().unwrap().operation_epoch
             && self.todo_painted(2, window)
+            && self.todo_stash_entries_painted(window)
         {
             assert!(
                 !self.engine.operation_error,
@@ -967,6 +1210,28 @@ impl Desktop {
             self.engine
                 .mark("desktop scroll done (120 measured frames)");
         }
+        if run.name.starts_with("stash-")
+            && let Some(path) = std::env::var_os("GIT_RUSTLE_FRAME_SAMPLES")
+        {
+            let observations: Vec<_> = run
+                .stash_paints
+                .borrow()
+                .iter()
+                .filter(|(_, (epoch, _, _))| *epoch == run.epoch)
+                .map(|((index, part), (_, oid, bounds))| {
+                    serde_json::json!({
+                        "index":index,"part":part,"oid":oid,
+                        "bounds":[f32::from(bounds.origin.x),f32::from(bounds.origin.y),
+                            f32::from(bounds.size.width),f32::from(bounds.size.height)]
+                    })
+                })
+                .collect();
+            std::fs::write(
+                std::path::PathBuf::from(path).with_extension("stash-bounds.json"),
+                serde_json::to_vec_pretty(&observations).unwrap(),
+            )
+            .unwrap();
+        }
         run.verified = true;
         run.phase = 250;
     }
@@ -988,7 +1253,7 @@ impl Desktop {
             return String::new();
         };
         format!(
-            "todos_verified={} todos_checks={} todos_frames={} todos_phase={} todos_hover_rows_max={} todos_hover_cells_max={} todos_tool_scrolls={} todos_tool_list_verified={}\ntodo_handler_ms={}\ntodos_tool_input_bounds={}",
+            "todos_verified={} todos_checks={} todos_frames={} todos_phase={} todos_hover_rows_max={} todos_hover_cells_max={} todos_tool_scrolls={} todos_tool_list_verified={} todos_selected_path_checks={} todos_stash_entry_paints={}\ntodo_handler_ms={}\ntodos_tool_input_bounds={}",
             run.verified,
             run.checks,
             run.samples.len(),
@@ -997,6 +1262,12 @@ impl Desktop {
             run.hover_cells_max,
             run.tool_scrolls,
             run.tool_list_fixture && run.verified,
+            run.selected_path_checks,
+            run.stash_paints
+                .borrow()
+                .values()
+                .filter(|(epoch, _, _)| *epoch == run.epoch)
+                .count(),
             serde_json::to_string(&run.handlers).unwrap(),
             serde_json::to_string(&run.tool_bounds).unwrap()
         )

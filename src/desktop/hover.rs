@@ -1,5 +1,5 @@
 use super::*;
-use crate::graph::hover::{Row, trace};
+use crate::graph::hover::{FlatFlags, Row, trace};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +13,8 @@ struct Key {
     anchor: usize,
     range: Range<usize>,
     history_len: usize,
+    commits: usize,
+    refs_fingerprint: Option<u64>,
     cells: (usize, usize),
     search_generation: u64,
     // Partial results can replace/relayout the graph without changing generation.
@@ -27,6 +29,10 @@ pub(super) struct State {
     key: Option<Key>,
     first: usize,
     flags: Vec<Vec<u8>>,
+    flat: Option<FlatFlags>,
+    // Selection traces once per anchor/graph revision. Scrolling copies only
+    // the requested viewport; hover retains its strictly viewport-only trace.
+    selection: Option<Box<State>>,
 }
 
 impl State {
@@ -35,6 +41,7 @@ impl State {
         self.identity = None;
         self.key = None;
         self.flags.clear();
+        self.flat = None;
     }
 
     fn identity_at(app: &crate::app::App, row: usize) -> Option<Anchor> {
@@ -79,6 +86,10 @@ impl State {
     }
 
     pub fn update(&mut self, app: &crate::app::App, range: Range<usize>) {
+        self.update_inner(app, range, false);
+    }
+
+    fn update_inner(&mut self, app: &crate::app::App, range: Range<usize>, flat: bool) {
         let Some(anchor) = self.anchor else {
             self.clear();
             return;
@@ -107,6 +118,8 @@ impl State {
             anchor,
             range: range.clone(),
             history_len: app.history.len(),
+            commits: app.history.commits.as_ptr() as usize,
+            refs_fingerprint: app.refs.as_ref().map(|refs| refs.fingerprint),
             cells: (app.history.cells.as_ptr() as usize, app.history.cells.len()),
             search_generation: app.search.generation,
             search: app
@@ -141,6 +154,36 @@ impl State {
             );
             (lane, cells, head.is_some())
         });
+        if flat {
+            let flags = self.flat.get_or_insert_with(FlatFlags::default);
+            flags.trace(range.len(), anchor - range.start, |offset| {
+                let row = range.start + offset;
+                if pending.is_some_and(|p| p.0 == row) {
+                    let (lane, cells, parent) = pending_geometry.as_ref()?;
+                    return Some(Row {
+                        cells,
+                        node_lane: *lane,
+                        has_parents: *parent,
+                    });
+                }
+                let index = app.history_index(row)?;
+                let record = app.history.commits.get(index)?;
+                let (lane, cells) = if app.search.active() {
+                    let graph = app.search.result.as_ref()?.graph.get(row)?;
+                    (graph.1 as usize, graph.0.as_slice())
+                } else {
+                    (record.node_lane as usize, app.history.row_cells(index))
+                };
+                Some(Row {
+                    cells,
+                    node_lane: lane,
+                    has_parents: record.parents.len != 0,
+                })
+            });
+            self.first = range.start;
+            self.key = Some(key);
+            return;
+        }
         let positions: Vec<_> = range
             .clone()
             .filter(|&row| {
@@ -188,7 +231,39 @@ impl State {
         self.key = Some(key);
     }
 
+    pub fn select(&mut self, app: &crate::app::App, range: Range<usize>) {
+        let row = app.graph_selected();
+        let identity = Self::identity_at(app, row);
+        let cached = self.selection.get_or_insert_with(Box::default);
+        if cached.anchor != Some(row) || cached.identity != identity {
+            cached.anchor = Some(row);
+            cached.identity = identity;
+            cached.key = None;
+        }
+        cached.update_inner(app, 0..app.graph_len(), true);
+        self.anchor = cached.anchor;
+        self.identity = cached.identity;
+        self.first = range.start;
+        self.flags.clear();
+        self.flags.extend(range.map(|index| cached.row(index)));
+    }
+
+    pub fn combined_row(&self, other: &Self, index: usize) -> Vec<u8> {
+        let mut flags = self.row(index);
+        let selected = other.row(index);
+        flags.resize(flags.len().max(selected.len()), 0);
+        for (flag, selected) in flags.iter_mut().zip(selected) {
+            *flag |= selected;
+        }
+        flags
+    }
+
     pub fn row(&self, index: usize) -> Vec<u8> {
+        if let Some(flat) = &self.flat {
+            return index
+                .checked_sub(self.first)
+                .map_or_else(Vec::new, |index| flat.row(index).to_vec());
+        }
         index
             .checked_sub(self.first)
             .and_then(|i| self.flags.get(i))
@@ -219,6 +294,87 @@ mod tests {
 
     fn id(n: u8) -> gix::ObjectId {
         gix::ObjectId::from_bytes_or_panic(&[n; 20])
+    }
+
+    #[test]
+    fn selected_and_hovered_paths_coexist_and_selection_follows_pending_moves() {
+        let mut app = fixture();
+        app.pending.selected = false;
+        app.selected = 0;
+        let mut selected = State::default();
+        let mut hovered = State::default();
+        let range = 0..app.graph_len();
+        selected.select(&app, range.clone());
+        hovered.hover(&app, app.pending.row() + 1, true);
+        hovered.update(&app, range.clone());
+        for row in range.clone() {
+            let union = hovered.combined_row(&selected, row);
+            for (index, flag) in union.iter().enumerate() {
+                assert_eq!(
+                    *flag,
+                    hovered.row(row).get(index).copied().unwrap_or(0)
+                        | selected.row(row).get(index).copied().unwrap_or(0)
+                );
+            }
+        }
+        hovered.clear();
+        assert!(selected.diagnostics().1 > 0);
+        app.selected = app.pending.head_index.unwrap();
+        selected.select(&app, range);
+        assert_eq!(selected.anchor, Some(app.graph_selected()));
+        assert_eq!(selected.identity, Some(super::Anchor::Commit(id(5))));
+        app.pending.selected = true;
+        selected.select(&app, 0..app.graph_len());
+        assert_eq!(selected.anchor, Some(app.pending.row()));
+        assert_eq!(selected.identity, Some(super::Anchor::Pending(Some(id(5)))));
+    }
+
+    #[test]
+    fn selected_track_survives_offscreen_scroll_and_invalidates_on_graph_growth() {
+        let mut app = fixture();
+        app.pending.selected = false;
+        app.selected = 0;
+        let mut state = State::default();
+        state.select(&app, 0..2);
+        let cached = state
+            .selection
+            .as_ref()
+            .unwrap()
+            .flat
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        let expected = state.selection.as_ref().unwrap().row(4);
+        state.select(&app, 4..6);
+        assert_eq!(state.anchor, Some(0));
+        assert_eq!(state.row(4), expected);
+        assert!(state.row(4).iter().any(|flag| *flag != 0));
+        assert_eq!(
+            state
+                .selection
+                .as_ref()
+                .unwrap()
+                .flat
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            cached
+        );
+        let record = app.history.commits[0];
+        app.history.commits.push(record);
+        state.select(&app, 4..6);
+        assert_eq!(
+            state
+                .selection
+                .as_ref()
+                .unwrap()
+                .flat
+                .as_ref()
+                .unwrap()
+                .len(),
+            app.graph_len()
+        );
+        assert_eq!(state.diagnostics().0, 2);
     }
 
     fn fixture() -> App {
@@ -270,6 +426,45 @@ mod tests {
             ..Default::default()
         }));
         app
+    }
+
+    #[test]
+    #[ignore = "one warm-up and 15 selected-plus-hover viewport/cache samples"]
+    fn benchmark_selected_path() {
+        let mut app = fixture();
+        let record = app.history.commits[0];
+        app.history.commits.resize(100_000, record);
+        app.pending.snapshot.files.clear();
+        app.pending.selected = false;
+        let mut selected = State::default();
+        let mut hovered = State::default();
+        for sample in -1..15 {
+            app.selected = sample.max(0) as usize + 20;
+            selected.selection = None;
+            let selection_start = std::time::Instant::now();
+            selected.select(&app, 0..80);
+            let selection_ms = selection_start.elapsed().as_secs_f64() * 1000.;
+            let start = std::time::Instant::now();
+            for step in 0..1000 {
+                let first = step * 37 % (app.history.len() - 80);
+                let range = first..first + 80;
+                selected.select(&app, range.clone());
+                hovered.hover(&app, first + step % 80, true);
+                hovered.update(&app, range.clone());
+                // A repeat frame exercises both cache hits and the row union.
+                selected.select(&app, range.clone());
+                hovered.update(&app, range.clone());
+                for row in range {
+                    std::hint::black_box(hovered.combined_row(&selected, row));
+                }
+                assert_eq!(selected.diagnostics().0, 80);
+            }
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"historyRows":app.history.len(),
+                "visibleRows":80,"selectionMs":selection_ms,"selectedHoverMs":start.elapsed().as_secs_f64()})
+            );
+        }
     }
 
     #[test]

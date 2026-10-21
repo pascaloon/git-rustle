@@ -6,6 +6,7 @@ param(
     [string]$DisposableFixtureRoot,
     [string]$ToolsDiscoveryFixtureRoot,
     [switch]$RequireSyntax,
+    [switch]$RequireSelectedPath,
     [ValidateRange(0,200000)][int]$ExpectedSyntaxSpans = 0,
     [switch]$RejectCompetingBuilds,
     [int]$Samples = 15,
@@ -14,6 +15,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/benchmark-processes.ps1"
+. "$PSScriptRoot/benchmark-native-process.ps1"
 $Repository = (Resolve-Path -LiteralPath $Repository).Path
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 if ($Baseline) { $Baseline = (Resolve-Path -LiteralPath $Baseline).Path }
@@ -51,6 +53,8 @@ function New-DisposableFixture([string]$Scenario,[string]$Label,[int]$Sample) {
         Fixture-Git $path @('config','user.name','Benchmark') | Out-Null
         Fixture-Git $path @('config','user.email','benchmark@example.invalid') | Out-Null
         Fixture-Git $path @('config','commit.gpgsign','false') | Out-Null
+        Fixture-Git $path @('config','core.autocrlf','false') | Out-Null
+        Fixture-Git $path @('config','core.hooksPath','disabled-test-hooks') | Out-Null
         [IO.File]::WriteAllText((Join-Path $path '.git/git-rustle-todos-fixture'),'disposable todos benchmark fixture')
         foreach($n in 1..2){
             $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE="2026-10-19T00:00:0${n}Z"
@@ -79,7 +83,7 @@ function New-DisposableFixture([string]$Scenario,[string]$Label,[int]$Sample) {
             [IO.File]::WriteAllText((Join-Path $path 'untracked.txt'),"untracked`n")
         }
         return $path
-    } finally { foreach($name in $dates.Keys){ [Environment]::SetEnvironmentVariable($name,$dates[$name],'Process') } }
+    } finally { foreach($name in $dates.Keys){ if($null-eq$dates[$name]){Remove-Item -LiteralPath ('Env:'+$name) -ErrorAction SilentlyContinue}else{[Environment]::SetEnvironmentVariable($name,$dates[$name],'Process')} } }
 }
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if ($ToolsDiscoveryFixtureRoot) {
@@ -116,23 +120,30 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $env:GIT_RUSTLE_SCENARIO = $scenario
     $env:GIT_RUSTLE_FRAME_SAMPLES = Join-Path $OutputDirectory "$label-$scenario-$sample-frames.json"
     $env:GIT_RUSTLE_DUMP = Join-Path $OutputDirectory "$label-$scenario-$sample-state.txt"
-    $fixture = $scenario -in @('todo-graph','stash-panel','stash-apply','stash-delete','ref-storage')
+    $fixture = $scenario -in @('todo-graph','stash-panel','stash-apply','stash-delete','stash-create','ref-storage')
     $launchRepository = if($fixture){ New-DisposableFixture $scenario $label $sample }else{$Repository}
     $beforeFixture = if($fixture){ Fixture-State $launchRepository }else{$null}
     if($fixture){[pscustomobject]@{scenario=$scenario;sample=$sample;repository=$launchRepository;before=$beforeFixture}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $OutputDirectory "$label-$scenario-$sample-fixture-before.json")}
-    # These are the actual visible UI frames under test; a hidden GPUI window
-    # does not reliably receive presentation callbacks.
-    $p = Start-Process -FilePath $exe -ArgumentList @('"' + $launchRepository + '"') -WindowStyle Normal -RedirectStandardError $log -PassThru
-    if (-not $p.WaitForExit(60000)) { Stop-Process -Id $p.Id; throw "Timeout: $log" }
+    # Display-enabled windows paint on a private desktop that is never activated.
+    $p = Start-BenchmarkNativeProcess -FilePath $exe -ArgumentList @('"' + $launchRepository + '"') -RedirectStandardError $log
+    if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "Timeout: $log" }
     $p.Refresh()
     if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     if ($p.ExitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
-    if($scenario -in @('todo-graph','branch-sort','graph-hover','stash-panel','stash-apply','stash-delete','external-tools','ref-storage') -and $state -notmatch 'todos_verified=true'){
+    if($RequireSelectedPath -and $label -eq 'candidate' -and $scenario -eq 'graph-hover' -and $state -notmatch 'todos_selected_path_checks=[1-9][0-9]*'){
+        throw "Selected commit path did not verify its painted viewport: $log"
+    }
+    if($label -eq 'candidate' -and $scenario -like 'stash-*'){
+        if($state -notmatch 'todos_stash_entry_paints=([0-9]+)' -or [int]$Matches[1] -lt 6){throw "Expected actual stash subjects and actions to paint for at least three entries: $log"}
+        $boundsPath=([IO.Path]::ChangeExtension($env:GIT_RUSTLE_FRAME_SAMPLES,'stash-bounds.json'))
+        if(!(Test-Path -LiteralPath $boundsPath)){throw "Missing stash entry paint bounds: $boundsPath"}
+    }
+    if($scenario -in @('todo-graph','branch-sort','graph-hover','stash-panel','stash-apply','stash-delete','stash-create','external-tools','ref-storage') -and $state -notmatch 'todos_verified=true'){
         throw "Todo scenario did not verify its completed frame: $log"
     }
-    if($scenario -in @('todo-graph','branch-sort','graph-hover','stash-panel','stash-apply','stash-delete','external-tools','ref-storage') -and $state -notmatch 'todos_checks=[1-9][0-9]*'){
+    if($scenario -in @('todo-graph','branch-sort','graph-hover','stash-panel','stash-apply','stash-delete','stash-create','external-tools','ref-storage') -and $state -notmatch 'todos_checks=[1-9][0-9]*'){
         throw "Todo scenario did not record functional checks: $log"
     }
     if($ToolsDiscoveryFixtureRoot -and $scenario-eq'external-tools'){
@@ -151,10 +162,13 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
             if($afterFixture.stashes.Count -ne 3 -or (($beforeFixture.stashes -join "`n") -cne ($afterFixture.stashes -join "`n")) -or !$afterFixture.status){throw "Stash apply must retain all3 entries and produce pending changes: $log"}
         }elseif($scenario -eq 'stash-delete'){
             if($afterFixture.stashes.Count -ne 2 -or (($beforeFixture.stashes[1..2] -join "`n") -cne ($afterFixture.stashes -join "`n")) -or $afterFixture.status){throw "Stash delete must remove only the selected newest entry: $log"}
+        }elseif($scenario -eq 'stash-create'){
+            if($afterFixture.stashes.Count -ne 4 -or $afterFixture.status){throw "Stash creation must leave four entries and a clean worktree: $log"}
         }else{
             if($beforeFixture.index -cne $afterFixture.index -or $beforeFixture.status -cne $afterFixture.status -or (ConvertTo-Json -InputObject @($beforeFixture.files) -Compress) -cne (ConvertTo-Json -InputObject @($afterFixture.files) -Compress)){throw "Fixture index/worktree changed unexpectedly: $log"}
         }
         if($scenario -eq 'stash-panel' -and $afterFixture.stashes.Count -ne 3){throw "Stash panel must retain3 entries: $log"}
+        if($scenario -eq 'stash-create' -and ($afterFixture.stashes.Count -ne 4 -or $afterFixture.status)){throw "Stash create/external refresh must leave four stashes and a clean worktree: $log"}
         if($scenario -eq 'ref-storage' -and (Fixture-Git $launchRepository @('rev-parse','--show-ref-format')) -cne 'reftable'){throw "Reference conversion did not finish: $log"}
     }
     if ($scenario -eq 'filter-visuals' -and
@@ -175,7 +189,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
          $state -notmatch 'toolbar_contexts=4' -or $state -notmatch 'toolbar_states=6')) {
         throw "Toolbar count states or bounds were not fully verified: $log"
     }
-    if ($scenario -in @('search-focus','branch-search-focus','search-clear','search-clear-multi','provider-scroll','provider-menu') -and
+    if ($scenario -in @('search-focus','branch-search-focus','search-clear','search-clear-multi','provider-scroll','provider-menu','refresh-feedback') -and
         $state -notmatch 'improvement_verified=true') { throw "Native improvement scenario did not verify its final frame: $log" }
     if ($scenario -eq 'search-clear-multi' -and $state -notmatch 'improvement_selected=2(?:\s|$)') {
         throw "Expected two selections preserved after clearing search: $log"
@@ -229,11 +243,11 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     }
     if (-not $marks.ContainsKey('desktop scenario frame')) { throw "Missing rendered scenario frame: $log" }
     $metric = switch ($scenario) {
-        { $_ -in 'todo-graph','stash-panel','stash-apply','stash-delete','external-tools','ref-storage' } { 'desktop scenario frame' }
+        { $_ -in 'todo-graph','stash-panel','stash-apply','stash-delete','stash-create','external-tools','ref-storage' } { 'desktop scenario frame' }
         { $_ -in 'branch-sort','graph-hover' } { 'desktop scroll done' }
         { $_ -in 'filter-visuals','general-settings' } { 'desktop scenario frame' }
         'general-tabs' { 'desktop scroll done' }
-        { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop scenario frame' }
+        { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu','refresh-feedback' } { 'desktop scenario frame' }
         'provider-scroll' { 'desktop scroll done' }
         'toolbar-counts' { 'desktop scroll done' }
         { $_ -in 'settings-cache','settings-cache-clear' } { 'desktop scenario frame' }
@@ -270,10 +284,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     $end = @($marks.Keys | Where-Object { $_.StartsWith($metric) } | Sort-Object)[0]
     if (-not $end) { throw "Missing $metric in $log" }
     $start = switch ($scenario) {
-        { $_ -in 'todo-graph','stash-panel','stash-apply','stash-delete','external-tools','ref-storage' } { 'desktop scenario requested' }
+        { $_ -in 'todo-graph','stash-panel','stash-apply','stash-delete','stash-create','external-tools','ref-storage' } { 'desktop scenario requested' }
         'filter-visuals' { 'desktop filter requested' }
         'general-settings' { 'general settings requested' }
-        { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu' } { 'desktop improvement requested' }
+        { $_ -in 'search-focus','branch-search-focus','search-clear','search-clear-multi','provider-menu','refresh-feedback' } { 'desktop improvement requested' }
         'settings-cache' { 'image cache requested' }
         'settings-cache-clear' { 'image cache clear requested' }
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'avatar cache requested' }

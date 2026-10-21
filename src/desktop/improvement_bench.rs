@@ -8,9 +8,21 @@ pub(super) struct State {
     selected: Vec<gix::ObjectId>,
     verified: bool,
     dense_rows: usize,
+    refresh_image: Option<std::sync::Arc<Image>>,
+    refresh_paints: std::cell::Cell<usize>,
 }
 
 impl Desktop {
+    pub(super) fn refresh_feedback_rendered(&self, working: bool) {
+        if self.scenario.as_deref() == Some("refresh-feedback")
+            && self.improvement_bench.phase == 2
+            && working
+        {
+            let n = self.improvement_bench.refresh_paints.get();
+            self.improvement_bench.refresh_paints.set(n + 1);
+        }
+    }
+
     fn improvement_focus_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Dispatch outside the entity update: keyboard listeners update this same
         // Desktop entity and otherwise would reenter its mutable borrow.
@@ -51,7 +63,7 @@ impl Desktop {
                     s.set_value("m: merge", window, cx);
                 });
             }
-            Some("provider-scroll" | "provider-menu") => {
+            Some("provider-scroll" | "provider-menu" | "refresh-feedback") => {
                 // Discovery rebuilds graph labels. Seed only after its final event
                 // so an in-flight Local/Branches message cannot erase the fixture.
                 self.improvement_bench.phase = 1;
@@ -66,11 +78,23 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.scenario.as_deref() == Some("refresh-feedback")
+            && self.improvement_bench.phase == 3
+            && self.provider_scenario_ready(window, cx)
+        {
+            self.improvement_bench.refresh_image = self.provider_scenario_image();
+            self.improvement_bench.phase = 2;
+            self.engine.mark("desktop improvement requested");
+            self.action(Action::Refresh, window, cx);
+            // The real refresh handler must preserve the already decoded image.
+            self.assert_refresh_image_retained();
+            cx.notify();
+        }
         if self.improvement_bench.phase != 1 {
             return;
         }
         match self.scenario.as_deref() {
-            Some("provider-scroll" | "provider-menu") => {
+            Some("provider-scroll" | "provider-menu" | "refresh-feedback") => {
                 let branches = &self.engine.app.branches;
                 if branches.last_check.is_none()
                     || branches.loading
@@ -79,6 +103,11 @@ impl Desktop {
                     return;
                 }
                 self.seed_provider_scenario();
+                if self.scenario.as_deref() == Some("refresh-feedback") {
+                    self.improvement_bench.phase = 3;
+                    cx.notify();
+                    return;
+                }
                 self.engine.mark("desktop improvement requested");
                 if self.scenario.as_deref() == Some("provider-scroll") {
                     self.scroll_step = 1;
@@ -151,6 +180,11 @@ impl Desktop {
 
     pub(super) fn improvement_scenario_ready(&self) -> Option<bool> {
         match self.scenario.as_deref() {
+            Some("refresh-feedback") => Some(
+                self.improvement_bench.phase == 2
+                    && !self.engine.refresh_in_progress()
+                    && self.improvement_bench.refresh_paints.get() > 0,
+            ),
             Some("provider-scroll") => Some(self.scroll_step > 121),
             Some("search-clear" | "search-clear-multi") => {
                 Some(self.improvement_bench.phase == 2 && !self.engine.app.search.active())
@@ -199,6 +233,11 @@ impl Desktop {
             self.improvement_bench.dense_rows = dense;
         }
         match self.scenario.as_deref() {
+            Some("refresh-feedback") => {
+                self.assert_refresh_image_retained();
+                assert!(!self.engine.refresh_in_progress());
+                assert!(self.improvement_bench.refresh_paints.get() > 0);
+            }
             Some("search-focus") => {
                 assert!(self.search.read(cx).focus_handle(cx).is_focused(window));
             }
@@ -270,7 +309,7 @@ impl Desktop {
 
     pub(super) fn improvement_scenario_summary(&self) -> String {
         format!(
-            "improvement_verified={} improvement_selected={} improvement_row={} improvement_scroll={} improvement_dense_rows={}\n{}",
+            "improvement_verified={} improvement_selected={} improvement_row={} improvement_scroll={} improvement_dense_rows={} refresh_paints={}\n{}",
             self.improvement_bench.verified,
             self.selected_commits
                 .ids(self.engine.app.selected_id())
@@ -278,7 +317,16 @@ impl Desktop {
             self.engine.app.graph_selected(),
             self.engine.app.scroll,
             self.improvement_bench.dense_rows,
+            self.improvement_bench.refresh_paints.get(),
             self.provider_scenario_summary(),
         )
+    }
+
+    fn assert_refresh_image_retained(&self) {
+        let before = self.improvement_bench.refresh_image.as_ref().unwrap();
+        let after = self
+            .provider_scenario_image()
+            .expect("refresh retains header image");
+        assert!(std::sync::Arc::ptr_eq(before, &after));
     }
 }

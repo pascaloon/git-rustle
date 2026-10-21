@@ -33,6 +33,21 @@ pub fn list(root: &Path) -> Result<Vec<Stash>> {
     Ok(entries)
 }
 
+pub(super) fn create(context: &Context, message: Option<&str>) -> Result<()> {
+    if command::checked(
+        &context.root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?
+    .is_empty()
+    {
+        return Err("There are no pending changes to stash.".into());
+    }
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+        args.extend(["--message", message]);
+    }
+    command::checked(&context.root, &args).map(|_| ())
+}
 fn current(root: &Path, frozen: &Stash) -> Result<Stash> {
     list(root)?
         .into_iter()

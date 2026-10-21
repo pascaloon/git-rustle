@@ -53,6 +53,10 @@ interior pixels. The icon generator retains the resulting alpha channel.
   Drag to select details text and use Ctrl+C to copy.
 - Use **HEAD** to locate the checked-out commit. Dirty repositories initially
   select **Pending changes**; clean repositories initially select HEAD.
+- Graph ordering and lanes stay stable when checking out commits already in the
+  reference history. Detached commits outside that history appear after it;
+  **HEAD** still locates them. The selected and hovered branch paths have a thin
+  light outline, preserving their branch colors.
 - Right-click a graph row for **Diff commit** and **Checkout…**. Ctrl+click
   toggles additional commits; the context menu compares exactly two selected
   commits and disables Checkout for multiple selections. Double-click opens a
@@ -140,6 +144,19 @@ accepts a multiline description and optional new branch name. File/folder
 checkboxes and **Check all** / **Uncheck all** select whole files, using their
 current working contents. **Commit** submits the checked files. Unchecked files
 and their staged contents are preserved. Drafts and checks survive viewing diffs.
+
+Right-click a file in the pending file list and choose **Discard file** to arm
+the action. The item turns red and changes to **Confirm discard file — click
+again**; click it again to restore that file to HEAD, or remove it if it is new.
+This discards both its staged and unstaged changes while preserving other files.
+Click elsewhere or press Escape to cancel. Undo / redo history can recover the
+discarded contents.
+
+Right-click the pending graph row and choose **Stash changes…** to open the
+Stashes panel. Enter an optional name and click **Stash changes** to save staged,
+unstaged and untracked files. Apply keeps the stash entry; Delete removes it and
+can be recovered through Undo / redo history. The panel follows external stash
+changes and the global Refresh action.
 
 A branch name creates and switches to a new branch from HEAD; existing names are
 rejected. A blank field commits on the current branch or detached HEAD. Empty

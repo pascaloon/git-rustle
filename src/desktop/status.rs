@@ -194,20 +194,33 @@ impl Desktop {
         }
     }
 
-    fn status_messages(&self) -> [Option<Message<'_>>; 9] {
+    fn status_messages(&self) -> [Option<Message<'_>>; 10] {
         if self.engine.landing() {
             let mut messages = std::array::from_fn(|_| None);
             messages[0] = message("App", self.notice.as_str(), Level::Error);
             return messages;
         }
-        messages(
+        let base = messages(
             &self.engine.app,
             &self.engine.operation_status,
             self.engine.operation_error,
             self.engine.operation_busy,
             &self.notice,
             self.close_requested,
-        )
+        );
+        let refreshing = self.engine.refresh_in_progress() || self.provider.pending;
+        let mut base = base.into_iter();
+        std::array::from_fn(|index| {
+            if index < 9 {
+                base.next().unwrap()
+            } else {
+                refreshing.then(|| Message {
+                    source: "Refresh",
+                    text: "Refreshing repository…".into(),
+                    level: Level::Working,
+                })
+            }
+        })
     }
 
     pub(super) fn status_bar(&self, cx: &Context<Self>) -> AnyElement {
@@ -219,6 +232,8 @@ impl Desktop {
             "Repository ready"
         };
         let (text, level) = primary.map_or((ready, Level::Info), |m| (m.text.as_ref(), m.level));
+        let working = messages.iter().flatten().any(|m| m.level == Level::Working);
+        self.refresh_feedback_rendered(working);
         row()
             .id("status-bar")
             .h(px(HEIGHT))
@@ -232,10 +247,21 @@ impl Desktop {
             .children(self.update_button(cx))
             .child(
                 div()
-                    .size(px(6.))
+                    .size(px(14.))
                     .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(level.color())),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(working, |s| {
+                        s.child(
+                            gpui_component::spinner::Spinner::new()
+                                .xsmall()
+                                .color(rgb(ACCENT).into()),
+                        )
+                    })
+                    .when(!working, |s| {
+                        s.child(div().size(px(6.)).rounded_full().bg(rgb(level.color())))
+                    }),
             )
             .when(primary.is_some(), |s| {
                 s.child(

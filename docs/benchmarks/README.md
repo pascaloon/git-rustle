@@ -15,6 +15,21 @@ before timing, and run suites sequentially on an unlocked desktop.
 
 ## Additional scenario scripts
 
+[`benchmark-discard.ps1`](../../scripts/benchmark-discard.ps1) measures the pending
+file menu, its armed red confirmation paint and the confirmed worker through a
+verified result frame. Run it with `-Candidate <final executable> -Samples 15
+-OutputDirectory target/bench/<run>/discard` after all builds finish. It creates
+fresh marked disposable repositories, isolates configuration/app-data/temp and
+checks that HEAD, another staged file and an untracked file remain intact. The
+exact fixture marker is `.git/git-rustle-discard-fixture`, containing
+`disposable discard benchmark fixture`. One warm-up and 15 retained launches
+produce raw logs, JSON samples and a report. Run the preserved final test harness
+with `git::worktree::discard::tests::benchmark_discard_file --ignored --exact
+--nocapture` for the separate worker interval. These are candidate-only feature
+costs; compare startup and shared controls against the preserved baseline
+separately. Small fixtures do not establish large-worktree discard latency,
+physical pointer delivery or display scanout.
+
 [`benchmark-conflicts.ps1`](../../scripts/benchmark-conflicts.ps1) bundles shared
 startup/graph-frame controls and a preserved stash-operation worker with marked
 merge/rebase/stash conflict UI workflows. It verifies actual commit/details

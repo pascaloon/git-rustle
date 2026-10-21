@@ -8,35 +8,103 @@ use super::layout::{CellKind, GraphCell};
 pub const GLYPH: u8 = 1;
 pub const CONNECTOR: u8 = 2;
 
+#[derive(Clone, Copy)]
 pub struct Row<'a> {
     pub cells: &'a [GraphCell],
     pub node_lane: usize,
     pub has_parents: bool,
 }
 
+/// Contiguous selection flags: one payload allocation and one row-offset allocation.
+#[derive(Default)]
+pub struct FlatFlags {
+    offsets: Vec<usize>,
+    flags: Vec<u8>,
+}
+impl FlatFlags {
+    pub fn trace<'a>(
+        &mut self,
+        count: usize,
+        anchor: usize,
+        row_at: impl Fn(usize) -> Option<Row<'a>>,
+    ) {
+        self.offsets.clear();
+        self.offsets.reserve(count + 1);
+        self.offsets.push(0);
+        let mut total = 0;
+        for index in 0..count {
+            total += row_at(index).map_or(0, |row| row.cells.len());
+            self.offsets.push(total);
+        }
+        self.flags.clear();
+        self.flags.resize(total, 0);
+        follow(count, anchor, row_at, self);
+    }
+    pub fn row(&self, index: usize) -> &[u8] {
+        let Some(pair) = self.offsets.get(index..index.saturating_add(2)) else {
+            return &[];
+        };
+        &self.flags[pair[0]..pair[1]]
+    }
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+    #[cfg(test)]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.flags.as_ptr()
+    }
+}
+trait FlagRows {
+    fn row_mut(&mut self, index: usize) -> &mut [u8];
+}
+impl FlagRows for FlatFlags {
+    fn row_mut(&mut self, index: usize) -> &mut [u8] {
+        &mut self.flags[self.offsets[index]..self.offsets[index + 1]]
+    }
+}
+impl FlagRows for Vec<Vec<u8>> {
+    fn row_mut(&mut self, index: usize) -> &mut [u8] {
+        &mut self[index]
+    }
+}
+
 pub fn trace(rows: &[Row<'_>], anchor: usize) -> Vec<Vec<u8>> {
     let mut flags: Vec<_> = rows.iter().map(|row| vec![0; row.cells.len()]).collect();
-    let Some(origin) = rows.get(anchor) else {
-        return flags;
+    follow(
+        rows.len(),
+        anchor,
+        |index| rows.get(index).copied(),
+        &mut flags,
+    );
+    flags
+}
+
+fn follow<'a>(
+    count: usize,
+    anchor: usize,
+    row_at: impl Fn(usize) -> Option<Row<'a>>,
+    flags: &mut impl FlagRows,
+) {
+    let Some(origin) = row_at(anchor) else {
+        return;
     };
     for reverse in [false, true] {
         let mut lane = origin.node_lane;
-        let count = if reverse {
-            anchor + 1
-        } else {
-            rows.len() - anchor
-        };
-        for step in 0..count {
+        let steps = if reverse { anchor + 1 } else { count - anchor };
+        for step in 0..steps {
             let index = if reverse {
                 anchor - step
             } else {
                 anchor + step
             };
-            let row = &rows[index];
+            let Some(row) = row_at(index) else {
+                break;
+            };
             let Some(cell) = row.cells.get(lane) else {
                 break;
             };
-            let mark = &mut flags[index];
+            let mark = flags.row_mut(index);
             use CellKind::*;
             match cell.kind() {
                 Empty | Horizontal => break,
@@ -66,9 +134,7 @@ pub fn trace(rows: &[Row<'_>], anchor: usize) -> Vec<Vec<u8>> {
             }
         }
     }
-    flags
 }
-
 fn span(cells: &[GraphCell], flags: &mut [u8], from: usize, to: usize) {
     for col in from.min(to)..from.max(to) {
         flags[col] |= CONNECTOR;
@@ -208,5 +274,49 @@ mod tests {
                 "hoverMs": started.elapsed().as_secs_f64() * 1000. / 1000.})
             );
         }
+    }
+    #[test]
+    fn contiguous_flags_match_hover_traces_for_every_anchor_and_reuse_storage() {
+        let mut layout = Layout::new();
+        let definitions: &[(u8, &[u8])] = &[
+            (9, &[7, 6]),
+            (8, &[6]),
+            (7, &[5]),
+            (6, &[4]),
+            (5, &[3]),
+            (4, &[3]),
+            (3, &[2]),
+            (2, &[1]),
+            (1, &[]),
+        ];
+        let geometry: Vec<_> = definitions
+            .iter()
+            .map(|(n, parents)| {
+                let parents: Vec<_> = parents.iter().copied().map(id).collect();
+                (layout.push(&id(*n), &parents), !parents.is_empty())
+            })
+            .collect();
+        let rows: Vec<_> = geometry
+            .iter()
+            .map(|(row, parent)| Row {
+                cells: &row.cells,
+                node_lane: row.node_lane as usize,
+                has_parents: *parent,
+            })
+            .collect();
+        let mut flat = FlatFlags::default();
+        for anchor in 0..rows.len() {
+            let expected = trace(&rows, anchor);
+            flat.trace(rows.len(), anchor, |index| rows.get(index).copied());
+            for (index, row) in expected.iter().enumerate() {
+                assert_eq!(flat.row(index), row);
+            }
+            let storage = flat.as_ptr();
+            flat.trace(rows.len(), anchor, |index| rows.get(index).copied());
+            assert_eq!(flat.as_ptr(), storage);
+        }
+        assert!(flat.row(rows.len()).is_empty());
+        flat.trace(0, 0, |_| None);
+        assert_eq!(flat.len(), 0);
     }
 }
