@@ -1,7 +1,7 @@
-//! A single-file discard, guarded by the status snapshot reviewed in the menu.
+//! File discard, guarded by the complete status snapshot reviewed in the menu.
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscardRequest {
     pub fingerprint: u64,
     pub head: Option<ObjectId>,
@@ -48,71 +48,122 @@ fn safe_path(root: &Path, path: &str) -> Result<(), String> {
 }
 
 pub fn discard_file(root: &Path, request: &DiscardRequest) -> Result<(), String> {
+    discard_files(root, std::slice::from_ref(request))
+}
+
+/// Validate the entire reviewed selection before changing any file. The outer
+/// operation journal captures the batch as one recoverable action.
+pub fn discard_files(root: &Path, requests: &[DiscardRequest]) -> Result<(), String> {
+    if requests.is_empty() {
+        return Err("Select at least one file to discard.".into());
+    }
     let repository = super::super::open(root).map_err(|e| e.to_string())?;
     let current = snapshot(&repository)?;
     if current.conflicts {
         return Err("Resolve or abort the active conflict before discarding files.".into());
     }
-    if current.fingerprint != request.fingerprint
-        || current.head != request.head
-        || current.branch != request.branch
-        || !current.files.contains(&request.file)
-    {
-        return Err("Pending changes changed. Refresh and confirm Discard file again.".into());
-    }
-    let file = &request.file;
-    safe_path(root, &file.path)?;
-    if file.old.is_some_and(|s| s.kind == EntryKind::Commit) {
-        return Err("Discard file does not modify submodules.".into());
-    }
-    if let Some(old) = &file.old_path {
-        safe_path(root, old)?;
-        if current
-            .files
-            .iter()
-            .any(|other| other.path == *old && other.path != file.path)
+    let current_files: std::collections::HashMap<_, _> = current
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let mut paths = std::collections::HashSet::new();
+    for request in requests {
+        if !paths.insert(&request.file.path) {
+            return Err("Duplicate discard path.".into());
+        }
+        if current.fingerprint != request.fingerprint
+            || current.head != request.head
+            || current.branch != request.branch
+            || current_files.get(request.file.path.as_str()).copied() != Some(&request.file)
         {
-            return Err(
-                "The original rename path has separate changes; discard them separately.".into(),
-            );
+            return Err("Pending changes changed. Refresh and confirm Discard file again.".into());
+        }
+        let file = &request.file;
+        safe_path(root, &file.path)?;
+        if file.old.is_some_and(|s| s.kind == EntryKind::Commit) {
+            return Err("Discard file does not modify submodules.".into());
+        }
+        if let Some(old) = &file.old_path {
+            safe_path(root, old)?;
+            if old != &file.path && current_files.contains_key(old.as_str()) {
+                return Err(
+                    "The original rename path has separate changes; discard them separately."
+                        .into(),
+                );
+            }
         }
     }
-    let pathspec = format!(":(literal){}", file.path);
-    if file.old.is_some() {
-        let original = file.old_path.as_deref().unwrap_or(&file.path);
-        let original_spec = format!(":(literal){original}");
-        // restore updates precisely these index entries and their worktree files.
-        command::checked(
+    let mut restore = std::collections::BTreeSet::new();
+    let mut remove = std::collections::BTreeSet::new();
+    for request in requests {
+        let file = &request.file;
+        if file.old.is_some() {
+            let original = file.old_path.as_deref().unwrap_or(&file.path);
+            restore.insert(original);
+            if original == file.path {
+                continue;
+            }
+        }
+        // Added files and rename destinations have no HEAD content to restore.
+        remove.insert(file.path.as_str());
+    }
+    if !restore.is_empty() {
+        discard_paths(
             root,
             &[
                 "restore",
                 "--source=HEAD",
                 "--staged",
                 "--worktree",
-                "--",
-                &original_spec,
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
             ],
+            &restore,
         )?;
-        if original == file.path {
-            return Ok(());
+    }
+    if !remove.is_empty() {
+        discard_paths(
+            root,
+            &[
+                "rm",
+                "--cached",
+                "--force",
+                "--ignore-unmatch",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &remove,
+        )?;
+        for path in remove {
+            match std::fs::remove_file(root.join(path)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Could not discard {path}: {e}")),
+            }
         }
     }
-    // A staged addition/rename destination has no HEAD content to restore.
-    command::checked(
-        root,
-        &[
-            "rm",
-            "--cached",
-            "--force",
-            "--ignore-unmatch",
-            "--",
-            &pathspec,
-        ],
-    )?;
-    match std::fs::remove_file(root.join(&file.path)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Could not discard {}: {e}", file.path)),
+    Ok(())
+}
+
+fn discard_paths(
+    root: &Path,
+    args: &[&str],
+    paths: &std::collections::BTreeSet<&str>,
+) -> Result<(), String> {
+    // NUL-delimited literal pathspecs preserve spaces, glob characters and newlines
+    // without growing the process command line with the selected file count.
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(b":(literal)");
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let output = command::run(root, args, Some(&input), Duration::from_secs(300))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command::clean(&String::from_utf8_lossy(&output.stderr)))
     }
 }
 
@@ -127,6 +178,137 @@ mod tests {
             &snapshot,
             snapshot.files.iter().find(|f| f.path == path).unwrap(),
         )
+    }
+
+    fn batch_fixture() -> (Fixture, Vec<DiscardRequest>) {
+        let f = Fixture::new(true);
+        for index in 0..50 {
+            f.write(
+                &format!("batch/tracked [{index}].txt"),
+                &format!("base {index}\n"),
+            );
+        }
+        f.git(&["add", "batch"]);
+        f.git(&["commit", "-qm", "Batch discard baseline"]);
+        for index in 2..50 {
+            f.write(
+                &format!("batch/tracked [{index}].txt"),
+                &format!("staged {index}\n"),
+            );
+        }
+        for index in 0..20 {
+            f.write(&format!("batch/added [{index}].txt"), "staged addition\n");
+        }
+        f.write("b.txt", "preserved staged b\n");
+        f.git(&["add", "."]);
+        f.git(&["mv", "batch/tracked [0].txt", "batch/renamed [0].txt"]);
+        f.git(&["--literal-pathspecs", "rm", "batch/tracked [1].txt"]);
+        for index in 2..12 {
+            f.write(
+                &format!("batch/tracked [{index}].txt"),
+                &format!("unstaged {index}\n"),
+            );
+        }
+        for index in 0..30 {
+            f.write(
+                &format!("batch/untracked [{index}].txt"),
+                "untracked addition\n",
+            );
+        }
+        f.write("a.txt", "preserved unstaged a\n");
+        f.write("b.txt", "preserved unstaged b\n");
+        f.write("preserve-untracked.txt", "preserved untracked bytes\n");
+        let snapshot = f.snapshot();
+        let requests: Vec<_> = snapshot
+            .files
+            .iter()
+            .filter(|file| file.path.starts_with("batch/"))
+            .map(|file| DiscardRequest::new(&snapshot, file))
+            .collect();
+        assert_eq!(requests.len(), 100);
+        (f, requests)
+    }
+
+    fn assert_batch_discarded(f: &Fixture) {
+        for index in 0..50 {
+            assert_eq!(
+                std::fs::read_to_string(f.root().join(format!("batch/tracked [{index}].txt")))
+                    .unwrap(),
+                format!("base {index}\n")
+            );
+        }
+        assert!(!f.root().join("batch/renamed [0].txt").exists());
+        for (kind, count) in [("added", 20), ("untracked", 30)] {
+            for index in 0..count {
+                assert!(
+                    !f.root()
+                        .join(format!("batch/{kind} [{index}].txt"))
+                        .exists()
+                );
+            }
+        }
+        assert_eq!(f.git(&["diff", "--cached", "--name-only"]), "b.txt");
+        assert_eq!(f.git(&["show", ":b.txt"]), "preserved staged b");
+        for (path, expected) in [
+            ("a.txt", "preserved unstaged a\n"),
+            ("b.txt", "preserved unstaged b\n"),
+            ("preserve-untracked.txt", "preserved untracked bytes\n"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(f.root().join(path)).unwrap(),
+                expected
+            );
+        }
+        assert!(
+            !f.snapshot()
+                .files
+                .iter()
+                .any(|file| file.path.starts_with("batch/"))
+        );
+    }
+
+    #[test]
+    fn discard_hundred_mixed_files_preserves_unrelated_index_and_worktree() {
+        let (f, requests) = batch_fixture();
+        discard_files(f.root(), &requests).unwrap();
+        assert_batch_discarded(&f);
+    }
+
+    #[test]
+    #[ignore = "one warmup and fifteen 100-file tracked/untracked batch discard samples"]
+    fn benchmark_discard_batch() {
+        for sample in -1..15 {
+            let (f, requests) = batch_fixture();
+            let started = std::time::Instant::now();
+            discard_files(f.root(), &requests).unwrap();
+            let worker_ms = started.elapsed().as_secs_f64() * 1000.;
+            assert_batch_discarded(&f);
+            println!(
+                "{}",
+                serde_json::json!({"sample": sample, "files": requests.len(), "workerMs": worker_ms})
+            );
+        }
+    }
+
+    #[test]
+    fn discard_batch_validates_every_request_before_mutating() {
+        let f = Fixture::new(true);
+        f.write("a.txt", "changed a\n");
+        f.write("b.txt", "changed b\n");
+        let a = request(&f, "a.txt");
+        let mut b = request(&f, "b.txt");
+        b.fingerprint ^= 1;
+        assert!(discard_files(f.root(), &[a.clone(), b]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(f.root().join("a.txt")).unwrap(),
+            "changed a\n"
+        );
+        assert!(discard_files(f.root(), &[a.clone(), a]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(f.root().join("b.txt")).unwrap(),
+            "changed b\n"
+        );
+        assert!(discard_files(f.root(), &[]).is_err());
     }
 
     #[test]

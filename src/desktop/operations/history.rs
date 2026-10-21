@@ -123,7 +123,7 @@ impl Desktop {
                             .child(
                                 Button::new("confirm-clear-history")
                                     .small()
-                                    .danger()
+                                    .primary()
                                     .label("Clear history")
                                     .disabled(!self.history_enabled())
                                     .on_click(cx.listener(|v, _, window, cx| {

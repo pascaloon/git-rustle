@@ -12,16 +12,85 @@ use std::{
 
 const MAX_RESULTS: usize = 1000;
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
+/// Byte ranges in the original text, including Unicode lowercase expansion.
+pub fn highlight_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let folded = text.to_lowercase();
+    if text.is_ascii() {
+        return folded
+            .match_indices(&query)
+            .map(|(start, matched)| start..start + matched.len())
+            .collect();
+    }
+    let mut boundaries = Vec::new();
+    for (start, ch) in text.char_indices() {
+        for _ in 0..ch.to_lowercase().map(char::len_utf8).sum::<usize>() {
+            boundaries.push((start, start + ch.len_utf8()));
+        }
+    }
+    folded
+        .match_indices(&query)
+        .filter_map(|(start, matched)| {
+            Some(boundaries.get(start)?.0..boundaries.get(start + matched.len() - 1)?.1)
+        })
+        .collect()
+}
+/// A folded query of N bytes matches at most N original Unicode scalars, each
+/// at most four bytes. Include that bounded overlap around a displayed span so
+/// wrap-crossing matches paint without repeatedly scanning a huge source line.
+fn highlight_window(
+    text: &str,
+    query: &str,
+    visible: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let overlap = query.trim().to_lowercase().len().saturating_mul(4);
+    let mut start = visible.start.saturating_sub(overlap).min(text.len());
+    let mut end = visible.end.saturating_add(overlap).min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    start..end
+}
+/// Clip matches to a displayed byte span, including queries crossing a wrap.
+pub fn visible_highlight_ranges(
+    text: &str,
+    query: &str,
+    visible: std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let window = highlight_window(text, query, &visible);
+    highlight_ranges(&text[window.clone()], query)
+        .into_iter()
+        .filter_map(|range| {
+            let start = (range.start + window.start).max(visible.start);
+            let end = (range.end + window.start).min(visible.end);
+            (start < end)
+                .then_some(start.saturating_sub(visible.start)..end.saturating_sub(visible.start))
+        })
+        .collect()
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
     pub file: usize,
     pub right: bool,
     pub line: Option<u32>,
+    /// UTF-8 byte offset in the displayed line, with four-column tabs expanded.
+    pub offset: Option<usize>,
     pub preview: String,
 }
 pub struct ResultSet {
     pub sequence: u64,
     pub hits: Vec<Hit>,
+    /// Complete file membership, independent of the bounded navigation list.
+    pub matching_files: Vec<usize>,
     pub done: bool,
     pub skipped: usize,
     pub limited: bool,
@@ -153,6 +222,7 @@ impl Worker {
                         continue;
                     }
                     let mut hits = Vec::new();
+                    let mut matching_files = vec![false; index.files.len()];
                     for (file, change) in index.files.iter().enumerate() {
                         if cancelled() {
                             break;
@@ -163,14 +233,15 @@ impl Worker {
                                 .as_ref()
                                 .is_some_and(|p| p.to_lowercase().contains(&query))
                         {
-                            hits.push(Hit {
-                                file,
-                                right: true,
-                                line: None,
-                                preview: "Filename match".into(),
-                            });
-                            if hits.len() == MAX_RESULTS {
-                                break;
+                            matching_files[file] = true;
+                            if hits.len() < MAX_RESULTS {
+                                hits.push(Hit {
+                                    file,
+                                    right: true,
+                                    line: None,
+                                    offset: None,
+                                    preview: "Filename match".into(),
+                                });
                             }
                         }
                     }
@@ -180,6 +251,11 @@ impl Worker {
                     let _ = results.send(ResultSet {
                         sequence,
                         hits: hits.clone(),
+                        matching_files: matching_files
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(file, matched)| matched.then_some(file))
+                            .collect(),
                         done: false,
                         skipped: 0,
                         limited: hits.len() == MAX_RESULTS,
@@ -190,8 +266,8 @@ impl Worker {
                     let repo = crate::git::open(&request.root);
                     let mut skipped = 0;
                     if let Ok(repo) = repo {
-                        for file in 0..index.files.len() {
-                            if cancelled() || hits.len() == MAX_RESULTS {
+                        for (file, membership) in matching_files.iter_mut().enumerate() {
+                            if cancelled() {
                                 break;
                             }
                             index.load(file, &repo);
@@ -201,7 +277,18 @@ impl Worker {
                                 skipped += 1;
                                 continue;
                             };
-                            scan(file, texts, &query, &mut hits, &cancelled);
+                            let matched = if hits.len() < MAX_RESULTS {
+                                scan(file, texts, &query, &mut hits, &cancelled)
+                            } else {
+                                texts.iter().any(|text| {
+                                    text.folded
+                                        .lines()
+                                        .enumerate()
+                                        .take_while(|(line, _)| line % 128 != 0 || !cancelled())
+                                        .any(|(_, content)| content.contains(&query))
+                                })
+                            };
+                            *membership |= matched;
                         }
                     } else {
                         skipped = index.files.len();
@@ -211,6 +298,11 @@ impl Worker {
                         let _ = results.send(ResultSet {
                             sequence,
                             hits,
+                            matching_files: matching_files
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(file, matched)| matched.then_some(file))
+                                .collect(),
                             done: true,
                             skipped,
                             limited,
@@ -253,7 +345,8 @@ fn scan(
     query: &str,
     hits: &mut Vec<Hit>,
     cancelled: &impl Fn() -> bool,
-) {
+) -> bool {
+    let mut matched = false;
     for (side, text) in texts.iter().enumerate() {
         // Unchanged complete files do not need duplicate before/after results.
         if side == 0 && text.original == texts[1].original {
@@ -262,38 +355,66 @@ fn scan(
         for (line, (folded, original)) in text.folded.lines().zip(text.original.lines()).enumerate()
         {
             if line % 128 == 0 && cancelled() {
-                return;
+                return matched;
             }
-            if let Some(offset) = folded.find(query) {
+            let mut matches = folded.match_indices(query).peekable();
+            if matches.peek().is_none() {
+                continue;
+            }
+            let plain_ascii = original.is_ascii() && !original.contains('\t');
+            let mut positions = original.char_indices();
+            let (mut folded_bytes, mut displayed_bytes, mut displayed_columns) = (0, 0, 0);
+            let (mut original_hit, mut displayed_hit) = (0, 0);
+            for (offset, _) in matches {
+                if hits.len().is_multiple_of(128) && cancelled() {
+                    return matched;
+                }
+                if plain_ascii {
+                    original_hit = offset;
+                    displayed_hit = offset;
+                } else {
+                    // Sorted matches share a single forward mapping pass, even
+                    // when Unicode lowercase expands or tabs precede a match.
+                    while folded_bytes <= offset {
+                        let Some((index, ch)) = positions.next() else {
+                            break;
+                        };
+                        original_hit = index;
+                        displayed_hit = displayed_bytes;
+                        folded_bytes += if ch.is_ascii() {
+                            1
+                        } else {
+                            ch.to_lowercase().map(char::len_utf8).sum()
+                        };
+                        if ch == '\t' {
+                            let spaces = 4 - displayed_columns % 4;
+                            displayed_bytes += spaces;
+                            displayed_columns += spaces;
+                        } else {
+                            displayed_bytes += ch.len_utf8();
+                            displayed_columns += 1;
+                        }
+                    }
+                }
+                matched = true;
                 hits.push(Hit {
                     file,
                     right: side == 1,
                     line: Some((line + 1) as u32),
-                    preview: match_preview(original, offset),
+                    offset: Some(displayed_hit),
+                    preview: match_preview(original, original_hit),
                 });
                 if hits.len() == MAX_RESULTS {
-                    return;
+                    return true;
                 }
             }
         }
     }
+    matched
 }
 
-/// Match offsets refer to the cached lowercase text. Unicode lowercase can grow
-/// or shrink its UTF-8 representation, so map back before choosing the snippet.
-fn match_preview(original: &str, folded_offset: usize) -> String {
-    let hit = if original.is_ascii() {
-        folded_offset.min(original.len())
-    } else {
-        let mut folded = 0;
-        original
-            .char_indices()
-            .find_map(|(index, ch)| {
-                folded += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
-                (folded > folded_offset).then_some(index)
-            })
-            .unwrap_or(original.len())
-    };
+/// `hit` is a byte boundary in the original, non-folded line.
+fn match_preview(original: &str, hit: usize) -> String {
     // Keep the match near the leading edge: results live in a narrow sidebar.
     let start = original[..hit]
         .char_indices()
@@ -321,6 +442,86 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::time::{Duration, Instant};
+    #[test]
+    fn highlight_offsets_follow_original_unicode_and_multiple_matches() {
+        let text = "İ CAFÉ café";
+        let ranges = highlight_ranges(text, "café");
+        assert_eq!(
+            ranges.iter().map(|r| &text[r.clone()]).collect::<Vec<_>>(),
+            ["CAFÉ", "café"]
+        );
+        assert!(highlight_ranges(text, " ").is_empty());
+        assert_eq!(&text[highlight_ranges(text, "i")[0].clone()], "İ");
+    }
+    #[test]
+    fn scanner_navigates_each_occurrence_and_maps_unicode_and_tabs_once() {
+        for (original, query) in [
+            ("needle and needle", "needle"),
+            ("İ\tCAFÉ and café", "café"),
+        ] {
+            let mut hits = Vec::new();
+            scan(0, &texts("", original), query, &mut hits, &|| false);
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0].line, hits[1].line);
+            assert!(hits[1].offset > hits[0].offset);
+            let displayed = super::super::sidebyside::decode(original.as_bytes());
+            let expected = highlight_ranges(&displayed, query);
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.offset.unwrap())
+                    .collect::<Vec<_>>(),
+                expected.iter().map(|range| range.start).collect::<Vec<_>>()
+            );
+        }
+    }
+    #[test]
+    fn matches_crossing_wrap_boundaries_highlight_both_visible_segments() {
+        let text = "prefix CAFÉ needle suffix";
+        let boundary = text.find("needle").unwrap();
+        let left = visible_highlight_ranges(text, "café needle", 0..boundary);
+        let right = visible_highlight_ranges(text, "café needle", boundary..text.len());
+        assert_eq!(&text[left[0].clone()], "CAFÉ ");
+        assert_eq!(
+            &text[boundary + right[0].start..boundary + right[0].end],
+            "needle"
+        );
+        assert!(visible_highlight_ranges(text, "CAFÉ", boundary..text.len()).is_empty());
+    }
+    #[test]
+    fn wrapped_highlight_work_is_bounded_by_visible_span_and_query() {
+        let text = "界".repeat(1_400_000);
+        let visible = 2_100_000..2_100_300;
+        let window = highlight_window(&text, "界界", &visible);
+        assert!(text.is_char_boundary(window.start) && text.is_char_boundary(window.end));
+        assert!(window.len() <= visible.len() + 8 * "界界".len() + 6);
+        let matches = visible_highlight_ranges(&text, "界界", visible.clone());
+        assert!(!matches.is_empty());
+        assert!(matches.iter().all(|range| range.end <= visible.len()));
+    }
+    #[test]
+    fn navigation_cap_does_not_hide_later_content_or_filename_membership() {
+        let (dir, files) = fixture();
+        let source = files.iter().find(|f| f.path == "source.txt").unwrap();
+        let mut many = Vec::new();
+        for i in 0..MAX_RESULTS + 2 {
+            let mut file = source.clone();
+            file.path = format!("needle-{i}.txt");
+            many.push(file);
+        }
+        many.push(source.clone());
+        let worker = Worker::default();
+        let sequence = worker.search(dir.path().into(), Arc::new(many), "needle".into());
+        loop {
+            let result = worker.rx.recv_timeout(Duration::from_secs(15)).unwrap();
+            if result.sequence == sequence && result.done {
+                assert_eq!(result.hits.len(), MAX_RESULTS);
+                assert!(result.limited);
+                assert_eq!(result.matching_files.len(), MAX_RESULTS + 3);
+                assert_eq!(result.matching_files.last(), Some(&(MAX_RESULTS + 2)));
+                break;
+            }
+        }
+    }
     fn git(root: &Path, args: &[&str]) -> String {
         String::from_utf8(crate::git::command::checked(root, args).unwrap())
             .unwrap()
@@ -531,22 +732,17 @@ mod tests {
     }
     #[test]
     fn result_count_is_bounded() {
-        let mut hits = vec![];
-        scan(
-            0,
-            &texts("", &"needle\n".repeat(5000)),
-            "needle",
-            &mut hits,
-            &|| false,
-        );
-        assert_eq!(hits.len(), MAX_RESULTS);
+        for content in ["needle\n".repeat(5000), "needle ".repeat(5000)] {
+            let mut hits = vec![];
+            scan(0, &texts("", &content), "needle", &mut hits, &|| false);
+            assert_eq!(hits.len(), MAX_RESULTS);
+        }
     }
     #[test]
     fn long_line_preview_centers_match_and_maps_unicode_lowercase_offsets() {
         for prefix in ["x".repeat(500), "İ".repeat(250), "ẞ".repeat(250)] {
             let original = format!("{prefix} marker CAFÉ {}", "z".repeat(500));
-            let folded = original.to_lowercase();
-            let offset = folded.find("café").unwrap();
+            let offset = original.find("CAFÉ").unwrap();
             let preview = match_preview(&original, offset);
             assert!(preview.starts_with('…') && preview.ends_with('…'));
             assert!(preview.contains("marker CAFÉ"));

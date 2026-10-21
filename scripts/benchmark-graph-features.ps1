@@ -1,6 +1,6 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','multi-details','dense-labels','checkout-simple','diff-base'),
+    [string[]]$Scenarios=@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [Parameter(Mandatory)][string]$OutputDirectory
@@ -25,12 +25,12 @@ function Read-GraphLiveLog([string]$Path){
     }catch [IO.IOException]{return ''}
     finally{if($null-ne$reader){$reader.Dispose()}elseif($null-ne$stream){$stream.Dispose()}}
 }
-function Graph-State([string]$Path){return @{head=Graph-Git $Path @('rev-parse','HEAD');branch=Graph-Git $Path @('branch','--show-current');refs=Graph-Git $Path @('for-each-ref','--format=%(objectname) %(refname)','refs/heads','refs/remotes','refs/tags');status=Graph-Git $Path @('status','--porcelain=v1');index=Graph-Git $Path @('write-tree');files=@(Get-ChildItem -LiteralPath $Path -File|ForEach-Object{@{name=$_.Name;sha=(Get-FileHash -LiteralPath $_.FullName).Hash}})}|ConvertTo-Json -Depth 5 -Compress}
+function Graph-State([string]$Path){return @{head=Graph-Git $Path @('rev-parse','HEAD');branch=Graph-Git $Path @('branch','--show-current');refs=Graph-Git $Path @('for-each-ref','--format=%(objectname) %(refname)','refs/heads','refs/remotes','refs/tags');stashes=Graph-Git $Path @('stash','list','--format=%H %s');status=Graph-Git $Path @('status','--porcelain=v1');index=Graph-Git $Path @('write-tree');files=@(Get-ChildItem -LiteralPath $Path -File|ForEach-Object{@{name=$_.Name;sha=(Get-FileHash -LiteralPath $_.FullName).Hash}})}|ConvertTo-Json -Depth 5 -Compress}
 try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','multi-details','dense-labels','checkout-simple','diff-base')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
             Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
@@ -44,6 +44,18 @@ try{
             Graph-Git $fixture @('checkout','-b','topic')|Out-Null
             foreach($n in 0..1){Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value "topic $n";Graph-Git $fixture @('commit','-am',"Topic commit $n")|Out-Null}
             Graph-Git $fixture @('checkout','main')|Out-Null;Set-Content -LiteralPath (Join-Path $fixture 'main.txt') -Value 'main advanced';Graph-Git $fixture @('add','.')|Out-Null;Graph-Git $fixture @('commit','-m','Main advanced after topic diverged')|Out-Null
+            if($scenario-eq'pending-graph'){
+                Graph-Git $fixture @('update-ref','refs/remotes/origin/main','HEAD')|Out-Null
+                Graph-Git $fixture @('reset','--hard','HEAD~1')|Out-Null
+                Set-Content -LiteralPath (Join-Path $fixture 'pending.txt') -Value 'Pending beside incoming remote history'
+            }
+            if($scenario-like'stash-*'){
+                foreach($stashNumber in 1..3){
+                    Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value "saved tracked change $stashNumber"
+                    Set-Content -LiteralPath (Join-Path $fixture 'saved-untracked.txt') -Value "saved untracked change $stashNumber"
+                    Graph-Git $fixture @('stash','push','-u','-m',"Saved work $stashNumber")|Out-Null
+                }
+            }
             $before=Graph-State $fixture;$before|Set-Content -LiteralPath (Join-Path $directory 'before.json')
             $env:GIT_RUSTLE_SCENARIO=$scenario;$env:GIT_RUSTLE_AUTOQUIT=if($Screenshots){'600000'}else{'100'};$env:GIT_RUSTLE_DUMP=Join-Path $directory 'state.txt'
             $log=Join-Path $directory 'app.log';$process=$null
@@ -68,10 +80,17 @@ try{
             $start=[regex]::Match($text,'([0-9.]+) ms\s+graph feature requested');$end=[regex]::Match($text,'([0-9.]+) ms\s+graph feature verified frame')
             $after=Graph-State $fixture;$after|Set-Content -LiteralPath (Join-Path $directory 'after.json')
             $a=$after|ConvertFrom-Json;$b=$before|ConvertFrom-Json
-            foreach($key in @('refs','status')){if($a.$key-cne$b.$key){throw "Graph feature changed unrelated $key"}}
+            foreach($key in @('refs')){if($a.$key-cne$b.$key){throw "Graph feature changed unrelated $key"}}
+            if($scenario-ne'stash-pop'-and($a.status-cne$b.status-or$a.stashes-cne$b.stashes)){throw 'Graph feature changed unrelated status or stashes'}
             if($scenario-eq'checkout-simple'){
                 if($a.branch-cne'topic'){throw 'Checkout failed to attach topic'}
                 if($a.index-cne(Graph-Git $fixture @('rev-parse','HEAD^{tree}'))){throw 'Checkout index differs from target tree'}
+            }elseif($scenario-eq'stash-pop'){
+                if($a.index-cne$b.index-or$a.head-cne$b.head-or$a.branch-cne$b.branch){throw 'Stash Pop changed HEAD or index'}
+                if((Graph-Git $fixture @('stash','list','--format=%s'))-match'Saved work 3'){throw 'Successful Pop did not drop selected stash'}
+                if((Get-Content -LiteralPath (Join-Path $fixture 'file.txt') -Raw).Trim()-cne'saved tracked change 3'){throw 'Stash Pop tracked content differs'}
+                if((Get-Content -LiteralPath (Join-Path $fixture 'saved-untracked.txt') -Raw).Trim()-cne'saved untracked change 3'){throw 'Stash Pop untracked content differs'}
+                if(@(& git -C $fixture stash list).Count-ne2){throw 'Stash Pop removed an unrelated stash'}
             }else{
                 if($a.index-cne$b.index-or($a.files|ConvertTo-Json -Compress)-cne($b.files|ConvertTo-Json -Compress)){throw 'Read-only graph feature changed index or worktree'}
                 if($a.head-cne$b.head-or$a.branch-cne$b.branch){throw 'Read-only graph scenario changed HEAD'}

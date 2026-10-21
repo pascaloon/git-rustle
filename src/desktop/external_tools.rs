@@ -158,6 +158,16 @@ impl Desktop {
     }
 
     pub(super) fn tools_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scenario.as_deref() == Some("tool-icons-diff")
+            && self.tools.icon_scenario_started
+            && self.tools.picker.is_none()
+            && let Mode::Diff(view) = &self.engine.app.mode
+            && let Some(change) = view.current_change().cloned()
+        {
+            // Exercise the split button's real menu handler so every configured
+            // icon is painted; quick launch now intentionally shows just one.
+            self.tools_action(Action::OpenDiff(change), window, cx);
+        }
         if self.tools.general_requested && !self.engine.app.settings.busy {
             self.tools.general_requested = false;
             if self.engine.app.settings.open {
@@ -637,9 +647,9 @@ impl Desktop {
         } else {
             &self.tools.diff_choices
         };
-        let mut controls = row().gap_1();
+        let mut controls = row().gap_0();
         if let Some(choices) = choices {
-            for (index, (id, name)) in choices.iter().take(4).enumerate() {
+            for (index, (id, name)) in choices.iter().take(1).enumerate() {
                 let Some(entry) = self.tools.config.entry(id) else {
                     continue;
                 };
@@ -655,6 +665,10 @@ impl Desktop {
                         .xsmall()
                         .ghost()
                         .child(self.tool_icon(&entry.executable))
+                        .label(format!(
+                            "{} with {name}",
+                            if merging { "Merge" } else { "Open" }
+                        ))
                         .tooltip(format!(
                             "{} with {}",
                             if merging { "Merge" } else { "Compare" },
@@ -732,12 +746,9 @@ impl Desktop {
             "diff-picker".into()
         };
         Popover::new(popover_id)
+            .p_1()
             .open(open)
-            .trigger(button.label(if merging {
-                "Merge tool ▾"
-            } else {
-                "Open in tool ▾"
-            }))
+            .trigger(button.child(icon("down")).tooltip("Choose comparison tool"))
             .on_open_change(move |open, window, cx| {
                 let _ = changed.update(cx, |v, cx| {
                     let action = if !open {
@@ -753,7 +764,12 @@ impl Desktop {
             })
             .content(move |_, _, cx| {
                 let probe = weak.upgrade().and_then(|v| v.read(cx).todo_probe(13));
-                let mut menu = column().relative().w(px(260.)).gap_1().children(probe);
+                let mut menu = column()
+                    .relative()
+                    .w(px(220.))
+                    .gap_0()
+                    .p_1()
+                    .children(probe);
                 for (index, (id, name)) in choices.as_ref().unwrap().iter().enumerate() {
                     let tool_icon = weak.upgrade().map(|view| {
                         let view = view.read(cx);
@@ -766,7 +782,10 @@ impl Desktop {
                     let (weak, id, selected) = (weak.clone(), id.clone(), selected.clone());
                     menu = menu.child(
                         Button::new(("external-tool-choice", index))
+                            .xsmall()
                             .ghost()
+                            .w_full()
+                            .justify_start()
                             .child(row().gap_2().children(tool_icon).child(name.clone()))
                             .on_click(move |_, window, cx| {
                                 let _ = weak.update(cx, |v, cx| {
@@ -786,7 +805,10 @@ impl Desktop {
                 let weak = weak.clone();
                 menu.child(
                     Button::new("picker-configure-tools")
+                        .xsmall()
                         .ghost()
+                        .w_full()
+                        .justify_start()
                         .label("Configure tools…")
                         .on_click(move |_, window, cx| {
                             let _ = weak

@@ -20,6 +20,20 @@ $saved=@{}
 $names=@(@(Get-ChildItem Env:|Where-Object Name -Match '^(GIT_|GIT_RUSTLE_)'|ForEach-Object Name)+@('LOCALAPPDATA','APPDATA','TEMP','TMP','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_BENCH_REPO','GIT_RUSTLE_BENCH_BRANCHES')|Select-Object -Unique)
 foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 function Git([string]$Path,[string[]]$Arguments){$lines=@(& git.exe -C $Path @Arguments 2>&1);if($LASTEXITCODE-ne0){throw "Fixture Git failed: $Arguments $($lines-join' ')"};($lines-join"`n").TrimEnd()}
+function Write-FixtureRefs([string]$Path,[string[]]$Commands){
+    $start=[Diagnostics.ProcessStartInfo]::new('git.exe')
+    $start.UseShellExecute=$false;$start.CreateNoWindow=$true
+    $start.RedirectStandardInput=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+    foreach($argument in @('-C',$Path,'update-ref','--stdin')){$start.ArgumentList.Add($argument)}
+    $process=[Diagnostics.Process]::Start($start)
+    try{
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write(($Commands-join"`n")+"`n");$process.StandardInput.Close()
+        if(!$process.WaitForExit(30000)){$process.Kill($true);throw 'Fixture ref creation timed out'}
+        $output=$stdout.GetAwaiter().GetResult();$errorText=$stderr.GetAwaiter().GetResult()
+        if($process.ExitCode-ne0){throw "Fixture ref creation failed: $errorText $output"}
+    }finally{$process.Dispose()}
+}
 function New-Stage([string]$Name){$path=Join-Path $OutputDirectory $Name;if(Test-Path -LiteralPath $path){throw "Retaining existing stage $Name; omit it to resume"};New-Item -ItemType Directory -Path $path|Out-Null;return $path}
 function Assert-Idle{Assert-BenchmarkIdle -WorkspaceRoot $sourceRoot -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
 function Read-LiveLog([string]$Path){
@@ -44,6 +58,17 @@ function Fixture([string]$Root){
     Git $working @('push','-qu','origin','main','fixes/task-123','master')|Out-Null
     Git $bare @('symbolic-ref','HEAD','refs/heads/main')|Out-Null
     Git $working @('symbolic-ref','refs/remotes/origin/HEAD','refs/remotes/origin/main')|Out-Null
+    # Enough real rows in each independent cleanup list to require scrolling.
+    $current=Git $working @('rev-parse','HEAD');$old=Git $working @('rev-parse','refs/heads/old/local')
+    $localCommands=[Collections.Generic.List[string]]::new();$serverCommands=[Collections.Generic.List[string]]::new()
+    foreach($index in 0..39){
+        $name='zz-scroll/{0:d3}'-f$index
+        $localCommands.Add("create refs/heads/$name $current");$localCommands.Add("create refs/remotes/origin/$name $current")
+        $localCommands.Add("create refs/heads/zz-old/{0:d3} $old"-f$index)
+        $serverCommands.Add("create refs/heads/$name $current")
+    }
+    Write-FixtureRefs $working $localCommands.ToArray()
+    Write-FixtureRefs $bare $serverCommands.ToArray()
     [IO.File]::WriteAllText((Join-Path $working '.git/git-rustle-cleanup-fixture'),'disposable branch cleanup fixture')
     return $working
 }
@@ -112,7 +137,7 @@ try{
             if($test-eq'branches::tests::benchmark_browser'-and!$Repository){throw 'Shared browser worker needs Repository'}
             foreach($role in 'baseline','candidate'){$exe=if($role-eq'baseline'){$BaselineHarness}else{$CandidateHarness};Harness $exe $test (Join-Path $directory "$role-$($test-replace'::','-').txt")}
         }}
-        foreach($test in 'branches::hierarchy_tests::benchmark_branch_projection','git::operations::cleanup::tests::benchmark_cleanup','git::operations::cleanup::tests::benchmark_cleanup_remote'){Harness $CandidateHarness $test (Join-Path $directory "candidate-$($test-replace'::','-').txt")}
+        foreach($test in 'branches::hierarchy_tests::benchmark_branch_projection','git::operations::cleanup::tests::benchmark_cleanup','git::operations::cleanup::tests::benchmark_cleanup_remote','git::operations::cleanup::tests::benchmark_cleanup_large'){Harness $CandidateHarness $test (Join-Path $directory "candidate-$($test-replace'::','-').txt")}
     }
     if('Screenshots'-in$Stages){$directory=New-Stage 'screenshots';foreach($scenario in 'branches-hierarchy','cleanup-review'){Native $scenario 0 $directory $true|ConvertTo-Json -Depth 5|Set-Content (Join-Path $directory "$scenario.json")}}
     $after=@(Get-ChildItem src,scripts -Recurse -File|Sort-Object FullName|ForEach-Object{[pscustomobject]@{path=$_.FullName;sha256=(Get-FileHash $_.FullName).Hash}})

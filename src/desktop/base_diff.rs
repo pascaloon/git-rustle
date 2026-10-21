@@ -117,14 +117,16 @@ impl Desktop {
                             }))
                     }))
                     .child(
-                        Button::new("cancel-base-diff")
-                            .label("Cancel")
-                            .on_click(cx.listener(|v, _, _, cx| {
-                                v.base_diff.epoch = v.base_diff.epoch.wrapping_add(1);
-                                v.base_diff.busy = false;
-                                v.base_diff.choices.clear();
-                                cx.notify();
-                            })),
+                        row().justify_end().child(
+                            Button::new("cancel-base-diff")
+                                .label("Cancel")
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    v.base_diff.epoch = v.base_diff.epoch.wrapping_add(1);
+                                    v.base_diff.busy = false;
+                                    v.base_diff.choices.clear();
+                                    cx.notify();
+                                })),
+                        ),
                     ),
             )
             .into_any_element(),

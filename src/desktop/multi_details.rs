@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 struct Header {
     id: gix::ObjectId,
     subject: String,
+    author: String,
 }
 #[derive(Default)]
 pub(super) struct State {
@@ -42,7 +43,11 @@ impl State {
 }
 impl Desktop {
     pub(super) fn sync_multi_details(&mut self, cx: &mut Context<Self>) {
+        if self.engine.app.pending.selected {
+            self.selected_commits.clear();
+        }
         if self.selected_commits.count(self.engine.app.selected_id()) <= 1 {
+            self.engine.app.set_details_selection(&[]);
             // The ordinary inspector owns single-selection details. Avoid path
             // clones, selection allocations, and history searches on its render
             // path, including every streaming-history revision.
@@ -65,6 +70,7 @@ impl Desktop {
             };
         }
         let ids = self.selected_commits.ids(self.engine.app.selected_id());
+        self.engine.app.set_details_selection(&ids);
         let graph_version = (
             self.engine.app.history.commits.as_ptr() as usize,
             self.engine.app.history.len(),
@@ -80,6 +86,13 @@ impl Desktop {
                 .iter()
                 .map(|id| Header {
                     id: *id,
+                    author: self
+                        .engine
+                        .app
+                        .history
+                        .index_of(id)
+                        .map(|index| self.engine.app.history.author(index).to_owned())
+                        .unwrap_or_else(|| "?".into()),
                     subject: self
                         .engine
                         .app
@@ -185,7 +198,11 @@ impl Desktop {
             .id("multi-commit-details")
             .relative()
             .children(self.graph_feature_probe(0, 4))
-            .h(relative(0.75))
+            .h(if self.multi_details.ids.len() == 2 {
+                relative(0.75)
+            } else {
+                relative(1.)
+            })
             .flex_shrink_0()
             .min_h_0()
             .overflow_y_scroll()
@@ -204,8 +221,9 @@ impl Desktop {
                             .child(
                                 row()
                                     .id(("commit-accordion", index))
-                                    .px_3()
-                                    .py_2()
+                                    .h(px(44.))
+                                    .flex_shrink_0()
+                                    .px_4()
                                     .min_w_0()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(HOVER)))
@@ -214,17 +232,46 @@ impl Desktop {
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_ellipsis()
+                                            .text_color(rgb(INSPECTOR_MUTED))
+                                            .child(header.subject.clone()),
+                                    )
+                                    .child(requests::avatar(
+                                        self.avatars.image(&id),
+                                        &header.author,
+                                        28.,
+                                    ))
+                                    .child(
+                                        div()
                                             .font_family("Cascadia Mono")
                                             .text_size(px(11.))
+                                            .text_color(rgb(INSPECTOR_MUTED))
                                             .flex_shrink_0()
                                             .child(id.to_hex_with_len(8).to_string()),
                                     )
                                     .child(
                                         div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_ellipsis()
-                                            .child(header.subject.clone()),
+                                            .id(("copy-multi-sha", index))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .h(px(30.))
+                                            .rounded_md()
+                                            .bg(rgb(CONTROL))
+                                            .text_color(rgb(TEXT))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                                            .child(icon("copy"))
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    id.to_string(),
+                                                ));
+                                                cx.stop_propagation();
+                                            })),
                                     )
                                     .on_click(cx.listener(move |v, _, _, cx| {
                                         v.toggle_multi_detail(id, cx);
@@ -234,8 +281,8 @@ impl Desktop {
                                 s.child(
                                     div()
                                         .h(px(200.))
-                                        .px_3()
-                                        .py_2()
+                                        .px_4()
+                                        .py_3()
                                         .when_some(
                                             self.multi_details.documents.get(&id),
                                             |s, block| s.child(block.clone()),

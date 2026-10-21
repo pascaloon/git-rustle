@@ -46,7 +46,7 @@ try{
             foreach($revision in 1..2){
                 foreach($file in 0..15){
                     $lines=[Text.StringBuilder]::new()
-                    foreach($line in 1..500){$value=if($line-eq250){"revision $revision MAGIC_NEEDLE item $file"}else{"source line $line ordinary content in file $file"};[void]$lines.AppendLine($value)}
+                    foreach($line in 1..500){$value=if($line-eq250){"revision $revision MAGIC_NEEDLE item $file"}elseif($line-eq258){"second changed hunk revision $revision file $file"}elseif($line-eq430){("long source prefix "*80)+"LONG_SEGMENT_NEEDLE "+("more long source "*80)+"LONG_SEGMENT_NEEDLE file $file"}else{"source line $line ordinary content in file $file"};[void]$lines.AppendLine($value)}
                     [IO.File]::WriteAllText((Join-Path $fixture "needle-file-$file.txt"),$lines.ToString())
                 }
                 UI-Git $fixture @('add','.')|Out-Null;UI-Git $fixture @('commit','-m',"needle revision $revision")|Out-Null

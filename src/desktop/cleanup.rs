@@ -2,7 +2,7 @@
 use super::*;
 use crate::git::operations::{
     Request,
-    cleanup::{Analysis, MAX_BATCH, Plan, Section},
+    cleanup::{Analysis, Plan, Section},
 };
 use std::collections::HashSet;
 
@@ -27,7 +27,8 @@ pub(super) struct State {
     delete_remotes: bool,
     message: String,
     waiting_epoch: Option<u64>,
-    scroll: UniformListScrollHandle,
+    matching_scroll: UniformListScrollHandle,
+    caution_scroll: UniformListScrollHandle,
 }
 impl Desktop {
     pub(super) fn cleanup_mutation_started(&mut self) {
@@ -78,13 +79,7 @@ impl Desktop {
                 v.cleanup.loading = false;
                 match result {
                     Ok(analysis) => {
-                        v.cleanup.selected = analysis
-                            .candidates
-                            .iter()
-                            .filter(|c| c.section == Section::Matching && !c.protected)
-                            .take(MAX_BATCH)
-                            .map(|c| c.name.clone())
-                            .collect();
+                        v.cleanup.selected = matching_selection(&analysis);
                         v.cleanup.analysis = Some(analysis);
                         v.cleanup.delete_remotes = false;
                     }
@@ -120,7 +115,7 @@ impl Desktop {
                 self.load_cleanup(cx);
             }
             Action::Toggle(name) if idle => {
-                if !self.cleanup.selected.remove(&name) && self.cleanup.selected.len() < MAX_BATCH {
+                if !self.cleanup.selected.remove(&name) {
                     self.cleanup.selected.insert(name);
                 }
             }
@@ -130,12 +125,9 @@ impl Desktop {
                 self.cleanup.selected = self
                     .cleanup
                     .analysis
-                    .iter()
-                    .flat_map(|a| &a.candidates)
-                    .filter(|c| c.section == Section::Matching && !c.protected)
-                    .take(MAX_BATCH)
-                    .map(|c| c.name.clone())
-                    .collect();
+                    .as_ref()
+                    .map(matching_selection)
+                    .unwrap_or_default();
             }
             Action::Review if idle && !self.cleanup.selected.is_empty() => {
                 let branches: Vec<_> = self
@@ -171,10 +163,10 @@ impl Desktop {
                             "ALSO DELETE {remote_count} REMOTE BRANCH(ES). This changes the server. Expected commit IDs are rechecked and protected by leases."
                         )
                     } else {
-                        "Remote branches will be kept.".into()
+                        "Server branches and cached origin/… tracking refs will be kept.".into()
                     },
                     if remote_count > 0 {
-                        " Remote deletion cannot be undone by local History. Separate remote groups may partially complete if another group fails."
+                        " Remote deletion cannot be undone by local History. Remote groups or command-sized batches may partially complete if a later batch fails."
                     } else {
                         ""
                     }
@@ -195,27 +187,37 @@ impl Desktop {
         }
         cx.notify();
     }
-    pub(super) fn cleanup_content(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn cleanup_section(&self, section: Section, cx: &mut Context<Self>) -> AnyElement {
         let busy =
             self.cleanup.loading || self.engine.operation_busy || self.engine.repository_edit_busy;
-        let analysis = self.cleanup.analysis.as_ref();
-        let count = analysis.map_or(0, |a| a.candidates.len());
+        let indices: Vec<_> = self
+            .cleanup
+            .analysis
+            .iter()
+            .flat_map(|a| a.candidates.iter().enumerate())
+            .filter(|(_, c)| c.section == section)
+            .map(|(i, _)| i)
+            .collect();
+        let count = indices.len();
+        let scroll = if section == Section::Matching {
+            &self.cleanup.matching_scroll
+        } else {
+            &self.cleanup.caution_scroll
+        };
         let list = uniform_list(
-            "cleanup-candidates",
+            if section == Section::Matching {
+                "cleanup-matching"
+            } else {
+                "cleanup-caution"
+            },
             count,
             cx.processor(move |v, range: std::ops::Range<usize>, _, cx| {
                 range
                     .map(|index| {
-                        let candidates = &v.cleanup.analysis.as_ref().unwrap().candidates;
-                        let entry = &candidates[index];
+                        let entry =
+                            &v.cleanup.analysis.as_ref().unwrap().candidates[indices[index]];
                         let name = entry.name.clone();
-                        let section_start =
-                            index == 0 || candidates[index - 1].section != entry.section;
-                        let date = crate::ui::time::format_absolute(entry.time, 0)
-                            .chars()
-                            .take(10)
-                            .collect::<String>();
-                        column()
+                        branch_views::branch_row(false)
                             .relative()
                             .children(if entry.name == "fixes/task-123" {
                                 v.branch_cleanup_probe(4)
@@ -224,92 +226,98 @@ impl Desktop {
                             } else {
                                 None
                             })
-                            .w_full()
-                            .h(px(106.))
-                            .px_4()
-                            .py_2()
-                            .gap_2()
-                            .border_b_1()
-                            .border_color(rgb(LINE))
+                            .gap_3()
                             .child(
-                                caption(if section_start {
-                                    if entry.section == Section::Matching {
-                                        "MATCHING REMOTE COPIES · LOCAL REFS"
-                                    } else {
-                                        "CAUTION · LAST COMMIT AT LEAST 6 MONTHS AGO"
-                                    }
-                                } else {
-                                    ""
-                                })
-                                .h(px(16.)),
+                                Checkbox::new(("cleanup-select", indices[index]))
+                                    .checked(v.cleanup.selected.contains(&entry.name))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |v, _, window, cx| {
+                                        v.cleanup_action(Action::Toggle(name.clone()), window, cx)
+                                    })),
                             )
+                            .child(icon("branch").text_color(rgb(MUTED)))
                             .child(
-                                row()
-                                    .gap_3()
-                                    .child(
-                                        Checkbox::new(("cleanup-select", index))
-                                            .checked(v.cleanup.selected.contains(&entry.name))
-                                            .disabled(busy)
-                                            .on_click(cx.listener(move |v, _, window, cx| {
-                                                v.cleanup_action(
-                                                    Action::Toggle(name.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(entry.name.clone()),
-                                    )
-                                    .when(entry.protected, |r| {
-                                        r.child(caption("Protected by default"))
-                                    })
-                                    .child(caption(date)),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(entry.name.clone()),
                             )
+                            .when_some(entry.tracking.as_ref(), |r, (remote, branch)| {
+                                r.child(icon("cloud").text_color(rgb(REMOTE_TEXT))).child(
+                                    div()
+                                        .max_w(px(200.))
+                                        .truncate()
+                                        .text_color(rgb(REMOTE_TEXT))
+                                        .child(format!("{remote}/{branch}")),
+                                )
+                            })
+                            .when(entry.protected, |r| {
+                                r.child(caption("Protected by default"))
+                            })
                             .child(
-                                row()
-                                    .pl(px(28.))
-                                    .gap_3()
-                                    .child(caption(entry.author.clone()))
-                                    .child(caption(
-                                        entry
-                                            .tracking
-                                            .as_ref()
-                                            .map(|(remote, branch)| {
-                                                format!(
-                                                    "Matches {remote}/{branch}{}",
-                                                    if entry.remote.is_none() {
-                                                        " · remote deletion unavailable"
-                                                    } else {
-                                                        ""
-                                                    }
-                                                )
-                                            })
-                                            .unwrap_or_else(|| {
-                                                "No matching cached remote copy".into()
-                                            }),
-                                    )),
+                                div()
+                                    .w(px(150.))
+                                    .flex_shrink_0()
+                                    .truncate()
+                                    .text_color(rgb(MUTED))
+                                    .child(entry.author.clone()),
                             )
+                            .child(div().w(px(90.)).flex_shrink_0().text_right().child(caption(
+                                crate::ui::time::format_relative(
+                                    entry.time,
+                                    crate::ui::time::now_unix(),
+                                ),
+                            )))
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
             }),
         )
         .size_full()
-        .track_scroll(self.cleanup.scroll.clone());
+        .track_scroll(scroll.clone());
+        column()
+            .relative()
+            .children(self.branch_cleanup_probe(if section == Section::Matching { 7 } else { 8 }))
+            .flex_1()
+            .min_h_0()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .child(
+                row()
+                    .h(px(32.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .child(caption(format!(
+                        "{} · {count}",
+                        if section == Section::Matching {
+                            "MATCHING CACHED REMOTE COPIES"
+                        } else {
+                            "CAUTION · LAST COMMIT AT LEAST 6 MONTHS AGO"
+                        }
+                    ))),
+            )
+            .child(self.scroll_region(
+                if section == Section::Matching { 3 } else { 4 },
+                list,
+                Scrollbar::vertical(scroll),
+                cx,
+            ))
+            .into_any_element()
+    }
+    pub(super) fn cleanup_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let busy =
+            self.cleanup.loading || self.engine.operation_busy || self.engine.repository_edit_busy;
+        let analysis = self.cleanup.analysis.as_ref();
         column().relative().children(self.branch_cleanup_probe(3)).flex_1().min_h_0()
             .child(row().px_4().py_3().gap_3().child(icon("broom")).child("Cleanup").child(div().flex_1())
-                .child(Button::new("cleanup-analyze").small().label("Analyze again").disabled(busy)
+                .child(Button::new("cleanup-analyze").small().ghost().icon(gpui_component::Icon::default().path("rustle/refresh")).tooltip("Refresh cleanup analysis").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Analyze, w, cx))))
                 .child(Button::new("cleanup-optimize").small().ghost().label("Optimize storage…").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Optimize, w, cx)))))
             .child(column().px_4().pb_3().gap_2()
-                .child(caption("Analysis uses local branch and remote-tracking refs. Fetch first for fresher remote information."))
-                .child(caption("Matching a remote is not proof commits are disposable. Removing references does not immediately free commit storage; recovery keeps those commits."))
+                .child(caption("origin/… is a cached reference on this computer. Matching it does not verify that the server branch still exists; fetch first."))
+                .child(caption("Default cleanup removes local branches and keeps cached copies and server branches. Commits remain recoverable in History."))
                 .when_some(analysis, |s, a| s.child(caption(format!("{} candidates · {} checked-out branches excluded · Git object storage {} KiB", a.candidates.len(), a.excluded_worktrees, a.storage_kib))))
                 .children(analysis.into_iter().flat_map(|a| &a.warnings).cloned().map(caption)))
             .when(self.cleanup.loading, |s| s.child(row().px_4().py_3().child(gpui_component::spinner::Spinner::new().small()).child("Analyzing branches and storage…")))
@@ -319,20 +327,74 @@ impl Desktop {
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::SelectMatching, w, cx))))
                 .child(Button::new("cleanup-clear").small().ghost().label("Clear").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Clear, w, cx))))
-                .child(caption(format!("{} selected (up to {MAX_BATCH})", self.cleanup.selected.len())))
+                .child(caption(format!("{} selected", self.cleanup.selected.len()))))
+            .child(self.cleanup_section(Section::Matching, cx))
+            .child(self.cleanup_section(Section::OldLocal, cx))
+            .child(row().relative().children(self.branch_cleanup_probe(9)).flex_shrink_0().px_4().py_3().gap_2().border_t_1().border_color(rgb(LINE))
                 .child(div().flex_1())
-                .child(Button::new("cleanup-review").small().label("Review selected…").disabled(busy || self.cleanup.selected.is_empty())
-                    .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Review, w, cx)))))
-            .child(row().px_4().pb_3().gap_2()
                 .child(Checkbox::new("cleanup-remote").checked(self.cleanup.delete_remotes).disabled(busy)
                     .on_click(cx.listener(|v, checked, w, cx| v.cleanup_action(Action::Remote(*checked), w, cx))))
-                .child(caption("Also delete matching remote branches (requires explicit review; cannot be undone here)")))
-            .when(count == 0 && !self.cleanup.loading, |s| s.child(caption("No cleanup candidates found in the current local refs.").p_4()))
-            .child(self.scroll_region(3, list, Scrollbar::vertical(&self.cleanup.scroll), cx)).into_any_element()
+                .child(caption("Also delete actual server branches (cannot be undone here)"))
+                .child(Button::new("cleanup-review").small().primary().label("Review selected…").disabled(busy || self.cleanup.selected.is_empty())
+                    .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Review, w, cx)))))
+            .into_any_element()
     }
 }
 
 impl Desktop {
+    pub(super) fn cleanup_scenario_scroll(&self, caution: bool, reset: bool) {
+        let section = if caution {
+            Section::OldLocal
+        } else {
+            Section::Matching
+        };
+        let count = self
+            .cleanup
+            .analysis
+            .as_ref()
+            .unwrap()
+            .candidates
+            .iter()
+            .filter(|c| c.section == section)
+            .count();
+        let scroll = if caution {
+            &self.cleanup.caution_scroll
+        } else {
+            &self.cleanup.matching_scroll
+        };
+        scroll.scroll_to_item(
+            if reset { 0 } else { count.saturating_sub(1) },
+            ScrollStrategy::Top,
+        );
+    }
+    pub(super) fn cleanup_scenario_assert_scroll(&self, caution: bool) {
+        let matching = self
+            .cleanup
+            .matching_scroll
+            .0
+            .borrow()
+            .base_handle
+            .offset()
+            .y;
+        let old = self
+            .cleanup
+            .caution_scroll
+            .0
+            .borrow()
+            .base_handle
+            .offset()
+            .y;
+        assert!(matching < px(0.), "matching list must actually scroll");
+        if caution {
+            assert!(old < px(0.), "caution list must independently scroll");
+        } else {
+            assert_eq!(
+                old,
+                px(0.),
+                "scrolling matching must preserve caution offset"
+            );
+        }
+    }
     pub(super) fn cleanup_scenario_ready(&self) -> bool {
         self.cleanup.analysis.is_some()
             && !self.cleanup.loading
@@ -378,5 +440,47 @@ impl Desktop {
             std::path::Path::new(&target.url).canonicalize().unwrap(),
             expected
         );
+    }
+}
+
+fn matching_selection(analysis: &Analysis) -> HashSet<String> {
+    analysis
+        .candidates
+        .iter()
+        .filter(|c| c.section == Section::Matching && !c.protected)
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Analysis, Section, matching_selection};
+    #[test]
+    fn matching_selection_checks_every_eligible_branch_without_a_batch_limit() {
+        let mut analysis = Analysis::default();
+        for index in 0..1500 {
+            analysis
+                .candidates
+                .push(crate::git::operations::cleanup::Candidate {
+                    name: format!("candidate/{index}"),
+                    oid: "a".repeat(40),
+                    author: "Owner".into(),
+                    time: 1,
+                    section: if index == 1499 {
+                        Section::OldLocal
+                    } else {
+                        Section::Matching
+                    },
+                    protected: index == 1498,
+                    remote: None,
+                    upstream: None,
+                    tracking: None,
+                });
+        }
+        let selected = matching_selection(&analysis);
+        assert_eq!(selected.len(), 1498);
+        assert!(selected.contains("candidate/1497"));
+        assert!(!selected.contains("candidate/1498"));
+        assert!(!selected.contains("candidate/1499"));
     }
 }

@@ -126,10 +126,13 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
     if($fixture){[pscustomobject]@{scenario=$scenario;sample=$sample;repository=$launchRepository;before=$beforeFixture}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $OutputDirectory "$label-$scenario-$sample-fixture-before.json")}
     # Display-enabled windows paint on a private desktop that is never activated.
     $p = Start-BenchmarkNativeProcess -FilePath $exe -ArgumentList @('"' + $launchRepository + '"') -RedirectStandardError $log
-    if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "Timeout: $log" }
-    $p.Refresh()
+    try {
+        if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "Timeout: $log" }
+        $p.Refresh()
+        $exitCode = $p.ExitCode
+    } finally { $p.Dispose() }
     if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
-    if ($p.ExitCode -ne 0) { throw "Failed: $log" }
+    if ($exitCode -ne 0) { throw "Failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $state = Get-Content -LiteralPath $env:GIT_RUSTLE_DUMP -Raw
     if($RequireSelectedPath -and $label -eq 'candidate' -and $scenario -eq 'graph-hover' -and $state -notmatch 'todos_selected_path_checks=[1-9][0-9]*'){

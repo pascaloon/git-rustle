@@ -754,6 +754,23 @@ impl Desktop {
                 return;
             }
             let frozen = self.stash_entries()[0].clone();
+            if name == "stash-delete" {
+                self.action(
+                    Action::Stashes(Box::new(stashes::Action::Delete(frozen.clone()))),
+                    window,
+                    cx,
+                );
+                assert!(!self.operations.modal_open());
+                assert!(!self.engine.operation_busy);
+                self.todo_bench.run.as_mut().unwrap().operation_epoch = self.engine.operation_epoch;
+                self.action(
+                    Action::Stashes(Box::new(stashes::Action::Delete(frozen))),
+                    window,
+                    cx,
+                );
+                self.todo_advance(3);
+                return;
+            }
             let action = if name == "stash-apply" {
                 stashes::Action::Apply(frozen)
             } else {
@@ -770,11 +787,18 @@ impl Desktop {
             );
             self.todo_advance(3);
         } else if phase == 3
-            && self.stashes_ready()
+            && (if name == "stash-apply" {
+                !self.stashes.open
+                    && self.engine.app.pending.selected
+                    && !self.engine.operation_busy
+                    && self.todo_painted(0, window)
+            } else {
+                self.stashes_ready()
+                    && self.todo_painted(2, window)
+                    && self.todo_stash_entries_painted(window)
+            })
             && !self.engine.app.pending.loading
             && self.engine.operation_epoch != self.todo_bench.run.as_ref().unwrap().operation_epoch
-            && self.todo_painted(2, window)
-            && self.todo_stash_entries_painted(window)
         {
             assert!(
                 !self.engine.operation_error,

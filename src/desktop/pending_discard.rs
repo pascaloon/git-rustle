@@ -10,6 +10,9 @@ pub(super) struct Scenario {
     paint: Rc<Cell<u8>>,
     preserved_index: Vec<u8>,
     preserved_untracked: Vec<u8>,
+    preserved_a: Vec<u8>,
+    preserved_status: Vec<u8>,
+    cursor: usize,
     pub(super) verified: bool,
 }
 
@@ -20,7 +23,129 @@ pub(super) struct Menu {
     armed: bool,
 }
 
+#[derive(PartialEq, Eq)]
+pub(super) struct Batch {
+    repository: String,
+    requests: Vec<DiscardRequest>,
+}
+
 impl Desktop {
+    fn selected_discard_batch(&self) -> Option<Batch> {
+        let app = &self.engine.app;
+        let changes = match &app.mode {
+            Mode::Graph if app.pending.selected => app.details_changes.as_ref()?,
+            Mode::Diff(diff) => &diff.changes,
+            _ => return None,
+        };
+        let checked = changes.checked.as_ref()?;
+        let current: std::collections::HashMap<_, _> = app
+            .pending
+            .snapshot
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        let requests = changes
+            .files
+            .iter()
+            .zip(checked)
+            .filter(|(file, checked)| **checked && file.worktree)
+            .map(|(file, _)| {
+                (current.get(file.path.as_str()).copied() == Some(file))
+                    .then(|| DiscardRequest::new(&app.pending.snapshot, file))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Batch {
+            repository: self.engine.repository_path(),
+            requests,
+        })
+    }
+
+    pub(super) fn discard_selected_button(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let app = &self.engine.app;
+        let changes = match &app.mode {
+            Mode::Graph if app.pending.selected => app.details_changes.as_ref()?,
+            Mode::Diff(diff) => &diff.changes,
+            _ => return None,
+        };
+        let checked = changes.checked.as_ref()?;
+        // Painting counts borrowed flags only; freeze and validate complete
+        // FileChanges on clicks rather than allocating requests every frame.
+        let selected = || {
+            changes
+                .files
+                .iter()
+                .zip(checked)
+                .filter(|(file, checked)| **checked && file.worktree)
+                .map(|(file, _)| file)
+        };
+        let count = selected().count();
+        let enabled = count > 0 && self.discard_idle();
+        let armed = self.discard_batch.as_ref().is_some_and(|batch| {
+            self.engine
+                .repository_root()
+                .is_some_and(|path| path == std::path::Path::new(&batch.repository))
+                && batch.requests.len() == count
+                && selected().zip(&batch.requests).all(|(file, request)| {
+                    request.fingerprint == app.pending.snapshot.fingerprint
+                        && request.head == app.pending.snapshot.head
+                        && request.branch == app.pending.snapshot.branch
+                        && request.file.path == file.path
+                })
+        });
+        Some(
+            Button::new("discard-selected")
+                .relative()
+                .ghost()
+                .small()
+                .icon(gpui_component::Icon::default().path("rustle/trash"))
+                .label(if armed {
+                    format!("Confirm discard ({count})")
+                } else {
+                    format!("Discard selected ({count})")
+                })
+                .text_color(rgb(if armed { ACCENT } else { MUTED }))
+                .disabled(!enabled)
+                .when_some(self.discard_batch_probe(armed), |s, probe| s.child(probe))
+                .tooltip(if armed {
+                    "Click again to discard the reviewed selection"
+                } else {
+                    "Discard selected pending files; click again to confirm"
+                })
+                .on_click(cx.listener(|v, _, window, cx| v.confirm_discard_selected(window, cx)))
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn confirm_discard_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.discard_idle() {
+            self.discard_batch = None;
+            cx.notify();
+            return;
+        }
+        let Some(batch) = self
+            .selected_discard_batch()
+            .filter(|b| !b.requests.is_empty())
+        else {
+            self.discard_batch = None;
+            cx.notify();
+            return;
+        };
+        if self.discard_batch.as_ref() == Some(&batch) {
+            self.discard_batch = None;
+            self.operation_action(
+                operations::Action::Run(crate::git::operations::Request::DiscardFiles(
+                    batch.requests,
+                )),
+                window,
+                cx,
+            );
+        } else {
+            self.discard_batch = Some(batch);
+        }
+        cx.notify();
+    }
+
     fn discard_idle(&self) -> bool {
         !self.engine.operation_busy
             && !self.engine.repository_edit_busy
@@ -197,8 +322,10 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.scenario.as_deref() != Some("pending-discard")
-            || !self.scenario_started
+        if !matches!(
+            self.scenario.as_deref(),
+            Some("pending-discard" | "pending-discard-selected")
+        ) || !self.scenario_started
             || self.discard_scenario.verified
             || self.discard_scenario.scheduled
         {
@@ -216,6 +343,10 @@ impl Desktop {
     }
 
     fn discard_scenario_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scenario.as_deref() == Some("pending-discard-selected") {
+            self.discard_batch_scenario_tick(window, cx);
+            return;
+        }
         let root = std::path::PathBuf::from(self.engine.repository_path());
         match self.discard_scenario.phase {
             0 => {
@@ -288,6 +419,158 @@ impl Desktop {
                     self.discard_scenario.preserved_untracked
                 );
                 self.engine.mark("desktop discard verified frame");
+                self.discard_scenario.verified = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn discard_batch_probe(&self, armed: bool) -> Option<AnyElement> {
+        if self.scenario.as_deref() != Some("pending-discard-selected") {
+            return None;
+        }
+        let paint = self.discard_scenario.paint.clone();
+        Some(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, _, _| {
+                    assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+                    paint.set(if armed { 5 } else { 4 });
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into_any_element(),
+        )
+    }
+
+    fn discard_batch_scenario_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let root = std::path::PathBuf::from(self.engine.repository_path());
+        match self.discard_scenario.phase {
+            0 => {
+                assert_eq!(
+                    std::fs::read_to_string(root.join(".git/git-rustle-discard-fixture"))
+                        .unwrap()
+                        .trim(),
+                    "disposable discard benchmark fixture"
+                );
+                if !self.engine.app.pending.known || !self.discard_idle() {
+                    return;
+                }
+                self.action(Action::Head, window, cx);
+                let Some(changes) = &self.engine.app.details_changes else {
+                    return;
+                };
+                let Some(unchecked) = changes.tree.nodes.iter().position(|node| {
+                    node.file
+                        .is_some_and(|i| changes.files[i].path == "untracked.txt")
+                }) else {
+                    return;
+                };
+                self.action(Action::Check(unchecked), window, cx);
+                assert_eq!(self.selected_discard_batch().unwrap().requests.len(), 2);
+                self.discard_scenario.preserved_a = std::fs::read(root.join("a.txt")).unwrap();
+                self.discard_scenario.preserved_index =
+                    crate::git::command::checked(&root, &["write-tree"]).unwrap();
+                self.discard_scenario.preserved_status =
+                    crate::git::command::checked(&root, &["status", "--porcelain=v1", "-z"])
+                        .unwrap();
+                self.discard_scenario.preserved_untracked =
+                    std::fs::read(root.join("untracked.txt")).unwrap();
+                self.discard_scenario.cursor = self.engine.operations.cursor;
+                self.engine.mark("desktop discard menu requested");
+                self.discard_scenario.paint.set(0);
+                self.discard_scenario.phase = 1;
+            }
+            1 if self.discard_scenario.paint.get() == 4 => {
+                self.engine.mark("desktop discard menu painted");
+                self.confirm_discard_selected(window, cx);
+                assert!(self.discard_batch.is_some() && !self.engine.operation_busy);
+                assert_eq!(
+                    std::fs::read(root.join("a.txt")).unwrap(),
+                    self.discard_scenario.preserved_a
+                );
+                self.discard_scenario.phase = 2;
+            }
+            2 if self.discard_scenario.paint.get() == 5 => {
+                self.engine.mark("desktop discard armed red painted");
+                self.engine.mark("desktop discard requested");
+                self.confirm_discard_selected(window, cx);
+                assert!(self.discard_batch.is_none());
+                self.discard_scenario.paint.set(0);
+                self.discard_scenario.phase = 3;
+            }
+            3 if self.discard_idle()
+                && !self.engine.app.pending.loading
+                && !self.engine.app.pending.want_refresh =>
+            {
+                if self
+                    .engine
+                    .app
+                    .pending
+                    .snapshot
+                    .files
+                    .iter()
+                    .any(|f| f.path == "a.txt" || f.path == "b.txt")
+                    || self.discard_scenario.paint.get() != 4
+                {
+                    return;
+                }
+                for path in ["a.txt", "b.txt"] {
+                    assert_eq!(
+                        std::fs::read(root.join(path)).unwrap(),
+                        crate::git::command::checked(&root, &["show", &format!("HEAD:{path}")])
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(root.join("untracked.txt")).unwrap(),
+                    self.discard_scenario.preserved_untracked
+                );
+                assert_eq!(
+                    self.engine.operations.cursor,
+                    self.discard_scenario.cursor + 1
+                );
+                self.engine.mark("desktop discard verified frame");
+                self.operation_action(
+                    operations::Action::Run(crate::git::operations::Request::MoveTo(
+                        self.discard_scenario.cursor,
+                    )),
+                    window,
+                    cx,
+                );
+                self.discard_scenario.paint.set(0);
+                self.discard_scenario.phase = 4;
+            }
+            4 if self.discard_idle()
+                && !self.engine.app.pending.loading
+                && !self.engine.app.pending.want_refresh =>
+            {
+                if self.engine.operations.cursor != self.discard_scenario.cursor
+                    || self.discard_scenario.paint.get() != 4
+                {
+                    return;
+                }
+                assert_eq!(
+                    std::fs::read(root.join("a.txt")).unwrap(),
+                    self.discard_scenario.preserved_a
+                );
+                assert_eq!(
+                    crate::git::command::checked(&root, &["write-tree"]).unwrap(),
+                    self.discard_scenario.preserved_index
+                );
+                assert_eq!(
+                    crate::git::command::checked(&root, &["status", "--porcelain=v1", "-z"])
+                        .unwrap(),
+                    self.discard_scenario.preserved_status
+                );
+                assert_eq!(
+                    std::fs::read(root.join("untracked.txt")).unwrap(),
+                    self.discard_scenario.preserved_untracked
+                );
+                self.engine.mark("desktop discard undo verified frame");
                 self.discard_scenario.verified = true;
             }
             _ => {}

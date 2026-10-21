@@ -17,6 +17,8 @@ impl AssetSource for Assets {
             _ => path.strip_prefix("rustle/").unwrap_or(""),
         };
         let body = match name {
+            "trash" => "<path d='M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7'/>",
+            "external-link" => "<path d='M14 3h7v7m0-7L10 14M10 3H3v18h18v-7'/>",
             "pipeline-pending" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>",
             "pipeline-running" => "<circle cx='12' cy='12' r='9'/><path d='m10 8 6 4-6 4z'/>",
             "pipeline-success" => "<circle cx='12' cy='12' r='9'/><path d='m7 12 3 3 7-7'/>",
@@ -64,6 +66,7 @@ impl AssetSource for Assets {
             "graph" => {
                 "<circle cx='6' cy='4' r='2'/><circle cx='6' cy='20' r='2'/><circle cx='18' cy='12' r='2'/><path d='M6 6v12m0-10c8 0 12 0 12 2'/>"
             }
+            "list" => "<path d='M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'/>",
             "folder" => "<path d='M3 6h7l2 3h9v11H3zM3 6V4h7l2 2h8v3'/>",
             "terminal" => {
                 "<rect x='2' y='4' width='20' height='16' rx='2'/><path d='m6 9 3 3-3 3m6 1h6'/>"

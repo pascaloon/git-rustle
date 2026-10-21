@@ -17,6 +17,10 @@ impl Desktop {
                 *name,
                 "graph-multiselect"
                     | "multi-details"
+                    | "pending-graph"
+                    | "stash-preview"
+                    | "stash-file"
+                    | "stash-pop"
                     | "dense-labels"
                     | "checkout-simple"
                     | "diff-base"
@@ -28,9 +32,19 @@ impl Desktop {
         if part == 4 && !self.multi_details_loaded(2) {
             return None;
         }
+        if part == 7
+            && !self
+                .engine
+                .app
+                .details_changes
+                .as_ref()
+                .is_some_and(|cs| cs.loaded)
+        {
+            return None;
+        }
         if part == 5
             && match self.graph_feature_name().unwrap() {
-                "diff-base" => {
+                "diff-base" | "stash-file" => {
                     !matches!(&self.engine.app.mode,Mode::Diff(view) if view.changes.loaded)
                 }
                 "checkout-simple" => {
@@ -131,7 +145,38 @@ impl Desktop {
                     self.action(Action::Select(index, false), window, cx);
                     self.action(Action::DiffBase, window, cx);
                 }
+                "stash-preview" | "stash-file" | "stash-pop" => {
+                    self.action(Action::Tab(Tab::Stashes), window, cx);
+                }
                 _ => {
+                    if name == "pending-graph" {
+                        assert!(self.engine.app.pending.exists());
+                        assert!(self.engine.app.pending.head_index.unwrap() > 0);
+                        let row = self.engine.app.pending.row();
+                        self.action(Action::Select(0, false), window, cx);
+                        self.action(Action::Select(1, true), window, cx);
+                        assert_eq!(
+                            self.selected_commits.count(self.engine.app.selected_id()),
+                            2
+                        );
+                        self.action(Action::Select(row, true), window, cx);
+                        assert!(self.engine.app.pending.selected);
+                        assert_eq!(
+                            self.selected_commits.count(self.engine.app.selected_id()),
+                            0
+                        );
+                        self.action(Action::Select(0, true), window, cx);
+                        assert!(!self.engine.app.pending.selected);
+                        assert_eq!(
+                            self.selected_commits.count(self.engine.app.selected_id()),
+                            1
+                        );
+                        self.action(Action::Select(row, true), window, cx);
+                        self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        self.graph_features.paints.borrow_mut().clear();
+                        self.graph_features.phase = 1;
+                        return;
+                    }
                     self.action(Action::Select(0, false), window, cx);
                     if name == "dense-labels" {
                         let id = self.engine.app.history.commits[0].id;
@@ -149,7 +194,9 @@ impl Desktop {
                         );
                     } else {
                         self.action(Action::Select(1, true), window, cx);
-                        self.action(Action::Select(2, true), window, cx);
+                        if name != "multi-details" {
+                            self.action(Action::Select(2, true), window, cx);
+                        }
                         if name == "multi-details" {
                             let id = self.selected_commits.ids(self.engine.app.selected_id())[0];
                             self.toggle_multi_detail(id, cx);
@@ -160,6 +207,77 @@ impl Desktop {
             }
             self.graph_features.paints.borrow_mut().clear();
             self.graph_features.phase = 1;
+            return;
+        }
+        if name.starts_with("stash-") {
+            let phase = self.graph_features.phase;
+            if phase == 1 {
+                if !self.stashes_ready() {
+                    return;
+                }
+                let stash = self
+                    .stash_entries()
+                    .first()
+                    .expect("populated stash fixture")
+                    .clone();
+                if name == "stash-pop" {
+                    self.stash_action(stashes::Action::Pop(stash), window, cx);
+                } else {
+                    self.stash_action(stashes::Action::Expand(stash), window, cx);
+                }
+                self.graph_features.phase = 2;
+                self.graph_features.paints.borrow_mut().clear();
+                return;
+            }
+            if phase == 2 && name == "stash-pop" {
+                if !self.operations.modal_open() {
+                    return;
+                }
+                self.operation_action(operations::Action::Confirm, window, cx);
+                self.graph_features.phase = 3;
+                return;
+            }
+            if phase == 2 {
+                let stash = self.stash_entries()[0].clone();
+                let Some(files) = self.stash_preview_file_count(&stash) else {
+                    return;
+                };
+                assert!(files >= 2, "tracked and untracked stash preview");
+                if !self.graph_features.paints.borrow().contains_key(&(0, 8)) {
+                    return;
+                }
+                if name == "stash-file" {
+                    self.stash_action(stashes::Action::File(stash, 0), window, cx);
+                    self.graph_features.phase = 3;
+                    return;
+                }
+            } else if phase == 3 && name == "stash-file" {
+                if !matches!(&self.engine.app.mode,Mode::Diff(view) if view.diff.is_some() && view.changes.loaded)
+                {
+                    return;
+                }
+                if !self.graph_features.paints.borrow().contains_key(&(0, 5)) {
+                    return;
+                }
+            } else if phase == 3 && name == "stash-pop" {
+                if self.stashes.open
+                    || !self.engine.app.pending.selected
+                    || self.engine.app.pending.loading
+                    || self.engine.operation_busy
+                {
+                    return;
+                }
+                assert!(self.engine.app.pending.exists());
+                assert_eq!(self.stash_entries().len(), 2);
+                if !self.graph_features.paints.borrow().contains_key(&(0, 6)) {
+                    return;
+                }
+            } else {
+                return;
+            }
+            assert_eq!(self.engine.app.head_id(), self.graph_features.head);
+            self.graph_features.verified = true;
+            self.engine.mark("graph feature verified frame");
             return;
         }
         if self.graph_features.phase != 1 {
@@ -202,6 +320,22 @@ impl Desktop {
             if !self.graph_features.paints.borrow().contains_key(&(0, 5)) {
                 return;
             }
+        } else if name == "pending-graph" {
+            if !self.graph_features.paints.borrow().contains_key(&(0, 6)) {
+                return;
+            }
+            assert!(self.engine.app.pending.selected);
+            assert_eq!(
+                self.selected_commits.count(self.engine.app.selected_id()),
+                0
+            );
+            assert!(
+                self.engine
+                    .app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|cs| cs.checked.is_some())
+            );
         } else {
             let paints = self.graph_features.paints.borrow();
             let Some(sha) = paints.get(&(0, 0)) else {
@@ -230,12 +364,26 @@ impl Desktop {
             {
                 return;
             }
+            if name == "multi-details" {
+                let Some(cs) = &self.engine.app.details_changes else {
+                    return;
+                };
+                if !cs.loaded || !paints.contains_key(&(0, 7)) {
+                    return;
+                }
+                assert!(cs.error.is_none());
+                let ids = self.selected_commits.ids(self.engine.app.selected_id());
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&cs.new) && ids.contains(&cs.old.unwrap()));
+            } else if name == "graph-multiselect" {
+                assert!(self.engine.app.details_changes.is_none());
+            }
             if name != "dense-labels" {
                 assert_eq!(
                     self.selected_commits
                         .ids(self.engine.app.selected_id())
                         .len(),
-                    3
+                    if name == "multi-details" { 2 } else { 3 }
                 );
             }
         }

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 mod discard;
-pub use discard::{DiscardRequest, discard_file};
+pub use discard::{DiscardRequest, discard_file, discard_files};
 
 fn text(bytes: &[u8]) -> Result<&str, String> {
     std::str::from_utf8(bytes)

@@ -101,6 +101,8 @@ pub struct App {
     next_view_id: u32,
     /// Files changed by the selected commit (vs. its first parent).
     pub details_changes: Option<ChangeSet>,
+    /// Explicit desktop multi-selection; single selection follows normal focus.
+    details_selection: Vec<ObjectId>,
     pub details_cursor: TreeCursor,
     /// Where the details panel drew the file tree, for hit-testing.
     pub files_area: Rect,
@@ -154,6 +156,7 @@ impl App {
             sidebar_width: 32,
             next_view_id: 1,
             details_changes: None,
+            details_selection: Vec::new(),
             details_cursor: TreeCursor::default(),
             files_area: Rect::default(),
             next_key: 1,
@@ -623,7 +626,29 @@ impl App {
         }
     }
 
-    /// Keep `details_changes` pointed at the selected commit.
+    pub fn set_details_selection(&mut self, ids: &[ObjectId]) {
+        if ids.len() > 1 && !self.pending.selected {
+            if self.details_selection != ids {
+                self.details_selection = ids.to_vec();
+            }
+        } else {
+            self.details_selection.clear();
+        }
+    }
+
+    fn ordered_pair(&self, a: ObjectId, b: ObjectId) -> (ObjectId, ObjectId) {
+        let time = |id: &ObjectId| {
+            self.history
+                .index_of(id)
+                .map(|i| (self.history.commits[i].commit_time, std::cmp::Reverse(i)))
+        };
+        match (time(&a), time(&b)) {
+            (Some(ta), Some(tb)) if tb < ta => (b, a),
+            _ => (a, b),
+        }
+    }
+
+    /// Keep files pointed at the selected commit or exact selected pair.
     pub fn sync_details_changes(&mut self) {
         if self.inspection.is_none() && self.pending.selected {
             if matches!(self.mode, Mode::Diff(_)) {
@@ -638,11 +663,25 @@ impl App {
             }
             return;
         }
-        let Some(id) = self.details_id() else { return };
-        if self.details_changes.as_ref().map(|c| c.new) == Some(id) {
+        if self.inspection.is_none() && self.details_selection.len() > 2 {
+            self.details_changes = None;
             return;
         }
-        let parent = self.parent_of(&id);
+        let (parent, id) = if self.inspection.is_none() && self.details_selection.len() == 2 {
+            let (old, new) =
+                self.ordered_pair(self.details_selection[0], self.details_selection[1]);
+            (Some(old), new)
+        } else {
+            let Some(id) = self.details_id() else { return };
+            (self.parent_of(&id), id)
+        };
+        if self
+            .details_changes
+            .as_ref()
+            .is_some_and(|c| c.new == id && c.old == parent)
+        {
+            return;
+        }
         self.details_changes = Some(self.new_changes(parent, id));
         self.details_cursor = TreeCursor {
             rows: self.details_cursor.rows,
@@ -726,6 +765,10 @@ impl App {
             }
             return;
         }
+        if self.details_selection.len() > 1 {
+            self.open_selected_diff(&self.details_selection.clone());
+            return;
+        }
         let ids = if self.marks.is_empty() {
             self.selected_id().into_iter().collect()
         } else {
@@ -737,18 +780,18 @@ impl App {
     /// Compare one commit with its parent, or exactly two selected commits.
     pub fn open_selected_diff(&mut self, ids: &[ObjectId]) {
         if ids.len() == 2 {
-            let (a, b) = (ids[0], ids[1]);
-            let time = |id: &ObjectId| {
-                self.history
-                    .index_of(id)
-                    .map(|i| (self.history.commits[i].commit_time, std::cmp::Reverse(i)))
-            };
-            let (old, new) = match (time(&a), time(&b)) {
-                (Some(ta), Some(tb)) if tb < ta => (b, a),
-                _ => (a, b),
-            };
-            let changes = self.new_changes(Some(old), new);
-            self.show_view(changes, None);
+            let (old, new) = self.ordered_pair(ids[0], ids[1]);
+            if self
+                .details_changes
+                .as_ref()
+                .is_some_and(|c| c.old == Some(old) && c.new == new)
+            {
+                let changes = self.details_changes.take().unwrap();
+                self.show_view(changes, Some(self.details_cursor));
+            } else {
+                let changes = self.new_changes(Some(old), new);
+                self.show_view(changes, None);
+            }
         } else if let [id] = ids {
             self.open_parent_diff(*id);
         }
@@ -757,7 +800,11 @@ impl App {
     /// Diff `id` against its first parent, reusing the details panel's change
     /// set (and cursor) when it is the selected commit.
     pub fn open_parent_diff(&mut self, id: ObjectId) {
-        if self.details_changes.as_ref().is_some_and(|c| c.new == id) {
+        if self
+            .details_changes
+            .as_ref()
+            .is_some_and(|c| c.new == id && c.old == self.parent_of(&id))
+        {
             let cs = self.details_changes.take().unwrap();
             let cursor = self.details_cursor;
             self.show_view(cs, Some(cursor));
@@ -2914,6 +2961,31 @@ mod tests {
         assert!(
             matches!(&app.mode,Mode::Diff(v) if v.changes.old==Some(ids[2]) && v.changes.new==ids[0])
         );
+    }
+
+    #[test]
+    fn multi_selection_files_compare_pair_and_clear_for_three_commits() {
+        let mut app = app_with(4);
+        let ids: Vec<_> = app.history.commits.iter().map(|c| c.id).collect();
+        app.history.commits[0].commit_time = 20;
+        app.history.commits[2].commit_time = 10;
+        app.set_details_selection(&[ids[0], ids[2]]);
+        app.sync_details_changes();
+        let cs = app.details_changes.as_ref().unwrap();
+        assert_eq!((cs.old, cs.new), (Some(ids[2]), ids[0]));
+        let key = cs.key;
+        app.sync_details_changes();
+        assert_eq!(app.details_changes.as_ref().unwrap().key, key);
+        app.open_diff();
+        assert!(matches!(&app.mode, Mode::Diff(v) if v.changes.key == key));
+        app.close_diff();
+        app.set_details_selection(&ids[..3]);
+        app.sync_details_changes();
+        assert!(app.details_changes.is_none());
+        app.set_details_selection(&ids[..1]);
+        app.sync_details_changes();
+        let cs = app.details_changes.as_ref().unwrap();
+        assert_eq!((cs.old, cs.new), (None, ids[0]));
     }
 
     #[test]

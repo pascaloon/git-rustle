@@ -2,7 +2,6 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
-pub const MAX_BATCH: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Matching,
@@ -199,8 +198,8 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
 // Keep URL and OID in the identity so no other stale plan gains an exemption.
 type CompletedDeletes = HashSet<(String, String, String, String)>;
 fn validate_plan(context: &Context, plan: &Plan, completed: &CompletedDeletes) -> Result<()> {
-    if plan.branches.is_empty() || plan.branches.len() > MAX_BATCH {
-        return Err("Select 1–256 branches for a cleanup batch.".into());
+    if plan.branches.is_empty() {
+        return Err("Select at least one branch for cleanup.".into());
     }
     let checked = checked_out(&context.root)?;
     let repo = super::super::open(&context.root).map_err(err)?;
@@ -225,7 +224,12 @@ fn validate_plan(context: &Context, plan: &Plan, completed: &CompletedDeletes) -
     let mut urls = HashMap::new();
     let mut names = HashSet::new();
     for candidate in &plan.branches {
-        validate_name(&context.root, &candidate.name)?;
+        // The fresh Git snapshot below validates reference membership without
+        // spawning check-ref-format once per selected branch.
+        if candidate.name.is_empty() || candidate.name.starts_with('-') || candidate.name == "HEAD"
+        {
+            return Err("Enter a valid branch name".into());
+        }
         if !names.insert(&candidate.name) {
             return Err("Duplicate cleanup branch.".into());
         }
@@ -297,16 +301,16 @@ fn apply_with_post_push(context: &Context, plan: &Plan, after_push: impl FnOnce(
                     .insert(remote.branch.clone(), candidate.oid.clone());
             }
         }
-        // Validate every remote before changing any remote or local reference.
+        // Fetch each remote advertisement once, independently of selection size.
         for ((_, url), branches) in &groups {
+            let advertisement = output(&context.root, &["ls-remote", "--heads", "--", url])?;
+            let tips: HashMap<_, _> = advertisement
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .map(|(oid, name)| (name, oid))
+                .collect();
             for (branch, oid) in branches {
-                let name = format!("refs/heads/{branch}");
-                let remote = output(
-                    &context.root,
-                    &["ls-remote", "--exit-code", "--heads", "--", url, &name],
-                )?;
-                let fields: Vec<_> = remote.split_whitespace().collect();
-                if fields.as_slice() != [oid.as_str(), name.as_str()] {
+                if tips.get(format!("refs/heads/{branch}").as_str()) != Some(&oid.as_str()) {
                     return Err(format!(
                         "Remote branch {branch} changed. Fetch and analyze again."
                     ));
@@ -314,21 +318,23 @@ fn apply_with_post_push(context: &Context, plan: &Plan, after_push: impl FnOnce(
             }
         }
         for ((name, url), branches) in &groups {
-            let mut owned = vec!["push".to_string(), "--atomic".into()];
-            for (branch, oid) in branches {
-                owned.push(format!("--force-with-lease=refs/heads/{branch}:{oid}"));
+            for chunk in remote_chunks(branches, url)? {
+                let mut owned = vec!["push".to_string(), "--atomic".into()];
+                for (branch, oid) in &chunk {
+                    owned.push(format!("--force-with-lease=refs/heads/{branch}:{oid}"));
+                }
+                owned.extend(["--".into(), url.clone()]);
+                for (branch, _) in &chunk {
+                    owned.push(format!(":refs/heads/{branch}"));
+                }
+                command::checked(&context.root, &owned.iter().map(String::as_str).collect::<Vec<_>>())
+                    .map_err(|e| format!("Remote cleanup stopped at {name}: {e}. Earlier remote groups or chunks may have completed; local branches were retained."))?;
+                completed.extend(
+                    chunk.into_iter().map(|(branch, oid)| {
+                        (name.clone(), branch.clone(), url.clone(), oid.clone())
+                    }),
+                );
             }
-            owned.extend(["--".into(), url.clone()]);
-            for branch in branches.keys() {
-                owned.push(format!(":refs/heads/{branch}"));
-            }
-            command::checked(&context.root, &owned.iter().map(String::as_str).collect::<Vec<_>>())
-                .map_err(|e| format!("Remote cleanup stopped at {name}: {e}. Earlier remote groups may have completed; local branches were retained."))?;
-            completed.extend(
-                branches
-                    .iter()
-                    .map(|(branch, oid)| (name.clone(), branch.clone(), url.clone(), oid.clone())),
-            );
         }
     }
     after_push();
@@ -351,19 +357,65 @@ fn apply_with_post_push(context: &Context, plan: &Plan, after_push: impl FnOnce(
         Some(input.as_bytes()),
         &[],
     )?;
-    for candidate in &plan.branches {
-        if plan.delete_remotes
-            && let Some(remote) = &candidate.remote
-        {
-            // A newer tracking ref must not be overwritten after the remote lease.
-            let reference = format!("refs/remotes/{}/{}", remote.name, remote.branch);
-            let _ = command::checked(
-                &context.root,
-                &["update-ref", "-d", &reference, &candidate.oid],
-            );
+    if plan.delete_remotes {
+        // One guarded stdin transaction avoids thousands of child processes.
+        // Missing tracking refs were already validated against push receipts.
+        let repo = super::super::open(&context.root).map_err(err)?;
+        let refs = super::super::snapshot_refs(&repo).map_err(err)?;
+        let tips: HashMap<_, _> = refs
+            .refs
+            .iter()
+            .filter(|r| r.kind == super::super::RefKind::Remote)
+            .map(|r| (r.name.as_str(), r.id.to_string()))
+            .collect();
+        let mut input = String::from("start\n");
+        let mut seen = HashSet::new();
+        for candidate in &plan.branches {
+            if let Some(remote) = &candidate.remote {
+                let name = format!("{}/{}", remote.name, remote.branch);
+                if tips.get(name.as_str()) == Some(&candidate.oid) && seen.insert(name.clone()) {
+                    input += &format!("delete refs/remotes/{name} {}\n", candidate.oid);
+                }
+            }
         }
+        input += "prepare\ncommit\n";
+        // A racing tracking-ref update keeps the cache rather than overwriting it.
+        let _ = run(
+            &context.root,
+            &["update-ref", "--stdin"],
+            Some(input.as_bytes()),
+            &[],
+        );
     }
     Ok(())
+}
+// Bound UTF-16 arguments below Windows' 32k process command-line limit.
+type RemoteChunk<'a> = Vec<(&'a String, &'a String)>;
+fn remote_chunks<'a>(
+    branches: &'a BTreeMap<String, String>,
+    url: &str,
+) -> Result<Vec<RemoteChunk<'a>>> {
+    const LIMIT: usize = 20_000;
+    let base = url.encode_utf16().count() + 128;
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut size = base;
+    for (branch, oid) in branches {
+        let cost = branch.encode_utf16().count() * 2 + oid.len() + 96;
+        if base + cost > LIMIT {
+            return Err("Remote URL or branch name exceeds the safe command-line size.".into());
+        }
+        if size + cost > LIMIT && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+            size = base;
+        }
+        size += cost;
+        chunk.push((branch, oid));
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    Ok(chunks)
 }
 pub(super) fn optimize(context: &Context) -> Result<String> {
     let before = storage_kib(&context.root)?;
@@ -452,6 +504,171 @@ mod tests {
         }
     }
     #[test]
+    fn cleanup_more_than_a_thousand_branches_is_atomic_and_recoverable() {
+        let f = Fixture::new();
+        let oid = f.git(&["rev-parse", "refs/heads/old/local"]);
+        let mut input = String::from("start\n");
+        for index in 0..1100 {
+            input += &format!("create refs/heads/large-cleanup/{index:04} {oid}\n");
+        }
+        input += "prepare\ncommit\n";
+        run(
+            &f.root,
+            &["update-ref", "--stdin"],
+            Some(input.as_bytes()),
+            &[],
+        )
+        .unwrap();
+        let branches: Vec<_> = analyze(&f.root, crate::ui::time::now_unix())
+            .unwrap()
+            .candidates
+            .into_iter()
+            .filter(|c| c.name.starts_with("large-cleanup/"))
+            .collect();
+        assert_eq!(branches.len(), 1100);
+        let outcome = f.run(Plan {
+            branches,
+            delete_remotes: false,
+        });
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert!(
+            f.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/large-cleanup/"
+            ])
+            .is_empty()
+        );
+        assert_eq!(f.git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        assert_eq!(
+            f.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/large-cleanup/"
+            ])
+            .lines()
+            .count(),
+            1100
+        );
+        assert!(execute(&f.root, Request::MoveTo(1)).result.is_ok());
+        assert!(
+            f.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/large-cleanup/"
+            ])
+            .is_empty()
+        );
+        assert!(f.git(&["status", "--porcelain"]).is_empty());
+        assert!(
+            !output(&f.bare, &["rev-parse", "refs/heads/fixes/task-123"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn cleanup_server_batch_above_former_limit_keeps_local_transaction_and_leases() {
+        let f = Fixture::new();
+        let oid = f.git(&["rev-parse", "HEAD"]);
+        let mut local = String::from("start\n");
+        let mut server = String::from("start\n");
+        for index in 0..300 {
+            let name = format!("large-remote/{index:04}");
+            local += &format!(
+                "create refs/heads/{name} {oid}\ncreate refs/remotes/origin/{name} {oid}\n"
+            );
+            server += &format!("create refs/heads/{name} {oid}\n");
+        }
+        local += "prepare\ncommit\n";
+        server += "prepare\ncommit\n";
+        run(
+            &f.root,
+            &["update-ref", "--stdin"],
+            Some(local.as_bytes()),
+            &[],
+        )
+        .unwrap();
+        run(
+            &f.bare,
+            &["update-ref", "--stdin"],
+            Some(server.as_bytes()),
+            &[],
+        )
+        .unwrap();
+        let branches: Vec<_> = analyze(&f.root, crate::ui::time::now_unix())
+            .unwrap()
+            .candidates
+            .into_iter()
+            .filter(|c| c.name.starts_with("large-remote/"))
+            .collect();
+        assert_eq!(branches.len(), 300);
+        let result = f.run(Plan {
+            branches,
+            delete_remotes: true,
+        });
+        assert!(result.result.is_ok(), "{:?}", result.result);
+        for (root, prefix) in [
+            (&f.root, "refs/heads/large-remote/"),
+            (&f.root, "refs/remotes/origin/large-remote/"),
+            (&f.bare, "refs/heads/large-remote/"),
+        ] {
+            assert!(
+                output(root, &["for-each-ref", "--format=%(refname)", prefix])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        assert_eq!(
+            f.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/large-remote/"
+            ])
+            .lines()
+            .count(),
+            300
+        );
+        assert!(
+            output(
+                &f.bare,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads/large-remote/"
+                ]
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+    #[test]
+    fn cleanup_remote_chunks_bound_arguments_without_losing_any_selection() {
+        let branches: BTreeMap<_, _> = (0..1500)
+            .map(|i| {
+                (
+                    format!("features/{i:04}/{}", "long".repeat(20)),
+                    "a".repeat(40),
+                )
+            })
+            .collect();
+        let chunks = remote_chunks(&branches, "local-origin.git").unwrap();
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 1500);
+        for chunk in chunks {
+            assert!(
+                chunk
+                    .iter()
+                    .map(|(b, oid)| b.encode_utf16().count() * 2 + oid.len() + 96)
+                    .sum::<usize>()
+                    + 128
+                    + "local-origin.git".len()
+                    <= 20_000
+            );
+        }
+    }
+    #[test]
     fn cleanup_analysis_classifies_dates_protection_and_worktree_exclusions() {
         let f = Fixture::new();
         let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
@@ -534,6 +751,10 @@ mod tests {
         );
         assert_eq!(
             output(&f.bare, &["rev-parse", "refs/heads/fixes/task-123"]).unwrap(),
+            branch.oid
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/fixes/task-123"]),
             branch.oid
         );
         assert_eq!(fs::read(f.root.join("file.txt")).unwrap(), before);
@@ -759,6 +980,54 @@ mod tests {
             f.git(&["rev-parse", "refs/heads/fixes/task-123"]),
             branch.oid
         );
+    }
+    #[test]
+    #[ignore = "one warmup and fifteen 1500-branch cleanup action samples"]
+    fn benchmark_cleanup_large() {
+        for sample in -1..15 {
+            let f = Fixture::new();
+            let oid = f.git(&["rev-parse", "refs/heads/old/local"]);
+            let mut input = String::from("start\n");
+            for index in 0..1500 {
+                input += &format!("create refs/heads/large-cleanup/{index:04} {oid}\n");
+            }
+            input += "prepare\ncommit\n";
+            run(
+                &f.root,
+                &["update-ref", "--stdin"],
+                Some(input.as_bytes()),
+                &[],
+            )
+            .unwrap();
+            let start = std::time::Instant::now();
+            let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+            let analysis_ms = start.elapsed().as_secs_f64() * 1000.;
+            let branches: Vec<_> = analysis
+                .candidates
+                .into_iter()
+                .filter(|c| c.name.starts_with("large-cleanup/"))
+                .collect();
+            assert_eq!(branches.len(), 1500);
+            let start = std::time::Instant::now();
+            let result = f.run(Plan {
+                branches,
+                delete_remotes: false,
+            });
+            assert!(result.result.is_ok(), "{:?}", result.result);
+            let delete_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert!(
+                f.git(&[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads/large-cleanup/"
+                ])
+                .is_empty()
+            );
+            println!(
+                "{}",
+                serde_json::json!({"sample": sample, "branches": 1500, "analysisMs": analysis_ms, "deleteMs": delete_ms})
+            );
+        }
     }
     #[test]
     #[ignore = "one warmup and fifteen disposable cleanup analysis/action samples"]

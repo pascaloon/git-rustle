@@ -219,6 +219,7 @@ struct Desktop {
     diff_files_scroll: UniformListScrollHandle,
     context_menu: Option<Point<Pixels>>,
     pending_discard: Option<pending_discard::Menu>,
+    discard_batch: Option<pending_discard::Batch>,
     discard_scenario: pending_discard::Scenario,
     settings_loaded: bool,
     branches_loaded: bool,
@@ -231,7 +232,7 @@ struct Desktop {
     branches_scroll: UniformListScrollHandle,
     diff_scroll: UniformListScrollHandle,
     diff_horizontal: crate::desktop_scroll::DiffScroll,
-    hovered_scroll: [bool; 4],
+    hovered_scroll: [bool; 5],
     notice: String,
     status_panel: Option<status::Panel>,
     close_requested: bool,
@@ -278,7 +279,7 @@ fn dialog_body(title: &'static str) -> Div {
         .child(div().flex_shrink_0().text_size(px(22.)).child(title))
 }
 fn dialog_actions() -> Div {
-    row().flex_shrink_0().justify_end()
+    row().w_full().flex_shrink_0().justify_end().gap_2()
 }
 fn dialog_overlay(body: Div) -> Div {
     column()
@@ -802,7 +803,7 @@ impl Desktop {
                         v.engine.tick(message);
                         v.poll_updates(cx);
                         v.sync_operations(window, cx);
-                        v.sync_stashes(cx);
+                        v.sync_stashes(window, cx);
                         v.sync_diff_search(window, cx);
                         v.sync_cleanup(cx);
                         v.sync_avatars(cx);
@@ -1150,6 +1151,7 @@ impl Desktop {
             diff_files_scroll: UniformListScrollHandle::new(),
             context_menu: None,
             pending_discard: None,
+            discard_batch: None,
             discard_scenario: pending_discard::Scenario::default(),
             settings_loaded: false,
             branches_loaded: false,
@@ -1162,7 +1164,7 @@ impl Desktop {
             branches_scroll: UniformListScrollHandle::new(),
             diff_horizontal: crate::desktop_scroll::DiffScroll::new(diff_scroll.clone()),
             diff_scroll,
-            hovered_scroll: [false; 4],
+            hovered_scroll: [false; 5],
             notice: String::new(),
             status_panel: None,
             close_requested: false,
@@ -1467,6 +1469,7 @@ impl Desktop {
         }
         self.context_menu = None;
         self.pending_discard = None;
+        self.discard_batch = None;
         if let Action::OpenProviderUrl(url) = action {
             if crate::remote::requests::safe_web_url(&url) {
                 cx.open_url(&url);
@@ -1797,6 +1800,9 @@ impl Desktop {
         if matches!(action, Action::CheckUpdates) {
             self.request_update_check(cx);
         }
+        self.engine
+            .app
+            .set_details_selection(&self.selected_commits.ids(self.engine.app.selected_id()));
         self.changed(cx);
         self.sync_inputs(window, cx);
     }
@@ -2260,6 +2266,18 @@ impl Desktop {
                                 .head_index
                                 .and_then(|i| app.history.commits.get(i).map(|rec| (i, rec)));
                             let lane = head.map_or(0, |(_, rec)| rec.node_lane as usize);
+                            let incoming = head.is_some_and(|(index, rec)| {
+                                index.checked_sub(1).is_some_and(|previous| {
+                                    pending_incoming(
+                                        app.history.row_cells(previous).get(lane).copied(),
+                                        app.history.commits[previous].parents.len != 0,
+                                        app.history
+                                            .row_cells(index)
+                                            .get(rec.node_lane as usize)
+                                            .copied(),
+                                    )
+                                })
+                            });
                             let cells = pending_graph_cells(
                                 head.map_or(&[], |(i, _)| app.history.row_cells(i)),
                                 lane,
@@ -2274,16 +2292,17 @@ impl Desktop {
                             r = r
                                 .relative()
                                 .children(v.todo_probe(1))
+                                .children(v.graph_feature_probe(0, 6))
                                 .bg(rgb(if selected { 0x4a2b15 } else { 0x241508 }))
                                 .border_l_2()
                                 .border_color(rgb(ACCENT))
                                 .pl(px(6.))
                                 .text_color(rgb(ACCENT_HOVER))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .hover(|s| s.bg(rgb(0x53331c)))
                                 .child(pending_graph_canvas(
                                     graph_width,
                                     lane,
+                                    incoming,
                                     cells,
                                     flags,
                                     v.graph_hover
@@ -2512,12 +2531,15 @@ impl Desktop {
         column()
             .flex_1()
             .min_h(px(120.))
+            .relative()
+            .children(self.graph_feature_probe(0, 7))
             .child(
                 row()
                     .p_2()
                     .border_b_1()
                     .border_color(rgb(LINE))
                     .child(div().flex_1().child(caption("FILES")))
+                    .children(self.discard_selected_button(cx))
                     .child(self.button("expand", "", Action::Expand(true), cx))
                     .child(self.button("collapse", "", Action::Expand(false), cx)),
             )
@@ -2710,7 +2732,12 @@ impl Desktop {
                         ),
                 );
         }
-        panel.child(self.files(cx)).into_any_element()
+        if !workflow && !app.pending.selected && self.selected_commits.count(app.selected_id()) > 2
+        {
+            panel.into_any_element()
+        } else {
+            panel.child(self.files(cx)).into_any_element()
+        }
     }
     fn diff(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.prepare_diff_search(window, cx);
@@ -2786,6 +2813,8 @@ impl Desktop {
                         let i = wrapped.map_or(visual, |r| r.source);
                         match &diff.rows[i] {
                             diff::Row::Line { left, right } => row()
+                                .relative()
+                                .children(v.ui_feature_probe(5))
                                 .w_full()
                                 .h(px(24.))
                                 .gap_0()
@@ -2794,7 +2823,10 @@ impl Desktop {
                                         left.as_ref().filter(|_| {
                                             wrapped.is_none_or(|r| r.sides[0].is_some())
                                         }),
-                                        diff.syntax_line(false, left.as_ref()),
+                                        (
+                                            diff.syntax_line(false, left.as_ref()),
+                                            &v.diff_find.query,
+                                        ),
                                         (view.id, i, false, visual),
                                         wrapped.and_then(|r| r.sides[0].clone()),
                                         v.selection.clone(),
@@ -2807,7 +2839,10 @@ impl Desktop {
                                         right.as_ref().filter(|_| {
                                             wrapped.is_none_or(|r| r.sides[1].is_some())
                                         }),
-                                        diff.syntax_line(true, right.as_ref()),
+                                        (
+                                            diff.syntax_line(true, right.as_ref()),
+                                            &v.diff_find.query,
+                                        ),
                                         (view.id, i, true, visual),
                                         wrapped.and_then(|r| r.sides[1].clone()),
                                         v.selection.clone(),
@@ -2981,6 +3016,9 @@ impl Desktop {
                         .child(
                             Button::new("project-website")
                                 .ghost()
+                                .icon(gpui_component::Icon::default().path("rustle/external-link"))
+                                .text_color(rgb(ACCENT))
+                                .tooltip("Open the project website in your browser")
                                 .label("Website")
                                 .on_click(|_, _, cx| {
                                     cx.open_url("https://pascaloon.github.io/git-rustle/")
@@ -2989,6 +3027,9 @@ impl Desktop {
                         .child(
                             Button::new("project-releases")
                                 .ghost()
+                                .icon(gpui_component::Icon::default().path("rustle/external-link"))
+                                .text_color(rgb(ACCENT))
+                                .tooltip("Open release notes in your browser")
                                 .label("Release notes")
                                 .on_click(|_, _, cx| {
                                     cx.open_url("https://github.com/pascaloon/git-rustle/releases")
@@ -3170,6 +3211,10 @@ impl Desktop {
             Some(
                 "graph-multiselect"
                     | "multi-details"
+                    | "pending-graph"
+                    | "stash-preview"
+                    | "stash-file"
+                    | "stash-pop"
                     | "dense-labels"
                     | "checkout-simple"
                     | "diff-base"
@@ -3177,7 +3222,10 @@ impl Desktop {
         ) {
             return self.graph_features.verified;
         }
-        if self.scenario.as_deref() == Some("pending-discard") {
+        if matches!(
+            self.scenario.as_deref(),
+            Some("pending-discard" | "pending-discard-selected")
+        ) {
             return self.discard_scenario.verified;
         }
         if let Some(ready) = self.conflicts_ready() {
@@ -3670,7 +3718,9 @@ impl Render for Desktop {
                     cx.stop_propagation();
                     return;
                 }
-                if e.keystroke.key == "escape" && v.pending_discard.take().is_some() {
+                if e.keystroke.key == "escape"
+                    && (v.pending_discard.take().is_some() | v.discard_batch.take().is_some())
+                {
                     cx.notify();
                     cx.stop_propagation();
                     return;
@@ -3780,13 +3830,14 @@ fn diff_stats(added: u32, removed: u32) -> Div {
 
 fn diff_line(
     line: Option<&diff::Line>,
-    syntax: &[diff::syntax::Span],
+    highlights: (&[diff::syntax::Span], &str),
     id: (u32, usize, bool, usize),
     span: Option<std::ops::Range<usize>>,
     selection: std::rc::Rc<std::cell::RefCell<crate::selectable::Selection>>,
     focus: FocusHandle,
     horizontal: std::rc::Rc<std::cell::Cell<Pixels>>,
 ) -> Div {
+    let (syntax, search_query) = highlights;
     let added = id.2;
     let changed = line.is_some_and(|l| l.kind != diff::LineKind::Context);
     let offset = span.as_ref().map_or(0, |r| r.start);
@@ -3839,6 +3890,13 @@ fn diff_line(
         .when(line.is_some(), |s| {
             let decorations = crate::selectable::Decorations {
                 changes: hl,
+                matches: line.map_or_else(Vec::new, |line| {
+                    diff::search::visible_highlight_ranges(
+                        &line.text,
+                        search_query,
+                        offset..offset + text.len(),
+                    )
+                }),
                 syntax: diff::syntax::clipped(syntax, offset..offset + text.len()),
             };
             s.child(crate::selectable::line(
@@ -3886,7 +3944,7 @@ fn paint_graph_node_outline(center: Point<Pixels>, window: &mut Window) {
         radius,
         rgba(0),
         px(1.),
-        rgb(TEXT),
+        rgb(0x996039),
         BorderStyle::Solid,
     ));
 }
@@ -3903,6 +3961,36 @@ fn graph_connects_top(kind: CellKind) -> bool {
             | CellKind::JoinFromLeft
             | CellKind::JoinFromRight
     )
+}
+
+fn graph_connects_bottom(kind: CellKind) -> bool {
+    matches!(
+        kind,
+        CellKind::Vertical
+            | CellKind::Node
+            | CellKind::MergeNode
+            | CellKind::Cross
+            | CellKind::StartToRight
+            | CellKind::StartToLeft
+            | CellKind::JoinFromLeft
+            | CellKind::JoinFromRight
+    )
+}
+
+fn pending_incoming(
+    previous: Option<GraphCell>,
+    previous_has_parents: bool,
+    head: Option<GraphCell>,
+) -> bool {
+    match (previous, head) {
+        (Some(previous), Some(head)) => {
+            previous.color() == head.color()
+                && graph_connects_bottom(previous.kind())
+                && (previous_has_parents
+                    || !matches!(previous.kind(), CellKind::Node | CellKind::MergeNode))
+        }
+        _ => false,
+    }
 }
 
 fn graph_color(cell: GraphCell, flag: u8) -> Hsla {
@@ -3941,6 +4029,7 @@ fn pending_graph_cells(head: &[GraphCell], lane: usize) -> Vec<GraphCell> {
 fn pending_graph_canvas(
     width: f32,
     lane: usize,
+    incoming: bool,
     cells: Vec<GraphCell>,
     flags: Vec<u8>,
     hovered: Vec<u8>,
@@ -3958,12 +4047,24 @@ fn pending_graph_canvas(
                         continue;
                     }
                     let color = if outline {
-                        rgb(TEXT).into()
+                        rgb(0x996039).into()
                     } else {
                         graph_color(*cell, flags.get(i).copied().unwrap_or(0))
                     };
                     let track_width = px(if outline { 4. } else { 2. });
                     if i == lane {
+                        if incoming {
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(center.x - track_width / 2., bounds.top()),
+                                    size(
+                                        track_width,
+                                        center.y - px(GRAPH_NODE_RADIUS) - bounds.top(),
+                                    ),
+                                ),
+                                color,
+                            ));
+                        }
                         // Stop at the rim so the pending marker stays hollow on every background.
                         let start = center.y + px(GRAPH_NODE_RADIUS);
                         window.paint_quad(fill(
@@ -4014,13 +4115,13 @@ fn graph_canvas(
                     let highlighted = hover & crate::graph::hover::GLYPH != 0;
                     let base = graph_color(*c, flags.get(i).copied().unwrap_or(0));
                     let color = if outline && highlighted {
-                        rgb(TEXT).into()
+                        rgb(0x996039).into()
                     } else {
                         base
                     };
                     let connector = hover & crate::graph::hover::CONNECTOR != 0;
                     let connector_color = if outline && connector {
-                        rgb(TEXT).into()
+                        rgb(0x996039).into()
                     } else {
                         base
                     };
@@ -4160,5 +4261,36 @@ mod graph_tests {
             pending_graph_cells(&[], 0),
             vec![GraphCell::new(CellKind::Node, 0)]
         );
+    }
+
+    #[test]
+    fn pending_below_remote_descendant_preserves_incoming_head_lane() {
+        let mut layout = Layout::new();
+        let remote = layout.push(&id(3), &[id(2)]);
+        let head = layout.push(&id(2), &[id(1)]);
+        let lane = head.node_lane as usize;
+        assert!(super::graph_connects_bottom(remote.cells[lane].kind()));
+        let pending = pending_graph_cells(&head.cells, lane);
+        assert_eq!(pending[lane].kind(), CellKind::Node);
+        assert_eq!(pending[lane].color(), remote.cells[lane].color());
+        assert!(super::graph_connects_top(head.cells[lane].kind()));
+        assert!(super::pending_incoming(
+            Some(remote.cells[lane]),
+            true,
+            Some(head.cells[lane])
+        ));
+    }
+
+    #[test]
+    fn pending_does_not_connect_to_an_unrelated_root_reusing_the_lane() {
+        let node = |color| Some(GraphCell::new(CellKind::Node, color));
+        assert!(!super::pending_incoming(node(0), false, node(1)));
+        assert!(!super::pending_incoming(node(0), false, node(0)));
+        assert!(!super::pending_incoming(node(0), true, node(1)));
+        assert!(super::pending_incoming(
+            Some(GraphCell::new(CellKind::Vertical, 1)),
+            false,
+            node(1)
+        ));
     }
 }

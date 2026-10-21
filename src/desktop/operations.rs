@@ -565,6 +565,7 @@ impl Desktop {
                 request @ (Request::Abort
                 | Request::Skip
                 | Request::ApplyStash(_)
+                | Request::PopStash(_)
                 | Request::DropStash(_)
                 | Request::Resolve {
                     choice: Resolution::Ours | Resolution::Theirs,
@@ -588,6 +589,10 @@ impl Desktop {
                     }
                     Request::ApplyStash(stash) => format!(
                         "Apply {}? Pending changes must be committed or stashed first. The stash will be kept.",
+                        stash.subject
+                    ),
+                    Request::PopStash(stash) => format!(
+                        "Pop {}? Pending changes must be committed or stashed first. The stash is removed only after successful application; conflicts keep it.",
                         stash.subject
                     ),
                     Request::DropStash(stash) => format!(
@@ -627,8 +632,8 @@ impl Desktop {
             {
                 self.engine.app.checkout_notice = None;
             }
-            let refresh_stashes =
-                matches!(&request, Request::ApplyStash(_) | Request::DropStash(_));
+            let applied_stash = matches!(&request, Request::ApplyStash(_) | Request::PopStash(_));
+            let refresh_stashes = applied_stash || matches!(&request, Request::DropStash(_));
             let cleanup_mutation =
                 matches!(&request, Request::Cleanup(_) | Request::OptimizeStorage);
             let read_conflict = matches!(&request, Request::ReadConflict(_));
@@ -638,6 +643,9 @@ impl Desktop {
                 }
                 if refresh_stashes {
                     self.stash_mutation_started();
+                }
+                if applied_stash {
+                    self.stash_apply_started();
                 }
             } else if read_conflict {
                 self.defer_conflict_read();
@@ -1138,15 +1146,7 @@ impl Desktop {
                             .px_4()
                             .py_2()
                             .rounded_md()
-                            .bg(rgb(if enabled {
-                                if dialog == Dialog::Delete {
-                                    REMOVED
-                                } else {
-                                    ACCENT
-                                }
-                            } else {
-                                CONTROL
-                            }))
+                            .bg(rgb(if enabled { ACCENT } else { CONTROL }))
                             .text_color(rgb(if enabled { BG } else { MUTED }))
                             .child(submit)
                             .when(enabled, |s| {
@@ -1185,19 +1185,29 @@ impl Desktop {
                             .child(div().text_size(px(20.)).child("Review Git operation"))
                             .child(text.clone())
                             .child(
-                                row()
-                                    .child(self.op_button(
-                                        "operation-confirm",
-                                        "Confirm",
-                                        Action::Confirm,
-                                        cx,
-                                    ))
+                                dialog_actions()
                                     .child(self.op_button(
                                         "operation-cancel",
                                         "Cancel",
                                         Action::Cancel,
                                         cx,
-                                    )),
+                                    ))
+                                    .child(
+                                        Button::new("operation-confirm")
+                                            .primary()
+                                            .label("Confirm")
+                                            .disabled(
+                                                self.engine.operation_busy
+                                                    || self.engine.repository_edit_busy
+                                                    || self.engine.app.pending.busy
+                                                    || self.engine.app.branches.busy
+                                                    || self.engine.app.settings.saving
+                                                    || self.external_merge_busy(),
+                                            )
+                                            .on_click(cx.listener(|v, _, w, cx| {
+                                                v.operation_action(Action::Confirm, w, cx)
+                                            })),
+                                    ),
                             ),
                     )
                     .into_any_element(),

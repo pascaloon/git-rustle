@@ -70,6 +70,7 @@ impl Selection {
 }
 pub struct Decorations {
     pub changes: Vec<Range<usize>>,
+    pub matches: Vec<Range<usize>>,
     pub syntax: Vec<crate::diff::syntax::Span>,
 }
 
@@ -177,6 +178,15 @@ pub fn line(
                             } else {
                                 crate::desktop_theme::REMOVED_HIGHLIGHT
                             }),
+                        ));
+                    }
+                    for range in &decorations.matches {
+                        window.paint_quad(fill(
+                            Bounds::from_corners(
+                                point(left + line.x_for_index(range.start), bounds.top()),
+                                point(left + line.x_for_index(range.end), bounds.bottom()),
+                            ),
+                            rgba(0xd9a44188),
                         ));
                     }
                     let s = paint_selection.borrow();

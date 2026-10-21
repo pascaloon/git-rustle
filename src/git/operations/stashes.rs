@@ -33,6 +33,34 @@ pub fn list(root: &Path) -> Result<Vec<Stash>> {
     Ok(entries)
 }
 
+/// Stash worktree versus its original HEAD, plus the optional untracked tree.
+/// Immutable blob IDs let the ordinary diff/search workers inspect the result.
+#[derive(Clone, Debug)]
+pub struct Preview {
+    pub base: gix::ObjectId,
+    pub oid: gix::ObjectId,
+    pub changes: crate::diff::TreeDiff,
+}
+pub fn preview(root: &Path, frozen: &Stash) -> Result<Preview> {
+    let stash = current(root, frozen)?;
+    let repo = super::super::open(root).map_err(err)?;
+    let oid = gix::ObjectId::from_hex(stash.oid.as_bytes()).map_err(err)?;
+    let details = super::super::commit_details(&repo, &oid).map_err(err)?;
+    let base = details
+        .parents
+        .first()
+        .copied()
+        .ok_or("Stash has no base commit")?;
+    let mut changes = crate::diff::tree_diff(&repo, Some(&base), &oid).map_err(err)?;
+    if let Some(untracked) = details.parents.get(2) {
+        let extra = crate::diff::tree_diff(&repo, None, untracked).map_err(err)?;
+        changes.files.extend(extra.files);
+        changes.files.sort_by(|a, b| a.path.cmp(&b.path));
+        changes.files.dedup_by(|a, b| a.path == b.path);
+    }
+    Ok(Preview { base, oid, changes })
+}
+
 pub(super) fn create(context: &Context, message: Option<&str>) -> Result<()> {
     if command::checked(
         &context.root,

@@ -1,6 +1,16 @@
 //! Flat and slash-folder branch views; projections are cached by Browser updates.
 use super::*;
-type Paints = std::rc::Rc<std::cell::RefCell<[Option<(u64, Bounds<Pixels>)>; 7]>>;
+
+pub(super) fn branch_row(selected: bool) -> Div {
+    row()
+        .w_full()
+        .h(px(40.))
+        .px_4()
+        .bg(rgb(if selected { SELECTED } else { BG }))
+        .hover(|s| s.bg(rgb(HOVER)))
+}
+
+type Paints = std::rc::Rc<std::cell::RefCell<[Option<(u64, Bounds<Pixels>)>; 10]>>;
 #[derive(Default)]
 pub(super) struct State {
     bench: Option<Box<Bench>>,
@@ -51,7 +61,7 @@ impl Desktop {
                                         .pl(px(16. + *depth as f32 * 18.))
                                         .pr_4()
                                         .gap_2()
-                                        .bg(rgb(PANEL))
+                                        .bg(rgb(BG))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgb(HOVER)))
                                         .child(icon(
@@ -79,7 +89,7 @@ impl Desktop {
                             (i, b.entries[b.visible[i]].target.label(), 0)
                         };
                         let entry = &b.entries[b.visible[i]];
-                        row()
+                        branch_row(b.selected == i)
                             .relative()
                             .children(
                                 (entry.target.name == "fixes/task-123")
@@ -102,7 +112,6 @@ impl Desktop {
                             .pl(px(16. + depth as f32 * 18.))
                             .bg(rgb(if b.selected == i { SELECTED } else { BG }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
                             .child(
                                 icon(if entry.current {
                                     "head"
@@ -239,7 +248,6 @@ impl Desktop {
                     .px_3()
                     .border_b_1()
                     .border_color(rgb(LINE))
-                    .child(caption(format!("{} branches", browser.matching_count)))
                     .child(
                         row()
                             .gap_0()
@@ -250,7 +258,8 @@ impl Desktop {
                                 Button::new("branch-view-list")
                                     .small()
                                     .ghost()
-                                    .label("List")
+                                    .icon(gpui_component::Icon::default().path("rustle/list"))
+                                    .tooltip("List view")
                                     .selected(!browser.hierarchy)
                                     .on_click(cx.listener(|v, _, _, cx| {
                                         v.branch_view_mode(false, cx);
@@ -260,13 +269,15 @@ impl Desktop {
                                 Button::new("branch-view-hierarchy")
                                     .small()
                                     .ghost()
-                                    .label("Folders")
+                                    .icon(gpui_component::Icon::default().path("rustle/folder"))
+                                    .tooltip("Folder view")
                                     .selected(browser.hierarchy)
                                     .on_click(cx.listener(|v, _, _, cx| {
                                         v.branch_view_mode(true, cx);
                                     })),
                             ),
                     )
+                    .child(caption(format!("{} branches", browser.matching_count)).ml_3())
                     .child(div().flex_1())
                     .child(
                         div()
@@ -393,7 +404,7 @@ impl Desktop {
             verified: false,
             started: Instant::now(),
             head: self.engine.app.head_id(),
-            paints: std::rc::Rc::new(std::cell::RefCell::new([None; 7])),
+            paints: std::rc::Rc::new(std::cell::RefCell::new([None; 10])),
         }));
         self.engine.mark("branch cleanup requested");
         self.action(
@@ -505,10 +516,25 @@ impl Desktop {
             && self.branch_cleanup_painted(3, window)
             && self.branch_cleanup_painted(4, window)
             && self.branch_cleanup_painted(5, window)
+            && self.branch_cleanup_painted(7, window)
+            && self.branch_cleanup_painted(8, window)
+            && self.branch_cleanup_painted(9, window)
         {
+            let paints = self.branch_views.bench.as_ref().unwrap().paints.borrow();
+            let content = paints[3].unwrap().1;
+            let matching = paints[7].unwrap().1;
+            let caution = paints[8].unwrap().1;
+            let footer = paints[9].unwrap().1;
+            assert!(matching.bottom() <= caution.top());
+            assert!(caution.bottom() <= footer.top());
+            assert!((footer.bottom() - content.bottom()).abs() <= px(1.));
+            assert!((paints[4].unwrap().1.size.height - px(40.)).abs() <= px(1.));
+            assert!((paints[5].unwrap().1.size.height - px(40.)).abs() <= px(1.));
+            drop(paints);
             self.cleanup_scenario_assert_defaults();
             if name == "cleanup-review" {
-                self.branch_cleanup_finish();
+                self.cleanup_scenario_scroll(false, false);
+                self.branch_cleanup_advance(10);
             } else {
                 self.cleanup_action(cleanup::Action::Clear, window, cx);
                 self.cleanup_action(cleanup::Action::Toggle("fixes/task-123".into()), window, cx);
@@ -524,6 +550,26 @@ impl Desktop {
                 );
                 self.branch_cleanup_advance(2);
             }
+        } else if phase == 10
+            && self.branch_cleanup_painted(7, window)
+            && self.branch_cleanup_painted(8, window)
+        {
+            self.cleanup_scenario_assert_scroll(false);
+            self.cleanup_scenario_scroll(true, false);
+            self.branch_cleanup_advance(11);
+        } else if phase == 11
+            && self.branch_cleanup_painted(7, window)
+            && self.branch_cleanup_painted(8, window)
+        {
+            self.cleanup_scenario_assert_scroll(true);
+            self.cleanup_scenario_scroll(false, true);
+            self.cleanup_scenario_scroll(true, true);
+            self.branch_cleanup_advance(12);
+        } else if phase == 12
+            && self.branch_cleanup_painted(4, window)
+            && self.branch_cleanup_painted(5, window)
+        {
+            self.branch_cleanup_finish();
         } else if phase == 2 && self.branch_cleanup_painted(6, window) {
             self.engine.mark("cleanup delete requested");
             self.operation_action(operations::Action::Confirm, window, cx);

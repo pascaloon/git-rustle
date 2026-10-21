@@ -30,7 +30,7 @@ rendering and its durations are not performance samples.
 
 The next graph feature bundle adds `scripts/benchmark-graph-features.ps1`. Supply
 the final candidate and a fresh ignored output directory; its default matrix
-retains one warm-up plus 15 samples for `graph-multiselect`, `multi-details`,
+retains one warm-up plus 15 samples for `graph-multiselect`, `multi-details`, `pending-graph`,
 `dense-labels`, `checkout-simple`, and `diff-base`. It builds clean disposable
 main/topic fixtures, invokes real handlers, awaits loaded workers and relevant
 GPUI paints, checks column bounds and index/worktree/ref postconditions, and
@@ -39,6 +39,31 @@ single capture per view; inspect those PNGs rather than treating pixel checks as
 visual review. The candidate-only intervals measure request through verified
 frame and include worker dispatch and final frame scheduling. They are not a
 comparison against the former confirmation workflow.
+
+The multi-details case selects exactly two commits, expands both metadata cards,
+and waits for the comparison files and inspector to paint. The three-selection
+case verifies that no misleading single-commit file tree remains. The pending
+case keeps HEAD below an incoming remote reference, switches from multiple
+commits to Pending with Control held, then back to one commit and Pending again.
+It verifies exclusive selection and the painted pending row; screenshot review
+separately checks the incoming lane and dim orange selected graph accents.
+
+The same runner also includes `stash-preview`, `stash-file`, and `stash-pop`.
+Disposable stashes include tracked and untracked content. Preview waits for
+expanded file rows to paint; file inspection invokes the actual file action and
+awaits its blob diff and frame. Pop confirms the real journaled operation, waits
+for refreshed pending changes and the graph paint, and verifies exact restored
+content, two surviving stashes, and unchanged HEAD and index. These new flows
+have candidate-only costs. Use separate `-Screenshots` runs for visual review.
+
+For checked pending files, run `scripts/benchmark-discard.ps1 -Batch -Candidate
+<candidate> -Samples 15 -OutputDirectory target/bench/<run>/discard-batch`.
+The native scenario awaits the toolbar's initial and armed paints, invokes its
+two real action handlers, verifies two files were discarded while the unchecked
+untracked file survived, and restores the exact prior index and worktree through
+journal Undo. `discardFrameMs` ends at the verified discard frame; Undo is checked
+afterward. Run `-Batch -Screenshots` in a separate directory to inspect the final
+restored pending-file toolbar. Capture intervals are excluded from timing.
 
 Also run `desktop::hover::tests::benchmark_multi_selected_paths` (100k records,
 80-row viewport, 1/4/16 anchors), `checkout::tests::benchmark_branch_choices`

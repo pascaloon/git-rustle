@@ -1,12 +1,15 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
     [ValidateRange(1,100)][int]$Samples = 15,
+    [switch]$Batch,
+    [switch]$Screenshots,
     [Parameter(Mandatory)][string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
 $sourceRoot = (Resolve-Path -LiteralPath "$PSScriptRoot/..").Path
 . (Join-Path $PSScriptRoot 'benchmark-processes.ps1')
 . (Join-Path $PSScriptRoot 'benchmark-native-process.ps1')
+. (Join-Path $PSScriptRoot 'benchmark-screenshot.ps1')
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $allowed = Join-Path $sourceRoot 'target/bench'
@@ -14,7 +17,7 @@ if (!$OutputDirectory.StartsWith($allowed + [IO.Path]::DirectorySeparatorChar, [
 if (Test-Path -LiteralPath $OutputDirectory) { throw 'Choose a new output directory; existing samples are retained.' }
 New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
 $saved = @{}
-$names = @('LOCALAPPDATA','TEMP','TMP','GIT_RUSTLE_TIMING','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES','GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_CONFIG_COUNT','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM')
+$names = @('LOCALAPPDATA','TEMP','TMP','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES','GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_CONFIG_COUNT','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM')
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 function Fixture-Git([string]$Path, [string[]]$Arguments) {
     $lines = @(& git -c "safe.directory=$($Path.Replace('\','/'))" -c core.hooksPath= -c core.autocrlf=false -c commit.gpgSign=false -C $Path @Arguments 2>&1)
@@ -30,8 +33,9 @@ try {
     [IO.File]::WriteAllText($env:GIT_CONFIG_GLOBAL, '')
     $null = Fixture-Git $sourceRoot @('config','--file',$env:GIT_CONFIG_GLOBAL,'--add','safe.directory',($OutputDirectory.Replace('\','/') + '/*'))
     $hashBefore = (Get-FileHash -LiteralPath $Candidate).Hash
-    [pscustomobject]@{candidate=$Candidate;sha256=$hashBefore;sourceHead=(Fixture-Git $sourceRoot @('rev-parse','HEAD'));samples=$Samples;scenario='pending-discard'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
-    for ($sample = 0; $sample -le $Samples; $sample++) {
+    [pscustomobject]@{candidate=$Candidate;sha256=$hashBefore;sourceHead=(Fixture-Git $sourceRoot @('rev-parse','HEAD'));samples=$Samples;batch=[bool]$Batch;screenshots=[bool]$Screenshots} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
+    $lastSample = if($Screenshots){0}else{$Samples}
+    for ($sample = 0; $sample -le $lastSample; $sample++) {
         Assert-BenchmarkIdle -WorkspaceRoot $sourceRoot -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
         $launch = Join-Path $OutputDirectory "sample-$sample"
         $fixture = Join-Path $launch 'repository'
@@ -51,21 +55,37 @@ try {
         $head = Fixture-Git $fixture @('rev-parse','HEAD')
         $indexB = Fixture-Git $fixture @('show',':b.txt')
         $untrackedHash = (Get-FileHash -LiteralPath (Join-Path $fixture 'untracked.txt')).Hash
+        $beforeStatus = Fixture-Git $fixture @('status','--porcelain=v1')
+        $beforeIndex = Fixture-Git $fixture @('write-tree')
         $env:LOCALAPPDATA = Join-Path $launch 'appdata'
         $env:TEMP = Join-Path $launch 'temp'
         $env:TMP = $env:TEMP
         New-Item -ItemType Directory -Path $env:LOCALAPPDATA,$env:TEMP | Out-Null
         $env:GIT_RUSTLE_TIMING = '1'
-        $env:GIT_RUSTLE_AUTOQUIT = '100'
-        $env:GIT_RUSTLE_SCENARIO = 'pending-discard'
+        $env:GIT_RUSTLE_TRACE = if($Screenshots){'1'}else{'0'}
+        $env:GIT_RUSTLE_AUTOQUIT = if($Screenshots){'600000'}else{'100'}
+        $env:GIT_RUSTLE_SCENARIO = if($Batch){'pending-discard-selected'}else{'pending-discard'}
         $env:GIT_RUSTLE_DUMP = Join-Path $launch 'state.txt'
         $env:GIT_RUSTLE_FRAME_SAMPLES = Join-Path $launch 'frames.json'
         $log = Join-Path $launch 'timing.txt'
         # Automated actions verify GPUI paint without interactive user input.
         $process = Start-BenchmarkNativeProcess -FilePath $Candidate -ArgumentList @('"' + $fixture + '"') -RedirectStandardError $log
-        if (!$process.WaitForExit(60000)) { $process.Kill(); throw "Timeout: $log" }
-        $process.Refresh()
-        if ($process.ExitCode -ne 0) { throw "Native discard failed: $log" }
+        try {
+            if($Screenshots){
+                $readyMark=if($Batch){'desktop discard undo verified frame'}else{'desktop discard verified frame'}
+                $deadline=[DateTime]::UtcNow.AddSeconds(60);$ready=$false
+                while([DateTime]::UtcNow-lt$deadline){
+                    if($process.WaitForExit(0)){throw "Discard exited before capture: $log"}
+                    if((Get-Content -LiteralPath $log -Raw)-match$readyMark){$ready=$true;break}
+                    Start-Sleep -Milliseconds 50
+                }
+                if(!$ready){throw "Discard paint timeout: $log"}
+                Save-BenchmarkNativeScreenshot -Process $process -OutputPath (Join-Path $launch 'screenshot.png') -CloseAfterCapture -TimeoutSeconds 15|Out-Null
+            }
+            if (!$process.WaitForExit(60000)) { $process.Kill(); throw "Timeout: $log" }
+            $process.Refresh()
+            if ($process.ExitCode -ne 0) { throw "Native discard failed: $log" }
+        } finally { $process.Dispose() }
         $marks = @{}
         foreach ($match in [regex]::Matches((Get-Content -LiteralPath $log -Raw),'([\d.]+) ms  ([^\r\n]+)')) { if (!$marks.ContainsKey($match.Groups[2].Value)) { $marks[$match.Groups[2].Value] = [double]::Parse($match.Groups[1].Value,[cultureinfo]::InvariantCulture) } }
         foreach ($mark in @('desktop discard menu requested','desktop discard menu painted','desktop discard armed red painted','desktop discard requested','desktop discard verified frame','desktop scenario frame')) { if (!$marks.ContainsKey($mark)) { throw "Missing $mark in $log" } }
@@ -79,12 +99,19 @@ try {
         $workerMs = [double]::Parse($workerEnd.Groups[1].Value,[cultureinfo]::InvariantCulture) - [double]::Parse($workerStart.Groups[1].Value,[cultureinfo]::InvariantCulture)
         if ($marks['desktop discard armed red painted'] -lt $marks['desktop discard menu painted']) { throw 'Confirmation did not follow initial menu paint.' }
         if ((Fixture-Git $fixture @('rev-parse','HEAD')) -ne $head -or (Fixture-Git $fixture @('show',':b.txt')) -ne $indexB -or (Get-FileHash -LiteralPath (Join-Path $fixture 'untracked.txt')).Hash -ne $untrackedHash) { throw 'Discard modified unrelated fixture state.' }
-        if ([IO.File]::ReadAllText((Join-Path $fixture 'a.txt')) -cne "base a`n" -or (Fixture-Git $fixture @('diff','--cached','--name-only')) -ne 'b.txt') { throw 'Discard did not restore only a.txt.' }
+        if($Batch){
+            if(!$marks.ContainsKey('desktop discard undo verified frame')){throw 'Missing batch Undo paint'}
+            if([IO.File]::ReadAllText((Join-Path $fixture 'a.txt'))-cne"unstaged a`n"-or(Fixture-Git $fixture @('write-tree'))-cne$beforeIndex-or(Fixture-Git $fixture @('status','--porcelain=v1'))-cne$beforeStatus){throw 'Batch Undo did not restore exact fixture state'}
+        }elseif ([IO.File]::ReadAllText((Join-Path $fixture 'a.txt')) -cne "base a`n" -or (Fixture-Git $fixture @('diff','--cached','--name-only')) -ne 'b.txt') { throw 'Discard did not restore only a.txt.' }
         $rows += [pscustomobject]@{sample=$sample;warmup=($sample -eq 0);menuMs=$marks['desktop discard menu painted']-$marks['desktop discard menu requested'];armedMs=$marks['desktop discard armed red painted']-$marks['desktop discard menu painted'];discardWorkerMs=$workerMs;discardFrameMs=$marks['desktop discard verified frame']-$marks['desktop discard requested'];log=$log}
         $rows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'samples.json')
     }
     if ((Get-FileHash -LiteralPath $Candidate).Hash -ne $hashBefore) { throw 'Candidate executable changed during benchmark.' }
     Assert-BenchmarkIdle -WorkspaceRoot $sourceRoot -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
+    if($Screenshots){
+        'Separate screenshot capture after verified native actions. Inspect PNG for visual review; capture intervals are not performance samples.'|Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.md')
+        return
+    }
     $retained = @($rows | Where-Object { !$_.warmup })
     $report = @('# Pending-file discard benchmark', '', "Retained samples: $Samples (one additional warm-up).", '', '| Metric | Median ms | p95 ms |', '| --- | ---: | ---: |')
     foreach ($metric in @('menuMs','armedMs','discardWorkerMs','discardFrameMs')) {

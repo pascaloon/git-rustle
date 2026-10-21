@@ -92,4 +92,15 @@ mod tests {
         s.click(Some(id(1)), None, true);
         assert_eq!(s.last(Some(id(9))), None);
     }
+
+    #[test]
+    fn pending_clears_multi_selection_and_next_control_click_starts_fresh() {
+        let mut selection = Commits::default();
+        selection.click(Some(id(2)), Some(id(1)), true);
+        assert_eq!(selection.count(Some(id(2))), 2);
+        selection.click(None, Some(id(2)), true);
+        assert!(selection.ids(None).is_empty());
+        selection.click(Some(id(3)), None, true);
+        assert_eq!(selection.ids(Some(id(3))), vec![id(3)]);
+    }
 }

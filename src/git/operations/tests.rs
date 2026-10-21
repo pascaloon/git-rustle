@@ -141,6 +141,84 @@ fn stash_apply_keeps_entry_and_recovers_tracked_and_untracked_files() {
 }
 
 #[test]
+fn stash_pop_and_preview_include_untracked_and_restore_the_stack_on_undo() {
+    let (f, stash) = stash_fixture(false);
+    let preview = stashes::preview(f.root(), &stash).unwrap();
+    assert_eq!(
+        preview
+            .changes
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["file.txt", "stash-only.txt"]
+    );
+    assert!(preview.changes.files.iter().all(|f| !f.worktree));
+    f.run(Request::PopStash(stash.clone()));
+    assert!(stashes::list(f.root()).unwrap().is_empty());
+    assert_eq!(
+        fs::read(f.root().join("file.txt")).unwrap(),
+        b"stashed contents\n"
+    );
+    assert_eq!(
+        fs::read(f.root().join("stash-only.txt")).unwrap(),
+        b"untracked stash contents\n"
+    );
+    assert!(stashes::preview(f.root(), &stash).is_err());
+    f.run(Request::MoveTo(0));
+    assert_eq!(stashes::list(f.root()).unwrap(), vec![stash]);
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"base\n");
+    assert!(!f.root().join("stash-only.txt").exists());
+    f.run(Request::MoveTo(1));
+    assert!(stashes::list(f.root()).unwrap().is_empty());
+    assert!(f.root().join("stash-only.txt").exists());
+}
+
+#[test]
+fn stash_pop_conflict_keeps_stash_and_remains_recoverable() {
+    let (f, stash) = stash_fixture(true);
+    let out = execute(f.root(), Request::PopStash(stash.clone()));
+    assert!(out.result.is_err());
+    assert_eq!(out.view.conflict.unwrap().kind, "Stash apply");
+    assert_eq!(stashes::list(f.root()).unwrap(), vec![stash.clone()]);
+    f.run(Request::Abort);
+    assert_eq!(stashes::list(f.root()).unwrap(), vec![stash]);
+    assert_eq!(
+        fs::read(f.root().join("file.txt")).unwrap(),
+        b"new committed contents\n"
+    );
+}
+
+#[test]
+fn discard_batch_is_one_recoverable_action_and_preserves_unselected_files() {
+    let f = Fixture::new();
+    f.write("file.txt", "staged\n");
+    f.git(&["add", "file.txt"]);
+    f.write("file.txt", "unstaged\n");
+    f.write("new.txt", "new\n");
+    f.write("keep.txt", "keep\n");
+    let snapshot =
+        super::super::worktree::snapshot(&super::super::open(f.root()).unwrap()).unwrap();
+    let requests = snapshot
+        .files
+        .iter()
+        .filter(|file| file.path != "keep.txt")
+        .map(|file| super::super::worktree::DiscardRequest::new(&snapshot, file))
+        .collect();
+    f.run(Request::DiscardFiles(requests));
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"base\n");
+    assert!(!f.root().join("new.txt").exists());
+    assert_eq!(fs::read(f.root().join("keep.txt")).unwrap(), b"keep\n");
+    f.run(Request::MoveTo(0));
+    assert_eq!(f.git(&["show", ":file.txt"]), "staged");
+    assert_eq!(fs::read(f.root().join("file.txt")).unwrap(), b"unstaged\n");
+    assert!(f.root().join("new.txt").exists());
+    f.run(Request::MoveTo(1));
+    assert!(!f.root().join("new.txt").exists());
+    assert!(f.root().join("keep.txt").exists());
+}
+
+#[test]
 fn stash_drop_re_resolves_frozen_entry_and_undo_restores_entire_stack() {
     let (f, stash) = stash_fixture(false);
     f.write("file.txt", "second stash\n");

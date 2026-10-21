@@ -22,6 +22,7 @@ pub enum Request {
     Cleanup(cleanup::Plan),
     OptimizeStorage,
     ApplyStash(stashes::Stash),
+    PopStash(stashes::Stash),
     DropStash(stashes::Stash),
     PreviewPush,
     OnBranch {
@@ -78,6 +79,7 @@ pub enum Request {
     Checkout(crate::checkout::Request),
     Commit(crate::pending::Request),
     DiscardFile(super::worktree::DiscardRequest),
+    DiscardFiles(Vec<super::worktree::DiscardRequest>),
 }
 impl Request {
     pub fn changes_repository(&self) -> bool {
@@ -1748,6 +1750,7 @@ fn execute_inner(
             }
         ),
         Request::ApplyStash(stash) => format!("Apply stash {}", stash.subject),
+        Request::PopStash(stash) => format!("Pop stash {}", stash.subject),
         Request::DropStash(stash) => format!("Delete stash {}", stash.subject),
         Request::CreateTag { name, .. } => format!("Create tag {name}"),
         Request::Delete { name, .. } => format!("Delete branch {name}"),
@@ -1759,6 +1762,7 @@ fn execute_inner(
         Request::Checkout(target) => format!("Checkout {}", target.label()),
         Request::Commit(_) => "Commit selected changes".into(),
         Request::DiscardFile(request) => format!("Discard file {}", request.file.path),
+        Request::DiscardFiles(files) => format!("Discard {} selected files", files.len()),
         _ => return Err("Unsupported operation".into()),
     };
     context.pin(&before)?;
@@ -1772,6 +1776,10 @@ fn execute_inner(
             Request::CreateStash(message) => stashes::create(context, message.as_deref())?,
             Request::Cleanup(plan) => cleanup::apply(context, plan)?,
             Request::ApplyStash(stash) => stashes::apply(context, stash)?,
+            Request::PopStash(stash) => {
+                stashes::apply(context, stash)?;
+                stashes::drop_stash(context, stash)?;
+            }
             Request::DropStash(stash) => stashes::drop_stash(context, stash)?,
             Request::Create { name, target } => {
                 validate_name(&context.root, name)?;
@@ -1831,6 +1839,9 @@ fn execute_inner(
             }
             Request::DiscardFile(request) => {
                 super::worktree::discard_file(&context.root, request)?;
+            }
+            Request::DiscardFiles(requests) => {
+                super::worktree::discard_files(&context.root, requests)?;
             }
             _ => unreachable!(),
         }

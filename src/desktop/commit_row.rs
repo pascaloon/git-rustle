@@ -77,18 +77,23 @@ impl Desktop {
         let on_path = self.graph_selected_path.node_on_path(row_index, node_lane);
         r = r.child(
             div()
-                .w(px(76.))
+                .w(px(62.))
+                .flex()
+                .items_center()
                 .relative()
                 .children(self.graph_feature_probe(row_index, 0))
                 .font_family("Cascadia Mono")
                 .flex_shrink_0()
-                .when(on_path, |s| {
-                    s.bg(rgb(TEXT)).text_color(rgb(BG)).rounded_sm()
-                })
-                .when(!on_path, |s| {
-                    s.text_color(rgb(if ghost { MUTED } else { ACCENT }))
-                })
-                .child(self.matches.styled(id.to_hex_with_len(8).to_string())),
+                .text_color(rgb(if ghost { MUTED } else { ACCENT }))
+                .child(
+                    div()
+                        .when(on_path, |s| {
+                            s.bg(rgb(0x674125))
+                                .text_color(rgb(ACCENT_HOVER))
+                                .rounded_sm()
+                        })
+                        .child(self.matches.styled(id.to_hex_with_len(8).to_string())),
+                ),
         );
         let mut middle = row()
             .relative()

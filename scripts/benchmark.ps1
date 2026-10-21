@@ -32,13 +32,16 @@ function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
     $runArgs = @('"' + $Repository + '"')
     if ($mode -eq 'uncached') { $runArgs += '--no-cache' }
     $process = Start-BenchmarkNativeProcess -FilePath $exe -ArgumentList $runArgs -RedirectStandardError $log
-    if (-not $process.WaitForExit(120000)) {
-        $process.Kill()
-        throw "Benchmark exceeded two minutes: $log"
-    }
-    $process.Refresh()
+    try {
+        if (-not $process.WaitForExit(120000)) {
+            $process.Kill()
+            throw "Benchmark exceeded two minutes: $log"
+        }
+        $process.Refresh()
+        $exitCode = $process.ExitCode
+    } finally { $process.Dispose() }
     if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
-    if ($process.ExitCode -ne 0) { throw "Benchmark failed: $log" }
+    if ($exitCode -ne 0) { throw "Benchmark failed: $log" }
     $text = Get-Content -LiteralPath $log -Raw
     $frame = [regex]::Match($text, '([\d.]+) ms  first frame')
     $walk = [regex]::Match($text, '([\d.]+) ms  walk done')
