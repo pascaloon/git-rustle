@@ -487,6 +487,22 @@ pub fn load(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TagPolicy {
+    Cached,
+    IfStale,
+    Force,
+}
+
+#[derive(Default)]
+pub struct RetainedPreview {
+    pub ghosts: HashMap<ObjectId, CommitDetails>,
+    pub sources: HashMap<ObjectId, Remote>,
+    pub branches: Vec<(ObjectId, String)>,
+    pub tags: Vec<(ObjectId, String)>,
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_stream(
     repo: &gix::Repository,
@@ -495,6 +511,37 @@ pub fn load_stream(
     updates: &[Update],
     requested: &[crate::branches::Target],
     force: bool,
+    no_cache: bool,
+    cancel: &AtomicBool,
+    publish: Option<&mut dyn FnMut(Preview)>,
+) -> Preview {
+    load_stream_policy(
+        repo,
+        local,
+        refs,
+        updates,
+        requested,
+        if force {
+            TagPolicy::Force
+        } else {
+            TagPolicy::IfStale
+        },
+        &RetainedPreview::default(),
+        no_cache,
+        cancel,
+        publish,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_stream_policy(
+    repo: &gix::Repository,
+    local: &History,
+    refs: &RefSnapshot,
+    updates: &[Update],
+    requested: &[crate::branches::Target],
+    policy: TagPolicy,
+    seed: &RetainedPreview,
     no_cache: bool,
     cancel: &AtomicBool,
     mut publish: Option<&mut dyn FnMut(Preview)>,
@@ -521,6 +568,9 @@ pub fn load_stream(
             } else {
                 eligible(path, refs, remote)?
             };
+            if policy != TagPolicy::IfStale {
+                names.extend(super::graph_names(refs, remote));
+            }
             names.extend(
                 requested
                     .iter()
@@ -587,6 +637,10 @@ pub fn load_stream(
                     return Err("Remote preview cancelled".into());
                 }
                 let details = if let Some(d) = extra.get(&id) {
+                    d.clone()
+                } else if let Some(d) = seed.ghosts.get(&id) {
+                    sources.insert(id, remote.clone());
+                    ghosts.insert(id, d.clone());
                     d.clone()
                 } else if let Ok(d) = crate::git::commit_details(repo, &id) {
                     d
@@ -657,6 +711,26 @@ pub fn load_stream(
         })();
         if let Err(error) = result {
             errors.push(format!("{}: {error}", command::clean(&update.remote.name)));
+            // A verified new tip can outlive a failing commit API. Keep the last
+            // usable ancestry for this remote until that tip can be hydrated.
+            for (id, details) in &seed.ghosts {
+                if seed.sources.get(id) == Some(&update.remote) && !local_ids.contains(id) {
+                    extra.entry(*id).or_insert_with(|| details.clone());
+                    ghosts.entry(*id).or_insert_with(|| details.clone());
+                    sources.entry(*id).or_insert_with(|| update.remote.clone());
+                }
+            }
+            let prefix = format!("{}/", update.remote.name);
+            branch_labels.extend(
+                seed.branches
+                    .iter()
+                    .filter(|(_, label)| {
+                        label
+                            .strip_prefix(&prefix)
+                            .is_some_and(|name| update.branches.iter().any(|b| b.name == name))
+                    })
+                    .cloned(),
+            );
         }
     }
     let history = if extra.is_empty() {
@@ -681,6 +755,16 @@ pub fn load_stream(
             }
         }
     };
+    if policy == TagPolicy::Cached {
+        tags.extend(
+            seed.tags
+                .iter()
+                .filter(|(id, _)| local_ids.contains(id) || extra.contains_key(id))
+                .cloned(),
+        );
+        tags.sort();
+        tags.dedup();
+    }
     let mut preview = Preview {
         history,
         ghosts,
@@ -700,6 +784,9 @@ pub fn load_stream(
             errors: preview.errors.clone(),
         });
     }
+    if policy == TagPolicy::Cached {
+        return preview;
+    }
     let gate = shared_gate(&git_dir);
     let _tag_phase = loop {
         if cancel.load(Ordering::Relaxed) {
@@ -717,7 +804,10 @@ pub fn load_stream(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if !force && stored.tags_saved != 0 && now().saturating_sub(stored.tags_saved) < TTL {
+        if policy != TagPolicy::Force
+            && stored.tags_saved != 0
+            && now().saturating_sub(stored.tags_saved) < TTL
+        {
             continue;
         }
         let mut client = Client {
@@ -1661,6 +1751,73 @@ mod tests {
         );
         assert!(published);
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cached_tag_policy_reuses_in_memory_ghost_ancestry_without_any_network() {
+        let (_dir, repo, refs, local) = fixture();
+        let ghost = oid(&"a".repeat(40)).unwrap();
+        let mut metadata = crate::git::commit_details(&repo, &refs.head_id.unwrap()).unwrap();
+        metadata.id = ghost;
+        metadata.parents = vec![refs.head_id.unwrap()];
+        let seed = HashMap::from([(ghost, metadata)]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = "http://127.0.0.1:1/branches".into();
+        let seed = RetainedPreview {
+            ghosts: seed,
+            sources: HashMap::from([(ghost, remote.clone())]),
+            branches: vec![(ghost, "origin/main".into())],
+            tags: vec![(ghost, "origin/v1".into())],
+        };
+        let update = Update {
+            remote,
+            branches: vec![Branch {
+                name: "main".into(),
+                sha: ghost.to_string(),
+            }],
+            scoped: true,
+            cached: false,
+            stale: false,
+        };
+        let tags = vec![(ghost, "origin/v1".into())];
+        let preview = load_stream_policy(
+            &repo,
+            &local,
+            &refs,
+            std::slice::from_ref(&update),
+            &[],
+            TagPolicy::Cached,
+            &seed,
+            true,
+            &AtomicBool::new(false),
+            None,
+        );
+        assert!(preview.errors.is_empty(), "{:?}", preview.errors);
+        assert!(preview.ghosts.contains_key(&ghost));
+        assert_eq!(preview.tags, tags);
+        assert_eq!(preview.history.unwrap().len(), local.len() + 1);
+        let mut advanced = update;
+        advanced.branches[0].sha = "b".repeat(40);
+        let failed = load_stream_policy(
+            &repo,
+            &local,
+            &refs,
+            &[advanced],
+            &[],
+            TagPolicy::Cached,
+            &seed,
+            true,
+            &AtomicBool::new(false),
+            None,
+        );
+        assert!(!failed.errors.is_empty());
+        assert!(failed.ghosts.contains_key(&ghost));
+        assert!(failed.branches.contains(&(ghost, "origin/main".into())));
     }
 
     #[test]

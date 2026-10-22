@@ -101,7 +101,15 @@ interior pixels. The icon generator retains the resulting alpha channel.
   branches start unchecked. Remote deletion is separately opted into and cannot
   be undone locally. **Optimize storage** consolidates objects while retaining
   recovery and unreachable commits, and reports Git's measured storage change.
-- **Refresh** reloads refs/status and revalidates remote data.
+- **Refresh** / **F5** checks local refs/status and current server tips for the
+  branches in the loaded Graph, including their upstreams, fetched remote refs
+  and explicitly previewed branches. It retains reusable caches and skips full
+  server branch lists, tags, provider metadata and stashes. Unchanged tips retain
+  the existing Graph, selection and search. Slow server checks finish in the
+  background with progress visible.
+- **Ctrl+click Refresh** / **Ctrl+F5** performs a **Force Refresh** of all views,
+  including complete server branch lists, tags, provider metadata and stashes.
+  Immutable commit, file and image caches remain reusable.
 - **Pull**, **Push**, and **New branch** live in the graph toolbar. Push reviews
   the current branch with a green, orange or red safety shield. Right-click a
   commit to merge, rebase, or rename/delete its local branches.
@@ -187,7 +195,7 @@ Right-click the pending graph row and choose **Stash changes…** to open the
 Stashes tab. Enter an optional name and click **Stash changes** to save staged,
 unstaged and untracked files. Apply keeps the stash entry; Delete removes it and
 can be recovered through Undo / redo history. The tab follows external stash
-changes and the global Refresh action.
+changes and the global Force Refresh action.
 
 A branch name creates and switches to a new branch from HEAD; existing names are
 rejected. A blank field commits on the current branch or detached HEAD. Empty
@@ -238,7 +246,8 @@ name and a cloud icon marks that tip. Matching tips share one badge.
 
 Ghost previews preserve merge ancestry and selection. Immutable metadata, trees,
 file contents and assembled previews are cached separately; branch/tag caches
-have a five-minute TTL. Refresh revalidates them. Cached results remain usable
+have a five-minute TTL. Smart Refresh always verifies Graph branch tips;
+Force Refresh also revalidates the full branch and tag lists. Cached results remain usable
 when requests fail. Remote pairs can compare divergent branches, local/remote
 endpoints or separate provider endpoints. Truncated remote trees produce errors
 rather than incomplete comparisons. Provider limits and unavailable ancestry

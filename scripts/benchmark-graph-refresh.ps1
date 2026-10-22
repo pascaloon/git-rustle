@@ -7,10 +7,14 @@ param(
     [ValidateRange(1,100)][int]$Samples = 15,
     [switch]$Capture,
     [switch]$EnableCache,
+    [switch]$CandidateOnly,
+    [ValidateSet('changed','unchanged','full','after-branches')][string]$RefreshCase = 'changed',
+    [ValidateRange(0,10000)][int]$ServerOnlyBranches = 1000,
     [ValidateRange(2,100)][int]$Branches = 12,
     [ValidateRange(0,1000)][int]$DelayMs = 60
 )
 $ErrorActionPreference = 'Stop'
+if ($RefreshCase -ne 'changed' -and !$CandidateOnly) { throw 'New scenarios require -CandidateOnly; the preserved baseline supports changed only.' }
 if (!$IsWindows) { throw 'This runner requires the Windows private-desktop native helper.' }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
 . "$PSScriptRoot/benchmark-processes.ps1"
@@ -26,7 +30,7 @@ $names = @(@(Get-ChildItem Env: | Where-Object { $_.Name -match '^(GIT_|GIT_RUST
     'LOCALAPPDATA','APPDATA','XDG_CONFIG_HOME','XDG_CACHE_HOME','PYTHONUNBUFFERED',
     'GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE',
     'GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_REFRESH_CONTROL',
-    'GIT_RUSTLE_REFRESH_OLD','GIT_RUSTLE_REFRESH_EXPECTED'
+    'GIT_RUSTLE_REFRESH_OLD','GIT_RUSTLE_REFRESH_EXPECTED','GIT_RUSTLE_REFRESH_CASE'
 ) | Select-Object -Unique)
 $saved = @{}
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
@@ -74,7 +78,7 @@ try {
     $indices = if ($Capture) { @(0) } else { @(-1..($Samples-1)) }
     foreach ($sample in $indices) {
         # Alternate order within each pair, with one fresh warm-up per executable.
-        $order = if (($sample + 1) % 2 -eq 0) { @('baseline','candidate') } else { @('candidate','baseline') }
+        $order = if ($CandidateOnly) { @('candidate') } elseif (($sample + 1) % 2 -eq 0) { @('baseline','candidate') } else { @('candidate','baseline') }
         foreach ($label in $order) {
             Assert-BenchmarkIdle -WorkspaceRoot $workspace -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
             $suffix = if ($Capture) { 'capture' } elseif ($sample -lt 0) { 'warmup' } else { 'sample-'+$sample.ToString('00') }
@@ -87,8 +91,10 @@ try {
             $server = $null; $native = $null; $control = $null; $statsSaved = $false
             $cleanup = [ordered]@{fixtureStopRequested=$false;fixtureKilled=$false;nativeDisposed=$false}
             try {
+                $fixtureArguments = @('-u',('"'+$fixtureScript+'"'),'--directory',('"'+$ownedFixture+'"'),'--branches',$Branches,'--delay-ms',$DelayMs,'--server-only',$ServerOnlyBranches)
+                if ($RefreshCase -eq 'unchanged') { $fixtureArguments += '--unchanged' }
                 $server = Start-Process -FilePath $Python -WindowStyle Hidden -PassThru `
-                    -ArgumentList @('-u',('"'+$fixtureScript+'"'),'--directory',('"'+$ownedFixture+'"'),'--branches',$Branches,'--delay-ms',$DelayMs) `
+                    -ArgumentList $fixtureArguments `
                     -RedirectStandardOutput (Join-Path $directory 'fixture.stdout.log') -RedirectStandardError (Join-Path $directory 'fixture.stderr.log')
                 $manifestPath = Join-Path $ownedFixture 'manifest.json'
                 $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -113,6 +119,7 @@ try {
                 if (!$initialStats.refsUnchanged -or !$initialStats.fetchHeadAbsent -or $initialStats.advanced) { throw 'Fixture initial repository/control state is invalid' }
                 $initialStats | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $directory 'stats-before.json')
                 $env:GIT_RUSTLE_SCENARIO = 'refresh-native'
+                $env:GIT_RUSTLE_REFRESH_CASE = $RefreshCase
                 $env:GIT_RUSTLE_AUTOQUIT = if ($Capture) { '600000' } else { '100' }
                 $env:GIT_RUSTLE_DUMP = Join-Path $directory 'state.txt'
                 $env:GIT_RUSTLE_REFRESH_CONTROL = $control+'/advance'
@@ -147,14 +154,25 @@ try {
                 $settled = Refresh-Interval $text 'refresh native settled frame'
                 if ($settled -lt $firstGhost) { throw 'Settled refresh preceded its first ghost frame' }
                 $stats = Save-RefreshStats $control $directory; $statsSaved = $true
-                if (!$stats.refsUnchanged -or !$stats.fetchHeadAbsent) { throw "Refresh mutated refs or FETCH_HEAD: $directory" }
+                if (!$stats.refsUnchanged -or !$stats.fetchHeadAbsent -or !$stats.filesUnchanged) { throw "Refresh mutated refs or FETCH_HEAD: $directory" }
                 if (!$stats.advanced) { throw 'Native scenario did not advance the controlled fixture' }
                 $advanced = @($stats.requests | Where-Object { $_.advanced })
                 $projectRefresh = @($advanced | Where-Object { ([string]$_.path).Split('?')[0] -ceq '/repos/team/repo' }).Count
                 $pullRefresh = @($advanced | Where-Object { ([string]$_.path).Split('?')[0] -ceq '/repos/team/repo/pulls' }).Count
                 $pipelineRefresh = @($advanced | Where-Object { ([string]$_.path).Split('?')[0] -ceq '/repos/team/repo/actions/runs' }).Count
-                if ($projectRefresh -lt 1 -or $pullRefresh -lt 1) { throw "Refresh must exercise project and pull endpoints for both executables: $directory" }
-                if ($label -eq 'baseline' -and ($pipelineRefresh -lt 1 -or [int]$stats.pipelineRequests -lt 1)) { throw "Baseline did not execute its historical pipeline provider request: $directory" }
+                $full = $label -eq 'baseline' -or $RefreshCase -eq 'full'
+                if ($full -and ($projectRefresh -lt 1 -or $pullRefresh -lt 1)) { throw "Full refresh must exercise provider metadata: $directory" }
+                if (!$full -and ($projectRefresh -ne 0 -or $pullRefresh -ne 0)) { throw "Smart refresh requested broad provider metadata: $directory" }
+                $tagRefresh = @($advanced | Where-Object { ([string]$_.path).Split('?')[0] -ceq '/repos/team/repo/tags' }).Count
+                $listRefresh = @($advanced | Where-Object { ([string]$_.path).Split('?')[0] -ceq '/repos/team/repo/branches' }).Count
+                if (!$full -and ($tagRefresh -ne 0 -or $listRefresh -ne 0)) { throw "Smart refresh requested tags or the complete branch list: $directory" }
+                if ($label -eq 'candidate' -and $RefreshCase -eq 'full' -and ($tagRefresh -lt 1 -or $listRefresh -lt 1)) { throw "Force refresh omitted tags or complete branch list" }
+                $localFrame = $null; $tipsFrame = $null
+                if ($label -eq 'candidate') {
+                    $localFrame = Refresh-Interval $text 'refresh native local frame'
+                    $tipsFrame = Refresh-Interval $text 'refresh native tips frame'
+                }
+
                 if ($label -eq 'candidate' -and ([int]$stats.pipelineRequests -ne 0 -or $pipelineRefresh -ne 0)) { throw "Candidate executed a removed pipeline provider request: $directory" }
                 if ($label -eq 'candidate' -and @($stats.forbidden).Count -ne 0) { throw "Candidate requested forbidden pipeline endpoints: $directory" }
                 $cacheRoot = Join-Path $env:LOCALAPPDATA 'git-rustle/cache'
@@ -162,7 +180,7 @@ try {
                 $remoteCacheCount = @($cacheFiles | Where-Object { $_.path -match '^remotes[\\/].+\.heads\.json$' }).Count
                 [pscustomobject]@{mode=$cacheMode;enabled=[bool]$EnableCache;root=$cacheRoot;freshDirectoryAtLaunch=$true;remoteCacheFiles=$remoteCacheCount;files=$cacheFiles} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $directory 'cache-evidence.json')
                 if ($EnableCache -and $remoteCacheCount -lt 1) { throw "Cache-enabled refresh did not persist an isolated remote-head cache: $directory" }
-                $results.Add([pscustomobject]@{label=$label;sample=$sample;warmup=($sample-lt0);capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;remoteCacheFiles=$remoteCacheCount;performanceSample=(!$Capture-and$sample-ge0);firstGhostMs=$(if($Capture){$null}else{$firstGhost});settledMs=$(if($Capture){$null}else{$settled});peakRequests=$stats.peakRequests;requestCount=@($stats.requests).Count;forbiddenCount=@($stats.forbidden).Count;projectRequests=[int]$stats.projectRequests;pullRequests=[int]$stats.pullRequests;pipelineRequests=[int]$stats.pipelineRequests;refreshProjectRequests=$projectRefresh;refreshPullRequests=$pullRefresh;refreshPipelineRequests=$pipelineRefresh;providerFairnessVerified=$true;refsUnchanged=[bool]$stats.refsUnchanged;fetchHeadAbsent=[bool]$stats.fetchHeadAbsent;directory=$directory})
+                $results.Add([pscustomobject]@{label=$label;sample=$sample;warmup=($sample-lt0);capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;remoteCacheFiles=$remoteCacheCount;performanceSample=(!$Capture-and$sample-ge0);refreshCase=$RefreshCase;localFrameMs=$localFrame;tipsFrameMs=$tipsFrame;refreshTagRequests=$tagRefresh;refreshListRequests=$listRefresh;firstGhostMs=$(if($Capture){$null}else{$firstGhost});settledMs=$(if($Capture){$null}else{$settled});peakRequests=$stats.peakRequests;requestCount=@($stats.requests).Count;forbiddenCount=@($stats.forbidden).Count;projectRequests=[int]$stats.projectRequests;pullRequests=[int]$stats.pullRequests;pipelineRequests=[int]$stats.pipelineRequests;refreshProjectRequests=$projectRefresh;refreshPullRequests=$pullRefresh;refreshPipelineRequests=$pipelineRefresh;providerFairnessVerified=$true;refsUnchanged=[bool]$stats.refsUnchanged;fetchHeadAbsent=[bool]$stats.fetchHeadAbsent;directory=$directory})
                 $results.ToArray() | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'samples.json')
             } finally {
                 try {
@@ -184,6 +202,13 @@ try {
             }
         }
     }
+    if (!$Capture -and $Samples -ge 15 -and $RefreshCase -ne 'full' -and $Branches -eq 12 -and $DelayMs -eq 60) {
+        $durations = @($results | Where-Object { $_.label -eq 'candidate' -and $_.performanceSample } | ForEach-Object { [double]$_.settledMs } | Sort-Object)
+        if ($durations.Count -ne $Samples) { throw 'Missing candidate samples for the refresh performance gate' }
+        $median = $durations[[int][Math]::Floor($durations.Count/2)]
+        $p95 = $durations[[int][Math]::Ceiling($durations.Count*0.95)-1]
+        if ($median -gt 1000 -or $p95 -gt 2000) { throw "Smart refresh exceeded the performance gate: median=$median ms; p95=$p95 ms" }
+    }
 } catch { $failure = $_.ToString(); throw }
 finally {
     foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
@@ -192,7 +217,7 @@ finally {
     $report.Add('')
     $report.Add('Fresh fixture, isolated app data and hidden localhost server for every launch. Executable order alternates. Raw evidence is retained beside this report.')
     $report.Add('')
-    $report.Add('Cache mode: '+$cacheMode+'. Both executables use the same mode. Enabled mode omits --no-cache, starts with an empty isolated application cache for each launch, then measures the real forced Refresh after initial load has populated the cache. It does not measure warmed application reopening; cache-evidence.json retains persisted cache file hashes.')
+    $report.Add('Case: '+$RefreshCase+'. Cache mode: '+$cacheMode+'. Enabled mode starts with an empty isolated application cache for each launch, then measures Refresh after initial load has populated the cache. This does not measure warmed application reopening. cache-evidence.json retains persisted cache hashes. New cases use -CandidateOnly; changed compares the original v0.1.14 Refresh against Smart Refresh.')
     $report.Add('')
     if ($Capture) {
         $report.Add('Capture-only run: screenshot durations and trace intervals are excluded from performance samples. Review the actual PNGs separately.')
@@ -217,8 +242,8 @@ finally {
         if ($Samples -lt 15) { $report.Add(''); $report.Add('Smoke run only; fewer than 15 measured samples per executable. Do not treat this as a performance conclusion.') }
     }
     $report.Add('')
-    $report.Add('Both executables must retain refs and avoid FETCH_HEAD. Both advanced refreshes must request project details and pull requests; baseline must also request its historical pipeline endpoint, while candidate pipeline requests must be empty. Per-launch total and advanced-refresh endpoint counts are retained in samples.json and raw stats.json. Baseline uses the same backported scenario. These synthetic private-desktop paints exclude physical input, interactive desktop composition, scanout and real network latency. Existing user applications may remain running under the idle policy.')
+    $report.Add('Smart candidate refreshes must request no broad provider metadata, tags or branch lists; Full must request all three. Original v0.1.14 baseline refreshes metadata. Git refs, objects, index, worktree and stashes remain unchanged. Raw per-endpoint counts and local/tip frame intervals are retained. Private-desktop paints exclude physical input, interactive composition, scanout and live-network latency.')
     if ($failure) { $report.Add(''); $report.Add('Run failed: '+$failure) }
     $report.ToArray() | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.md')
-    [pscustomobject]@{startedUtc=$startedUtc;finishedUtc=[DateTime]::UtcNow.ToString('o');success=($null-eq$failure);failure=$failure;baseline=$Baseline;baselineSha256=(Get-FileHash -LiteralPath $Baseline).Hash;providerFairness='Each advanced refresh includes exact project and pulls endpoints. Baseline actions/runs count is positive; candidate pipeline and forbidden counts are zero.';candidate=$Candidate;candidateSha256=(Get-FileHash -LiteralPath $Candidate).Hash;python=$Python;fixtureScript=$fixtureScript;fixtureSha256=(Get-FileHash -LiteralPath $fixtureScript).Hash;runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;nativeHelperSha256=(Get-FileHash -LiteralPath "$PSScriptRoot/benchmark-native-process.ps1").Hash;samplesPerExecutable=$(if($Capture){0}else{$Samples});warmupsPerExecutable=$(if($Capture){0}else{1});capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;cachePolicy='Fresh isolated disk cache for each launch; enable via -EnableCache; default retains --no-cache. Initial load followed by forced Refresh in the same process.';branches=$Branches;delayMs=$DelayMs;limitations='Fresh loopback synthetic provider, fresh repository and isolated app configuration for every launch. Alternating executable order; first new ghost and settled refresh end at native GPUI paint marks. Baseline must include the same refresh-native harness backport. Capture runs are separate and their durations are not performance samples. Private-desktop paint/capture excludes physical input, interactive desktop composition, display scanout and real network latency. Existing verified user application may remain running under the shared idle policy.'} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
+    [pscustomobject]@{startedUtc=$startedUtc;finishedUtc=[DateTime]::UtcNow.ToString('o');success=($null-eq$failure);failure=$failure;baseline=$Baseline;baselineSha256=(Get-FileHash -LiteralPath $Baseline).Hash;refreshCase=$RefreshCase;candidateOnly=[bool]$CandidateOnly;serverOnlyBranches=$ServerOnlyBranches;providerFairness='Original v0.1.14 baseline refreshes metadata. Smart candidate does not; Full candidate must refresh metadata, tags and complete branches. Pipelines remain forbidden.';candidate=$Candidate;candidateSha256=(Get-FileHash -LiteralPath $Candidate).Hash;python=$Python;fixtureScript=$fixtureScript;fixtureSha256=(Get-FileHash -LiteralPath $fixtureScript).Hash;runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;nativeHelperSha256=(Get-FileHash -LiteralPath "$PSScriptRoot/benchmark-native-process.ps1").Hash;samplesPerExecutable=$(if($Capture){0}else{$Samples});warmupsPerExecutable=$(if($Capture){0}else{1});capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;cachePolicy='Fresh isolated disk cache for each launch; enable via -EnableCache; default retains --no-cache. Initial load followed by forced Refresh in the same process.';branches=$Branches;delayMs=$DelayMs;limitations='Fresh loopback synthetic provider, fresh repository and isolated app configuration for every launch. Alternating executable order; first new ghost and settled refresh end at native GPUI paint marks. Baseline must include the same refresh-native harness backport. Capture runs are separate and their durations are not performance samples. Private-desktop paint/capture excludes physical input, interactive desktop composition, display scanout and real network latency. Existing verified user application may remain running under the shared idle policy.'} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
 }

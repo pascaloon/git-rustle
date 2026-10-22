@@ -13,6 +13,12 @@ use crate::model::History;
 use crate::term::{Button, KeyCode, KeyEvent, MouseEvent, MouseKind, Rect};
 use crate::ui::Areas;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RefreshMode {
+    Smart,
+    Full,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     List,
@@ -111,6 +117,7 @@ pub struct App {
     pub quit: bool,
     pub want_rewalk: bool,
     pub want_refresh: bool,
+    pub refresh_request: Option<RefreshMode>,
     pub needs_redraw: bool,
     /// Rows visible in the list, updated by the renderer.
     pub list_rows: usize,
@@ -163,6 +170,7 @@ impl App {
             quit: false,
             want_rewalk: false,
             want_refresh: false,
+            refresh_request: None,
             needs_redraw: true,
             list_rows: 1,
         }
@@ -1320,7 +1328,20 @@ impl App {
         self.confirm_checkout(choices);
     }
 
+    pub fn request_refresh(&mut self, mode: RefreshMode) {
+        self.refresh_request = Some(self.refresh_request.map_or(mode, |old| old.max(mode)));
+        self.needs_redraw = true;
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::F(5) && !key.alt {
+            self.request_refresh(if key.ctrl {
+                RefreshMode::Full
+            } else {
+                RefreshMode::Smart
+            });
+            return;
+        }
         self.startup_head_search = None;
         self.pending.autofocus = false;
         self.pending.return_to_head = None;
@@ -2604,13 +2625,18 @@ mod tests {
             assert_eq!(app.branches.want_refresh, None);
             app.focus = focus;
             app.handle_key(key(KeyCode::F(5)));
-            assert!(app.want_refresh);
-            assert_eq!(app.branches.want_refresh, Some(true));
+            assert_eq!(app.refresh_request, Some(RefreshMode::Smart));
+            assert!(!app.want_refresh);
+            assert_eq!(app.branches.want_refresh, None);
+            let mut force = key(KeyCode::F(5));
+            force.ctrl = true;
+            app.handle_key(force);
+            assert_eq!(app.refresh_request, Some(RefreshMode::Full));
         }
         let mut app = app_with(3);
         app.branches.show(None);
         app.handle_key(key(KeyCode::F(5)));
-        assert_eq!(app.branches.want_refresh, Some(true));
+        assert_eq!(app.refresh_request, Some(RefreshMode::Smart));
     }
 
     #[test]

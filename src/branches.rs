@@ -297,6 +297,29 @@ impl Browser {
         self.rebuild(refs);
     }
 
+    pub fn merge_scoped(
+        &self,
+        mut update: remote::Update,
+        scope: &HashSet<String>,
+    ) -> remote::Update {
+        if let Some(previous) = self
+            .remotes
+            .get(&update.remote.name)
+            .filter(|old| old.remote == update.remote)
+        {
+            update.branches.extend(
+                previous
+                    .branches
+                    .iter()
+                    .filter(|b| !scope.contains(&b.name))
+                    .cloned(),
+            );
+            update.scoped = previous.scoped;
+        }
+        update.branches.sort_by(|a, b| a.name.cmp(&b.name));
+        update
+    }
+
     pub fn rebuild(&mut self, refs: Option<&RefSnapshot>) {
         for tips in self.fetched_tips.values_mut() {
             tips.clear();

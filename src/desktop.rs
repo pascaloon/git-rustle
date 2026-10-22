@@ -3,7 +3,7 @@ use crate::desktop_icons::icon;
 use crate::desktop_text::{Matches, TextBlock};
 use crate::desktop_theme::*;
 use crate::{
-    app::Mode,
+    app::{Mode, RefreshMode},
     diff,
     engine::Engine,
     graph::layout::{CellKind, GraphCell},
@@ -149,6 +149,14 @@ enum Tab {
     Settings,
 }
 
+fn refresh_action(control: bool) -> Action {
+    if control {
+        Action::ForceRefresh
+    } else {
+        Action::Refresh
+    }
+}
+
 #[derive(Clone)]
 enum Action {
     OpenProviderUrl(String),
@@ -162,6 +170,7 @@ enum Action {
     Explorer,
     Terminal,
     Refresh,
+    ForceRefresh,
     Head,
     Branches,
     Settings,
@@ -1782,9 +1791,15 @@ impl Desktop {
         {
             return;
         }
-        if matches!(action, Action::Refresh) {
-            self.refresh_provider();
+        if matches!(action, Action::ForceRefresh) {
+            // A coalesced repository check must still queue a fresh stash list
+            // when the preceding list is already in flight.
             self.invalidate_stashes();
+            if self.engine.full_refresh_pending() {
+                cx.notify();
+                return;
+            }
+            self.refresh_provider();
         }
         if matches!(action, Action::Tab(Tab::Stashes | Tab::Cleanup)) {
             self.engine.app.park_diff();
@@ -1811,11 +1826,8 @@ impl Desktop {
             Action::Stashes(_) => unreachable!(),
             Action::Tools(_) => unreachable!(),
             Action::RefStorage(_) | Action::DiffBase | Action::DiffBaseChoose => unreachable!(),
-            Action::Refresh => {
-                app.want_refresh = true;
-                app.pending.want_refresh = true;
-                app.branches.want_refresh = Some(true);
-            }
+            Action::Refresh => app.request_refresh(RefreshMode::Smart),
+            Action::ForceRefresh => app.request_refresh(RefreshMode::Full),
             Action::Head => {
                 self.selected_commits.clear();
                 if app.settings.saving {
@@ -2169,7 +2181,7 @@ impl Desktop {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let icon_name = match action {
-            Action::Refresh => Some("refresh"),
+            Action::Refresh | Action::ForceRefresh => Some("refresh"),
             Action::Operation(ref a) => match a.as_ref() {
                 operations::Action::Pull => Some("pull"),
                 operations::Action::Open(operations::Dialog::Push, ..) => Some("push"),
@@ -2279,7 +2291,9 @@ impl Desktop {
                 s.tooltip(move |w, cx| {
                     gpui_component::tooltip::Tooltip::new(match n {
                         "settings" => "Settings",
-                        "refresh" => "Refresh",
+                        "refresh" => {
+                            "Refresh Graph (F5). Ctrl+click or Ctrl+F5: Force Refresh all views"
+                        }
                         "pull" => "Pull current upstream",
                         "push" => "Review push for the current branch",
                         "wrap" => "Toggle word wrap",
@@ -2299,9 +2313,14 @@ impl Desktop {
             })
             .when(!text.is_empty(), |s| s.child(text))
             .when(enabled, |s| {
-                s.on_click(
-                    cx.listener(move |v, _, window, cx| v.action(action.clone(), window, cx)),
-                )
+                s.on_click(cx.listener(move |v, event: &ClickEvent, window, cx| {
+                    let action = if matches!(action, Action::Refresh) {
+                        refresh_action(event.modifiers().control)
+                    } else {
+                        action.clone()
+                    };
+                    v.action(action, window, cx)
+                }))
             })
     }
     fn graph_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3939,6 +3958,12 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .capture_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "f5" && !e.keystroke.modifiers.alt {
+                    v.action(refresh_action(e.keystroke.modifiers.control), window, cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 if e.keystroke.key == "escape" && v.tools_picker_open() {
                     v.tools_action(external_tools::Action::ClosePicker, window, cx);
                     cx.stop_propagation();

@@ -297,7 +297,7 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) -> u64 {
         let epoch = self.engine.stash_epoch;
-        self.action(super::Action::Refresh, window, cx);
+        self.action(super::Action::ForceRefresh, window, cx);
         assert!(
             self.stashes.want_refresh,
             "global refresh must invalidate stashes"
@@ -305,7 +305,7 @@ impl Desktop {
         self.request_stashes();
         assert!(self.stashes.requested && self.engine.operation_busy);
         assert!(!self.stashes.want_refresh);
-        self.action(super::Action::Refresh, window, cx);
+        self.action(super::Action::ForceRefresh, window, cx);
         assert!(
             self.stashes.requested && self.stashes.want_refresh,
             "explicit refresh during listing must remain queued"

@@ -2,7 +2,7 @@
 use crate::diffview::DiffReq;
 use crate::model::History;
 use crate::{
-    app::{self, App, LoadState},
+    app::{self, App, LoadState, RefreshMode},
     branches, cache, diff, git, pending, remote, search, settings, ui,
 };
 use async_channel::{Receiver, Sender};
@@ -318,6 +318,74 @@ fn refresh_repo(path: PathBuf, tx: Sender<Msg>) {
     });
 }
 
+fn graph_requests(app: &App) -> Vec<branches::Target> {
+    let mut requested = app.branches.preview_targets.clone();
+    for update in app.branches.remotes.values() {
+        if let Some(refs) = &app.refs {
+            for name in remote::graph_names(refs, &update.remote) {
+                requested.push(branches::Target {
+                    name,
+                    remote: Some(update.remote.name.clone()),
+                    url: Some(update.remote.url.clone()),
+                    sha: String::new(),
+                });
+            }
+        }
+    }
+    for (id, label) in &app.ghost_branches {
+        if let Some(source) = app.ghost_sources.get(id)
+            && let Some(name) = label.strip_prefix(&format!("{}/", source.name))
+        {
+            requested.push(branches::Target {
+                name: name.into(),
+                remote: Some(source.name.clone()),
+                url: Some(source.url.clone()),
+                sha: id.to_string(),
+            });
+        }
+    }
+    requested
+}
+
+fn graph_updates(app: &App) -> Vec<remote::Update> {
+    let requested = graph_requests(app);
+    app.branches
+        .remotes
+        .values()
+        .map(|update| {
+            let names: std::collections::HashSet<_> = requested
+                .iter()
+                .filter(|t| {
+                    t.remote.as_ref() == Some(&update.remote.name)
+                        && t.url.as_ref().is_none_or(|url| url == &update.remote.url)
+                })
+                .map(|t| &t.name)
+                .collect();
+            let mut result = remote::Update {
+                remote: update.remote.clone(),
+                branches: update
+                    .branches
+                    .iter()
+                    .filter(|b| names.contains(&b.name))
+                    .cloned()
+                    .collect(),
+                scoped: true,
+                cached: update.cached,
+                stale: update.stale,
+            };
+            result.branches.sort_by(|a, b| a.name.cmp(&b.name));
+            result
+        })
+        .collect()
+}
+
+fn same_graph_updates(a: &[remote::Update], b: &[remote::Update]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.remote == b.remote && a.branches == b.branches)
+}
+
 pub struct Engine {
     pub recents: Vec<PathBuf>,
     pub recents_loading: bool,
@@ -361,6 +429,10 @@ pub struct Engine {
     cache_seen: bool,
     repo_seen: bool,
     refreshing: bool,
+    refresh_mode: Option<RefreshMode>,
+    next_remote_mode: Option<RefreshMode>,
+    remote_explicit: bool,
+    preview_cached_only: bool,
     walker: Option<Walker>,
     finishing: Vec<Walker>,
     next_walk_id: u32,
@@ -384,6 +456,15 @@ pub struct Engine {
 impl Engine {
     /// Queued/in-flight refresh work, excluding periodic worktree status probes.
     pub fn refresh_in_progress(&self) -> bool {
+        self.app.refresh_request.is_some() || self.refresh_work_busy()
+    }
+
+    pub fn full_refresh_pending(&self) -> bool {
+        self.app.refresh_request == Some(RefreshMode::Full)
+            || (self.refresh_mode == Some(RefreshMode::Full) && self.refresh_work_busy())
+    }
+
+    fn refresh_work_busy(&self) -> bool {
         self.app.want_refresh
             || self.refreshing
             || self.app.want_rewalk
@@ -393,6 +474,8 @@ impl Engine {
             || self.preview_busy
             || self.preview_workers != 0
             || self.preview_wanted
+            || (self.refresh_mode.is_some()
+                && (self.app.pending.loading || self.app.pending.want_refresh))
     }
 
     pub fn stash_status_stamp(&self) -> Option<u64> {
@@ -562,6 +645,10 @@ impl Engine {
             cache_seen: false,
             repo_seen: false,
             refreshing: false,
+            refresh_mode: None,
+            next_remote_mode: None,
+            remote_explicit: false,
+            preview_cached_only: false,
             walker: None,
             finishing: Vec::new(),
             next_walk_id: 1,
@@ -597,6 +684,30 @@ impl Engine {
         self.app.set_provider_search_labels(labels)
     }
     fn advance(&mut self, message: Option<Msg>) {
+        if self.refresh_mode.is_some() && !self.refresh_work_busy() {
+            self.refresh_mode = None;
+        }
+        if let Some(mode) = self.app.refresh_request {
+            if self.refresh_mode.is_some_and(|active| active >= mode) {
+                self.app.refresh_request = None;
+            } else if self.refresh_mode.is_none()
+                && !self.refresh_work_busy()
+                && !self.operation_busy
+                && !self.repository_edit_busy
+                && !self.app.pending.busy
+                && !self.app.branches.busy
+                && !self.app.settings.saving
+                && self.repo.is_some()
+            {
+                self.app.refresh_request = None;
+                self.refresh_mode = Some(mode);
+                self.next_remote_mode = Some(mode);
+                self.preview_cached_only = true;
+                self.app.want_refresh = true;
+                self.app.pending.want_refresh = true;
+                self.timing.mark("explicit local refresh requested");
+            }
+        }
         if !self.operation_busy
             && self.operation_request.is_none()
             && !self.app.pending.busy
@@ -701,7 +812,7 @@ impl Engine {
                 && !app.pending.busy
                 && !app.branches.busy
                 && !app.pending.loading
-                && matches!(app.mode, app::Mode::Graph)
+                && (matches!(app.mode, app::Mode::Graph) || self.refresh_mode.is_some())
                 && (app.pending.want_refresh
                     || self.pending_checked.elapsed() >= Duration::from_secs(2))
             {
@@ -724,6 +835,7 @@ impl Engine {
             self.preview_wanted = true;
         }
         if self.preview_wanted
+            && self.next_remote_mode.is_none()
             && !self.preview_busy
             && !app.is_walking()
             && !app.want_rewalk
@@ -739,27 +851,50 @@ impl Engine {
                     .local_history
                     .get_or_insert_with(|| Arc::new(app.history.clone()))
                     .clone();
-                let updates = app.branches.remotes.values().cloned().collect::<Vec<_>>();
-                let requested = app.branches.preview_targets.clone();
+                let updates = if self.preview_cached_only || self.preview_force {
+                    graph_updates(app)
+                } else {
+                    app.branches.remotes.values().cloned().collect::<Vec<_>>()
+                };
+                let requested = graph_requests(app);
+                let seed = remote::history::RetainedPreview {
+                    ghosts: app.ghosts.clone(),
+                    sources: app.ghost_sources.clone(),
+                    branches: app.ghost_branches.clone(),
+                    tags: app.ghost_tags.clone(),
+                };
                 let r = r.clone();
                 let tx = tx.clone();
                 let epoch = self.preview_epoch;
                 self.preview_running_epoch = Some(epoch);
                 self.preview_workers += 1;
                 let force = std::mem::take(&mut self.preview_force);
+                let policy = if self.preview_cached_only {
+                    remote::history::TagPolicy::Cached
+                } else if force {
+                    remote::history::TagPolicy::Force
+                } else {
+                    remote::history::TagPolicy::IfStale
+                };
                 self.preview_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.preview_cancel.clone();
-                app.ghost_status = "Checking remote commits and tags…".into();
+                app.ghost_status = if self.preview_cached_only {
+                    "Checking remote commits…"
+                } else {
+                    "Checking remote commits and tags…"
+                }
+                .into();
                 app.needs_redraw = true;
                 timing.mark("ghost preview requested");
                 thread::spawn(move || {
-                    let preview = remote::history::load_stream(
+                    let preview = remote::history::load_stream_policy(
                         &r,
                         &local,
                         &refs,
                         &updates,
                         &requested,
-                        force,
+                        policy,
+                        &seed,
                         no_cache,
                         &cancel,
                         Some(&mut |preview| {
@@ -802,19 +937,30 @@ impl Engine {
                 && !app.branches.busy
                 && let Some(force) = app.branches.want_refresh.take()
             {
-                self.preview_epoch = self.preview_epoch.wrapping_add(1);
-                self.preview_cancel.store(true, Ordering::Relaxed);
-                self.preview_wanted = app.branches.pending_jump.is_some();
+                let mode = self.next_remote_mode.take();
+                self.remote_explicit = mode.is_some();
+                self.preview_cached_only = mode.is_some();
+                if mode != Some(RefreshMode::Smart) {
+                    self.preview_epoch = self.preview_epoch.wrapping_add(1);
+                    self.preview_cancel.store(true, Ordering::Relaxed);
+                    self.preview_wanted |= app.branches.pending_jump.is_some() || self.preview_busy;
+                }
                 self.remote_generation = self.remote_generation.wrapping_add(1);
                 let generation = self.remote_generation;
-                self.preview_force |= force;
+                self.preview_force |= force && mode != Some(RefreshMode::Smart);
                 app.branches.loading = true;
                 app.branches.errors.clear();
                 app.needs_redraw = true;
                 let git_dir = git::git_dir(r);
                 let tx = tx.clone();
                 let path = path.clone();
-                let local_only = !app.branches.open;
+                let scope = match mode {
+                    Some(RefreshMode::Smart) => remote::DiscoveryScope::Graph,
+                    Some(RefreshMode::Full) => remote::DiscoveryScope::All,
+                    None if app.branches.open => remote::DiscoveryScope::All,
+                    None => remote::DiscoveryScope::Startup,
+                };
+                let local_only = scope != remote::DiscoveryScope::All;
                 let mut requested = app.branches.preview_targets.clone();
                 for (id, label) in &app.ghost_branches {
                     if let Some(source) = app.ghost_sources.get(id)
@@ -839,7 +985,7 @@ impl Engine {
                         &git_dir,
                         force,
                         no_cache,
-                        local_only,
+                        scope,
                         &requested,
                         &cancel,
                         |event| {
@@ -1279,12 +1425,13 @@ impl Engine {
                         && !app.is_walking()
                         && !app.want_rewalk
                     {
+                        let tags_changed = app.ghost_tags != tags;
                         app.ghost_tags = tags;
                         if !errors.is_empty() {
                             app.ghost_status =
                                 format!("Remote preview incomplete: {}", errors.join(" | "));
                         }
-                        if let Some(refs) = app.refs.clone() {
+                        if tags_changed && let Some(refs) = app.refs.clone() {
                             app.set_refs(refs);
                         }
                     }
@@ -1356,8 +1503,10 @@ impl Engine {
                                     .collect();
                                 update.branches.sort_by(|a, b| a.name.cmp(&b.name));
                             }
+                            let update = app.branches.merge_scoped(update, &scope);
                             remote::Event::Branches(update)
                         }
+                        #[cfg(test)]
                         remote::Event::BranchesPartial { mut update, scope } => {
                             if let Some(previous) = app
                                 .branches
@@ -1378,7 +1527,11 @@ impl Engine {
                                 );
                                 update.branches.sort_by(|a, b| a.name.cmp(&b.name));
                             }
+                            let update = app.branches.merge_scoped(update, &scope);
                             remote::Event::Branches(update)
+                        }
+                        remote::Event::HeadsVerified { update, scope } => {
+                            remote::Event::Branches(app.branches.merge_scoped(update, &scope))
                         }
                         other => other,
                     };
@@ -1398,11 +1551,14 @@ impl Engine {
                                 self.preview_cancel.store(true, Ordering::Relaxed);
                                 self.preview_wanted = true;
                             }
-                            if let Some(refs) = app.refs.clone() {
+                            if app.branches.remotes.len() != previous_count
+                                && let Some(refs) = app.refs.clone()
+                            {
                                 app.set_refs(refs);
                             }
                         }
                         remote::Event::Branches(update) => {
+                            let previous_graph = graph_updates(app);
                             let changed =
                                 app.branches
                                     .remotes
@@ -1411,21 +1567,35 @@ impl Engine {
                                         old.remote != update.remote
                                             || old.branches != update.branches
                                     });
-                            if changed {
-                                self.preview_epoch = self.preview_epoch.wrapping_add(1);
-                                self.preview_cancel.store(true, Ordering::Relaxed);
-                                self.preview_wanted = true;
-                            }
+                            let live = !update.cached;
                             timing.mark(format!(
                                 "remote {} branches ({})",
                                 if update.cached { "cached" } else { "live" },
                                 update.branches.len()
                             ));
-                            app.branches.update(update, app.refs.as_ref());
-                            app.remote_labels();
+                            if changed {
+                                app.branches.update(update, app.refs.as_ref());
+                                let next_graph = graph_updates(app);
+                                if !same_graph_updates(&previous_graph, &next_graph) {
+                                    self.preview_epoch = self.preview_epoch.wrapping_add(1);
+                                    self.preview_cancel.store(true, Ordering::Relaxed);
+                                    self.preview_wanted = true;
+                                    app.remote_labels();
+                                }
+                            } else {
+                                app.branches
+                                    .remotes
+                                    .insert(update.remote.name.clone(), update);
+                            }
+                            if live {
+                                timing.mark("remote tips verified");
+                            }
                         }
-                        remote::Event::BranchesPartial { .. }
-                        | remote::Event::HeadsCached { .. } => {
+                        #[cfg(test)]
+                        remote::Event::BranchesPartial { .. } => {
+                            unreachable!("legacy partial normalized")
+                        }
+                        remote::Event::HeadsCached { .. } | remote::Event::HeadsVerified { .. } => {
                             unreachable!("non-authoritative heads normalized before dispatch")
                         }
                         remote::Event::Status(error) => {
@@ -1436,8 +1606,30 @@ impl Engine {
                             app.branches.loading = false;
                             app.branches.last_check = Some(Instant::now());
                             // If b was opened during the startup head check, finish with a full listing.
-                            if app.branches.open && self.remote_scoped_request {
+                            if app.branches.open
+                                && self.remote_scoped_request
+                                && !self.remote_explicit
+                            {
                                 app.branches.want_refresh = Some(false);
+                            }
+                            if self.remote_explicit && !self.remote_scoped_request {
+                                self.preview_cached_only = false;
+                                self.preview_wanted = true;
+                                self.preview_force = true;
+                            }
+                            if self.remote_explicit
+                                && self.remote_scoped_request
+                                && app.branches.errors.is_empty()
+                            {
+                                if app.ghost_status.starts_with("Remote preview incomplete:") {
+                                    self.preview_wanted = true;
+                                } else if app.ghost_status.starts_with("Remote:") {
+                                    app.ghost_status = if app.ghosts.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{} ghost commits (remote only)", app.ghosts.len())
+                                    };
+                                }
                             }
                             timing.mark("remote discovery done");
                         }
@@ -1467,8 +1659,20 @@ impl Engine {
                                 .refs
                                 .as_ref()
                                 .is_none_or(|old| old.fingerprint != snap.fingerprint);
-                            app.set_refs(snap);
+                            if changed {
+                                if app.branches.loading && self.remote_explicit {
+                                    self.remote_cancel.store(true, Ordering::Relaxed);
+                                    self.remote_generation = self.remote_generation.wrapping_add(1);
+                                    app.branches.loading = false;
+                                    self.next_remote_mode = self.refresh_mode;
+                                }
+                                app.set_refs(snap);
+                            }
                             self.repo = Some(r);
+                            if self.next_remote_mode.is_some() {
+                                app.branches.want_refresh = Some(true);
+                            }
+                            timing.mark("explicit local snapshot ready");
                             if changed {
                                 self.preview_epoch = self.preview_epoch.wrapping_add(1);
                                 self.preview_cancel.store(true, Ordering::Relaxed);
@@ -1476,7 +1680,10 @@ impl Engine {
                                 app.want_rewalk = true;
                             }
                         }
-                        Err(error) => app.set_error(error.to_string()),
+                        Err(error) => {
+                            self.next_remote_mode = None;
+                            app.set_error(error.to_string());
+                        }
                     }
                 }
                 Msg::Details(id, result) => {
@@ -1631,6 +1838,13 @@ impl Engine {
             }
         }
     }
+    pub(super) fn local_refresh_ready(&self) -> bool {
+        self.app.refresh_request.is_none()
+            && !self.app.want_refresh
+            && !self.refreshing
+            && self.next_remote_mode.is_none()
+    }
+
     pub fn has_presented(&self) -> bool {
         self.first_frame
     }
@@ -1880,6 +2094,155 @@ mod tests {
     }
 
     #[test]
+    fn smart_refresh_retains_unchanged_graph_search_details_and_checks_local_state() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.search.text.value = "m: First".into();
+        e.app.search.changed();
+        until(&mut e, |e| {
+            e.app.search.result.as_ref().is_some_and(|r| r.done)
+        });
+        let generation = e.app.search.generation;
+        let labels = e.app.labels_revision();
+        let history = e.app.history.commits.as_ptr();
+        let selected = e.app.selected_id();
+        let input = e.app.search.input.clone().unwrap();
+        let preview = e.preview_epoch;
+        e.app.request_refresh(RefreshMode::Smart);
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert_eq!(e.app.history.commits.as_ptr(), history);
+        assert_eq!(e.app.selected_id(), selected);
+        assert_eq!(e.app.labels_revision(), labels);
+        assert_eq!(e.preview_epoch, preview);
+        assert_eq!(e.app.search.generation, generation);
+        assert!(Arc::ptr_eq(&input, e.app.search.input.as_ref().unwrap()));
+        // A new local branch and worktree edit are visible without fetching.
+        git::command::checked(dir.path(), &["branch", "external"]).unwrap();
+        std::fs::write(dir.path().join("untracked.txt"), "retained local edit").unwrap();
+        e.app.request_refresh(RefreshMode::Smart);
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert!(
+            e.app
+                .refs
+                .as_ref()
+                .unwrap()
+                .refs
+                .iter()
+                .any(|r| r.name == "external")
+        );
+        assert!(
+            e.app
+                .pending
+                .snapshot
+                .files
+                .iter()
+                .any(|f| f.path == "untracked.txt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
+            "retained local edit"
+        );
+        assert!(!dir.path().join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn smart_refresh_coalesces_and_full_upgrades_after_the_current_check() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.refresh_mode = Some(RefreshMode::Smart);
+        e.app.branches.loading = true;
+        e.remote_explicit = true;
+        e.app.request_refresh(RefreshMode::Smart);
+        e.tick(None);
+        assert!(e.app.refresh_request.is_none());
+        let generation = e.remote_generation;
+        e.app.request_refresh(RefreshMode::Full);
+        e.tick(None);
+        assert_eq!(e.app.refresh_request, Some(RefreshMode::Full));
+        assert_eq!(e.remote_generation, generation);
+        e.repository_edit_busy = true;
+        e.tick(Some(Msg::Remote(generation, remote::Event::Done)));
+        assert_eq!(e.app.refresh_request, Some(RefreshMode::Full));
+        e.repository_edit_busy = false;
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert_eq!(e.remote_generation, generation + 1);
+        assert!(!e.remote_scoped_request);
+    }
+
+    #[test]
+    fn verified_scope_preserves_browser_heads_and_only_removes_confirmed_absences() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        let remote = remote::Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        let head = e.app.head_id().unwrap().to_string();
+        let branch = |name: &str| remote::Branch {
+            name: name.into(),
+            sha: head.clone(),
+        };
+        let full = remote::Update {
+            remote: remote.clone(),
+            branches: vec![
+                branch("main"),
+                branch("failed"),
+                branch("deleted"),
+                branch("browser-only"),
+            ],
+            scoped: false,
+            cached: false,
+            stale: false,
+        };
+        e.app.branches.update(full, e.app.refs.as_ref());
+        let labels = e.app.labels_revision();
+        let epoch = e.preview_epoch;
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::HeadsVerified {
+                update: remote::Update {
+                    remote: remote.clone(),
+                    branches: vec![branch("main")],
+                    scoped: true,
+                    cached: false,
+                    stale: true,
+                },
+                scope: ["main".into(), "deleted".into()].into_iter().collect(),
+            },
+        )));
+        let update = &e.app.branches.remotes["origin"];
+        assert_eq!(
+            update
+                .branches
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            ["browser-only", "failed", "main"]
+        );
+        assert!(!update.scoped);
+        assert_eq!(e.app.labels_revision(), labels);
+        assert_eq!(e.preview_epoch, epoch);
+        assert_eq!(graph_updates(&e.app)[0].branches.len(), 1);
+        e.tick(Some(Msg::Remote(
+            e.remote_generation.wrapping_sub(1),
+            remote::Event::HeadsVerified {
+                update: remote::Update {
+                    remote,
+                    branches: vec![],
+                    scoped: true,
+                    cached: false,
+                    stale: false,
+                },
+                scope: ["main".into()].into_iter().collect(),
+            },
+        )));
+        assert_eq!(e.app.branches.remotes["origin"].branches.len(), 3);
+    }
+
+    #[test]
     fn refresh_remains_busy_until_obsolete_tag_worker_finishes_without_blocking_new_overlay() {
         let dir = fixture();
         let mut e = quiet_engine(dir.path());
@@ -2126,7 +2489,7 @@ mod tests {
             },
         )));
         let heads = &e.app.branches.remotes["origin"].branches;
-        assert_eq!(heads.len(), 2);
+        assert_eq!(heads.len(), 3);
         assert!(
             heads
                 .iter()
@@ -2141,7 +2504,7 @@ mod tests {
             e.remote_generation,
             remote::Event::Status("fixture timeout".into()),
         )));
-        assert_eq!(e.app.branches.remotes["origin"].branches.len(), 2);
+        assert_eq!(e.app.branches.remotes["origin"].branches.len(), 3);
         // Only a completed authoritative set establishes that b is absent.
         e.tick(Some(Msg::Remote(
             e.remote_generation,

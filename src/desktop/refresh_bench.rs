@@ -3,7 +3,14 @@
 use super::*;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-type Paints = Rc<RefCell<HashMap<gix::ObjectId, (Bounds<Pixels>, bool)>>>;
+#[derive(Clone, Copy)]
+struct Paint {
+    bounds: Bounds<Pixels>,
+    settled: bool,
+    local: bool,
+    tips: bool,
+}
+type Paints = Rc<RefCell<HashMap<gix::ObjectId, Paint>>>;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -13,6 +20,10 @@ pub(super) struct State {
     old: Option<gix::ObjectId>,
     expected: Option<gix::ObjectId>,
     paints: Paints,
+    local_painted: bool,
+    tips_painted: bool,
+    branches_visited: bool,
+    retained: Option<(usize, u64, Option<gix::ObjectId>)>,
 }
 
 impl Desktop {
@@ -24,11 +35,26 @@ impl Desktop {
         let settled = self.refresh_bench.phase >= 2
             && !self.engine.refresh_in_progress()
             && !self.provider.pending;
+        let local = self.refresh_bench.phase >= 2
+            && self.engine.local_refresh_ready()
+            && !self.engine.app.pending.loading
+            && !self.engine.app.pending.want_refresh;
+        let tips = local
+            && !self.engine.app.branches.loading
+            && self.engine.app.branches.want_refresh.is_none();
         Some(
             canvas(
                 |bounds, _, _| bounds,
                 move |bounds, _, _, _| {
-                    paints.borrow_mut().insert(id, (bounds, settled));
+                    paints.borrow_mut().insert(
+                        id,
+                        Paint {
+                            bounds,
+                            settled,
+                            local,
+                            tips,
+                        },
+                    );
                 },
             )
             .absolute()
@@ -66,6 +92,30 @@ impl Desktop {
             self.refresh_bench.old = Some(oid("GIT_RUSTLE_REFRESH_OLD"));
             self.refresh_bench.expected = Some(oid("GIT_RUSTLE_REFRESH_EXPECTED"));
         }
+        let case = std::env::var("GIT_RUSTLE_REFRESH_CASE").unwrap_or_default();
+        if case == "after-branches" && !self.refresh_bench.branches_visited {
+            if self.engine.refresh_in_progress()
+                || self.provider.pending
+                || !self
+                    .engine
+                    .app
+                    .ghosts
+                    .contains_key(&self.refresh_bench.old.unwrap())
+            {
+                return;
+            }
+            self.refresh_bench.branches_visited = true;
+            self.action(Action::Tab(Tab::Branches), window, cx);
+            return;
+        }
+        if case == "after-branches" && self.engine.app.branches.open {
+            if self.engine.refresh_in_progress() {
+                return;
+            }
+            assert!(self.engine.app.branches.remotes.values().any(|u| !u.scoped));
+            self.action(Action::Tab(Tab::Graph), window, cx);
+            return;
+        }
         let old = self.refresh_bench.old.unwrap();
         let expected = self.refresh_bench.expected.unwrap();
         if self.refresh_bench.phase == 0 {
@@ -77,7 +127,7 @@ impl Desktop {
                 return;
             }
             assert!(
-                !self.engine.app.ghosts.contains_key(&expected),
+                expected == old || !self.engine.app.ghosts.contains_key(&expected),
                 "fixture advanced before Refresh"
             );
             let control =
@@ -110,17 +160,40 @@ impl Desktop {
                     .await;
                 let _ = view.update_in(cx, |v, window, cx| {
                     result.expect("advance controlled refresh fixture");
+                    v.refresh_bench.retained = Some((
+                        v.engine.app.history.commits.as_ptr() as usize,
+                        v.engine.app.labels_revision(),
+                        v.engine.app.selected_id(),
+                    ));
                     v.refresh_bench.paints.borrow_mut().clear();
                     v.refresh_bench.phase = 2;
                     v.engine.mark("refresh native requested");
-                    v.action(Action::Refresh, window, cx);
+                    let force = std::env::var("GIT_RUSTLE_REFRESH_CASE").as_deref() == Ok("full");
+                    // Same modifier dispatcher used by the real toolbar and F5.
+                    v.action(refresh_action(force), window, cx);
                     cx.notify();
                 });
             })
             .detach();
         } else if self.refresh_bench.phase >= 2 {
+            if !self.refresh_bench.local_painted
+                && self.refresh_bench.paints.borrow().values().any(|p| p.local)
+            {
+                self.engine.mark("refresh native local frame");
+                self.refresh_bench.local_painted = true;
+            }
+            if !self.refresh_bench.tips_painted
+                && self.refresh_bench.local_painted
+                && self.refresh_bench.paints.borrow().values().any(|p| p.tips)
+            {
+                self.engine.mark("refresh native tips frame");
+                self.refresh_bench.tips_painted = true;
+            }
             let painted = self.refresh_bench.paints.borrow().get(&expected).copied();
-            if let Some((bounds, settled)) = painted {
+            if let Some(Paint {
+                bounds, settled, ..
+            }) = painted
+            {
                 assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
                 let viewport = self.graph_scroll.0.borrow().base_handle.bounds();
                 assert!(
@@ -134,6 +207,17 @@ impl Desktop {
                     cx.notify();
                 }
                 if settled && !self.engine.refresh_in_progress() && !self.provider.pending {
+                    if expected == old {
+                        let (history, labels, selected) = self.refresh_bench.retained.unwrap();
+                        assert_eq!(self.engine.app.history.commits.as_ptr() as usize, history);
+                        assert_eq!(self.engine.app.labels_revision(), labels);
+                        assert_eq!(self.engine.app.selected_id(), selected);
+                    }
+                    if case == "after-branches" {
+                        assert!(self.engine.app.branches.remotes.values().any(|u| !u.scoped
+                            && u.branches.iter().any(|b| b.name == "server-only-00000")));
+                    }
+                    assert!(self.refresh_bench.local_painted && self.refresh_bench.tips_painted);
                     self.engine.mark("refresh native settled frame");
                     self.refresh_bench.verified = true;
                     cx.notify();

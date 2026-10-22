@@ -1439,7 +1439,10 @@ and nested filename/content matches. Inspect final PNGs separately for submenu
 edges, the wider dim-orange graph path halo, stash selection/inspector grouping,
 base comparison and the diff-search sidebar. Existing lane colors are unchanged.
 
-For API head/ghost refresh, use the dedicated runner and owned Python fixture:
+For API head/ghost refresh, use the dedicated runner and owned Python fixture.
+Smart Refresh / F5 verifies Graph tips without invalidating immutable caches;
+Ctrl+click / Ctrl+F5 requests a full refresh. Preserve the original application
+and test binaries from main before editing.
 
 ```powershell
 .\scripts\benchmark-graph-refresh.ps1 -Baseline $refreshBaselineExe -Candidate $candidateExe -Python $pythonExe -Samples 15 -OutputDirectory (Join-Path $benchRun 'refresh')
@@ -1463,12 +1466,29 @@ JSON file under the isolated `LOCALAPPDATA/git-rustle/cache/remotes` directory.
 Repository/ref, FETCH_HEAD and provider-request assertions still apply. Keep
 `-Capture` runs in another output directory and review their PNGs separately.
 
-The baseline must contain the identical refresh-native diagnostic scenario,
-paint hooks and diagnostic-only loopback exception backported onto the preserved
-baseline source. An ordinary old binary cannot drive this protocol. Preserve
-that patch, baseline commit/source manifest and hashes, and label the resulting
-binary as an instrumented comparison baseline; retain the untouched original
-baseline separately. Do not transplant new production refresh logic into it.
+The v0.1.14 baseline already contains the changed-tip native scenario and
+loopback exception; compare that untouched binary against the candidate for
+`-RefreshCase changed`. Older baselines lacking the protocol need a harness-only
+backport with its patch and source provenance retained. Never backport new
+production refresh logic into a comparison baseline.
+
+Run `-CandidateOnly -RefreshCase unchanged`, `full`, and `after-branches` in
+separate directories, with `-Samples 15`. The new cases cannot be compared
+against a binary lacking their scenario. The fixture defaults to 1,000 unrelated
+server-only branches. `after-branches` loads that complete browser snapshot
+before returning to Graph; smart checks must preserve those entries and issue
+no full-list, tag, project or request-list calls after Refresh. Full refresh must
+issue all those call types. Unchanged refresh asserts stable history storage,
+label revision and selection. Test missing/changed ancestry and partial errors
+with the functional harness too.
+
+Candidate marks separately measure local-state paint, verified-tip paint, first
+ghost paint and complete settlement. For unchanged cases, first ghost means the
+existing ghost's first paint after the request. The standard 12-head/60-ms smart
+fixture must settle at median <=1,000 ms and p95 <=2,000 ms. For slow-server
+coverage use `-CandidateOnly -DelayMs 1000 -Samples 1`; disclose its background
+completion time and do not apply the normal-network ceiling. Capture separately
+with `-Capture`, inspect actual PNGs, and retain failed runs as evidence.
 
 Each launch uses a fresh marked repository, isolated configuration/app data and
 hidden PID-verified loopback server (12 branches and 60 ms per-head delay by
