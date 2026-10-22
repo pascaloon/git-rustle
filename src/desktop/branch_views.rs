@@ -117,6 +117,8 @@ impl Desktop {
                                     "head"
                                 } else if entry.target.remote.is_none() {
                                     "branch"
+                                } else if b.remote_fetched(&entry.target) {
+                                    "computer"
                                 } else {
                                     "cloud"
                                 })
@@ -138,7 +140,15 @@ impl Desktop {
                                     .child(v.branch_matches.styled(display_name)),
                             )
                             .when(!entry.paired_remotes.is_empty(), |r| {
-                                r.child(icon("cloud").text_color(rgb(REMOTE_TEXT))).child(
+                                r.child(
+                                    icon(if b.remote_fetched(&entry.paired_remotes[0]) {
+                                        "computer"
+                                    } else {
+                                        "cloud"
+                                    })
+                                    .text_color(rgb(REMOTE_TEXT)),
+                                )
+                                .child(
                                     div()
                                         .max_w(px(200.))
                                         .overflow_hidden()
@@ -478,6 +488,10 @@ impl Desktop {
                     .find(|e| e.target.remote.is_none() && e.target.name == "fixes/task-123")
                     .unwrap();
                 assert_eq!(entry.paired_remotes.len(), 1);
+                assert!(
+                    browser.remote_fetched(&entry.paired_remotes[0]),
+                    "Paired blue label must classify the real cached remote tip as fetched"
+                );
                 assert!(
                     !browser
                         .entries

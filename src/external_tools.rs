@@ -1056,6 +1056,31 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "Hidden child for explicitly isolated native toolbar fixture only"]
+    fn toolbar_child() {
+        let Some(receipt) = std::env::var_os("GIT_RUSTLE_TOOLBAR_LAUNCH_RECEIPT") else {
+            return;
+        };
+        let args = std::env::args().collect::<Vec<_>>();
+        let paths = args
+            .windows(2)
+            .filter(|p| p[0] == "--skip")
+            .map(|p| p[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2, "distinct left/right argv required");
+        let left = fs::read(&paths[0]).expect("prepared left input");
+        let right = fs::read(&paths[1]).expect("prepared right input");
+        assert_ne!(left, right, "fixture revisions must differ");
+        fs::write(
+            receipt,
+            serde_json::to_vec(
+                &serde_json::json!({"tool":"toolbar-fixture", "left":left, "right":right}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    #[test]
     fn arguments_are_literal_and_scripts_are_rejected() {
         let tool = helper(false);
         let left = PathBuf::from("C:/file with spaces/$(touch);& left");

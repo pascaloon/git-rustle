@@ -66,12 +66,13 @@ function Fixture([string]$Root){
         $name='zz-scroll/{0:d3}'-f$index
         $localCommands.Add("create refs/heads/$name $current");$localCommands.Add("create refs/remotes/origin/$name $current")
         $localCommands.Add("create refs/heads/zz-old/{0:d3} $old"-f$index)
-        # Fetched-only rows require verification against the server.
-        $localCommands.Add("create refs/remotes/origin/zz-fetched/{0:d3} $current"-f$index)
+        # Server existence authorizes local-only cleanup even after its tip moved.
+        $cached = if($index -eq 0){$old}else{$current}
+        $localCommands.Add("create refs/remotes/origin/zz-fetched/{0:d3} $cached"-f$index)
         $serverCommands.Add("create refs/heads/zz-fetched/{0:d3} $current"-f$index)
         $serverCommands.Add("create refs/heads/$name $current")
     }
-    # Stale cached refs must not authorize cleanup.
+    # A missing server branch must retain its cached reference (possibly the last copy).
     $localCommands.Add("create refs/remotes/origin/zz-stale/missing $old")
     Write-FixtureRefs $working $localCommands.ToArray()
     Write-FixtureRefs $bare $serverCommands.ToArray()

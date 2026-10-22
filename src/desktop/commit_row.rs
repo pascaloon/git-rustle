@@ -153,8 +153,24 @@ impl Desktop {
                             .max_w(px(170.))
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .when(label.remote_only, |badge| {
-                                badge.child(icon("cloud").size(px(14.)).text_color(rgb(color)))
+                            .when(remote, |badge| {
+                                badge.child(
+                                    div()
+                                        .relative()
+                                        .children(self.graph_polish_badge_probe(
+                                            &label.name,
+                                            label.remote_only,
+                                        ))
+                                        .child(
+                                            icon(if label.remote_only {
+                                                "cloud"
+                                            } else {
+                                                "computer"
+                                            })
+                                            .size(px(14.))
+                                            .text_color(rgb(color)),
+                                        ),
+                                )
                             })
                             .child(self.matches.styled(label.name.clone())),
                     )

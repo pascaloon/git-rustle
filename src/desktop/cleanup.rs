@@ -308,7 +308,7 @@ impl Desktop {
                                     )
                                     .child(
                                         icon(if section == Section::FetchedOnly {
-                                            "cloud"
+                                            "computer"
                                         } else {
                                             "branch"
                                         })
@@ -601,6 +601,40 @@ impl Desktop {
                 .candidates
                 .iter()
                 .any(|c| c.name == "master" && c.protected)
+        );
+        let stale_fetched = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.name == "origin/zz-fetched/000")
+            .expect("server-ahead fetched reference must remain eligible");
+        assert_eq!(stale_fetched.section, Section::FetchedOnly);
+        assert_eq!(
+            stale_fetched.tracking_oid.as_deref(),
+            Some(stale_fetched.oid.as_str())
+        );
+        assert_ne!(
+            stale_fetched.oid,
+            self.engine.app.head_id().unwrap().to_string(),
+            "fixture cached tip must differ from the current server/HEAD tip"
+        );
+        assert!(
+            self.cleanup
+                .selected
+                .contains(&candidate_key(stale_fetched)),
+            "stale fetched reference must be preselected"
+        );
+        assert!(
+            !analysis
+                .candidates
+                .iter()
+                .any(|candidate| candidate.name == "origin/zz-stale/missing")
+        );
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("server branches no longer exist")),
+            "missing server reference must have a retention warning"
         );
         assert!(!self.cleanup.selected.contains("refs/heads/fixes/task-123"));
         assert!(!self.cleanup.selected.contains("refs/heads/master"));

@@ -59,6 +59,9 @@ impl AssetSource for Assets {
             "branch" => {
                 "<circle cx='6' cy='5' r='2'/><circle cx='18' cy='5' r='2'/><circle cx='6' cy='19' r='2'/><path d='M6 7v10m12-10v3c0 4-12 0-12 6'/>"
             }
+            "computer" => {
+                "<rect x='3' y='4' width='18' height='13' rx='1.5'/><path d='M8 21h8m-4-4v4'/>"
+            }
             "cloud" => "<path d='M6 18a4 4 0 0 1-.8-7.9 7 7 0 0 1 13.5-1A4.5 4.5 0 0 1 18.5 18Z'/>",
             "head" => {
                 "<circle cx='12' cy='12' r='7'/><circle cx='12' cy='12' r='2'/><path d='M12 2v4m0 12v4M2 12h4m12 0h4'/>"

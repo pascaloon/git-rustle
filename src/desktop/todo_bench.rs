@@ -1102,8 +1102,12 @@ impl Desktop {
                 self.todo_advance(10);
             }
             10 if self.todo_painted(13, window) => {
+                assert!(
+                    self.tools_scenario_picker_open(),
+                    "configuration dropdown must be open"
+                );
                 assert_eq!(
-                    self.tools_scenario_picker_ids(),
+                    self.tools_scenario_toolbar_ids(),
                     self.todo_bench.run.as_ref().unwrap().tool_ids
                 );
                 assert!(!self.external_merge_busy());
@@ -1118,7 +1122,7 @@ impl Desktop {
                 });
             }
             11 if self.todo_painted(5, window) => {
-                assert!(self.tools_scenario_picker_ids().is_empty());
+                assert!(!self.tools_scenario_picker_open());
                 assert!(matches!(self.engine.app.mode, Mode::Diff(_)));
                 self.todo_bench.run.as_mut().unwrap().checks += 2;
                 self.todo_finish();

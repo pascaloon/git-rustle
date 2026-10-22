@@ -31,6 +31,7 @@ mod general_bench;
 mod ghost_checkout_bench;
 mod graph_context_bench;
 mod graph_features_bench;
+mod graph_polish;
 mod hover;
 mod image_cache;
 mod improvement_bench;
@@ -191,6 +192,7 @@ struct Desktop {
     toolbar_bench: toolbar_bench::State,
     filter_bench: filter_bench::State,
     general_bench: general_bench::State,
+    graph_polish: graph_polish::State,
     graph_hover: hover::State,
     graph_selected_path: hover::State,
     base_diff: base_diff::State,
@@ -700,6 +702,7 @@ impl Desktop {
             }
         }
         let group = self.context_menu_group;
+        self.graph_context_reset_actions();
         let selected = if group == Some("Commit") {
             commit.clone()
         } else if group == Some("Branch") {
@@ -707,21 +710,47 @@ impl Desktop {
         } else {
             Vec::new()
         };
-        let submenu_height =
-            ((selected.len() * 36 + 10) as f32).min(f32::from(window.viewport_size().height) - 16.);
+        let commit_offset = top.len() as f32 * 36.;
+        let branch_offset = commit_offset + if commit.is_empty() { 0. } else { 36. };
+        let offset = if group == Some("Branch") {
+            branch_offset
+        } else {
+            commit_offset
+        };
+        let child_height = |count: usize, offset: f32| {
+            (count as f32 * 36. + 10.)
+                .min((f32::from(window.viewport_size().height) - offset - 16.).max(46.))
+        };
+        let submenu_height = child_height(selected.len(), offset);
+        let submenu_count = selected.len();
         let root_height =
             ((top.len() + usize::from(!commit.is_empty()) + usize::from(!branch.is_empty())) * 36
                 + 10) as f32;
-        let height = root_height.max(submenu_height);
+        // Reserve both group extents so opening a submenu never moves its parent.
+        let reserved = root_height
+            .max(commit_offset + child_height(commit.len(), commit_offset))
+            .max(branch_offset + child_height(branch.len(), branch_offset));
+        let height = root_height.max(offset + submenu_height);
+        let mut root_x = position
+            .x
+            .min(window.viewport_size().width - px(328.))
+            .max(px(8.));
+        if root_x + px(648.) > window.viewport_size().width - px(8.) && root_x < px(332.) {
+            root_x = px(8.);
+        }
+        let opens_left =
+            root_x + px(648.) > window.viewport_size().width - px(8.) && root_x >= px(332.);
+        let root_offset = if !selected.is_empty() && opens_left {
+            324.
+        } else {
+            0.
+        };
         let p = point(
-            position
-                .x
-                .min(window.viewport_size().width - px(648.))
-                .max(px(0.)),
+            root_x - px(root_offset),
             position
                 .y
-                .min(window.viewport_size().height - px(height + 8.))
-                .max(px(0.)),
+                .min(window.viewport_size().height - px(reserved + 8.))
+                .max(px(8.)),
         );
         deferred(
             div()
@@ -738,7 +767,9 @@ impl Desktop {
                 }))
                 .child(
                     column()
-                        .relative()
+                        .absolute()
+                        .left(px(root_offset))
+                        .top_0()
                         .children(self.graph_context_probe(1))
                         .w(px(320.))
                         .p_1()
@@ -760,7 +791,14 @@ impl Desktop {
                                 .map(|(name, _)| {
                                     row()
                                         .id(SharedString::from(format!("graph-menu-group-{name}")))
+                                        .relative()
+                                        .children(self.graph_context_probe(if name == "Commit" {
+                                            5
+                                        } else {
+                                            6
+                                        }))
                                         .h(px(36.))
+                                        .flex_shrink_0()
                                         .px_2()
                                         .rounded_sm()
                                         .cursor_pointer()
@@ -778,15 +816,11 @@ impl Desktop {
                                         .child(div().flex_1())
                                         .child(icon("right"))
                                         .on_mouse_move(cx.listener(move |v, _, _, cx| {
-                                            if v.context_menu_group != Some(name) {
-                                                v.context_menu_group = Some(name);
-                                                cx.notify();
-                                            }
+                                            v.graph_menu_group_hover(name, cx);
                                         }))
                                         .on_click(cx.listener(move |v, _, _, cx| {
                                             cx.stop_propagation();
-                                            v.context_menu_group = Some(name);
-                                            cx.notify();
+                                            v.graph_menu_group_hover(name, cx);
                                         }))
                                 }),
                         ),
@@ -797,12 +831,16 @@ impl Desktop {
                             .relative()
                             .children(self.graph_context_probe(2))
                             .absolute()
-                            .left(px(324.))
-                            .top(px(0.))
+                            .left(px(if opens_left { 0. } else { 324. }))
+                            .top(px(offset))
                             .w(px(320.))
                             .max_h(px(submenu_height))
                             .id("commit-submenu")
                             .overflow_y_scroll()
+                            .when(
+                                self.scenario.as_deref() == Some("graph-branch-menu-edge"),
+                                |menu| menu.track_scroll(&self.graph_context.submenu_scroll),
+                            )
                             .p_1()
                             .bg(rgb(PANEL))
                             .border_1()
@@ -810,12 +848,13 @@ impl Desktop {
                             .rounded_md()
                             .shadow_lg()
                             .occlude()
-                            .children(
-                                selected
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(i, item)| self.graph_menu_item(i + 100, item, cx)),
-                            ),
+                            .children(selected.into_iter().enumerate().map(|(i, item)| {
+                                self.graph_menu_item(i + 100, item, cx).children(
+                                    (i + 1 == submenu_count)
+                                        .then(|| self.graph_context_probe(10))
+                                        .flatten(),
+                                )
+                            })),
                     )
                 }),
         )
@@ -831,7 +870,11 @@ impl Desktop {
     ) -> Stateful<Div> {
         row()
             .id(("commit-menu-item", i))
+            .relative()
+            .children((i == 100).then(|| self.graph_context_probe(7)).flatten())
+            .children(self.graph_context_safe_probe(&action))
             .h(px(36.))
+            .flex_shrink_0()
             .px_2()
             .rounded_sm()
             .text_color(rgb(if enabled { TEXT } else { MUTED }))
@@ -842,9 +885,20 @@ impl Desktop {
                     .hover(|s| s.bg(rgb(SELECTED_HOVER)))
                     .on_click(cx.listener(move |v, _, w, cx| {
                         cx.stop_propagation();
-                        v.action(action.clone(), w, cx);
+                        v.graph_menu_activate(action.clone(), w, cx);
                     }))
             })
+    }
+
+    fn graph_menu_group_hover(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        if self.context_menu_group != Some(name) {
+            self.context_menu_group = Some(name);
+            cx.notify();
+        }
+    }
+
+    fn graph_menu_activate(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        self.action(action, window, cx);
     }
 
     pub(super) fn graph_cherry_pick_oids(&self) -> Vec<String> {
@@ -1288,6 +1342,7 @@ impl Desktop {
             toolbar_bench: Default::default(),
             filter_bench: Default::default(),
             general_bench: Default::default(),
+            graph_polish: Default::default(),
             graph_hover: Default::default(),
             graph_selected_path: Default::default(),
             base_diff: Default::default(),
@@ -2435,7 +2490,13 @@ impl Desktop {
                                     .w(px(graph_width))
                                     .h_full()
                                     .flex_shrink_0()
-                                    .child(graph_canvas(cells, flags, hovered, graph_width))
+                                    .child(graph_canvas(
+                                        cells,
+                                        flags,
+                                        hovered,
+                                        graph_width,
+                                        v.graph_polish_trace(row_index),
+                                    ))
                                     .when(node_lane as f32 * 14. < graph_width, |graph| {
                                         graph.child(
                                             div()
@@ -2510,6 +2571,7 @@ impl Desktop {
                                     flags,
                                     v.graph_hover
                                         .combined_row(&v.graph_selected_path, row_index),
+                                    v.graph_polish_trace(row_index),
                                 ))
                                 .child(format!(
                                     "Pending changes  ·  {} files",
@@ -3403,6 +3465,9 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if self.scenario.as_deref() == Some("graph-polish") {
+            return self.graph_polish.verified;
+        }
         if self.scenario.as_deref() == Some("refresh-native") {
             return self.refresh_bench.verified;
         }
@@ -3670,6 +3735,7 @@ impl Render for Desktop {
         self.conflicts_schedule(window, cx);
         self.discard_scenario_schedule(window, cx);
         self.graph_feature_schedule(window, cx);
+        self.graph_polish_schedule(window, cx);
         self.graph_context_schedule(window, cx);
         self.branch_cleanup_schedule(window, cx);
         self.ui_feature_schedule(window, cx);
@@ -3817,7 +3883,7 @@ impl Render for Desktop {
             ) || self.provider_scenario_ready(window, cx))
             && (!matches!(
                 self.scenario.as_deref(),
-                Some("tool-icons" | "tool-icons-diff")
+                Some("tool-icons" | "tool-icons-diff" | "tool-icons-merge")
             ) || self.tools_icons_scenario_ready(window, cx))
         {
             let weak = cx.entity().downgrade();
@@ -4239,6 +4305,17 @@ fn pending_graph_cells(head: &[GraphCell], lane: usize) -> Vec<GraphCell> {
     cells
 }
 
+fn paint_graph_connection(
+    window: &mut Window,
+    quad: PaintQuad,
+    trace: Option<&graph_polish::PaintTrace>,
+) {
+    window.paint_quad(quad);
+    if let Some(trace) = trace {
+        trace.connection();
+    }
+}
+
 fn pending_graph_canvas(
     width: f32,
     lane: usize,
@@ -4246,10 +4323,14 @@ fn pending_graph_canvas(
     cells: Vec<GraphCell>,
     flags: Vec<u8>,
     hovered: Vec<u8>,
+    trace: Option<graph_polish::PaintTrace>,
 ) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
+            if let Some(trace) = &trace {
+                trace.begin(bounds, true);
+            }
             for outline in [true, false] {
                 for (i, cell) in cells.iter().enumerate().take((width / 14.) as usize) {
                     let center = graph_node_center(bounds, i);
@@ -4267,40 +4348,68 @@ fn pending_graph_canvas(
                     let track_width = px(if outline { 6. } else { 2. });
                     if i == lane {
                         if incoming {
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(center.x - track_width / 2., bounds.top()),
-                                    size(
-                                        track_width,
-                                        center.y - px(GRAPH_NODE_RADIUS) - bounds.top(),
+                            paint_graph_connection(
+                                window,
+                                fill(
+                                    Bounds::new(
+                                        point(center.x - track_width / 2., bounds.top()),
+                                        size(
+                                            track_width,
+                                            center.y - px(GRAPH_NODE_RADIUS) - bounds.top(),
+                                        ),
                                     ),
+                                    color,
                                 ),
-                                color,
-                            ));
+                                trace.as_ref(),
+                            );
                         }
                         // Stop at the rim so the pending marker stays hollow on every background.
                         let start = center.y + px(GRAPH_NODE_RADIUS);
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(center.x - track_width / 2., start),
-                                size(track_width, bounds.bottom() - start),
+                        paint_graph_connection(
+                            window,
+                            fill(
+                                Bounds::new(
+                                    point(center.x - track_width / 2., start),
+                                    size(track_width, bounds.bottom() - start),
+                                ),
+                                color,
                             ),
-                            color,
-                        ));
-                        if outline {
-                            paint_graph_node_outline(center, window);
-                        } else {
-                            paint_graph_node(center, color, true, window);
-                        }
+                            trace.as_ref(),
+                        );
                     } else if cell.kind() == CellKind::Vertical {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(center.x - track_width / 2., bounds.top()),
-                                size(track_width, bounds.size.height),
+                        paint_graph_connection(
+                            window,
+                            fill(
+                                Bounds::new(
+                                    point(center.x - track_width / 2., bounds.top()),
+                                    size(track_width, bounds.size.height),
+                                ),
+                                color,
                             ),
-                            color,
-                        ));
+                            trace.as_ref(),
+                        );
                     }
+                }
+            }
+            // Foreground markers are painted only after every connection pass.
+            if lane < (width / 14.) as usize {
+                let center = graph_node_center(bounds, lane);
+                if hovered
+                    .get(lane)
+                    .is_some_and(|flag| flag & crate::graph::hover::GLYPH != 0)
+                {
+                    paint_graph_node_outline(center, window);
+                    if let Some(trace) = &trace {
+                        trace.node();
+                    }
+                }
+                let color = cells
+                    .get(lane)
+                    .map(|cell| graph_color(*cell, flags.get(lane).copied().unwrap_or(0)))
+                    .unwrap_or_else(|| rgb(COLORS[0]).into());
+                paint_graph_node(center, color, true, window);
+                if let Some(trace) = &trace {
+                    trace.node();
                 }
             }
         },
@@ -4315,10 +4424,14 @@ fn graph_canvas(
     flags: Vec<u8>,
     hovered: Vec<u8>,
     width: f32,
+    trace: Option<graph_polish::PaintTrace>,
 ) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
+            if let Some(trace) = &trace {
+                trace.begin(bounds, false);
+            }
             for outline in [true, false] {
                 for (i, c) in cells.iter().enumerate().take((width / 14.) as usize) {
                     let center = graph_node_center(bounds, i);
@@ -4354,22 +4467,30 @@ fn graph_canvas(
                             | CellKind::JoinFromRight
                     );
                     if top && (!outline || highlighted) {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(x - vertical_width / 2., bounds.top()),
-                                size(vertical_width, middle - bounds.top()),
+                        paint_graph_connection(
+                            window,
+                            fill(
+                                Bounds::new(
+                                    point(x - vertical_width / 2., bounds.top()),
+                                    size(vertical_width, middle - bounds.top()),
+                                ),
+                                color,
                             ),
-                            color,
-                        ));
+                            trace.as_ref(),
+                        );
                     }
                     if bottom && (!outline || highlighted) {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(x - vertical_width / 2., middle),
-                                size(vertical_width, bounds.bottom() - middle),
+                        paint_graph_connection(
+                            window,
+                            fill(
+                                Bounds::new(
+                                    point(x - vertical_width / 2., middle),
+                                    size(vertical_width, bounds.bottom() - middle),
+                                ),
+                                color,
                             ),
-                            color,
-                        ));
+                            trace.as_ref(),
+                        );
                     }
                     if (!outline || connector)
                         && matches!(
@@ -4381,13 +4502,17 @@ fn graph_canvas(
                                 | CellKind::JoinFromLeft
                         )
                     {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(x - px(14.), middle - horizontal_width / 2.),
-                                size(px(14.), horizontal_width),
+                        paint_graph_connection(
+                            window,
+                            fill(
+                                Bounds::new(
+                                    point(x - px(14.), middle - horizontal_width / 2.),
+                                    size(px(14.), horizontal_width),
+                                ),
+                                connector_color,
                             ),
-                            connector_color,
-                        ));
+                            trace.as_ref(),
+                        );
                     }
                     if (!outline || connector)
                         && matches!(
@@ -4399,19 +4524,47 @@ fn graph_canvas(
                                 | CellKind::JoinFromRight
                         )
                     {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(x, middle - horizontal_width / 2.),
-                                size(px(14.), horizontal_width),
+                        paint_graph_connection(
+                            window,
+                            fill(
+                                Bounds::new(
+                                    point(x, middle - horizontal_width / 2.),
+                                    size(px(14.), horizontal_width),
+                                ),
+                                connector_color,
                             ),
-                            connector_color,
-                        ));
+                            trace.as_ref(),
+                        );
                     }
-                    if matches!(k, CellKind::Node | CellKind::MergeNode) {
-                        if outline && highlighted {
+                }
+            }
+            // Later lanes may draw horizontal connections across an earlier
+            // node's center. Keep all node rims and fills above those lines.
+            for outline in [true, false] {
+                for (i, cell) in cells.iter().enumerate().take((width / 14.) as usize) {
+                    if !matches!(cell.kind(), CellKind::Node | CellKind::MergeNode) {
+                        continue;
+                    }
+                    let center = graph_node_center(bounds, i);
+                    if outline {
+                        if hovered
+                            .get(i)
+                            .is_some_and(|flag| flag & crate::graph::hover::GLYPH != 0)
+                        {
                             paint_graph_node_outline(center, window);
-                        } else if !outline {
-                            paint_graph_node(center, color, false, window);
+                            if let Some(trace) = &trace {
+                                trace.node();
+                            }
+                        }
+                    } else {
+                        paint_graph_node(
+                            center,
+                            graph_color(*cell, flags.get(i).copied().unwrap_or(0)),
+                            false,
+                            window,
+                        );
+                        if let Some(trace) = &trace {
+                            trace.node();
                         }
                     }
                 }

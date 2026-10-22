@@ -252,6 +252,8 @@ pub struct Browser {
     pub activity_errors: HashMap<Target, String>,
     pub activity_requests: usize,
     pub remotes: BTreeMap<String, remote::Update>,
+    /// Cached remote-ref tips, distinct from local branches and their upstreams.
+    fetched_tips: HashMap<String, HashMap<String, String>>,
     pub last_check: Option<std::time::Instant>,
     pub sort: Sort,
     pub hierarchy: bool,
@@ -261,6 +263,15 @@ pub struct Browser {
 }
 
 impl Browser {
+    /// Exact cached-tip membership, with borrowed lookups during row painting.
+    pub fn remote_fetched(&self, target: &Target) -> bool {
+        target
+            .remote
+            .as_ref()
+            .and_then(|remote| self.fetched_tips.get(remote))
+            .and_then(|branches| branches.get(&target.name))
+            .is_some_and(|sha| sha == &target.sha)
+    }
     pub fn show(&mut self, refs: Option<&RefSnapshot>) {
         self.reset_to_top();
         self.rebuild(refs);
@@ -287,6 +298,9 @@ impl Browser {
     }
 
     pub fn rebuild(&mut self, refs: Option<&RefSnapshot>) {
+        for tips in self.fetched_tips.values_mut() {
+            tips.clear();
+        }
         let keep = self
             .chosen()
             .map(|e| (e.target.remote.clone(), e.target.name.clone()));
@@ -312,11 +326,19 @@ impl Browser {
                         if name == "HEAD" {
                             continue;
                         }
+                        let sha = r.id.to_string();
+                        if let Some(tips) = self.fetched_tips.get_mut(remote) {
+                            tips.insert(name.into(), sha.clone());
+                        } else {
+                            let mut tips = HashMap::new();
+                            tips.insert(name.into(), sha.clone());
+                            self.fetched_tips.insert(remote.into(), tips);
+                        }
                         Target {
                             name: name.into(),
                             remote: Some(remote.into()),
                             url: None,
-                            sha: r.id.to_string(),
+                            sha,
                         }
                     }
                     _ => continue,
@@ -338,6 +360,7 @@ impl Browser {
                 );
             }
         }
+        self.fetched_tips.retain(|_, tips| !tips.is_empty());
         // No extra index work for the ordinary local-only case. Names are
         // borrowed from the immutable snapshot, never folded or copied.
         let has_remotes = !self.remotes.is_empty()
@@ -1630,6 +1653,38 @@ mod hierarchy_tests {
             )]),
             ..RefSnapshot::default()
         }
+    }
+    #[test]
+    fn fetched_remote_icons_require_exact_cached_tip_not_tracking_configuration() {
+        let mut refs = refs();
+        refs.upstreams
+            .insert("topic".into(), ("origin".into(), "server-only".into()));
+        let mut browser = Browser::default();
+        browser.rebuild(Some(&refs));
+        let mut target = Target {
+            name: "renamed".into(),
+            remote: Some("origin".into()),
+            url: None,
+            sha: "1111111111111111111111111111111111111111".into(),
+        };
+        assert!(browser.remote_fetched(&target));
+        target.sha = "2222222222222222222222222222222222222222".into();
+        assert!(
+            !browser.remote_fetched(&target),
+            "An advanced server tip has not been fetched"
+        );
+        target.name = "server-only".into();
+        target.sha = "1111111111111111111111111111111111111111".into();
+        assert!(
+            !browser.remote_fetched(&target),
+            "A configured local upstream does not create a cached remote ref"
+        );
+        target.name = "renamed".into();
+        browser.rebuild(None);
+        assert!(
+            !browser.remote_fetched(&target),
+            "Rebuild must not retain removed snapshot refs"
+        );
     }
     #[test]
     fn exact_upstream_same_tip_coalesces_but_distinct_branches_stay_visible() {

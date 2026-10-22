@@ -1093,7 +1093,9 @@ impl Desktop {
                     },
                 ),
             };
-            let mut body = dialog_body(title);
+            let mut body = dialog_body(title)
+                .relative()
+                .children(self.graph_context_probe(9));
             if dialog == Dialog::Push {
                 if op.push_pending {
                     body = body.child(caption("Checking the remote branch… You can close this dialog while the check runs."));

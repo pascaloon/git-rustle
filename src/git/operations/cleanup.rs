@@ -281,6 +281,7 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
             tracking: if matching { identity } else { None },
         });
     }
+    let mut missing_server_refs = 0usize;
     for ((r, b), id) in &cached {
         if associated.contains(&(r.clone(), b.clone())) || locals.contains(b) {
             continue;
@@ -288,7 +289,11 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
         let Some(server) = servers.get(r) else {
             continue;
         };
-        if server.heads.get(b) != Some(&id.to_string()) {
+        // This is a local cached copy. The server must still have that branch,
+        // but it may have advanced since the last fetch. Lease the cached OID
+        // independently; never write server refs or fetch branch objects here.
+        if !server.heads.contains_key(b) {
+            missing_server_refs += 1;
             continue;
         }
         if let std::collections::hash_map::Entry::Vacant(e) = details.entry(*id) {
@@ -311,6 +316,9 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
             tracking_oid: Some(id.to_string()),
             tracking: Some((r.clone(), b.clone())),
         });
+    }
+    if missing_server_refs > 0 {
+        result.warnings.push(format!("{missing_server_refs} fetched reference(s) were retained because their server branches no longer exist; these local references may be the last copy."));
     }
     let alias_targets: HashSet<_> = raw.iter().filter_map(|r| r.symbolic.as_deref()).collect();
     for candidate in &mut result.candidates {
@@ -758,6 +766,167 @@ mod tests {
         assert_eq!(ordinary(refs_at(&f.root)), ordinary(after));
         assert_eq!(refs_at(&f.bare), server);
         assert_eq!(f.git(&["rev-parse", "main"]), oid);
+    }
+
+    #[test]
+    fn fetched_only_cleanup_includes_server_ahead_but_retains_missing_server_last_copy() {
+        let f = Fixture::new();
+        let cached = f.git(&["rev-parse", "old/local"]);
+        let ahead = f.git(&["rev-parse", "main"]);
+        let unique = f.git(&[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-m",
+            "unique cached tip retained by cleanup recovery",
+        ]);
+        for (name, oid) in [
+            ("server-ahead", cached.as_str()),
+            ("server-missing", unique.as_str()),
+        ] {
+            f.git(&["update-ref", &format!("refs/remotes/origin/{name}"), oid]);
+        }
+        command::checked(&f.bare, &["update-ref", "refs/heads/server-ahead", &ahead]).unwrap();
+        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("1 fetched reference")
+                    && warning.contains("no longer exist"))
+        );
+        let branches: Vec<_> = analysis
+            .candidates
+            .into_iter()
+            .filter(|c| c.name == "origin/server-ahead" || c.name == "origin/server-missing")
+            .collect();
+        assert_eq!(branches.len(), 1);
+        assert!(branches.iter().all(|c| c.section == Section::FetchedOnly
+            && !c.protected
+            && c.tracking_oid.as_deref() == Some(c.oid.as_str())));
+        let server = refs_at(&f.bare);
+        assert!(f.run(Plan { branches }).result.is_ok());
+        assert!(
+            command::checked(
+                &f.root,
+                &["show-ref", "--verify", "refs/remotes/origin/server-ahead"]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/server-missing"]),
+            unique
+        );
+        assert_eq!(refs_at(&f.bare), server);
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        for (name, oid) in [
+            ("server-ahead", cached.as_str()),
+            ("server-missing", unique.as_str()),
+        ] {
+            assert_eq!(
+                f.git(&["rev-parse", &format!("refs/remotes/origin/{name}")]),
+                oid
+            );
+        }
+        assert!(execute(&f.root, Request::MoveTo(1)).result.is_ok());
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/server-missing"]),
+            unique
+        );
+        assert_eq!(refs_at(&f.bare), server);
+    }
+    #[test]
+    fn fetched_only_plan_leases_cached_ref_not_server_head_and_retains_unknown_server_refs() {
+        let f = Fixture::new();
+        let cached = f.git(&["rev-parse", "old/local"]);
+        let current = f.git(&["rev-parse", "main"]);
+        f.git(&["update-ref", "refs/remotes/origin/untracked-moved", &cached]);
+        command::checked(
+            &f.bare,
+            &["update-ref", "refs/heads/untracked-moved", &cached],
+        )
+        .unwrap();
+        let candidate = f.candidate("origin/untracked-moved");
+        command::checked(
+            &f.bare,
+            &["update-ref", "refs/heads/untracked-moved", &current],
+        )
+        .unwrap();
+        let server = refs_at(&f.bare);
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_ok()
+        );
+        assert_eq!(refs_at(&f.bare), server);
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        let candidate = f.candidate("origin/untracked-moved");
+        f.git(&[
+            "update-ref",
+            "refs/remotes/origin/untracked-moved",
+            &current,
+        ]);
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err()
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/untracked-moved"]),
+            current
+        );
+        let candidate = f.candidate("origin/untracked-moved");
+        command::checked(
+            &f.bare,
+            &["update-ref", "-d", "refs/heads/untracked-moved", &current],
+        )
+        .unwrap();
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err(),
+            "server deletion invalidates frozen fetched-only eligibility"
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/untracked-moved"]),
+            current
+        );
+        command::checked(
+            &f.bare,
+            &["update-ref", "refs/heads/untracked-moved", &current],
+        )
+        .unwrap();
+        let candidate = f.candidate("origin/untracked-moved");
+        f.git(&[
+            "config",
+            "remote.origin.url",
+            f._dir.path().join("offline.git").to_str().unwrap(),
+        ]);
+        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+        assert!(!analysis.warnings.is_empty());
+        assert!(
+            !analysis
+                .candidates
+                .iter()
+                .any(|c| c.name == "origin/untracked-moved")
+        );
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err()
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/untracked-moved"]),
+            current
+        );
+        assert_eq!(refs_at(&f.bare), server);
     }
     #[test]
     fn cleanup_server_stale_missing_and_offline_refs_are_not_matching() {

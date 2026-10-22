@@ -65,6 +65,9 @@ pub(super) struct State {
     icons: std::collections::HashMap<PathBuf, Option<Arc<Image>>>,
     icon_paths: Vec<PathBuf>,
     icon_generation: u64,
+    toolbar_paints:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Bounds<Pixels>>>>,
+    toolbar_launch_started: bool,
     icons_pending: bool,
     icon_scenario_started: bool,
     general_requested: bool,
@@ -133,7 +136,7 @@ impl Desktop {
         };
         if !matches!(
             self.scenario.as_deref(),
-            Some("tool-icons" | "tool-icons-diff")
+            Some("tool-icons" | "tool-icons-diff" | "tool-icons-merge")
         ) {
             return image;
         }
@@ -160,13 +163,14 @@ impl Desktop {
     pub(super) fn tools_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.scenario.as_deref() == Some("tool-icons-diff")
             && self.tools.icon_scenario_started
-            && self.tools.picker.is_none()
+            && !self.tools.toolbar_launch_started
+            && self.tools.toolbar_paints.borrow().len() == self.tools.config.tools.len() + 2
+            && std::env::var_os("GIT_RUSTLE_TOOLBAR_LAUNCH_RECEIPT").is_some()
             && let Mode::Diff(view) = &self.engine.app.mode
             && let Some(change) = view.current_change().cloned()
         {
-            // Exercise the split button's real menu handler so every configured
-            // icon is painted; quick launch now intentionally shows just one.
-            self.tools_action(Action::OpenDiff(change), window, cx);
+            self.tools.toolbar_launch_started = true;
+            self.tools_action(Action::Diff("toolbar-fixture".into(), change), window, cx);
         }
         if self.tools.general_requested && !self.engine.app.settings.busy {
             self.tools.general_requested = false;
@@ -181,7 +185,7 @@ impl Desktop {
         }
         if !matches!(
             self.scenario.as_deref(),
-            Some("tool-icons" | "tool-icons-diff")
+            Some("tool-icons" | "tool-icons-diff" | "tool-icons-merge")
         ) || self.tools.icon_scenario_started
             || !self.tools.loaded
             || self.tools_config_busy()
@@ -193,6 +197,8 @@ impl Desktop {
         self.engine.mark("desktop scenario requested");
         if self.scenario.as_deref() == Some("tool-icons-diff") {
             self.action(super::Action::Diff, window, cx);
+        } else if self.scenario.as_deref() == Some("tool-icons-merge") {
+            self.operation_action(operations::Action::ShowConflicts, window, cx);
         } else {
             self.tools_action(Action::Configure, window, cx);
         }
@@ -231,6 +237,82 @@ impl Desktop {
                 && image.clone().get_render_image(window, cx).is_none()
             {
                 return false;
+            }
+        }
+        if matches!(
+            self.scenario.as_deref(),
+            Some("tool-icons-diff" | "tool-icons-merge")
+        ) {
+            assert!(
+                self.tools.picker.is_none(),
+                "all tool icons must paint without opening the dropdown"
+            );
+            let paints = self.tools.toolbar_paints.borrow();
+            let choices = if self.scenario.as_deref() == Some("tool-icons-merge") {
+                &self.tools.merge_choices
+            } else {
+                &self.tools.diff_choices
+            }
+            .as_ref()
+            .expect("hydrated choices");
+            assert!(choices.len() >= 2, "multiple toolbar tools required");
+            let Some(header) = paints.get("header") else {
+                return false;
+            };
+            let viewport = window.viewport_size();
+            assert!(
+                header.origin.x >= px(0.)
+                    && header.origin.y >= px(0.)
+                    && header.origin.x + header.size.width <= viewport.width
+                    && header.origin.y + header.size.height <= viewport.height,
+                "tool header must fit in the viewport: {header:?}, {viewport:?}"
+            );
+            let mut previous: Vec<Bounds<Pixels>> = Vec::new();
+            for id in choices
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .chain(std::iter::once("dropdown"))
+            {
+                let Some(bounds) = paints.get(id) else {
+                    return false;
+                };
+                assert!(
+                    bounds.size.width >= px(20.) && bounds.size.width <= px(40.),
+                    "icon-only control {id} has unexpected bounds: {bounds:?}"
+                );
+                assert!(
+                    bounds.size.height >= px(20.),
+                    "tool control must paint: {id}"
+                );
+                assert!(
+                    bounds.origin.x >= header.origin.x
+                        && bounds.origin.y >= header.origin.y
+                        && bounds.origin.x + bounds.size.width
+                            <= header.origin.x + header.size.width
+                        && bounds.origin.y + bounds.size.height
+                            <= header.origin.y + header.size.height,
+                    "tool control {id} must fit within the header: {bounds:?}, {header:?}"
+                );
+                for earlier in &previous {
+                    assert!(
+                        bounds.origin.x >= earlier.origin.x + earlier.size.width
+                            || earlier.origin.x >= bounds.origin.x + bounds.size.width
+                            || bounds.origin.y >= earlier.origin.y + earlier.size.height
+                            || earlier.origin.y >= bounds.origin.y + bounds.size.height,
+                        "tool controls overlap: id={id} bounds={bounds:?}, earlier={earlier:?}, header={header:?}, all={paints:?}"
+                    );
+                }
+                previous.push(*bounds);
+            }
+            if std::env::var_os("GIT_RUSTLE_TOOLBAR_LAUNCH_RECEIPT").is_some() {
+                if !self.tools.toolbar_launch_started || self.tools.busy {
+                    return false;
+                }
+                assert!(
+                    !self.tools.error,
+                    "fixture tool launch failed: {}",
+                    self.tools.message
+                );
             }
         }
         true
@@ -647,9 +729,9 @@ impl Desktop {
         } else {
             &self.tools.diff_choices
         };
-        let mut controls = row().gap_0();
+        let mut controls = row().gap_1().flex_wrap().flex_shrink_0().max_w_full();
         if let Some(choices) = choices {
-            for (index, (id, name)) in choices.iter().take(1).enumerate() {
+            for (id, name) in choices.iter() {
                 let Some(entry) = self.tools.config.entry(id) else {
                     continue;
                 };
@@ -659,34 +741,74 @@ impl Desktop {
                     Action::Diff(id.clone(), change.clone().unwrap())
                 };
                 let button_id: SharedString =
-                    format!("quick-tool-{}-{index}", path.as_deref().unwrap_or("diff")).into();
-                controls = controls.child(
-                    Button::new(button_id)
-                        .xsmall()
-                        .ghost()
-                        .child(self.tool_icon(&entry.executable))
-                        .label(format!(
-                            "{} with {name}",
-                            if merging { "Merge" } else { "Open" }
-                        ))
-                        .tooltip(format!(
-                            "{} with {}",
-                            if merging { "Merge" } else { "Compare" },
-                            name
-                        ))
-                        .disabled(
-                            self.tools.busy
-                                || self.tools.loading
-                                || (merging && self.engine.operation_busy),
-                        )
-                        .on_click(
-                            cx.listener(move |v, _, w, cx| v.tools_action(action.clone(), w, cx)),
+                    format!("quick-tool-{}-{id}", path.as_deref().unwrap_or("diff")).into();
+                controls =
+                    controls.child(
+                        self.tool_toolbar_probe(
+                            merging,
+                            id,
+                            Button::new(button_id)
+                                .xsmall()
+                                .ghost()
+                                .child(self.tool_icon(&entry.executable))
+                                .tooltip(format!(
+                                    "{} with {}",
+                                    if merging { "Merge" } else { "Compare" },
+                                    name
+                                ))
+                                .disabled(
+                                    self.tools.busy
+                                        || self.tools.loading
+                                        || (merging && self.engine.operation_busy),
+                                )
+                                .on_click(cx.listener(move |v, _, w, cx| {
+                                    v.tools_action(action.clone(), w, cx)
+                                }))
+                                .into_any_element(),
                         ),
-                );
+                    );
             }
         }
-        controls
-            .child(self.tools_picker(change, path, cx))
+        self.tool_toolbar_probe(
+            merging,
+            "header",
+            controls
+                .child(self.tool_toolbar_probe(
+                    merging,
+                    "dropdown",
+                    self.tools_picker(change, path, cx),
+                ))
+                .into_any_element(),
+        )
+    }
+    fn tool_toolbar_probe(&self, merging: bool, id: &str, button: AnyElement) -> AnyElement {
+        // Conflict recovery is drawn over the existing Diff; do not combine
+        // geometry from its background Diff toolbar with the Merge toolbar.
+        let active = match self.scenario.as_deref() {
+            Some("tool-icons-diff") => !merging,
+            Some("tool-icons-merge") => merging,
+            _ => false,
+        };
+        if !active {
+            return button;
+        }
+        let paints = self.tools.toolbar_paints.clone();
+        let id = id.to_owned();
+        div()
+            .relative()
+            .flex_shrink_0()
+            .max_w_full()
+            .child(button)
+            .child(
+                canvas(
+                    move |bounds, _, _| bounds,
+                    move |bounds, _, _, _| {
+                        paints.borrow_mut().insert(id.clone(), bounds);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .into_any_element()
     }
     fn tools_picker(
@@ -711,7 +833,8 @@ impl Desktop {
         let button = Button::new(id).xsmall().ghost().disabled(disabled);
         if choices.as_ref().is_none_or(|c| c.is_empty()) {
             return button
-                .label("Configure tools…")
+                .child(icon("down"))
+                .tooltip("Configure external tools")
                 .on_click(
                     cx.listener(|v, _, window, cx| v.tools_action(Action::Configure, window, cx)),
                 )
@@ -725,12 +848,6 @@ impl Desktop {
             (Some(Picker::Merge(a)), Picker::Merge(b)) => a == b,
             _ => false,
         };
-        let selected = self
-            .tools
-            .picker
-            .clone()
-            .filter(|_| open)
-            .unwrap_or_else(|| context.clone());
         let weak = cx.entity().downgrade();
         let changed = weak.clone();
         let popover_id: SharedString = if merging {
@@ -748,7 +865,7 @@ impl Desktop {
         Popover::new(popover_id)
             .p_1()
             .open(open)
-            .trigger(button.child(icon("down")).tooltip("Choose comparison tool"))
+            .trigger(button.child(icon("down")).tooltip("Edit external tools"))
             .on_open_change(move |open, window, cx| {
                 let _ = changed.update(cx, |v, cx| {
                     let action = if !open {
@@ -764,44 +881,12 @@ impl Desktop {
             })
             .content(move |_, _, cx| {
                 let probe = weak.upgrade().and_then(|v| v.read(cx).todo_probe(13));
-                let mut menu = column()
+                let menu = column()
                     .relative()
                     .w(px(220.))
                     .gap_0()
                     .p_1()
                     .children(probe);
-                for (index, (id, name)) in choices.as_ref().unwrap().iter().enumerate() {
-                    let tool_icon = weak.upgrade().map(|view| {
-                        let view = view.read(cx);
-                        view.tools
-                            .config
-                            .entry(id)
-                            .map(|entry| view.tool_icon(&entry.executable))
-                            .unwrap_or_else(|| icon("tool").into_any_element())
-                    });
-                    let (weak, id, selected) = (weak.clone(), id.clone(), selected.clone());
-                    menu = menu.child(
-                        Button::new(("external-tool-choice", index))
-                            .xsmall()
-                            .ghost()
-                            .w_full()
-                            .justify_start()
-                            .child(row().gap_2().children(tool_icon).child(name.clone()))
-                            .on_click(move |_, window, cx| {
-                                let _ = weak.update(cx, |v, cx| {
-                                    let action = match &selected {
-                                        Picker::Diff(change) => {
-                                            Action::Diff(id.clone(), change.clone())
-                                        }
-                                        Picker::Merge(path) => {
-                                            Action::Merge(id.clone(), path.clone())
-                                        }
-                                    };
-                                    v.tools_action(action, window, cx);
-                                });
-                            }),
-                    );
-                }
                 let weak = weak.clone();
                 menu.child(
                     Button::new("picker-configure-tools")
@@ -851,7 +936,7 @@ impl Desktop {
         if !self.tools.open {
             return panel.children(self.tools_notice());
         }
-        panel = panel.child(caption("Saved tools appear by name in the Diff and Merge menus. Changes take effect after Save.").w_full().flex_shrink_0());
+        panel = panel.child(caption("Saved tools appear as icon buttons in Diff and Merge. Hover an icon for its name; use the arrow to configure tools. Changes take effect after Save.").w_full().flex_shrink_0());
         for (i, entry) in self.tools.draft.tools.iter().enumerate() {
             let id = entry.id.clone();
             panel = panel.child(
@@ -962,13 +1047,12 @@ impl Desktop {
             .value()
             .to_string()
     }
-    pub(super) fn tools_scenario_picker_ids(&self) -> Vec<String> {
-        let choices = match &self.tools.picker {
-            Some(Picker::Diff(_)) => &self.tools.diff_choices,
-            Some(Picker::Merge(_)) => &self.tools.merge_choices,
-            None => return Vec::new(),
-        };
-        choices
+    pub(super) fn tools_scenario_picker_open(&self) -> bool {
+        self.tools.picker.is_some()
+    }
+    pub(super) fn tools_scenario_toolbar_ids(&self) -> Vec<String> {
+        self.tools
+            .diff_choices
             .as_ref()
             .map(|c| c.iter().map(|(id, _)| id.clone()).collect())
             .unwrap_or_default()

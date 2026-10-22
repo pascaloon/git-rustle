@@ -4,17 +4,19 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$CandidateHarness,
     [string]$BaselineHarness,
-    [ValidateSet('provider-scroll','provider-menu','tool-icons','tool-icons-diff')][string[]]$Scenarios = @('provider-scroll','provider-menu','tool-icons','tool-icons-diff'),
+    [ValidateSet('provider-scroll','provider-menu','tool-icons','tool-icons-diff','tool-icons-merge')][string[]]$Scenarios = @('provider-scroll','provider-menu','tool-icons','tool-icons-diff','tool-icons-merge'),
     [ValidateRange(1,100)][int]$Samples = 15,
     [ValidateRange(5,60)][int]$TimeoutSeconds = 30,
     [switch]$SkipNative,
     [switch]$SkipScreenshots,
+    [switch]$VerifyToolLaunch,
     [switch]$SkipComponents
 )
 # No desktop input or screen capture. Every native process uses an owned private
-# desktop. Editors are resource fixtures only and are never launched.
+# desktop. Only the opt-in test-harness child is launched; editor resource fixtures are never launched.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/benchmark-screenshot.ps1"
+. "$PSScriptRoot/benchmark-processes.ps1"
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 $Baseline = (Resolve-Path -LiteralPath $Baseline).Path
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -23,10 +25,10 @@ if (!$OutputDirectory.StartsWith($allowed,[StringComparison]::OrdinalIgnoreCase)
 if (Test-Path -LiteralPath $OutputDirectory) { throw 'Retaining prior evidence; choose a new output directory' }
 New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
 $saved = @{}
-$names = @('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_TERMINAL_PROMPT','GIT_OPTIONAL_LOCKS','GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES','GIT_RUSTLE_TOOL_DISCOVERY_ROOTS','GIT_RUSTLE_ICON_BENCH_EXE')
+$names = @('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_TERMINAL_PROMPT','GIT_OPTIONAL_LOCKS','GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_DUMP','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_FRAME_SAMPLES','GIT_RUSTLE_TOOL_DISCOVERY_ROOTS','GIT_RUSTLE_ICON_BENCH_EXE','GIT_RUSTLE_TOOLBAR_LAUNCH_RECEIPT')
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 function Assert-Idle {
-    if (@(Get-Process cargo,rustc,link,cl -ErrorAction SilentlyContinue).Count) { throw 'Timing rejected: competing build detected' }
+    Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
 }
 function Fixture-Git([string]$Path,[string[]]$Arguments) {
     $result = @(& git -C $Path -c core.hooksPath= -c commit.gpgsign=false @Arguments 2>&1)
@@ -43,7 +45,7 @@ function Fixture-State([string]$Path) {
         file = (Get-FileHash -LiteralPath (Join-Path $Path 'fixture.txt')).Hash
     } | ConvertTo-Json -Compress
 }
-function New-Fixture([string]$Directory) {
+function New-Fixture([string]$Directory,[string]$Scenario) {
     $repository = Join-Path $Directory 'repository'
     New-Item -ItemType Directory -Path $repository | Out-Null
     Fixture-Git $repository @('init','-b','main') | Out-Null
@@ -55,6 +57,14 @@ function New-Fixture([string]$Directory) {
         Fixture-Git $repository @('add','fixture.txt') | Out-Null
         Fixture-Git $repository @('commit','-m',"Fixture revision $n") | Out-Null
     }
+    if ($Scenario -eq 'tool-icons-merge') {
+        Fixture-Git $repository @('checkout','-b','incoming','HEAD~1') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $repository 'fixture.txt'),"Incoming conflict fixture`n")
+        Fixture-Git $repository @('commit','-am','Incoming conflict') | Out-Null
+        Fixture-Git $repository @('checkout','main') | Out-Null
+        $mergeResult = @(& git -C $repository -c core.hooksPath= -c commit.gpgsign=false merge incoming 2>&1)
+        if ($LASTEXITCODE -ne 1 -or !(Fixture-Git $repository @('ls-files','-u'))) { throw "Expected disposable merge conflict: $mergeResult" }
+    }
     $env:LOCALAPPDATA = Join-Path $Directory 'appdata'
     $env:APPDATA = Join-Path $Directory 'roaming'
     $settings = Join-Path $env:LOCALAPPDATA 'git-rustle'
@@ -63,6 +73,12 @@ function New-Fixture([string]$Directory) {
         @{id='resource';name='Fixture application icon';executable=$Baseline;preset='Custom';diff_arguments=@('{left}','{right}');merge_arguments=@('{left}','{base}','{right}','{output}')},
         @{id='fallback';name='Unavailable fixture tool';executable=(Join-Path $Directory 'missing-tool.exe');preset='Custom';diff_arguments=@('{left}','{right}');merge_arguments=@('{left}','{base}','{right}','{output}')}
     )
+    $env:GIT_RUSTLE_TOOLBAR_LAUNCH_RECEIPT = $null
+    if ($VerifyToolLaunch -and $Scenario -eq 'tool-icons-diff') {
+        if (!$CandidateHarness) { throw '-VerifyToolLaunch requires -CandidateHarness' }
+        $env:GIT_RUSTLE_TOOLBAR_LAUNCH_RECEIPT = Join-Path $Directory 'tool-launch-receipt.json'
+        $entries += @{id='toolbar-fixture';name='Hidden fixture comparison';executable=(Resolve-Path -LiteralPath $CandidateHarness).Path;preset='Custom';diff_arguments=@('--exact','external_tools::tests::toolbar_child','--ignored','--nocapture','--skip','{left}','--skip','{right}')}
+    }
     @{scanned=$true;tools=$entries} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $settings 'tools.json')
     $repository
 }
@@ -71,7 +87,7 @@ function Run-Native([string]$Executable,[string]$Label,[string]$Scenario,[int]$S
     $group = if ($Capture) { 'screenshots' } else { 'native' }
     $directory = Join-Path $OutputDirectory "$group/$Label-$Scenario-$Sample"
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
-    $repository = New-Fixture $directory
+    $repository = New-Fixture $directory $Scenario
     $before = Fixture-State $repository
     $before | Set-Content -LiteralPath (Join-Path $directory 'fixture-before.json')
     $env:GIT_RUSTLE_TIMING='1'; $env:GIT_RUSTLE_TRACE='1'; $env:GIT_RUSTLE_SCENARIO=$Scenario
@@ -103,6 +119,12 @@ function Run-Native([string]$Executable,[string]$Label,[string]$Scenario,[int]$S
         if ($process.ExitCode -ne 0) { throw "Native scenario failed: $directory" }
     } finally { if ($null -ne $process) { $process.Dispose() } }
     Assert-Idle
+    if ($VerifyToolLaunch -and $Scenario -eq 'tool-icons-diff') {
+        $receiptPath = Join-Path $directory 'tool-launch-receipt.json'
+        if (!(Test-Path -LiteralPath $receiptPath)) { throw 'Toolbar handler did not launch the selected hidden fixture tool' }
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+        if ($receipt.tool -ne 'toolbar-fixture' -or !$receipt.left.Count -or !$receipt.right.Count) { throw 'Invalid selected-tool launch receipt' }
+    }
     $after = Fixture-State $repository
     $after | Set-Content -LiteralPath (Join-Path $directory 'fixture-after.json')
     if ($before -cne $after) { throw "Scenario changed its fixture: $directory" }
@@ -168,19 +190,18 @@ try {
     if (!$SkipComponents) {
         $env:LOCALAPPDATA=Join-Path $OutputDirectory 'component-appdata'
         New-Item -ItemType Directory -Path $env:LOCALAPPDATA | Out-Null
-        foreach($filter in @('remote::requests::pipelines::tests','provider_settings::tests','credentials::tests','desktop::provider::tests','external_tools::icons::tests')) {Run-Harness $CandidateHarness $filter ('tests-'+$filter.Replace('::','-')) $false}
+        foreach($filter in @('provider_settings::tests','credentials::tests','desktop::provider::tests','external_tools::icons::tests')) {Run-Harness $CandidateHarness $filter ('tests-'+$filter.Replace('::','-')) $false}
         foreach($label in @('baseline','candidate')) {
             $harness=if($label-eq'baseline'){$BaselineHarness}else{$CandidateHarness}
             Run-Harness $harness 'desktop::provider::tests::benchmark_provider_lookup' "$label-provider-lookup" $true
         }
-        Run-Harness $CandidateHarness 'remote::requests::pipelines::tests::benchmark_pipeline_snapshot' 'candidate-pipeline-snapshot' $true
         Run-Harness $CandidateHarness 'external_tools::icons::tests::benchmark_executable_icons' 'candidate-tool-icons' $true
     }
     if (!$SkipScreenshots) {
         $captures=@(foreach($scenario in $Scenarios) {Run-Native $Candidate 'candidate' $scenario 0 $true})
         $captures | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $OutputDirectory 'screenshots.json')
     }
-    $report=@('# Provider and executable icon validation','','Raw launch samples include one excluded warmup (sample -1) and retained samples. Baseline/candidate order alternates for shared provider scenarios. Tool-icons and pipeline snapshot/extraction component operations are candidate-only because preserved baseline has no equivalent feature. Screenshots run separately after timing samples.','','| Binary / scenario | Metric | Samples | Median ms | p95 ms |','| --- | --- | ---: | ---: | ---: |')
+    $report=@('# Provider and executable icon validation','','Raw launch samples include one excluded warmup (sample -1) and retained samples. Baseline/candidate order alternates for shared provider scenarios. Tool-icon scenarios and extraction components are candidate-only; preserved baseline toolbars have different semantics. Screenshots run separately after timing samples.','','| Binary / scenario | Metric | Samples | Median ms | p95 ms |','| --- | --- | ---: | ---: | ---: |')
     foreach($group in @($results | Where-Object {$_.sample-ge0} | Group-Object binary,scenario)) {
         foreach($metric in @('wall_ms','first_frame_ms','operation_ms','frames_ms')) {
             $values=@($group.Group | ForEach-Object { $_.$metric } | Sort-Object)
@@ -207,7 +228,7 @@ try {
             $report+='| {0} | 40 visible provider lookups / frame | {1} | {2:F6} | {3:F6} |' -f $log.BaseName,$values.Count,$values[$middle],$values[[int][Math]::Ceiling(.95*$values.Count)-1]
         }
     }
-    $report+=@('','Nearest-rank p95. Native wall_ms includes launch/startup through graceful exit; first_frame_ms and scenario_frame_ms use the application trace clock. operation_ms measures scenario action request through verified scenario frame (including 120 scrolling frames for provider-scroll). Frame arrays contain 120 native GPUI callback intervals per scrolling launch; those intervals are correlated. Component logs define narrower extraction, cache and loopback-worker timings; do not compare different boundaries. Fixtures have no real provider remotes, editors are never launched, all owned native processes/private desktops are disposed, and repository postconditions are checked. Screenshot appearance still requires PNG inspection. Physical input, interactive desktop composition, display scanout and real provider latency are excluded.')
+    $report+=@('','Nearest-rank p95. Native wall_ms includes launch/startup through graceful exit; first_frame_ms and scenario_frame_ms use the application trace clock. operation_ms measures scenario action request through verified scenario frame (including 120 scrolling frames for provider-scroll). Frame arrays contain 120 native GPUI callback intervals per scrolling launch; those intervals are correlated. Component logs define narrower extraction, cache and loopback-worker timings; do not compare different boundaries. Fixtures have no real provider remotes, only an explicitly opted-in hidden harness child may launch, all owned native processes/private desktops are disposed, and repository postconditions are checked. Screenshot appearance still requires PNG inspection. Physical input, interactive desktop composition, display scanout and real provider latency are excluded.')
     if(Test-Path -LiteralPath (Join-Path $OutputDirectory 'unsupported-integrations.json')) {$report+=@('','Windows Credential Manager persistence was unsupported for some integration tests in this logon session. Those real-store operations were not verified; independent pure/mock credential tests still ran. See unsupported-integrations.json and retained stderr logs for exact affected filters.')}
     $report | Set-Content (Join-Path $OutputDirectory 'report.md')
 } finally {foreach($name in $saved.Keys) {[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}}

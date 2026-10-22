@@ -1,6 +1,6 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-commit-menu','graph-branch-menu','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
+    [string[]]$Scenarios=@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [Parameter(Mandatory)][string]$OutputDirectory
@@ -30,7 +30,7 @@ try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-commit-menu','graph-branch-menu','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
             Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
@@ -44,6 +44,16 @@ try{
             Graph-Git $fixture @('checkout','-b','topic')|Out-Null
             foreach($n in 0..1){Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value "topic $n";Graph-Git $fixture @('commit','-am',"Topic commit $n")|Out-Null}
             Graph-Git $fixture @('checkout','main')|Out-Null;Set-Content -LiteralPath (Join-Path $fixture 'main.txt') -Value 'main advanced';Graph-Git $fixture @('add','.')|Out-Null;Graph-Git $fixture @('commit','-m','Main advanced after topic diverged')|Out-Null
+            if($scenario-eq'graph-branch-menu-edge'){
+                foreach($n in 0..15){Graph-Git $fixture @('update-ref',("refs/heads/long-menu-{0:d2}" -f $n),'topic')|Out-Null}
+            }
+            if($scenario-eq'graph-polish'){
+                Graph-Git $fixture @('merge','--no-ff','topic','-m','Merge dense graph fixture')|Out-Null
+                Graph-Git $fixture @('update-ref','refs/remotes/origin/fetched','HEAD')|Out-Null
+                Graph-Git $fixture @('config','branch.main.remote','origin')|Out-Null
+                Graph-Git $fixture @('config','branch.main.merge','refs/heads/server-only')|Out-Null
+                Set-Content -LiteralPath (Join-Path $fixture 'pending.txt') -Value 'Pending graph polish fixture'
+            }
             if($scenario-eq'pending-graph'){
                 Graph-Git $fixture @('update-ref','refs/remotes/origin/main','HEAD')|Out-Null
                 Graph-Git $fixture @('reset','--hard','HEAD~1')|Out-Null
@@ -68,7 +78,7 @@ try{
                     while([DateTime]::UtcNow-lt$deadline){
                         if($process.WaitForExit(0)){throw "Scenario exited before screenshot: $log"}
                         $observed=Read-GraphLiveLog $log
-                        if($observed-match'(graph feature|graph context) verified frame'){$ready=$true;break}
+                        if($observed-match'(graph feature|graph context|graph polish) verified frame'){$ready=$true;break}
                         Start-Sleep -Milliseconds 50
                     }
                     if(!$ready){throw "Graph scenario paint timeout: $log"}
@@ -77,8 +87,8 @@ try{
                 if(!$process.WaitForExit(60000)){throw "Graph scenario timeout: $log"};if($process.ExitCode-ne0){throw "Graph scenario failed: $log"}
             }finally{if($null-ne$process){$process.Dispose()}}
             $text=Read-GraphLiveLog $log
-            if($text-notmatch'(graph feature|graph context) verified frame'){throw "Missing verified paint: $log"}
-            $start=[regex]::Match($text,'([0-9.]+) ms\s+(?:graph feature|graph context) requested');$end=[regex]::Match($text,'([0-9.]+) ms\s+(?:graph feature|graph context) verified frame')
+            if($text-notmatch'(graph feature|graph context|graph polish) verified frame'){throw "Missing verified paint: $log"}
+            $start=[regex]::Match($text,'([0-9.]+) ms\s+(?:graph feature|graph context|graph polish) requested');$end=[regex]::Match($text,'([0-9.]+) ms\s+(?:graph feature|graph context|graph polish) verified frame')
             $after=Graph-State $fixture;$after|Set-Content -LiteralPath (Join-Path $directory 'after.json')
             $a=$after|ConvertFrom-Json;$b=$before|ConvertFrom-Json
             foreach($key in @('refs')){if($a.$key-cne$b.$key){throw "Graph feature changed unrelated $key"}}

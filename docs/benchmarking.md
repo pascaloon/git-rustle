@@ -49,8 +49,7 @@ It verifies exclusive selection and the painted pending row; screenshot review
 separately checks the incoming lane and dim orange selected graph accents.
 
 The same runner also includes `stash-preview`, `stash-file`, and `stash-pop`.
-Disposable stashes include tracked and untracked content. Preview waits for
-expanded file rows to paint; file inspection invokes the actual file action and
+Disposable stashes include tracked and untracked content. Preview waits for the selected row and right-side inspector file rows to paint; file inspection invokes the actual file action and
 awaits its blob diff and frame. Pop confirms the real journaled operation, waits
 for refreshed pending changes and the graph paint, and verifies exact restored
 content, two surviving stashes, and unchanged HEAD and index. These new flows
@@ -1342,8 +1341,9 @@ Use fresh subdirectories beneath the same ignored run directory for:
   precedence and General links. Screenshot metadata verifies the actual native
   project title. Use `-Samples 15`, then a separate `-Screenshots` run.
 - [Provider/tool measurements](benchmarks/provider-tools.md): remote-only and
-  deduplicated request badges, five pipeline states and actual executable icons
-  in settings and the diff toolbar. These fixtures never launch external tools.
+  deduplicated request badges and actual executable icons in settings and the
+  Diff/Merge toolbar. The opt-in launch fixture runs only a hidden test-harness
+  child; configured editor resource fixtures are never launched.
 - Existing `benchmark-stash-workflows.ps1`: stash open/create/apply/delete and
   preservation of unrelated work; candidate now uses a full tab, so native
   sidebar-versus-tab frame costs are not identical visual workloads.
@@ -1471,3 +1471,39 @@ samples, fixture scales and medians/p95, disclose every joint threshold crossing
 and distinguish head paint from background tag completion. Private-desktop
 painting excludes physical input, interactive composition, scanout and live
 provider/network behavior. Never combine screenshot intervals with timing.
+
+
+### Graph polish and direct external-tool controls
+
+For the v013 visual changes, run `benchmark-graph-features.ps1` with
+`-Scenarios graph-polish,graph-commit-menu,graph-branch-menu,graph-commit-menu-edge,graph-branch-menu-edge`
+and `-Samples 15`, then repeat with `-Screenshots` in a separate output directory.
+`graph-polish` covers cloud/computer reference markers and foreground commit
+nodes. Menu cases assert measured parent-row/submenu alignment, viewport bounds,
+row transitions and edge placement. They invoke the shared production menu
+handlers and await paints; this does not establish physical pointer input or
+public native pointer-event dispatch through the pinned GPUI version.
+
+Run `benchmark-provider-tools.ps1 -Candidate $candidateExe -Baseline $baselineExe
+-CandidateHarness $candidateTests -Scenarios tool-icons-diff,tool-icons-merge
+-VerifyToolLaunch -Samples 15 -SkipScreenshots -OutputDirectory <fresh-run>` as one
+PowerShell command. Then use the same arguments with `-SkipNative` instead of
+`-SkipScreenshots` and another output directory for PNGs. Both scenarios are
+candidate-only: the preserved baseline opens a different Diff tool menu and has
+no equivalent Merge scenario. Each scenario checks multiple directly visible
+icon buttons and a configuration-only arrow without opening the dropdown,
+including nonoverlap and toolbar/viewport bounds. Tooltips retain tool names;
+the pinned component API does not expose a separate accessibility-label setter.
+
+`-VerifyToolLaunch` adds an explicitly configured hidden test-harness executable
+to the disposable Diff fixture. The real tool handler prepares distinct left and
+right inputs, waits for the child and its success receipt, and checks unchanged
+repository/index/worktree state. It never launches a configured editor resource
+fixture. This validates handler/tool identity and worker completion, not physical
+click behavior. The default component stage retains supported provider/icon
+checks and omits obsolete graph-pipeline test/benchmark invocations; use
+`-SkipComponents` to isolate native toolbar timing from those unrelated workers.
+Shared startup and scrolling remain baseline/candidate controls. Native toolbar
+request-to-paint intervals include fixture worker/child completion and are not
+isolated icon extraction CPU measurements. No recipe alone establishes an
+improvement; retain all raw samples and review separately captured app PNGs.
