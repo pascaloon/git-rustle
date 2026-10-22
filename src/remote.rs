@@ -356,6 +356,7 @@ fn env_token(remote: &Remote) -> Option<String> {
 }
 
 fn credential(path: &Path, remote: &Remote) -> Option<String> {
+    let _span = crate::diagnostics::Span::new("remote_credential_helper");
     let endpoint = url::Url::parse(&remote.endpoint).ok()?;
     let host = if endpoint.host_str()? == "api.github.com" {
         "github.com"
@@ -416,6 +417,7 @@ fn helper_token(path: &Path, remote: &Remote) -> Option<String> {
 }
 
 fn cached_token(path: &Path, git_dir: &Path, remote: &Remote) -> Result<Option<String>, String> {
+    let _span = crate::diagnostics::Span::new("remote_token_lookup");
     if let Some(token) = crate::provider_settings::token(remote)?
         .or(crate::credentials::read(&remote.endpoint)?)
         .or_else(|| env_token(remote))
@@ -609,6 +611,9 @@ impl Http {
         token: Option<&str>,
         accept: &str,
     ) -> Result<Response, String> {
+        let mut span = crate::diagnostics::Span::new(http_span_name(remote, url));
+        span.outcome("transport_error");
+        let headers_started = std::time::Instant::now();
         let mut req = self
             .agent
             .get(url)
@@ -626,6 +631,14 @@ impl Http {
             req = req.header("If-None-Match", etag);
         }
         let mut response = req.call().map_err(|error| {
+            span.field("header_wait_us", headers_started.elapsed().as_micros() as u64);
+            span.outcome(match &error {
+                ureq::Error::HostNotFound => "dns_error",
+                ureq::Error::Timeout(_) => "timeout",
+                ureq::Error::NativeTls(_) | ureq::Error::Tls(_) => "tls_error",
+                ureq::Error::ConnectProxyFailed(_) | ureq::Error::InvalidProxyUrl => "proxy_error",
+                _ => "transport_error",
+            });
             match error {
                 ureq::Error::HostNotFound => "DNS lookup failed; check the server URL and VPN",
                 ureq::Error::Timeout(_) => "API request timed out; check VPN, firewall, and proxy",
@@ -634,7 +647,14 @@ impl Http {
                 _ => "API connection failed; check the server URL, network, VPN, and proxy",
             }.to_string()
         })?;
+        span.field(
+            "header_wait_us",
+            headers_started.elapsed().as_micros() as u64,
+        );
         let status = response.status().as_u16();
+        span.field("http_status", status as u64);
+        span.outcome("body_error");
+        let body_started = std::time::Instant::now();
         let etag = response
             .headers()
             .get("etag")
@@ -658,16 +678,59 @@ impl Http {
                 .with_config()
                 .limit(8 * 1024 * 1024)
                 .read_to_vec()
-                .map_err(|_| "Invalid or oversized API response".to_string())?
+                .map_err(|_| {
+                    span.field("body_us", body_started.elapsed().as_micros() as u64);
+                    "Invalid or oversized API response".to_string()
+                })?
         } else {
             Vec::new()
         };
+        span.field("body_us", body_started.elapsed().as_micros() as u64);
+        span.field("body_bytes", body.len() as u64);
+        span.outcome(if status == 200 || status == 304 {
+            "success"
+        } else {
+            "http_error"
+        });
         Ok(Response {
             status,
             etag,
             next,
             body,
         })
+    }
+}
+
+// Arbitrary URL text never becomes a diagnostic label.
+fn http_span_name(remote: &Remote, url: &str) -> &'static str {
+    let Some(root) = remote.endpoint.strip_suffix("/branches") else {
+        return "http_other";
+    };
+    if remote.provider == Provider::Gitlab
+        && let Some(project) = root.strip_suffix("/repository")
+        && let Some(suffix) = url.strip_prefix(project)
+    {
+        match suffix.split('?').next().unwrap_or_default() {
+            "" => return "http_project",
+            "/merge_requests" => return "http_open_requests",
+            "/avatar" => return "http_avatar",
+            _ => {}
+        }
+    }
+    let Some(suffix) = url.strip_prefix(root) else {
+        return "http_other";
+    };
+    let path = suffix.split('?').next().unwrap_or_default();
+    match path {
+        "" => "http_project",
+        "/branches" => "http_branches",
+        "/commits" => "http_commits",
+        "/tags" => "http_tags",
+        "/pulls" | "/merge_requests" => "http_open_requests",
+        "/avatar" => "http_avatar",
+        _ if path.starts_with("/branches/") => "http_branch",
+        _ if path.starts_with("/commits/") => "http_commit",
+        _ => "http_other",
     }
 }
 
@@ -823,10 +886,15 @@ fn load_cached(
     mut token: Option<String>,
     emit: &(impl Fn(Event) + Sync),
 ) {
+    let mut span = crate::diagnostics::Span::new("remote_full_branches");
+    span.outcome("error");
+    span.field("force", force as u64);
     let cached = location.as_ref().and_then(|(p, id)| read_cache(p, id));
+    span.field("cache_hit", cached.is_some() as u64);
     if let Some(cached) = &cached {
         let age = now().checked_sub(cached.saved);
         let fresh = age.is_some_and(|a| a < TTL);
+        span.field("cache_fresh", fresh as u64);
         emit(Event::Branches(Update {
             remote: remote.clone(),
             branches: branches(&cached.pages),
@@ -835,6 +903,7 @@ fn load_cached(
             stale: !fresh,
         }));
         if fresh && !force {
+            span.outcome("success");
             return;
         }
     }
@@ -857,6 +926,12 @@ fn load_cached(
     });
     match result {
         Ok(pages) => {
+            span.outcome("success");
+            span.field("pages", pages.len() as u64);
+            span.field(
+                "branches",
+                pages.iter().map(|p| p.branches.len() as u64).sum(),
+            );
             emit(Event::Branches(Update {
                 remote: remote.clone(),
                 branches: branches(&pages),
@@ -970,6 +1045,9 @@ fn load_heads_scoped(
     requested: &[crate::branches::Target],
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
+    let mut span = crate::diagnostics::Span::new("remote_scoped_heads");
+    span.outcome("error");
+    span.field("force", force as u64);
     let mut names = history::eligible_from_config(path, remote, upstreams)?;
     let priority: HashSet<_> = requested
         .iter()
@@ -980,6 +1058,7 @@ fn load_heads_scoped(
         .map(|t| t.name.as_str())
         .collect();
     names.extend(priority.iter().map(|s| s.to_string()));
+    span.field("eligible_heads", names.len() as u64);
     let mut token = cached_token(path, git_dir, remote)?;
     let mut sorted: Vec<_> = names.iter().collect();
     sorted.sort();
@@ -998,8 +1077,10 @@ fn load_heads_scoped(
     let cached = location.as_ref().and_then(|(p, id)| {
         read_cache(&p.with_extension(&extension), id).or_else(|| read_cache(p, id))
     });
+    span.field("cache_hit", cached.is_some() as u64);
     if let Some(cached) = &cached {
         let fresh = now().saturating_sub(cached.saved) < TTL;
+        span.field("cache_fresh", fresh as u64);
         emit(Event::HeadsCached {
             update: Update {
                 remote: remote.clone(),
@@ -1014,6 +1095,7 @@ fn load_heads_scoped(
             scope: names.clone(),
         });
         if fresh && !force {
+            span.outcome("success");
             return Ok(());
         }
     }
@@ -1048,6 +1130,7 @@ fn load_heads_scoped(
         }
         drop(send);
         let mut first_error = None;
+        let mut errors = 0;
         let mut completed = 0;
         let mut last_publish = std::time::Instant::now();
         for (result, resolved_token) in receive {
@@ -1059,6 +1142,7 @@ fn load_heads_scoped(
                 Ok(Some(branch)) => found.push(branch),
                 Ok(None) => {}
                 Err(error) => {
+                    errors += 1;
                     first_error.get_or_insert(error);
                 }
             }
@@ -1086,11 +1170,16 @@ fn load_heads_scoped(
                 });
             }
         }
+        span.field("errors", errors);
+        span.field("completed_heads", completed as u64);
         first_error.map_or(Ok(()), Err)
     })?;
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        span.outcome("cancelled");
         return Err("Remote head check cancelled".into());
     }
+    span.outcome("success");
+    span.field("verified_heads", found.len() as u64);
     found.sort_by(|a, b| a.name.cmp(&b.name));
     emit(Event::Branches(Update {
         remote: remote.clone(),
@@ -1142,8 +1231,20 @@ pub fn discover_scoped(
     cancel: &std::sync::atomic::AtomicBool,
     emit: impl Fn(Event) + Sync,
 ) {
+    let mut span = crate::diagnostics::Span::new("remote_discovery");
+    span.field("scoped", local_only as u64);
+    span.field("force", force as u64);
+    let statuses = std::sync::atomic::AtomicU64::new(0);
+    let emit_original = emit;
+    let emit = |event: Event| {
+        if matches!(&event, Event::Status(_)) {
+            statuses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        emit_original(event);
+    };
     match configured(path) {
         Ok((remotes, unsupported, upstreams)) => {
+            span.field("providers", remotes.len() as u64);
             emit(Event::Configured(
                 remotes
                     .iter()
@@ -1186,12 +1287,58 @@ pub fn discover_scoped(
         }
         Err(error) => emit(Event::Status(error)),
     }
+    span.field(
+        "status_events",
+        statuses.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    span.outcome(if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        "cancelled"
+    } else {
+        "completed"
+    });
     emit(Event::Done);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_http_labels_are_fixed() {
+        let remote =
+            Remote::parse("origin", "https://github.com/private/secret.git", None).unwrap();
+        let root = remote.endpoint.strip_suffix("/branches").unwrap();
+        assert_eq!(
+            http_span_name(&remote, &format!("{root}/commits/private?token=secret")),
+            "http_commit"
+        );
+        assert_eq!(
+            http_span_name(&remote, &format!("{root}stolen/commits")),
+            "http_other"
+        );
+        assert_eq!(
+            http_span_name(&remote, "https://secret.invalid/branches"),
+            "http_other"
+        );
+        let gitlab = Remote::parse("private", "https://gitlab.com/secret/team.git", None).unwrap();
+        let project = gitlab
+            .endpoint
+            .strip_suffix("/repository/branches")
+            .unwrap();
+        for (suffix, expected) in [
+            ("", "http_project"),
+            ("/merge_requests?private=token", "http_open_requests"),
+            ("/avatar", "http_avatar"),
+            ("/repository/branches/secret", "http_branch"),
+            ("/repository/tags?page=2", "http_tags"),
+            ("stolen/merge_requests", "http_other"),
+        ] {
+            assert_eq!(
+                http_span_name(&gitlab, &format!("{project}{suffix}")),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn urls_and_nested_gitlab_projects() {

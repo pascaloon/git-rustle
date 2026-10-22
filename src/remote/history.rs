@@ -499,6 +499,11 @@ pub fn load_stream(
     cancel: &AtomicBool,
     mut publish: Option<&mut dyn FnMut(Preview)>,
 ) -> Preview {
+    let mut span = crate::diagnostics::Span::new("remote_ghosts");
+    span.field("providers", updates.len() as u64);
+    span.field("force", force as u64);
+    span.outcome("cancelled");
+    let mut commits_span = crate::diagnostics::Span::new("remote_ghost_commit_phase");
     let path = repo.workdir().unwrap_or_else(|| repo.git_dir());
     let git_dir = crate::git::git_dir(repo);
     let local_ids: HashSet<_> = local.commits.iter().map(|c| c.id).collect();
@@ -530,6 +535,7 @@ pub fn load_stream(
                     })
                     .map(|t| t.name.clone()),
             );
+            crate::diagnostics::event("remote_ghost_eligible", &[("heads", names.len() as u64)]);
             let tips: Vec<_> = update
                 .branches
                 .iter()
@@ -553,6 +559,13 @@ pub fn load_stream(
                 .as_ref()
                 .and_then(|(p, id)| read_stored(p, id))
                 .unwrap_or_default();
+            crate::diagnostics::event(
+                "remote_ghost_cache",
+                &[
+                    ("commits", stored.commits.len() as u64),
+                    ("tags", stored.tags.len() as u64),
+                ],
+            );
             let mut known: HashMap<_, _> = stored
                 .commits
                 .drain(..)
@@ -647,6 +660,7 @@ pub fn load_stream(
                 stored.version = 1;
                 partitions.push(identity.clone());
                 stored.identity = identity.clone();
+                let _cache_write = crate::diagnostics::Span::new("remote_history_cache_write");
                 update_history_cache(file, &mut stored, false, cancel);
             }
             tag_jobs.push((remote.clone(), stored, location, client.token));
@@ -659,6 +673,9 @@ pub fn load_stream(
             errors.push(format!("{}: {error}", command::clean(&update.remote.name)));
         }
     }
+    commits_span.field("ghosts", ghosts.len() as u64);
+    drop(commits_span);
+    let merge_span = crate::diagnostics::Span::new("remote_ghost_merge");
     let history = if extra.is_empty() {
         None
     } else {
@@ -681,6 +698,7 @@ pub fn load_stream(
             }
         }
     };
+    drop(merge_span);
     let mut preview = Preview {
         history,
         ghosts,
@@ -701,6 +719,7 @@ pub fn load_stream(
         });
     }
     let gate = shared_gate(&git_dir);
+    let tag_wait_span = crate::diagnostics::Span::new("remote_tag_gate_wait");
     let _tag_phase = loop {
         if cancel.load(Ordering::Relaxed) {
             return preview;
@@ -713,11 +732,15 @@ pub fn load_stream(
             Err(std::sync::TryLockError::Poisoned(_)) => return preview,
         }
     };
+    drop(tag_wait_span);
+    let mut tags_span = crate::diagnostics::Span::new("remote_tags");
+    tags_span.field("providers", tag_jobs.len() as u64);
     for (remote, mut stored, location, token) in tag_jobs {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         if !force && stored.tags_saved != 0 && now().saturating_sub(stored.tags_saved) < TTL {
+            crate::diagnostics::event("remote_tags_cache_hit", &[]);
             continue;
         }
         let mut client = Client {
@@ -735,6 +758,7 @@ pub fn load_stream(
         let mut failure = None;
         let mut complete = false;
         for page in 1..=100 {
+            crate::diagnostics::event("remote_tag_page", &[("page", page as u64)]);
             match client
                 .get(&format!("{root}/tags?per_page=100&page={page}"))
                 .and_then(|r| parse_tags(remote.provider, r))
@@ -796,6 +820,16 @@ pub fn load_stream(
             ));
         }
     }
+    span.field("ghosts", preview.ghosts.len() as u64);
+    span.field("tags", preview.tags.len() as u64);
+    span.field("errors", preview.errors.len() as u64);
+    span.outcome(if cancel.load(Ordering::Relaxed) {
+        "cancelled"
+    } else if preview.errors.is_empty() {
+        "success"
+    } else {
+        "error"
+    });
     preview
 }
 

@@ -277,11 +277,14 @@ impl Desktop {
         self.provider.force = false;
         self.engine.mark("provider summary requested");
         cx.spawn(async move |view, cx| {
+            let mut diagnostic = crate::diagnostics::Span::new("provider_refresh");
+            diagnostic.field("force", force as u64);
             let request_path = path.clone();
             let config_path = path.clone();
             let (remotes, upstreams) = cx
                 .background_executor()
                 .spawn(async move {
+                    let _diagnostic = crate::diagnostics::Span::new("provider_config_worker");
                     let (configured, _, upstreams) =
                         remote::configured(&config_path).unwrap_or_default();
                     let upstreams = upstreams
@@ -347,6 +350,7 @@ impl Desktop {
                 let remote_name = remote.name.clone();
                 let (events, incoming) = async_channel::unbounded();
                 let worker = cx.background_executor().spawn(async move {
+                    let mut diagnostic = crate::diagnostics::Span::new("provider_summary_worker");
                     if let Ok(mut client) = Client::new(&load_path, &remote, no_cache) {
                         client.summary_stream(
                             force,
@@ -358,6 +362,7 @@ impl Desktop {
                             |event| events.send_blocking(WorkerEvent::Summary(event)).is_ok(),
                         );
                     } else {
+                        diagnostic.outcome("client_error");
                         let _ = events.send_blocking(WorkerEvent::Summary(
                             integration::SummaryEvent::Requests(Index::new()),
                         ));
@@ -366,6 +371,7 @@ impl Desktop {
                 while let Ok(event) = incoming.recv().await {
                     let current = view
                         .update(cx, |v, cx| {
+                            let _diagnostic = crate::diagnostics::Span::new("provider_event_apply");
                             if v.provider.path.as_ref() != Some(&request_path)
                                 || !Arc::ptr_eq(&v.provider.session, &session)
                             {

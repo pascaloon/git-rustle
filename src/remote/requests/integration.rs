@@ -78,7 +78,12 @@ impl Client<'_> {
     }
 
     pub fn project(&mut self, force: bool) -> Result<Project, String> {
+        let mut span = crate::diagnostics::Span::new("remote_project");
+        span.outcome("error");
+        span.field("force", force as u64);
         if !force && let Some(project) = self.cached_project() {
+            span.field("cache_hit", 1);
+            span.outcome("success");
             return Ok(project);
         }
         let response = self.get(root(self.remote))?;
@@ -103,6 +108,7 @@ impl Client<'_> {
             },
             &project,
         );
+        span.outcome("success");
         Ok(project)
     }
 
@@ -232,11 +238,17 @@ impl Client<'_> {
     }
 
     pub fn open_requests(&mut self, force: bool) -> Result<Index, String> {
+        let mut span = crate::diagnostics::Span::new("remote_open_requests");
+        span.outcome("error");
+        span.field("force", force as u64);
         if !force && let Some(mut index) = self.read::<Index>("open-requests-v1", TTL) {
             index.retain(|branch, requests| {
                 requests.retain(|request| request.number > 0 && safe_web_url(&request.url));
                 !branch.is_empty() && !branch.chars().any(char::is_control) && !requests.is_empty()
             });
+            span.field("cache_hit", 1);
+            span.field("branches", index.len() as u64);
+            span.outcome("success");
             return Ok(index);
         }
         let mut index = Index::new();
@@ -247,6 +259,7 @@ impl Client<'_> {
             Provider::Gitlab => ("merge_requests", "opened"),
         };
         for page in 1..=100 {
+            span.field("pages", page as u64);
             let response = self.get(&format!(
                 "{}/{suffix}?state={state}&per_page=100&page={page}",
                 root(self.remote)
@@ -271,6 +284,9 @@ impl Client<'_> {
                     return Err("PR / MR index exceeded its cache size limit.".into());
                 }
                 self.write("open-requests-v1", &index);
+                span.field("body_bytes", total_bytes as u64);
+                span.field("branches", index.len() as u64);
+                span.outcome("success");
                 return Ok(index);
             }
         }

@@ -24,6 +24,7 @@ mod cleanup;
 mod commit_row;
 mod conflicts;
 mod conflicts_bench;
+mod diagnostics;
 mod diff_search;
 mod external_tools;
 mod filter_bench;
@@ -200,6 +201,7 @@ struct Desktop {
     image_cache: image_cache::State,
     improvement_bench: improvement_bench::State,
     refresh_bench: refresh_bench::State,
+    refresh_diagnostics: diagnostics::State,
     toolbar_bench: toolbar_bench::State,
     filter_bench: filter_bench::State,
     general_bench: general_bench::State,
@@ -1042,6 +1044,7 @@ impl Desktop {
                         v.sync_cleanup(cx);
                         v.sync_avatars(cx);
                         v.sync_provider(cx);
+                        v.diagnostic_refresh_tick(window, cx);
                         v.poll_tool_discovery(window, cx);
                         if saving && !v.engine.app.settings.saving {
                             v.settings_identity = None;
@@ -1350,6 +1353,7 @@ impl Desktop {
             image_cache: Default::default(),
             improvement_bench: Default::default(),
             refresh_bench: Default::default(),
+            refresh_diagnostics: Default::default(),
             toolbar_bench: Default::default(),
             filter_bench: Default::default(),
             general_bench: Default::default(),
@@ -1783,6 +1787,7 @@ impl Desktop {
             return;
         }
         if matches!(action, Action::Refresh) {
+            self.diagnostic_refresh_requested();
             self.refresh_provider();
             self.invalidate_stashes();
         }
@@ -1833,6 +1838,10 @@ impl Desktop {
                 } else {
                     app.branches.resume();
                 }
+                crate::diagnostics::event(
+                    "branches_tab_open",
+                    &[("refresh_queued", app.branches.want_refresh.is_some() as u64)],
+                );
             }
             Action::Settings | Action::Tab(Tab::Settings) => {
                 app.park_diff();

@@ -282,6 +282,8 @@ fn spawn_walk(
     let handle = thread::Builder::new()
         .name(format!("walk-{id}"))
         .spawn(move || {
+            let mut diagnostic = crate::diagnostics::Span::new("history_walk_worker");
+            diagnostic.field("tips", tips.len() as u64);
             let mut full = cache_target.as_ref().map(|_| History::default());
             let result = git::walk(&repo, &tips, &mut |chunk: History| {
                 if cancel2.load(Ordering::Relaxed) {
@@ -293,6 +295,8 @@ fn spawn_walk(
                 tx.send_blocking(Msg::Batch(id, chunk)).is_ok()
             });
             let cancelled = cancel2.load(Ordering::Relaxed);
+            diagnostic.field("cancelled", cancelled as u64);
+            diagnostic.outcome(if result.is_ok() { "ok" } else { "error" });
             let ok = result.is_ok() && !cancelled;
             let _ = tx.send_blocking(Msg::WalkDone(id, result));
             if ok && let (Some(full), Some((path, git_dir, fp))) = (full, cache_target) {
@@ -310,10 +314,15 @@ fn spawn_walk(
 
 fn refresh_repo(path: PathBuf, tx: Sender<Msg>) {
     thread::spawn(move || {
+        let mut diagnostic = crate::diagnostics::Span::new("local_snapshot_worker");
         let result = git::open(&path).and_then(|repo| {
             let snap = git::snapshot_refs(&repo)?;
             Ok((repo, snap))
         });
+        diagnostic.outcome(if result.is_ok() { "ok" } else { "error" });
+        if let Ok((_, snapshot)) = &result {
+            diagnostic.field("refs", snapshot.refs.len() as u64);
+        }
         let _ = tx.send_blocking(Msg::Refreshed(Box::new(result)));
     });
 }
@@ -586,8 +595,11 @@ impl Engine {
         self.rx.clone()
     }
     pub fn tick(&mut self, message: Option<Msg>) {
+        let diagnostic = (crate::diagnostics::enabled() && self.refresh_in_progress())
+            .then(|| crate::diagnostics::Span::new("refresh_engine_tick"));
         self.advance(message);
         self.advance(None);
+        drop(diagnostic);
     }
 
     pub fn set_provider_search_labels(
@@ -714,7 +726,10 @@ impl Engine {
                 let tx = tx.clone();
                 timing.mark("pending status requested");
                 thread::spawn(move || {
-                    let _ = tx.send_blocking(Msg::Pending(generation, git::worktree::snapshot(&r)));
+                    let mut diagnostic = crate::diagnostics::Span::new("pending_status_worker");
+                    let result = git::worktree::snapshot(&r);
+                    diagnostic.outcome(if result.is_ok() { "ok" } else { "error" });
+                    let _ = tx.send_blocking(Msg::Pending(generation, result));
                 });
             }
         }
@@ -1190,6 +1205,11 @@ impl Engine {
                     }
                 }
                 Msg::Pending(generation, result) => {
+                    let mut diagnostic = crate::diagnostics::Span::new("pending_status_apply");
+                    diagnostic.field("current", (generation == self.pending_generation) as u64);
+                    if let Ok(snapshot) = &result {
+                        diagnostic.field("files", snapshot.files.len() as u64);
+                    }
                     if generation == self.pending_generation {
                         if let Ok(snapshot) = &result {
                             if self.stash_stamp != snapshot.stash_stamp {
@@ -1460,6 +1480,7 @@ impl Engine {
                     timing.mark("checkout done");
                 }
                 Msg::Refreshed(result) => {
+                    let mut diagnostic = crate::diagnostics::Span::new("local_snapshot_apply");
                     self.refreshing = false;
                     match *result {
                         Ok((r, snap)) => {
@@ -1467,6 +1488,8 @@ impl Engine {
                                 .refs
                                 .as_ref()
                                 .is_none_or(|old| old.fingerprint != snap.fingerprint);
+                            diagnostic.field("refs_changed", changed as u64);
+                            diagnostic.field("refs", snap.refs.len() as u64);
                             app.set_refs(snap);
                             self.repo = Some(r);
                             if changed {
@@ -1476,7 +1499,10 @@ impl Engine {
                                 app.want_rewalk = true;
                             }
                         }
-                        Err(error) => app.set_error(error.to_string()),
+                        Err(error) => {
+                            diagnostic.outcome("error");
+                            app.set_error(error.to_string());
+                        }
                     }
                 }
                 Msg::Details(id, result) => {
@@ -1546,6 +1572,8 @@ impl Engine {
                     }
                 }
                 Msg::Batch(id, batch) => {
+                    let mut diagnostic = crate::diagnostics::Span::new("history_batch_apply");
+                    diagnostic.field("rows", batch.len() as u64);
                     if self.walker.as_ref().is_some_and(|w| w.id == id) {
                         if batch.complete {
                             let so_far = match app.incoming.as_ref() {

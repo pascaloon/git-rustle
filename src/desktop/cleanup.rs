@@ -71,10 +71,17 @@ impl Desktop {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::git::operations::cleanup::analyze(&path, crate::ui::time::now_unix())
+                    let mut diagnostic = crate::diagnostics::Span::new("cleanup_analysis_worker");
+                    let result = crate::git::operations::cleanup::analyze(
+                        &path,
+                        crate::ui::time::now_unix(),
+                    );
+                    diagnostic.outcome(if result.is_ok() { "ok" } else { "error" });
+                    result
                 })
                 .await;
             let _ = view.update(cx, |v, cx| {
+                let _diagnostic = crate::diagnostics::Span::new("cleanup_analysis_apply");
                 if !session.same_channel(&v.engine.messages())
                     || v.engine.repository_root() != Some(source.as_path())
                     || v.cleanup.generation != generation
@@ -116,6 +123,7 @@ impl Desktop {
                 }
             }
             Action::Analyze if idle => {
+                crate::diagnostics::event("cleanup_explicit_request", &[]);
                 self.cleanup.message.clear();
                 self.load_cleanup(cx);
             }

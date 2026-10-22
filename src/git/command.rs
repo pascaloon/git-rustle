@@ -20,6 +20,8 @@ pub fn run_env(
     timeout: Duration,
     environment: &[(&str, &std::ffi::OsStr)],
 ) -> Result<Output, String> {
+    let mut span = crate::diagnostics::Span::new(git_span_name(args));
+    span.outcome("spawn_error");
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(path)
@@ -82,12 +84,16 @@ pub fn run_env(
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
             _ => {
+                span.outcome("timeout");
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err("Git operation timed out. Check connectivity and Git authentication outside Git Rustle.".into());
             }
         }
     };
+    span.field("has_exit_code", status.code().is_some() as u64);
+    span.field("exit_code", status.code().map_or(0, |c| c as u32 as u64));
+    span.outcome("pipe_timeout");
     let mut output = Output {
         status,
         stdout: Vec::new(),
@@ -97,7 +103,16 @@ pub fn run_env(
         let (is_out, data, truncated) = rx
             .recv_timeout(timeout.saturating_sub(start.elapsed()))
             .map_err(|_| "Git helper timed out".to_string())?;
+        span.field(
+            if is_out {
+                "stdout_bytes"
+            } else {
+                "stderr_bytes"
+            },
+            data.len() as u64,
+        );
         if truncated {
+            span.outcome("output_limit");
             return Err("Git output exceeded 16 MiB; the incomplete result was rejected.".into());
         }
         if is_out {
@@ -106,6 +121,11 @@ pub fn run_env(
             output.stderr = data;
         }
     }
+    span.outcome(if output.status.success() {
+        "success"
+    } else {
+        "exit_failure"
+    });
     Ok(output)
 }
 
@@ -165,5 +185,39 @@ impl Drop for Job {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
+    }
+}
+
+// Only exact first arguments select labels; arguments and paths are never emitted.
+fn git_span_name(args: &[&str]) -> &'static str {
+    match args.first().copied() {
+        Some("status") => "git_status",
+        Some("config") => "git_config",
+        Some("credential") => "git_credential",
+        Some("rev-parse") => "git_rev_parse",
+        Some("for-each-ref") => "git_for_each_ref",
+        Some("diff") => "git_diff",
+        Some("log") => "git_log",
+        Some("show") => "git_show",
+        Some("ls-files") => "git_ls_files",
+        Some("fetch") => "git_fetch",
+        Some("push") => "git_push",
+        Some("ls-remote") => "git_ls_remote",
+        _ => "git_other",
+    }
+}
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn labels_never_contain_arguments() {
+        for hostile in [
+            "https://token@secret/project",
+            "status\nsecret",
+            "-c",
+            "private",
+        ] {
+            assert_eq!(super::git_span_name(&[hostile, "secret"]), "git_other");
+        }
+        assert_eq!(super::git_span_name(&["status", "secret"]), "git_status");
     }
 }

@@ -938,6 +938,9 @@ impl App {
     }
 
     pub fn set_refs(&mut self, refs: RefSnapshot) {
+        let mut diagnostic = crate::diagnostics::Span::new("graph_refs_projection");
+        diagnostic.field("refs", refs.refs.len() as u64);
+        diagnostic.field("history_rows", self.history.len() as u64);
         let mut labels: HashMap<ObjectId, Vec<Label>> = HashMap::new();
         for (id, entries) in refs.labels_by_commit() {
             labels.insert(
@@ -1035,6 +1038,9 @@ impl App {
     }
 
     pub fn install_preview(&mut self, preview: crate::remote::history::Preview) {
+        let mut diagnostic = crate::diagnostics::Span::new("graph_preview_apply");
+        diagnostic.field("ghosts", preview.ghosts.len() as u64);
+        diagnostic.field("history_rows", self.history.len() as u64);
         let startup_pending = self.startup_head_search.is_some();
         let keep = (!self.pending.selected)
             .then(|| self.history.commits.get(self.selected).map(|c| c.id))

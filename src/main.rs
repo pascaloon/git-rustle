@@ -7,6 +7,7 @@ mod branches;
 mod cache;
 mod checkout;
 mod credentials;
+mod diagnostics;
 mod diff;
 mod diffview;
 mod git;
@@ -77,6 +78,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let _diagnostics = match diagnostics::init() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("git-rustle: could not create diagnostic log: {error}");
+            std::process::exit(2);
+        }
+    };
+    diagnostics::event("application_start", &[("no_cache", opts.no_cache as u64)]);
     let mut engine = engine::Engine::new(opts.path, opts.no_cache, start);
     update::restore_draft(&mut engine, draft);
     desktop::run(engine);
