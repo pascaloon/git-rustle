@@ -366,9 +366,13 @@ pub struct Engine {
     next_walk_id: u32,
     first_frame: bool,
     remote_generation: u32,
+    remote_cancel: Arc<AtomicBool>,
     preview_epoch: u32,
     preview_cancel: Arc<AtomicBool>,
     preview_busy: bool,
+    preview_running_epoch: Option<u32>,
+    // Includes obsolete workers waiting for their bounded tag HTTP response.
+    preview_workers: usize,
     preview_wanted: bool,
     preview_force: bool,
     activity_busy: bool,
@@ -387,6 +391,7 @@ impl Engine {
             || self.app.branches.want_refresh.is_some()
             || self.app.branches.loading
             || self.preview_busy
+            || self.preview_workers != 0
             || self.preview_wanted
     }
 
@@ -562,9 +567,12 @@ impl Engine {
             next_walk_id: 1,
             first_frame: false,
             remote_generation: 0,
+            remote_cancel: Arc::new(AtomicBool::new(false)),
             preview_epoch: 0,
             preview_cancel: Arc::new(AtomicBool::new(false)),
             preview_busy: false,
+            preview_running_epoch: None,
+            preview_workers: 0,
             preview_wanted: false,
             preview_force: false,
             activity_busy: false,
@@ -736,6 +744,8 @@ impl Engine {
                 let r = r.clone();
                 let tx = tx.clone();
                 let epoch = self.preview_epoch;
+                self.preview_running_epoch = Some(epoch);
+                self.preview_workers += 1;
                 let force = std::mem::take(&mut self.preview_force);
                 self.preview_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.preview_cancel.clone();
@@ -798,13 +808,6 @@ impl Engine {
                 self.remote_generation = self.remote_generation.wrapping_add(1);
                 let generation = self.remote_generation;
                 self.preview_force |= force;
-                if force {
-                    self.local_activity_done = None;
-                    app.branches.activity_cache.clear();
-                    app.branches.activity_attempted.clear();
-                    app.branches.activity_errors.clear();
-                    app.branches.activity_requests = 0;
-                }
                 app.branches.loading = true;
                 app.branches.errors.clear();
                 app.needs_redraw = true;
@@ -812,16 +815,38 @@ impl Engine {
                 let tx = tx.clone();
                 let path = path.clone();
                 let local_only = !app.branches.open;
+                let mut requested = app.branches.preview_targets.clone();
+                for (id, label) in &app.ghost_branches {
+                    if let Some(source) = app.ghost_sources.get(id)
+                        && let Some(name) = label.strip_prefix(&format!("{}/", source.name))
+                    {
+                        requested.push(crate::branches::Target {
+                            name: name.into(),
+                            remote: Some(source.name.clone()),
+                            url: Some(source.url.clone()),
+                            sha: id.to_string(),
+                        });
+                    }
+                }
+                self.remote_cancel.store(true, Ordering::Relaxed);
+                self.remote_cancel = Arc::new(AtomicBool::new(false));
+                let cancel = self.remote_cancel.clone();
                 self.remote_scoped_request = local_only;
                 timing.mark("remote discovery requested");
                 thread::spawn(move || {
-                    remote::discover(&path, &git_dir, force, no_cache, local_only, |event| {
-                        let _ = tx.send_blocking(Msg::Remote(generation, event));
-                    })
+                    remote::discover_scoped(
+                        &path,
+                        &git_dir,
+                        force,
+                        no_cache,
+                        local_only,
+                        &requested,
+                        &cancel,
+                        |event| {
+                            let _ = tx.send_blocking(Msg::Remote(generation, event));
+                        },
+                    )
                 });
-                if force {
-                    app.want_refresh = true;
-                }
             }
             if !self.operation_busy
                 && !app.branches.busy
@@ -1225,6 +1250,10 @@ impl Engine {
                     }
                 }
                 Msg::Preview(epoch, mut preview) => {
+                    if self.preview_running_epoch == Some(epoch) {
+                        self.preview_busy = false;
+                        self.preview_running_epoch = None;
+                    }
                     if epoch == self.preview_epoch
                         && !app.branches.preview_requested
                         && !app.is_walking()
@@ -1240,7 +1269,11 @@ impl Engine {
                     }
                 }
                 Msg::PreviewTags(epoch, tags, errors) => {
-                    self.preview_busy = false;
+                    self.preview_workers = self.preview_workers.saturating_sub(1);
+                    if self.preview_running_epoch == Some(epoch) {
+                        self.preview_busy = false;
+                        self.preview_running_epoch = None;
+                    }
                     if epoch == self.preview_epoch
                         && !app.branches.preview_requested
                         && !app.is_walking()
@@ -1272,6 +1305,7 @@ impl Engine {
                             tags: Vec::new(),
                             errors: Vec::new(),
                         });
+                        self.remote_cancel.store(true, Ordering::Relaxed);
                         remote::clear_auth_cache();
                         app.local_history = None;
                         self.remote_generation = self.remote_generation.wrapping_add(1);
@@ -1300,28 +1334,88 @@ impl Engine {
                     if generation != self.remote_generation {
                         continue;
                     }
+                    // Partial API batches never revoke identities that have not
+                    // answered yet. Scope prevents a prior full branch-browser
+                    // listing from broadening graph hydration to unrelated heads.
+                    let event = match event {
+                        remote::Event::HeadsCached { mut update, scope } => {
+                            if let Some(previous) = app
+                                .branches
+                                .remotes
+                                .get(&update.remote.name)
+                                .filter(|old| old.remote == update.remote)
+                            {
+                                // Memory also knows authoritative absences. Disk
+                                // only bootstraps a remote with no current snapshot;
+                                // it cannot resurrect a name omitted by a newer scan.
+                                update.branches = previous
+                                    .branches
+                                    .iter()
+                                    .filter(|b| scope.contains(&b.name))
+                                    .cloned()
+                                    .collect();
+                                update.branches.sort_by(|a, b| a.name.cmp(&b.name));
+                            }
+                            remote::Event::Branches(update)
+                        }
+                        remote::Event::BranchesPartial { mut update, scope } => {
+                            if let Some(previous) = app
+                                .branches
+                                .remotes
+                                .get(&update.remote.name)
+                                .filter(|old| old.remote == update.remote)
+                            {
+                                let seen: std::collections::HashSet<_> =
+                                    update.branches.iter().map(|b| b.name.clone()).collect();
+                                update.branches.extend(
+                                    previous
+                                        .branches
+                                        .iter()
+                                        .filter(|b| {
+                                            scope.contains(&b.name) && !seen.contains(&b.name)
+                                        })
+                                        .cloned(),
+                                );
+                                update.branches.sort_by(|a, b| a.name.cmp(&b.name));
+                            }
+                            remote::Event::Branches(update)
+                        }
+                        other => other,
+                    };
                     match event {
                         remote::Event::Configured(remotes) => {
                             if remotes.is_empty() && app.local_history.is_some() {
                                 self.preview_wanted = true;
                             }
+                            let previous_count = app.branches.remotes.len();
                             app.branches.remotes.retain(|name, update| {
                                 remotes
                                     .iter()
                                     .any(|(n, url)| n == name && url == &update.remote.url)
                             });
+                            if app.branches.remotes.len() != previous_count {
+                                self.preview_epoch = self.preview_epoch.wrapping_add(1);
+                                self.preview_cancel.store(true, Ordering::Relaxed);
+                                self.preview_wanted = true;
+                            }
                             if let Some(refs) = app.refs.clone() {
                                 app.set_refs(refs);
                             }
                         }
                         remote::Event::Branches(update) => {
-                            self.preview_wanted |= self.preview_force
-                                || app.branches.remotes.get(&update.remote.name).is_none_or(
-                                    |old| {
+                            let changed =
+                                app.branches
+                                    .remotes
+                                    .get(&update.remote.name)
+                                    .is_none_or(|old| {
                                         old.remote != update.remote
                                             || old.branches != update.branches
-                                    },
-                                );
+                                    });
+                            if changed {
+                                self.preview_epoch = self.preview_epoch.wrapping_add(1);
+                                self.preview_cancel.store(true, Ordering::Relaxed);
+                                self.preview_wanted = true;
+                            }
                             timing.mark(format!(
                                 "remote {} branches ({})",
                                 if update.cached { "cached" } else { "live" },
@@ -1329,6 +1423,10 @@ impl Engine {
                             ));
                             app.branches.update(update, app.refs.as_ref());
                             app.remote_labels();
+                        }
+                        remote::Event::BranchesPartial { .. }
+                        | remote::Event::HeadsCached { .. } => {
+                            unreachable!("non-authoritative heads normalized before dispatch")
                         }
                         remote::Event::Status(error) => {
                             app.ghost_status = format!("Remote: {error}");
@@ -1567,6 +1665,7 @@ impl Engine {
             && !self.app.branches.loading
             && self.app.branches.want_refresh.is_none()
             && !self.preview_busy
+            && self.preview_workers == 0
             && !self.preview_wanted
             && !self.activity_busy
     }
@@ -1598,6 +1697,7 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.search_latest.store(u64::MAX, Ordering::Relaxed);
         self.preview_cancel.store(true, Ordering::Relaxed);
+        self.remote_cancel.store(true, Ordering::Relaxed);
         if let Some(walker) = self.walker.take() {
             walker.cancel();
             walker.join();
@@ -1779,6 +1879,380 @@ mod tests {
         engine
     }
 
+    #[test]
+    fn refresh_remains_busy_until_obsolete_tag_worker_finishes_without_blocking_new_overlay() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        e.preview_epoch = 7;
+        e.preview_running_epoch = Some(7);
+        e.preview_busy = true;
+        e.preview_workers = 2;
+        let preview = remote::history::Preview {
+            history: None,
+            ghosts: Default::default(),
+            sources: Default::default(),
+            branches: vec![],
+            tags: vec![],
+            errors: vec![],
+        };
+        e.tick(Some(Msg::Preview(7, preview)));
+        assert!(!e.preview_busy);
+        assert!(e.refresh_in_progress());
+        e.tick(Some(Msg::PreviewTags(7, vec![], vec![])));
+        assert_eq!(e.preview_workers, 1);
+        assert!(e.refresh_in_progress());
+        e.tick(Some(Msg::PreviewTags(6, vec![], vec![])));
+        assert_eq!(e.preview_workers, 0);
+        assert!(!e.refresh_in_progress());
+    }
+
+    #[test]
+    fn disk_heads_bootstrap_empty_memory_but_never_resurrect_authoritatively_absent_names() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        let remote = remote::Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        let branch = |name: &str, sha: &str| remote::Branch {
+            name: name.into(),
+            sha: sha.repeat(40),
+        };
+        let scope: std::collections::HashSet<String> =
+            ["a".into(), "b".into()].into_iter().collect();
+        let cached = remote::Update {
+            remote: remote.clone(),
+            branches: vec![branch("a", "a"), branch("b", "b")],
+            scoped: true,
+            cached: true,
+            stale: false,
+        };
+        assert!(!e.app.branches.remotes.contains_key("origin"));
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::HeadsCached {
+                update: cached.clone(),
+                scope: scope.clone(),
+            },
+        )));
+        assert_eq!(
+            e.app.branches.remotes["origin"].branches.len(),
+            2,
+            "cold cache still seeds missing heads"
+        );
+        // A complete newer branch-browser listing proves b is gone.
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Branches(remote::Update {
+                remote: remote.clone(),
+                branches: vec![branch("a", "c")],
+                scoped: false,
+                cached: false,
+                stale: false,
+            }),
+        )));
+        let epoch = e.preview_epoch;
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::HeadsCached {
+                update: cached,
+                scope,
+            },
+        )));
+        let heads = &e.app.branches.remotes["origin"].branches;
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].name, "a");
+        assert_eq!(heads[0].sha, "c".repeat(40));
+        assert_eq!(e.preview_epoch, epoch);
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Status("fixture offline after cache replay".into()),
+        )));
+        assert!(
+            !e.app.branches.remotes["origin"]
+                .branches
+                .iter()
+                .any(|b| b.name == "b")
+        );
+    }
+    #[test]
+    fn old_disk_heads_cannot_rewind_verified_partial_or_add_unverified_missing_names() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        let remote = remote::Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        let branch = |name: &str, sha: &str| remote::Branch {
+            name: name.into(),
+            sha: sha.repeat(40),
+        };
+        let scope: std::collections::HashSet<String> =
+            ["a".into(), "b".into()].into_iter().collect();
+        // A verified network batch has a newer a; the following request later
+        // failed, so disk still has an older a plus previously unseen b.
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::BranchesPartial {
+                update: remote::Update {
+                    remote: remote.clone(),
+                    branches: vec![branch("a", "c")],
+                    scoped: true,
+                    cached: true,
+                    stale: true,
+                },
+                scope: scope.clone(),
+            },
+        )));
+        let epoch = e.preview_epoch;
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::HeadsCached {
+                update: remote::Update {
+                    remote: remote.clone(),
+                    branches: vec![branch("a", "a"), branch("b", "b")],
+                    scoped: true,
+                    cached: true,
+                    stale: true,
+                },
+                scope: scope.clone(),
+            },
+        )));
+        let heads = &e.app.branches.remotes["origin"].branches;
+        assert_eq!(heads.len(), 1);
+        assert!(
+            heads
+                .iter()
+                .any(|b| b.name == "a" && b.sha == "c".repeat(40))
+        );
+        assert!(!heads.iter().any(|b| b.name == "b"));
+        assert_eq!(e.preview_epoch, epoch);
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Status("fixture offline".into()),
+        )));
+        assert!(
+            e.app.branches.remotes["origin"]
+                .branches
+                .iter()
+                .any(|b| b.name == "a" && b.sha == "c".repeat(40))
+        );
+        // A batch checking only b must not resurrect cache-only a as if verified.
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::BranchesPartial {
+                update: remote::Update {
+                    remote: remote.clone(),
+                    branches: vec![branch("b", "e")],
+                    scoped: true,
+                    cached: true,
+                    stale: true,
+                },
+                scope: scope.clone(),
+            },
+        )));
+        assert!(
+            e.app.branches.remotes["origin"]
+                .branches
+                .iter()
+                .any(|b| b.name == "a" && b.sha == "c".repeat(40))
+        );
+        // A subsequent verified batch remains authoritative for its completed head.
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::BranchesPartial {
+                update: remote::Update {
+                    remote,
+                    branches: vec![branch("a", "d")],
+                    scoped: true,
+                    cached: true,
+                    stale: true,
+                },
+                scope,
+            },
+        )));
+        let heads = &e.app.branches.remotes["origin"].branches;
+        assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .any(|b| b.name == "a" && b.sha == "d".repeat(40))
+        );
+    }
+    #[test]
+    fn partial_heads_preserve_unanswered_in_memory_scope_and_failures_never_revoke_it() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        let remote = remote::Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        let branch = |name: &str, sha: &str| remote::Branch {
+            name: name.into(),
+            sha: sha.repeat(40),
+        };
+        e.app.branches.update(
+            remote::Update {
+                remote: remote.clone(),
+                branches: vec![branch("a", "a"), branch("b", "b"), branch("unrelated", "e")],
+                scoped: false,
+                cached: false,
+                stale: false,
+            },
+            e.app.refs.as_ref(),
+        );
+        let partial = remote::Update {
+            remote: remote.clone(),
+            branches: vec![branch("a", "c")],
+            scoped: true,
+            cached: true,
+            stale: true,
+        };
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::BranchesPartial {
+                update: partial,
+                scope: ["a".into(), "b".into()].into_iter().collect(),
+            },
+        )));
+        let heads = &e.app.branches.remotes["origin"].branches;
+        assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .any(|b| b.name == "b" && b.sha == "b".repeat(40))
+        );
+        assert!(
+            heads
+                .iter()
+                .any(|b| b.name == "a" && b.sha == "c".repeat(40))
+        );
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Status("fixture timeout".into()),
+        )));
+        assert_eq!(e.app.branches.remotes["origin"].branches.len(), 2);
+        // Only a completed authoritative set establishes that b is absent.
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Branches(remote::Update {
+                remote,
+                branches: vec![branch("a", "c")],
+                scoped: true,
+                cached: false,
+                stale: false,
+            }),
+        )));
+        assert_eq!(e.app.branches.remotes["origin"].branches.len(), 1);
+    }
+    #[test]
+    fn removing_one_of_multiple_remotes_invalidates_its_preview_even_if_other_heads_unchanged() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        for name in ["origin", "other"] {
+            let remote = remote::Remote::parse(
+                name,
+                &format!("https://example.invalid/team/{name}"),
+                Some("github"),
+            )
+            .unwrap();
+            e.app.branches.update(
+                remote::Update {
+                    remote,
+                    branches: vec![remote::Branch {
+                        name: "main".into(),
+                        sha: "a".repeat(40),
+                    }],
+                    scoped: true,
+                    cached: false,
+                    stale: false,
+                },
+                e.app.refs.as_ref(),
+            );
+        }
+        let other = e.app.branches.remotes["other"].remote.clone();
+        let epoch = e.preview_epoch;
+        let cancel = e.preview_cancel.clone();
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Configured(vec![(other.name.clone(), other.url.clone())]),
+        )));
+        assert_eq!(e.app.branches.remotes.len(), 1);
+        assert!(e.preview_wanted);
+        assert!(e.preview_epoch > epoch);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn unchanged_head_updates_preserve_preview_epoch_and_activity_cache() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        let id = e.app.history.commits[0].id.to_string();
+        let remote = remote::Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        let update = remote::Update {
+            remote,
+            branches: vec![remote::Branch {
+                name: "main".into(),
+                sha: id,
+            }],
+            scoped: true,
+            cached: true,
+            stale: false,
+        };
+        e.app.branches.update(update.clone(), e.app.refs.as_ref());
+        let epoch = e.preview_epoch;
+        e.preview_force = true;
+        let mut live = update;
+        live.cached = false;
+        e.tick(Some(Msg::Remote(
+            e.remote_generation,
+            remote::Event::Branches(live),
+        )));
+        assert_eq!(e.preview_epoch, epoch);
+        assert!(!e.preview_wanted);
+    }
+    #[test]
+    fn obsolete_preview_releases_its_worker_but_cannot_replace_graph_or_end_new_worker() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.busy = true;
+        e.preview_epoch = 7;
+        e.preview_busy = true;
+        e.preview_running_epoch = Some(6);
+        let count = e.app.history.len();
+        let preview = remote::history::Preview {
+            history: None,
+            ghosts: Default::default(),
+            sources: Default::default(),
+            branches: vec![],
+            tags: vec![],
+            errors: vec![],
+        };
+        e.tick(Some(Msg::Preview(6, preview)));
+        assert!(!e.preview_busy);
+        assert_eq!(e.app.history.len(), count);
+        e.preview_busy = true;
+        e.preview_running_epoch = Some(7);
+        e.tick(Some(Msg::PreviewTags(6, vec![], vec![])));
+        assert!(e.preview_busy);
+        assert_eq!(e.preview_running_epoch, Some(7));
+    }
     #[test]
     fn scoped_discovery_upgrades_after_partial_failure_once_and_ignores_stale_done() {
         let dir = fixture();

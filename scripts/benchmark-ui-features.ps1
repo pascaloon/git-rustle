@@ -16,7 +16,7 @@ $saved=@{};$names=@(@(Get-ChildItem Env: | Where-Object {$_.Name -match '^(GIT_|
 foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $results=[Collections.Generic.List[object]]::new()
 function UI-Git([string]$Path,[string[]]$Arguments){$value=@(& git -C $Path @Arguments 2>&1);if($LASTEXITCODE-ne0){throw "Fixture Git failed: $($value-join' ')"};return ($value-join"`n")}
-function UI-State([string]$Path){return @{head=UI-Git $Path @('rev-parse','HEAD');refs=UI-Git $Path @('show-ref');status=UI-Git $Path @('status','--porcelain=v1');index=UI-Git $Path @('write-tree');files=@(Get-ChildItem -LiteralPath $Path -File | Sort-Object Name | ForEach-Object{@{name=$_.Name;sha=(Get-FileHash -LiteralPath $_.FullName).Hash}})}|ConvertTo-Json -Depth 5 -Compress}
+function UI-State([string]$Path){return @{head=UI-Git $Path @('rev-parse','HEAD');refs=UI-Git $Path @('show-ref');status=UI-Git $Path @('status','--porcelain=v1');index=UI-Git $Path @('write-tree');files=@(Get-ChildItem -LiteralPath $Path -File -Recurse | Where-Object{!$_.FullName.StartsWith((Join-Path $Path '.git')+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)} | Sort-Object FullName | ForEach-Object{@{name=[IO.Path]::GetRelativePath($Path,$_.FullName);sha=(Get-FileHash -LiteralPath $_.FullName).Hash}})}|ConvertTo-Json -Depth 5 -Compress}
 function UI-Log([string]$Path){
     if(!(Test-Path -LiteralPath $Path)){return ''}
     $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite-bor[IO.FileShare]::Delete))
@@ -42,12 +42,13 @@ try{
             UI-Git $fixture @('init','-b','main')|Out-Null
             foreach($config in @(@('user.name','UI Fixture'),@('user.email','ui@example.test'),@('commit.gpgSign','false'),@('core.hooksPath','disabled-fixture-hooks'),@('core.autocrlf','false'))){UI-Git $fixture @('config',$config[0],$config[1])|Out-Null}
             Set-Content -LiteralPath (Join-Path $fixture '.git/git-rustle-ui-fixture') -Value 'disposable UI feature fixture'
-            # Sixteen changed files, ~800 KiB before+after, including unchanged context.
+            # Eighteen changed files, including nested paths and unchanged context.
             foreach($revision in 1..2){
-                foreach($file in 0..15){
+                foreach($file in 0..17){
                     $lines=[Text.StringBuilder]::new()
                     foreach($line in 1..500){$value=if($line-eq250){"revision $revision MAGIC_NEEDLE item $file"}elseif($line-eq258){"second changed hunk revision $revision file $file"}elseif($line-eq430){("long source prefix "*80)+"LONG_SEGMENT_NEEDLE "+("more long source "*80)+"LONG_SEGMENT_NEEDLE file $file"}else{"source line $line ordinary content in file $file"};[void]$lines.AppendLine($value)}
-                    [IO.File]::WriteAllText((Join-Path $fixture "needle-file-$file.txt"),$lines.ToString())
+                    $fileDirectory=if($file-ge16){Join-Path $fixture 'nested'}else{$fixture};[IO.Directory]::CreateDirectory($fileDirectory)|Out-Null
+                    [IO.File]::WriteAllText((Join-Path $fileDirectory "needle-file-$file.txt"),$lines.ToString())
                 }
                 UI-Git $fixture @('add','.')|Out-Null;UI-Git $fixture @('commit','-m',"needle revision $revision")|Out-Null
             }

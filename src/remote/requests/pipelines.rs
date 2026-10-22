@@ -10,18 +10,6 @@ pub enum Status {
     Failed,
 }
 
-impl Status {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pending => "Pending",
-            Self::Running => "Running",
-            Self::Success => "Passed",
-            Self::Warning => "Needs attention",
-            Self::Failed => "Failed",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pipeline {
     pub id: u64,

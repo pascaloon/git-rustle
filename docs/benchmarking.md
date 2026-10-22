@@ -1378,3 +1378,96 @@ worktree. Server branches are never deleted. Component benchmarks exclude GPUI
 painting; retain their raw sample fields and fixture dimensions separately from
 the native request-to-paint intervals. Run screenshots separately to inspect
 all three trees, mixed folder checks and section selection controls.
+
+
+## Graph refresh, context menus and cherry-pick
+
+Preserve the application and test baseline before editing, finish all builds,
+and run native timing, component cases and screenshots sequentially. The graph
+feature runner accepts these additional candidate-only cases:
+
+```powershell
+$contextCases = @('graph-commit-menu','graph-branch-menu',
+  'cherry-pick-one','cherry-pick-many','cherry-pick-review')
+.\scripts\benchmark-graph-features.ps1 -Candidate $candidateExe `
+  -Scenarios $contextCases -Samples 15 `
+  -OutputDirectory (Join-Path $benchRun 'context')
+# Separate launches, excluded from timing:
+.\scripts\benchmark-graph-features.ps1 -Candidate $candidateExe `
+  -Scenarios $contextCases -Screenshots `
+  -OutputDirectory (Join-Path $benchRun 'context-images')
+```
+
+Context cases open the
+Commit or Branch submenu while generic Checkout and Diff remain at the top.
+They assert actual root/submenu paint bounds. Cherry-pick freezes full OIDs in
+oldest-first graph order even when selection clicks occur in reverse order,
+paints exact-OID review, invokes real confirmation, awaits replay and graph paint,
+then uses journal Undo and verifies the restored frame. Fixtures check ordinary
+refs, HEAD, index and worktree afterward; recovery pins are retained. The full
+request-to-verified-frame interval includes review/Undo/scheduling and is not
+worker CPU. Backend tests cover duplicate/missing/merge IDs, pending work,
+frozen destination checks, Continue/Skip/Abort, Undo/Redo and rejection without
+journaling an external checkout during preparation. External Git can still race
+the final pre-launch check; there is no global lock on other Git clients.
+
+Run the same runner's stash-preview/file/pop and diff-base cases for the selected
+stash inspector and frozen branch/commit base selection. Commit objects do not
+record a branch parent; when creation history cannot establish the intended
+branch base, use **Diff against another base…** to select it explicitly. Compare
+the frozen branch/commit against its merge-base with that chosen reference, not
+the unrelated current checkout. This is particularly relevant to commit-tree
+fixtures whose branches have no useful creation reflog. Run
+benchmark-ui-features.ps1 with diff-search for sidebar replacement, query races
+and nested filename/content matches. Inspect final PNGs separately for submenu
+edges, the wider dim-orange graph path halo, stash selection/inspector grouping,
+base comparison and the diff-search sidebar. Existing lane colors are unchanged.
+
+For API head/ghost refresh, use the dedicated runner and owned Python fixture:
+
+```powershell
+.\scripts\benchmark-graph-refresh.ps1 -Baseline $refreshBaselineExe -Candidate $candidateExe -Python $pythonExe -Samples 15 -OutputDirectory (Join-Path $benchRun 'refresh')
+.\scripts\benchmark-graph-refresh.ps1 -Baseline $refreshBaselineExe -Candidate $candidateExe -Python $pythonExe -Capture -OutputDirectory (Join-Path $benchRun 'refresh-images')
+```
+
+The default passes `--no-cache` to both executables. Run the cache-enabled
+comparison separately, retaining a new output directory:
+
+```powershell
+.\scripts\benchmark-graph-refresh.ps1 -Baseline $refreshBaselineExe -Candidate $candidateExe -Python $pythonExe -EnableCache -Samples 15 -OutputDirectory (Join-Path $benchRun 'refresh-cache-enabled')
+```
+
+`-EnableCache` gives each launch an empty, isolated disk cache. Initial load
+populates it before the same process performs the forced Refresh; this measures
+initial-load → forced-refresh behavior, not warmed application reopening. Both
+executables use the same mode. Check the selected cache mode in provenance,
+samples and the report. Each launch retains `cache-evidence.json` with relative
+cache paths, sizes and hashes; enabled runs require at least one remote-head
+JSON file under the isolated `LOCALAPPDATA/git-rustle/cache/remotes` directory.
+Repository/ref, FETCH_HEAD and provider-request assertions still apply. Keep
+`-Capture` runs in another output directory and review their PNGs separately.
+
+The baseline must contain the identical refresh-native diagnostic scenario,
+paint hooks and diagnostic-only loopback exception backported onto the preserved
+baseline source. An ordinary old binary cannot drive this protocol. Preserve
+that patch, baseline commit/source manifest and hashes, and label the resulting
+binary as an instrumented comparison baseline; retain the untouched original
+baseline separately. Do not transplant new production refresh logic into it.
+
+Each launch uses a fresh marked repository, isolated configuration/app data and
+hidden PID-verified loopback server (12 branches and 60 ms per-head delay by
+default). The scenario advances a remote-only tip, invokes the normal Refresh
+handler and verifies first-new-ghost and settled GPUI paint milestones. Record
+both intervals, request counts and peak concurrency separately. Confirm unchanged
+Git refs, absent FETCH_HEAD and no candidate graph pipeline/check requests.
+Partial failures/cancellation must retain known scoped heads; removing a remote
+must remove its ghosts. The component
+remote::tests::benchmark_scoped_head_refresh measures bounded synthetic API head
+delivery separately. Shared startup, normal/searched scrolling and graph-hover
+controls still compare the untouched application baseline with the final app.
+
+These recipes establish no performance improvement by themselves. Retain raw
+samples, fixture scales and medians/p95, disclose every joint threshold crossing,
+and distinguish head paint from background tag completion. Private-desktop
+painting excludes physical input, interactive composition, scanout and live
+provider/network behavior. Never combine screenshot intervals with timing.

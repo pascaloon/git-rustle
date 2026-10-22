@@ -9,6 +9,23 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+// Repository tag phases and individual cache-file writes use separate path keys.
+// Network waits never hold a cache-file write lock.
+fn shared_gate(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    type Gate = std::sync::Mutex<()>;
+    static GATES: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<Gate>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut gates = GATES.lock().unwrap();
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(path).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+    gates.insert(path.to_path_buf(), std::sync::Arc::downgrade(&gate));
+    gate
+}
+
 const MAX_COMMITS: usize = 5000;
 const MAX_REQUESTS: usize = 100;
 
@@ -143,7 +160,7 @@ fn parse_commits(provider: Provider, bytes: &[u8]) -> Result<Vec<Metadata>, Stri
         .collect()
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Stored {
     version: u32,
     identity: String,
@@ -175,6 +192,35 @@ fn read_stored(path: &Path, identity: &str) -> Option<Stored> {
 }
 
 fn write_stored(path: &Path, data: &Stored) {
+    let gate = shared_gate(path);
+    let Ok(_write) = gate.lock() else {
+        return;
+    };
+    write_stored_atomic(path, data);
+}
+
+// An older tag job must not replace metadata written by a newer commit overlay,
+// and a newer overlay must retain tags completed since its initial cache read.
+fn update_history_cache(path: &Path, data: &mut Stored, tags: bool, cancel: &AtomicBool) {
+    let gate = shared_gate(path);
+    let Ok(_write) = gate.lock() else {
+        return;
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(latest) = read_stored(path, &data.identity) {
+        if tags {
+            data.commits = latest.commits;
+        } else {
+            data.tags = latest.tags;
+            data.tags_saved = latest.tags_saved;
+        }
+    }
+    write_stored_atomic(path, data);
+}
+
+fn write_stored_atomic(path: &Path, data: &Stored) {
     let Some(parent) = path.parent() else { return };
     let Ok(bytes) = serde_json::to_vec(data) else {
         return;
@@ -182,7 +228,9 @@ fn write_stored(path: &Path, data: &Stored) {
     if bytes.len() as u64 > MAX_CACHE || std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
@@ -599,7 +647,7 @@ pub fn load_stream(
                 stored.version = 1;
                 partitions.push(identity.clone());
                 stored.identity = identity.clone();
-                write_stored(file, &stored);
+                update_history_cache(file, &mut stored, false, cancel);
             }
             tag_jobs.push((remote.clone(), stored, location, client.token));
             if let Some(error) = failure {
@@ -652,6 +700,19 @@ pub fn load_stream(
             errors: preview.errors.clone(),
         });
     }
+    let gate = shared_gate(&git_dir);
+    let _tag_phase = loop {
+        if cancel.load(Ordering::Relaxed) {
+            return preview;
+        }
+        match gate.try_lock() {
+            Ok(permit) => break permit,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return preview,
+        }
+    };
     for (remote, mut stored, location, token) in tag_jobs {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -691,6 +752,9 @@ pub fn load_stream(
                 }
             }
         }
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if complete {
             stored.tags = fresh;
             stored.tags_saved = now();
@@ -701,7 +765,12 @@ pub fn load_stream(
                     cache_file(&git_dir, &remote, client.token.as_deref())
             {
                 stored.identity = identity;
-                write_stored(&file.with_extension("history.json"), &stored);
+                update_history_cache(
+                    &file.with_extension("history.json"),
+                    &mut stored,
+                    true,
+                    cancel,
+                );
             }
             let prefix = format!("{}/", remote.name);
             preview.tags.retain(|(_, name)| !name.starts_with(&prefix));
@@ -1345,6 +1414,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn concurrent_history_parts_preserve_new_metadata_and_completed_tags_and_cancel_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("history.json");
+        let metadata = |sha: &str| {
+            parse_commits(
+                Provider::Github,
+                &serde_json::to_vec(&json!([wire(Provider::Github, sha, &[])])).unwrap(),
+            )
+            .unwrap()
+        };
+        let old = Stored {
+            version: 1,
+            identity: "fixture".into(),
+            commits: metadata(&"a".repeat(40)),
+            tags: vec![],
+            tags_saved: 0,
+        };
+        write_stored(&file, &old);
+        let cancel = AtomicBool::new(false);
+        let mut newer = old.clone();
+        newer.commits.extend(metadata(&"b".repeat(40)));
+        update_history_cache(&file, &mut newer, false, &cancel);
+        let mut stale_tag_job = old.clone();
+        stale_tag_job.tags = vec![Branch {
+            name: "v1".into(),
+            sha: "b".repeat(40),
+        }];
+        stale_tag_job.tags_saved = 10;
+        update_history_cache(&file, &mut stale_tag_job, true, &cancel);
+        let latest = read_stored(&file, "fixture").unwrap();
+        assert_eq!(latest.commits.len(), 2);
+        assert_eq!(latest.tags_saved, 10);
+        let mut stale_commit_job = old.clone();
+        stale_commit_job.commits.extend(metadata(&"c".repeat(40)));
+        update_history_cache(&file, &mut stale_commit_job, false, &cancel);
+        let latest = read_stored(&file, "fixture").unwrap();
+        assert_eq!(latest.tags.len(), 1);
+        assert_eq!(latest.tags_saved, 10);
+        let before = std::fs::read(&file).unwrap();
+        let gate = shared_gate(&file);
+        let guard = gate.lock().unwrap();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancelled.clone();
+        let worker_file = file.clone();
+        let (ready, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut data = old;
+            ready.send(()).unwrap();
+            update_history_cache(&worker_file, &mut data, true, &worker_cancel);
+        });
+        receive.recv().unwrap();
+        cancelled.store(true, Ordering::Relaxed);
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "owned temporary files cleaned"
+        );
+    }
+    #[test]
+    fn busy_tag_phase_never_blocks_new_commit_overlay_or_starts_another_tag_request() {
+        let (_dir, repo, refs, local) = fixture();
+        let git_dir = crate::git::git_dir(&repo);
+        let gate = shared_gate(&git_dir);
+        let permit = gate.lock().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&gate, &shared_gate(&git_dir)));
+        let tip = "a".repeat(40);
+        // Exactly one response is supplied: the new immutable commit metadata.
+        // Attempting a second (tag) request fails this test's no-errors assertion.
+        let (url, server) = super::super::tests::server(vec![(
+            200,
+            String::new(),
+            serde_json::to_vec(&json!([wire(
+                Provider::Github,
+                &tip,
+                &[refs.head_id.unwrap().to_string()]
+            )]))
+            .unwrap(),
+        )]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        let update = Update {
+            remote,
+            branches: vec![Branch {
+                name: "main".into(),
+                sha: tip,
+            }],
+            scoped: true,
+            cached: false,
+            stale: false,
+        };
+        let mut published = false;
+        let cancel = AtomicBool::new(false);
+        let result = load_stream(
+            &repo,
+            &local,
+            &refs,
+            &[update],
+            &[],
+            true,
+            true,
+            &cancel,
+            Some(&mut |preview| {
+                published = true;
+                assert_eq!(preview.ghosts.len(), 1);
+                cancel.store(true, Ordering::Relaxed);
+            }),
+        );
+        assert!(published);
+        assert!(result.errors.is_empty());
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(shared_gate(&git_dir).try_lock().is_err());
+        drop(permit);
+        assert!(shared_gate(&git_dir).try_lock().is_ok());
+    }
+
+    #[test]
+    fn latest_tag_phase_runs_once_after_obsolete_permit_is_released_without_rehydrating_commits() {
+        let (_dir, repo, refs, local) = fixture();
+        let gate = shared_gate(&crate::git::git_dir(&repo));
+        let (ready, ready_receive) = std::sync::mpsc::channel();
+        let (release, release_receive) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _permit = gate.lock().unwrap();
+            ready.send(()).unwrap();
+            release_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
+        ready_receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let tip = "a".repeat(40);
+        let (url, server) = super::super::tests::server(vec![
+            (
+                200,
+                String::new(),
+                serde_json::to_vec(&json!([wire(
+                    Provider::Github,
+                    &tip,
+                    &[refs.head_id.unwrap().to_string()]
+                )]))
+                .unwrap(),
+            ),
+            (200, String::new(), b"[]".to_vec()),
+        ]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/branches");
+        let update = Update {
+            remote,
+            branches: vec![Branch {
+                name: "main".into(),
+                sha: tip,
+            }],
+            scoped: true,
+            cached: false,
+            stale: false,
+        };
+        let mut published = 0;
+        let result = load_stream(
+            &repo,
+            &local,
+            &refs,
+            &[update],
+            &[],
+            true,
+            true,
+            &AtomicBool::new(false),
+            Some(&mut |preview| {
+                published += 1;
+                assert_eq!(preview.ghosts.len(), 1);
+                release.send(()).unwrap();
+            }),
+        );
+        assert_eq!(published, 1);
+        assert!(result.errors.is_empty());
+        owner.join().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("/commits?"));
+        assert!(requests[1].contains("/tags?"));
+    }
     #[test]
     fn commits_are_published_before_tag_requests() {
         let (_dir, repo, refs, local) = fixture();

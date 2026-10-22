@@ -2,7 +2,6 @@
 use super::*;
 use crate::git::RefKind;
 use crate::remote::requests::integration::{self, Association, Index, Project};
-use crate::remote::requests::pipelines::{self, Pipeline, Status as PipelineStatus};
 use crate::remote::{self, Provider, Remote, requests::Client};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -17,14 +16,11 @@ struct Entry {
     remote: Remote,
     project: Project,
     requests: Index,
-    pipelines: pipelines::Index,
-    heads: BTreeMap<String, String>,
     image: Option<Arc<Image>>,
 }
 
 enum WorkerEvent {
     Summary(integration::SummaryEvent),
-    Pipelines(pipelines::Index),
 }
 
 fn same_image(entry: &Entry, bytes: &[u8]) -> bool {
@@ -46,8 +42,6 @@ pub(super) struct State {
     seeded: bool,
     force: bool,
     rendered_badges: std::cell::Cell<usize>,
-    rendered_pipelines: std::cell::Cell<usize>,
-    pipeline_paints: std::rc::Rc<std::cell::Cell<u8>>,
     search_revision: u64,
     search_projection: Option<(u64, u64)>,
 }
@@ -160,23 +154,6 @@ fn request_label(provider: Provider, association: &Association) -> String {
     )
 }
 
-fn pipeline_appearance(status: PipelineStatus) -> (&'static str, u32) {
-    match status {
-        PipelineStatus::Pending => ("pipeline-pending", 0x999999),
-        PipelineStatus::Running => ("pipeline-running", 0x55aaff),
-        PipelineStatus::Success => ("pipeline-success", 0x57c785),
-        PipelineStatus::Warning => ("pipeline-warning", 0xe8bf58),
-        PipelineStatus::Failed => ("pipeline-failed", 0xf07178),
-    }
-}
-
-fn current_pipeline<'a>(entry: &'a Entry, branch: &str, id: gix::ObjectId) -> Option<&'a Pipeline> {
-    entry.pipelines.get(branch).filter(|pipeline| {
-        entry.heads.get(branch) == Some(&pipeline.sha)
-            && gix::ObjectId::from_hex(pipeline.sha.as_bytes()).ok() == Some(id)
-    })
-}
-
 fn deduplicate_provider_items(items: &mut Vec<(Action, &'static str, String, bool)>, start: usize) {
     let mut urls = std::collections::HashSet::new();
     let mut index = 0;
@@ -227,24 +204,6 @@ impl Desktop {
         if self.provider.search_projection == Some(key) {
             return;
         }
-        if !self.provider.seeded {
-            for (name, entry) in &mut self.provider.entries {
-                entry.heads = self
-                    .engine
-                    .app
-                    .branches
-                    .remotes
-                    .get(name)
-                    .map(|update| {
-                        update
-                            .branches
-                            .iter()
-                            .map(|branch| (branch.name.clone(), branch.sha.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            }
-        }
         let labels = self.provider.search_labels(&self.engine.app.labels);
         self.provider.search_projection = Some(key);
         self.engine.set_provider_search_labels(labels);
@@ -276,7 +235,10 @@ impl Desktop {
             self.engine.set_provider_search_labels(HashMap::new());
         }
         self.refresh_provider_search_labels();
-        if self.provider.seeded || self.scenario.is_some() || !self.engine.has_presented() {
+        if self.provider.seeded
+            || (self.scenario.is_some() && self.scenario.as_deref() != Some("refresh-native"))
+            || !self.engine.has_presented()
+        {
             return;
         }
         let Some(path) = path else { return };
@@ -366,8 +328,7 @@ impl Desktop {
                                 remote: remote.clone(),
                                 project: Project::default(),
                                 requests: Index::new(),
-                                pipelines: pipelines::Index::new(),
-                                heads: BTreeMap::new(),
+
                                 image: None,
                             });
                     }
@@ -396,9 +357,6 @@ impl Desktop {
                             },
                             |event| events.send_blocking(WorkerEvent::Summary(event)).is_ok(),
                         );
-                        let _ = events.send_blocking(WorkerEvent::Pipelines(
-                            client.pipelines(force).unwrap_or_default(),
-                        ));
                     } else {
                         let _ = events.send_blocking(WorkerEvent::Summary(
                             integration::SummaryEvent::Requests(Index::new()),
@@ -450,7 +408,6 @@ impl Desktop {
                                         v.refresh_provider_search_labels();
                                     }
                                 }
-                                WorkerEvent::Pipelines(pipelines) => entry.pipelines = pipelines,
                             }
                             cx.notify();
                             true
@@ -519,69 +476,23 @@ impl Desktop {
         }) {
             return None;
         }
-        let pipeline = current_pipeline(entry, branch, id);
         let requests = entry
             .requests
             .get(branch)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        if pipeline.is_none() && requests.is_empty() {
+        if requests.is_empty() {
             return None;
         }
-        let mut badges = row()
+        let badges = row()
             .id(SharedString::from(format!(
                 "provider-{}-{name}",
                 entry.remote.name
             )))
             .gap_1()
             .flex_shrink_0();
-        if let Some(pipeline) = pipeline {
-            self.provider
-                .rendered_pipelines
-                .set(self.provider.rendered_pipelines.get() + 1);
-            let (shape, color) = pipeline_appearance(pipeline.status);
-            let title = format!(
-                "Pipeline {} · {} · {}",
-                pipeline.id,
-                pipeline.status.label(),
-                pipeline.detail
-            );
-            let paints = self.provider.pipeline_paints.clone();
-            let bit = 1u8 << pipeline.status as u8;
-            badges = badges.child(
-                div()
-                    .relative()
-                    .id(SharedString::from(format!(
-                        "pipeline-{}-{name}",
-                        entry.remote.name
-                    )))
-                    .text_color(rgb(color))
-                    .text_size(px(15.))
-                    .child(icon(shape).size(px(15.)).text_color(rgb(color)))
-                    .when(self.provider.seeded, |s| {
-                        s.child(
-                            canvas(
-                                move |bounds, _, _| bounds,
-                                move |bounds, _, _, _| {
-                                    assert!(
-                                        bounds.size.width >= px(14.)
-                                            && bounds.size.height >= px(14.)
-                                    );
-                                    paints.set(paints.get() | bit);
-                                },
-                            )
-                            .absolute()
-                            .size_full(),
-                        )
-                    })
-                    .tooltip(move |w, cx| {
-                        gpui_component::tooltip::Tooltip::new(title.clone()).build(w, cx)
-                    }),
-            );
-        }
-        let Some(request) = requests.first() else {
-            return pipeline.map(|_| badges);
-        };
+
+        let request = requests.first()?;
         let mut label = request_label(entry.remote.provider, request);
         if requests.len() > 1 {
             label.push_str(&format!(" +{}", requests.len() - 1));
@@ -647,18 +558,6 @@ impl Desktop {
                 ));
             }
         }
-        if let Some(pipeline) = entry
-            .pipelines
-            .get(branch)
-            .filter(|pipeline| entry.heads.get(branch) == Some(&pipeline.sha))
-        {
-            items.push((
-                Action::OpenProviderUrl(pipeline.url.clone()),
-                "cloud",
-                format!("Open pipeline · {name}"),
-                true,
-            ));
-        }
     }
 
     pub(super) fn provider_commit_items(
@@ -718,7 +617,19 @@ impl Desktop {
         cx: &Context<Self>,
     ) -> AnyElement {
         let mut items = Vec::new();
+        let mut base_items = Vec::new();
         if let Some(entry) = self.engine.app.branches.chosen() {
+            // Freeze the actual chosen row identity, independent of graph selection
+            // and any paired remote alias used only for provider browser links.
+            if let Ok(id) = gix::ObjectId::from_hex(entry.target.sha.as_bytes()) {
+                let enabled = !self.base_diff.busy && !self.engine.app.ghosts.contains_key(&id);
+                for (choose, label) in [
+                    (false, "Diff against branch base"),
+                    (true, "Diff against another base…"),
+                ] {
+                    base_items.push((id, entry.target.label(), choose, label, enabled));
+                }
+            }
             let target = entry.paired_remotes.first().unwrap_or(&entry.target);
             items.push((
                 Action::NewRequest(target.name.clone()),
@@ -733,8 +644,8 @@ impl Desktop {
             };
             self.provider_branch_items(kind, &target.label(), &mut items);
         }
-        let height =
-            ((items.len() * 36 + 10) as f32).min(f32::from(window.viewport_size().height) - 16.);
+        let height = (((items.len() + base_items.len()) * 36 + 10) as f32)
+            .min(f32::from(window.viewport_size().height) - 16.);
         let x = position
             .x
             .min(window.viewport_size().width - px(320.))
@@ -763,6 +674,27 @@ impl Desktop {
                     v.context_menu = None;
                     cx.notify();
                 }))
+                .children(base_items.into_iter().enumerate().map(
+                    |(index, (id, name, choose, label, enabled))| {
+                        row()
+                            .id(("branch-base-menu-item", index))
+                            .h(px(36.))
+                            .px_2()
+                            .rounded_sm()
+                            .text_color(rgb(if enabled { TEXT } else { MUTED }))
+                            .when(enabled, |row| {
+                                row.cursor_pointer()
+                                    .hover(|style| style.bg(rgb(SELECTED_HOVER)))
+                            })
+                            .child(icon("diff"))
+                            .child(label)
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                if enabled {
+                                    v.start_base_diff_branch(id, name.clone(), choose, cx);
+                                }
+                            }))
+                    },
+                ))
                 .children(items.into_iter().enumerate().map(
                     |(i, (action, icon_name, label, _))| {
                         row()
@@ -790,8 +722,7 @@ impl Desktop {
             remote,
             project: Project::default(),
             requests: Index::new(),
-            pipelines: pipelines::Index::new(),
-            heads: BTreeMap::new(),
+
             image: Some(Arc::new(Image::from_bytes(
                 ImageFormat::Png,
                 include_bytes!("../../assets/app-icon.png").to_vec(),
@@ -802,30 +733,7 @@ impl Desktop {
         // Shared names bound the index to 10k while retaining the full graph size.
         for (n, commit) in self.engine.app.history.commits.iter().enumerate() {
             let name = format!("benchmark/{}", n % 10000);
-            if n < 10000 {
-                let status = [
-                    PipelineStatus::Pending,
-                    PipelineStatus::Running,
-                    PipelineStatus::Success,
-                    PipelineStatus::Warning,
-                    PipelineStatus::Failed,
-                ][n % 5];
-                let sha = commit.id.to_string();
-                entry.heads.insert(name.clone(), sha.clone());
-                entry.pipelines.insert(
-                    name.clone(),
-                    Pipeline {
-                        id: n as u64 + 1,
-                        sha,
-                        status,
-                        detail: status.label().into(),
-                        url: format!(
-                            "https://github.com/benchmark/project/actions/runs/{}",
-                            n + 1
-                        ),
-                    },
-                );
-            }
+
             self.engine.app.labels.entry(commit.id).or_default().insert(
                 0,
                 crate::app::Label {
@@ -835,7 +743,7 @@ impl Desktop {
                 },
             );
         }
-        for (id, labels) in &self.engine.app.labels {
+        for labels in self.engine.app.labels.values() {
             for label in labels {
                 if matches!(label.kind, RefKind::Branch | RefKind::Remote) {
                     // Fixture maps every visible label explicitly; no repository refs are written.
@@ -853,25 +761,6 @@ impl Desktop {
                             url: "https://github.com/benchmark/project/pull/42".into(),
                         }],
                     );
-                    let status = [
-                        PipelineStatus::Pending,
-                        PipelineStatus::Running,
-                        PipelineStatus::Success,
-                        PipelineStatus::Warning,
-                        PipelineStatus::Failed,
-                    ][entry.pipelines.len() % 5];
-                    let sha = id.to_string();
-                    entry
-                        .heads
-                        .entry(branch.clone())
-                        .or_insert_with(|| sha.clone());
-                    entry.pipelines.entry(branch).or_insert_with(|| Pipeline {
-                        id: 42,
-                        sha,
-                        status,
-                        detail: status.label().into(),
-                        url: "https://github.com/benchmark/project/actions/runs/42".into(),
-                    });
                 }
             }
         }
@@ -901,7 +790,7 @@ impl Desktop {
 
     pub(super) fn provider_scenario_summary(&self) -> String {
         format!(
-            "provider_seeded={} provider_requests={} provider_images={} provider_badges_rendered={} provider_pipelines_rendered={} provider_pipeline_paint_mask={}",
+            "provider_seeded={} provider_requests={} provider_images={} provider_badges_rendered={}",
             self.provider.seeded,
             self.provider
                 .entries
@@ -913,16 +802,12 @@ impl Desktop {
                 .values()
                 .filter(|e| e.image.is_some())
                 .count(),
-            self.provider.rendered_badges.get(),
-            self.provider.rendered_pipelines.get(),
-            self.provider.pipeline_paints.get()
+            self.provider.rendered_badges.get()
         )
     }
 
     pub(super) fn provider_scenario_ready(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
         self.provider.rendered_badges.get() > 0
-            && self.provider.rendered_pipelines.get() > 0
-            && self.provider.pipeline_paints.get() == 31
             && self
                 .provider
                 .preferred()
@@ -938,13 +823,8 @@ impl Desktop {
 
     pub(super) fn assert_provider_scenario(&self) {
         assert!(
-            self.provider.rendered_pipelines.get() > 0,
-            "pipeline icons must actually paint"
-        );
-        assert_eq!(
-            self.provider.pipeline_paints.get(),
-            31,
-            "all five pipeline status shapes must actually paint"
+            self.provider.rendered_badges.get() > 0,
+            "request badges must actually paint"
         );
         let mut items = Vec::new();
         self.provider_commit_items(&mut items);
@@ -992,43 +872,6 @@ mod tests {
         }
         super::deduplicate_provider_items(&mut items, start);
         assert_eq!(items.len(), 3);
-    }
-
-    #[test]
-    fn pipeline_requires_exact_latest_server_head_and_each_status_has_its_own_shape_and_color() {
-        let mut state = state();
-        let entry = state.entries.get_mut("upstream").unwrap();
-        let current = gix::ObjectId::from_hex("a".repeat(40).as_bytes()).unwrap();
-        let old = gix::ObjectId::from_hex("b".repeat(40).as_bytes()).unwrap();
-        entry.heads.insert("main".into(), current.to_string());
-        entry.pipelines.insert(
-            "main".into(),
-            super::Pipeline {
-                id: 1,
-                sha: current.to_string(),
-                status: super::PipelineStatus::Running,
-                detail: "running".into(),
-                url: "https://example.invalid/pipelines/1".into(),
-            },
-        );
-        assert!(super::current_pipeline(entry, "main", current).is_some());
-        assert!(super::current_pipeline(entry, "main", old).is_none());
-        entry.heads.insert("main".into(), old.to_string());
-        assert!(
-            super::current_pipeline(entry, "main", current).is_none(),
-            "a pipeline on an older head must not decorate fetched origin labels"
-        );
-        let shapes: std::collections::HashSet<_> = [
-            super::PipelineStatus::Pending,
-            super::PipelineStatus::Running,
-            super::PipelineStatus::Success,
-            super::PipelineStatus::Warning,
-            super::PipelineStatus::Failed,
-        ]
-        .into_iter()
-        .map(super::pipeline_appearance)
-        .collect();
-        assert_eq!(shapes.len(), 5);
     }
 
     #[test]
@@ -1084,8 +927,7 @@ mod tests {
                                 remote: remote.clone(),
                                 project: Project::default(),
                                 requests: Default::default(),
-                                pipelines: Default::default(),
-                                heads: Default::default(),
+
                                 image: None,
                             },
                         )
@@ -1129,8 +971,7 @@ mod tests {
                     remote,
                     project: Project::default(),
                     requests,
-                    pipelines: Default::default(),
-                    heads: Default::default(),
+
                     image: None,
                 },
             )]

@@ -57,6 +57,7 @@ fn available(release: &Release, current: &str) -> Result<Option<Available>, Stri
 
 fn check_at(api: &str, current: &str) -> Result<Option<Available>, String> {
     let releases = updater(api, current)
+        .request_header("cache-control", "no-cache")
         .build()
         .map_err(|e| e.to_string())?
         .get_latest_release()
@@ -122,8 +123,7 @@ pub(crate) fn check_and_record_at(
 }
 
 fn install_at(api: &str, current: &str, candidate: &Available, exe: &Path) -> Result<(), String> {
-    // Pin the exact offered release AND digest: a changed release cannot silently
-    // substitute a different binary after the user accepted the original offer.
+    // Pin the freshly resolved release AND digest throughout the download.
     let status = updater(api, current)
         .release_tag(format!("v{}", candidate.version))
         .bin_install_path(exe)
@@ -140,6 +140,15 @@ fn install_at(api: &str, current: &str, candidate: &Available, exe: &Path) -> Re
     Ok(())
 }
 
+fn install_latest_at(api: &str, current: &str, exe: &Path) -> Result<Available, String> {
+    // The footer can have been displayed for hours. Resolve again when the user
+    // actually installs, then pin that result; never fall back to the stale offer.
+    let latest = check_at(api, current)?
+        .ok_or("No newer stable release is available. Close and reopen Git Rustle if another instance updated it.")?;
+    install_at(api, current, &latest, exe)?;
+    Ok(latest)
+}
+
 pub fn command(exe: &Path) -> Command {
     let mut command = Command::new(exe);
     #[cfg(windows)]
@@ -150,7 +159,7 @@ pub fn command(exe: &Path) -> Command {
     command
 }
 
-pub fn install(candidate: &Available, exe: &Path) -> Result<(), String> {
+pub fn install(exe: &Path) -> Result<Available, String> {
     let directory = directory()?;
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let lock = OpenOptions::new()
@@ -172,13 +181,10 @@ pub fn install(candidate: &Available, exe: &Path) -> Result<(), String> {
         .trim()
         .strip_prefix("git-rustle ")
         .ok_or("Cannot identify the installed executable")?;
-    if !output.status.success()
-        || !self_update::version::bump_is_greater(version, &candidate.version)
-            .map_err(|e| e.to_string())?
-    {
-        return Err("This update is already installed. Close and reopen Git Rustle.".into());
+    if !output.status.success() {
+        return Err("Cannot identify the installed executable".into());
     }
-    install_at(API, version, candidate, exe)
+    install_latest_at(API, version, exe)
 }
 
 /// Only the commit form is transferred; tokens and provider settings never enter

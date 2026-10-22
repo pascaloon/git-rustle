@@ -29,6 +29,7 @@ mod external_tools;
 mod filter_bench;
 mod general_bench;
 mod ghost_checkout_bench;
+mod graph_context_bench;
 mod graph_features_bench;
 mod hover;
 mod image_cache;
@@ -40,6 +41,7 @@ mod pending_discard;
 mod provider;
 mod rebase;
 mod ref_storage;
+mod refresh_bench;
 mod requests;
 mod stashes;
 mod status;
@@ -153,7 +155,9 @@ enum Action {
     Settings,
     Diff,
     DiffBase,
+    DiffBaseChoose,
     Checkout,
+    CheckoutCommit(gix::ObjectId),
     Commit,
     CopySha1,
     CheckAll(bool),
@@ -183,6 +187,7 @@ struct Desktop {
     provider: provider::State,
     image_cache: image_cache::State,
     improvement_bench: improvement_bench::State,
+    refresh_bench: refresh_bench::State,
     toolbar_bench: toolbar_bench::State,
     filter_bench: filter_bench::State,
     general_bench: general_bench::State,
@@ -191,6 +196,7 @@ struct Desktop {
     base_diff: base_diff::State,
     multi_details: multi_details::State,
     graph_features: graph_features_bench::State,
+    graph_context: graph_context_bench::State,
     todo_bench: todo_bench::State,
     ghost_checkout_bench: ghost_checkout_bench::State,
     conflicts_bench: conflicts_bench::State,
@@ -218,6 +224,7 @@ struct Desktop {
     graph_scroll: UniformListScrollHandle,
     diff_files_scroll: UniformListScrollHandle,
     context_menu: Option<Point<Pixels>>,
+    context_menu_group: Option<&'static str>,
     pending_discard: Option<pending_discard::Menu>,
     discard_batch: Option<pending_discard::Batch>,
     discard_scenario: pending_discard::Scenario,
@@ -232,7 +239,7 @@ struct Desktop {
     branches_scroll: UniformListScrollHandle,
     diff_scroll: UniformListScrollHandle,
     diff_horizontal: crate::desktop_scroll::DiffScroll,
-    hovered_scroll: [bool; 6],
+    hovered_scroll: [bool; 8],
     notice: String,
     status_panel: Option<status::Panel>,
     close_requested: bool,
@@ -533,6 +540,12 @@ impl Desktop {
                 "Diff against branch base".into(),
                 !self.base_diff.busy,
             ));
+            items.push((
+                Action::DiffBaseChoose,
+                "diff",
+                "Diff against another base…".into(),
+                !self.base_diff.busy,
+            ));
         }
         if app.pending.selected {
             let enabled = !self.external_merge_busy()
@@ -642,61 +655,217 @@ impl Desktop {
             }
         }
         self.provider_commit_items(&mut items);
-        let menu_height =
-            ((items.len() * 36 + 10) as f32).min(f32::from(window.viewport_size().height) - 16.);
+        if !app.pending.selected {
+            let commits = self.graph_cherry_pick_oids();
+            let ready = !commits.is_empty()
+                && !self.engine.operation_busy
+                && !self.engine.repository_edit_busy
+                && !app.pending.busy
+                && !app.branches.busy
+                && !app.settings.saving
+                && self.engine.operations.conflict.is_none()
+                && app.refs.as_ref().is_some_and(|r| r.head_branch.is_some());
+            items.push((
+                Action::Operation(Box::new(operations::Action::CherryPick(commits.clone()))),
+                "graph",
+                format!("Cherry-pick {} commit(s)…", commits.len()),
+                ready,
+            ));
+            if let Some(id) = self.selected_commits.checkout_target(app.selected_id()) {
+                items.push((
+                    Action::CheckoutCommit(id),
+                    "checkout",
+                    "Checkout commit (detached HEAD)…".into(),
+                    enabled_checkout && !self.engine.operation_busy,
+                ));
+            }
+        }
+        let mut top = Vec::new();
+        let mut commit = Vec::new();
+        let mut branch = Vec::new();
+        for item in items {
+            if matches!(
+                item.0,
+                Action::Diff
+                    | Action::DiffBase
+                    | Action::DiffBaseChoose
+                    | Action::Checkout
+                    | Action::Stashes(_)
+            ) {
+                top.push(item);
+            } else if graph_menu_branch_item(&item.0, item.1, &item.2) {
+                branch.push(item);
+            } else {
+                commit.push(item);
+            }
+        }
+        let group = self.context_menu_group;
+        let selected = if group == Some("Commit") {
+            commit.clone()
+        } else if group == Some("Branch") {
+            branch.clone()
+        } else {
+            Vec::new()
+        };
+        let submenu_height =
+            ((selected.len() * 36 + 10) as f32).min(f32::from(window.viewport_size().height) - 16.);
+        let root_height =
+            ((top.len() + usize::from(!commit.is_empty()) + usize::from(!branch.is_empty())) * 36
+                + 10) as f32;
+        let height = root_height.max(submenu_height);
         let p = point(
             position
                 .x
-                .min(window.viewport_size().width - px(320.))
+                .min(window.viewport_size().width - px(648.))
                 .max(px(0.)),
             position
                 .y
-                .min(window.viewport_size().height - px(menu_height))
+                .min(window.viewport_size().height - px(height + 8.))
                 .max(px(0.)),
         );
         deferred(
-            column()
+            div()
                 .id("commit-menu")
                 .absolute()
                 .left(p.x)
                 .top(p.y)
-                .w(px(320.))
-                .max_h(px(menu_height))
-                .overflow_y_scroll()
-                .p_1()
-                .bg(rgb(PANEL))
-                .border_1()
-                .border_color(rgb(LINE))
-                .rounded_md()
-                .shadow_lg()
-                .occlude()
+                .w(px(if selected.is_empty() { 320. } else { 648. }))
+                .h(px(height))
                 .on_mouse_down_out(cx.listener(|v, _, _, cx| {
                     v.context_menu = None;
+                    v.context_menu_group = None;
                     cx.notify();
                 }))
-                .children(items.into_iter().enumerate().map(
-                    |(i, (action, name, label, enabled))| {
-                        row()
-                            .id(("commit-menu-item", i))
-                            .h(px(36.))
-                            .px_2()
-                            .rounded_sm()
-                            .text_color(rgb(if enabled { TEXT } else { MUTED }))
-                            .child(icon(name).text_color(rgb(if enabled { TEXT } else { MUTED })))
-                            .child(label)
-                            .when(enabled, |s| {
-                                s.cursor_pointer()
-                                    .hover(|s| s.bg(rgb(SELECTED_HOVER)))
-                                    .on_click(cx.listener(move |v, _, w, cx| {
-                                        cx.stop_propagation();
-                                        v.action(action.clone(), w, cx);
-                                    }))
-                            })
-                    },
-                )),
+                .child(
+                    column()
+                        .relative()
+                        .children(self.graph_context_probe(1))
+                        .w(px(320.))
+                        .p_1()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(LINE))
+                        .rounded_md()
+                        .shadow_lg()
+                        .occlude()
+                        .children(
+                            top.into_iter()
+                                .enumerate()
+                                .map(|(i, item)| self.graph_menu_item(i, item, cx)),
+                        )
+                        .children(
+                            [("Commit", commit), ("Branch", branch)]
+                                .into_iter()
+                                .filter(|(_, items)| !items.is_empty())
+                                .map(|(name, _)| {
+                                    row()
+                                        .id(SharedString::from(format!("graph-menu-group-{name}")))
+                                        .h(px(36.))
+                                        .px_2()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(rgb(if group == Some(name) {
+                                            SELECTED_HOVER
+                                        } else {
+                                            PANEL
+                                        }))
+                                        .child(icon(if name == "Commit" {
+                                            "graph"
+                                        } else {
+                                            "branch"
+                                        }))
+                                        .child(name)
+                                        .child(div().flex_1())
+                                        .child(icon("right"))
+                                        .on_mouse_move(cx.listener(move |v, _, _, cx| {
+                                            if v.context_menu_group != Some(name) {
+                                                v.context_menu_group = Some(name);
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .on_click(cx.listener(move |v, _, _, cx| {
+                                            cx.stop_propagation();
+                                            v.context_menu_group = Some(name);
+                                            cx.notify();
+                                        }))
+                                }),
+                        ),
+                )
+                .when(!selected.is_empty(), |menu| {
+                    menu.child(
+                        column()
+                            .relative()
+                            .children(self.graph_context_probe(2))
+                            .absolute()
+                            .left(px(324.))
+                            .top(px(0.))
+                            .w(px(320.))
+                            .max_h(px(submenu_height))
+                            .id("commit-submenu")
+                            .overflow_y_scroll()
+                            .p_1()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .rounded_md()
+                            .shadow_lg()
+                            .occlude()
+                            .children(
+                                selected
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, item)| self.graph_menu_item(i + 100, item, cx)),
+                            ),
+                    )
+                }),
         )
         .with_priority(3)
         .into_any_element()
+    }
+
+    fn graph_menu_item(
+        &self,
+        i: usize,
+        (action, name, label, enabled): (Action, &'static str, String, bool),
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        row()
+            .id(("commit-menu-item", i))
+            .h(px(36.))
+            .px_2()
+            .rounded_sm()
+            .text_color(rgb(if enabled { TEXT } else { MUTED }))
+            .child(icon(name).text_color(rgb(if enabled { TEXT } else { MUTED })))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .when(enabled, |s| {
+                s.cursor_pointer()
+                    .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                    .on_click(cx.listener(move |v, _, w, cx| {
+                        cx.stop_propagation();
+                        v.action(action.clone(), w, cx);
+                    }))
+            })
+    }
+
+    pub(super) fn graph_cherry_pick_oids(&self) -> Vec<String> {
+        let app = &self.engine.app;
+        let selected = self.selected_commits.ids(app.selected_id());
+        if app.pending.selected || selected.iter().any(|id| app.ghosts.contains_key(id)) {
+            return Vec::new();
+        }
+        let mut ordered = Vec::with_capacity(selected.len());
+        for id in selected {
+            let Some(index) = app.history.index_of(&id) else {
+                return Vec::new();
+            };
+            ordered.push((index, id));
+        }
+        // History indices follow graph order (descendants first). Reverse only
+        // the selected indices so replay remains oldest-first without walking
+        // all loaded history when opening an ordinary single-commit menu.
+        ordered.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
+        ordered.dedup_by_key(|(_, id)| *id);
+        ordered.into_iter().map(|(_, id)| id.to_string()).collect()
     }
 
     fn poll_tool_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1115,6 +1284,7 @@ impl Desktop {
             provider: Default::default(),
             image_cache: Default::default(),
             improvement_bench: Default::default(),
+            refresh_bench: Default::default(),
             toolbar_bench: Default::default(),
             filter_bench: Default::default(),
             general_bench: Default::default(),
@@ -1123,6 +1293,7 @@ impl Desktop {
             base_diff: Default::default(),
             multi_details: Default::default(),
             graph_features: Default::default(),
+            graph_context: Default::default(),
             todo_bench: Default::default(),
             ghost_checkout_bench: Default::default(),
             conflicts_bench: Default::default(),
@@ -1150,6 +1321,7 @@ impl Desktop {
             graph_scroll: UniformListScrollHandle::new(),
             diff_files_scroll: UniformListScrollHandle::new(),
             context_menu: None,
+            context_menu_group: None,
             pending_discard: None,
             discard_batch: None,
             discard_scenario: pending_discard::Scenario::default(),
@@ -1164,7 +1336,7 @@ impl Desktop {
             branches_scroll: UniformListScrollHandle::new(),
             diff_horizontal: crate::desktop_scroll::DiffScroll::new(diff_scroll.clone()),
             diff_scroll,
-            hovered_scroll: [false; 6],
+            hovered_scroll: [false; 8],
             notice: String::new(),
             status_panel: None,
             close_requested: false,
@@ -1418,6 +1590,10 @@ impl Desktop {
         cx.notify();
     }
     fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(action, Action::DiffBaseChoose) {
+            self.start_base_diff_choose(cx);
+            return;
+        }
         if matches!(action, Action::DiffBase) {
             self.start_base_diff(None, cx);
             return;
@@ -1435,7 +1611,11 @@ impl Desktop {
         if self.engine.repository_edit_busy
             && matches!(
                 action,
-                Action::Commit | Action::Checkout | Action::Confirm(_) | Action::SaveSettings
+                Action::Commit
+                    | Action::Checkout
+                    | Action::CheckoutCommit(_)
+                    | Action::Confirm(_)
+                    | Action::SaveSettings
             )
         {
             return;
@@ -1468,6 +1648,7 @@ impl Desktop {
             self.diff_horizontal.set_x(px(0.));
         }
         self.context_menu = None;
+        self.context_menu_group = None;
         self.pending_discard = None;
         self.discard_batch = None;
         if let Action::OpenProviderUrl(url) = action {
@@ -1526,7 +1707,11 @@ impl Desktop {
         if self.engine.operation_busy
             && matches!(
                 action,
-                Action::Commit | Action::Checkout | Action::Confirm(_) | Action::SaveSettings
+                Action::Commit
+                    | Action::Checkout
+                    | Action::CheckoutCommit(_)
+                    | Action::Confirm(_)
+                    | Action::SaveSettings
             )
         {
             return;
@@ -1559,7 +1744,7 @@ impl Desktop {
             Action::Operation(_) => unreachable!(),
             Action::Stashes(_) => unreachable!(),
             Action::Tools(_) => unreachable!(),
-            Action::RefStorage(_) | Action::DiffBase => unreachable!(),
+            Action::RefStorage(_) | Action::DiffBase | Action::DiffBaseChoose => unreachable!(),
             Action::Refresh => {
                 app.want_refresh = true;
                 app.pending.want_refresh = true;
@@ -1659,6 +1844,14 @@ impl Desktop {
                     app.open_selected_diff(&self.selected_commits.ids(app.selected_id()));
                 }
                 self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+            Action::CheckoutCommit(id) => {
+                if !app.pending.busy && !app.branches.busy && !self.engine.repository_edit_busy {
+                    app.confirm_checkout(vec![crate::checkout::Request::Commit {
+                        id,
+                        remote: app.ghost_sources.get(&id).cloned(),
+                    }]);
+                }
             }
             Action::Checkout => {
                 if !app.pending.selected
@@ -1935,7 +2128,11 @@ impl Desktop {
         let enabled = (!self.engine.repository_edit_busy
             || !matches!(
                 action,
-                Action::Commit | Action::Checkout | Action::Confirm(_) | Action::SaveSettings
+                Action::Commit
+                    | Action::Checkout
+                    | Action::CheckoutCommit(_)
+                    | Action::Confirm(_)
+                    | Action::SaveSettings
             ))
             && (!matches!(action, Action::ClearImages)
                 || (self.engine.app.settings.page == crate::settings::GENERAL_PAGE
@@ -2172,6 +2369,7 @@ impl Desktop {
                                     if !selected {
                                         v.action(Action::Select(row_index, false), w, cx);
                                     }
+                                    v.context_menu_group = None;
                                     v.context_menu = Some(e.position);
                                     cx.stop_propagation();
                                     cx.notify();
@@ -2189,6 +2387,11 @@ impl Desktop {
                             }));
                         if let Some(i) = app.history_index(row_index) {
                             let rec = app.history.commits[i];
+                            r = r
+                                .when(v.scenario.as_deref() == Some("refresh-native"), |r| {
+                                    r.relative()
+                                })
+                                .children(v.refresh_bench_probe(rec.id));
                             let ghost = app.ghosts.contains_key(&rec.id);
                             let cells = if app.search.active() {
                                 app.search
@@ -3200,6 +3403,12 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if self.scenario.as_deref() == Some("refresh-native") {
+            return self.refresh_bench.verified;
+        }
+        if let Some(ready) = self.graph_context_ready() {
+            return ready;
+        }
         if let Some(ready) = self.ui_feature_ready() {
             return ready;
         }
@@ -3218,6 +3427,7 @@ impl Desktop {
                     | "dense-labels"
                     | "checkout-simple"
                     | "diff-base"
+                    | "diff-base-choose"
             )
         ) {
             return self.graph_features.verified;
@@ -3460,8 +3670,10 @@ impl Render for Desktop {
         self.conflicts_schedule(window, cx);
         self.discard_scenario_schedule(window, cx);
         self.graph_feature_schedule(window, cx);
+        self.graph_context_schedule(window, cx);
         self.branch_cleanup_schedule(window, cx);
         self.ui_feature_schedule(window, cx);
+        self.refresh_bench_schedule(window, cx);
         let app = &self.engine.app;
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
@@ -3809,8 +4021,9 @@ impl Render for Desktop {
             .child(self.status_bar(cx))
             .children(self.status_details(cx))
             .children(dialog)
-            .children(self.base_diff_dialog(cx))
+            .children(self.base_diff_dialog(window, cx))
             .children(self.graph_feature_probe(0, 5))
+            .children(self.graph_context_probe(3))
             .children(self.operations_overlay(cx))
             .children(self.context_menu.map(|p| self.commit_menu(p, window, cx)))
             .children(self.discard_menu(window, cx))
@@ -3935,7 +4148,7 @@ fn paint_graph_node(center: Point<Pixels>, color: Hsla, hollow: bool, window: &m
 }
 
 fn paint_graph_node_outline(center: Point<Pixels>, window: &mut Window) {
-    let radius = px(GRAPH_NODE_RADIUS + 1.);
+    let radius = px(GRAPH_NODE_RADIUS + 2.);
     window.paint_quad(quad(
         Bounds::new(
             center - point(radius, radius),
@@ -3943,7 +4156,7 @@ fn paint_graph_node_outline(center: Point<Pixels>, window: &mut Window) {
         ),
         radius,
         rgba(0),
-        px(1.),
+        px(2.),
         rgb(0x996039),
         BorderStyle::Solid,
     ));
@@ -4051,7 +4264,7 @@ fn pending_graph_canvas(
                     } else {
                         graph_color(*cell, flags.get(i).copied().unwrap_or(0))
                     };
-                    let track_width = px(if outline { 4. } else { 2. });
+                    let track_width = px(if outline { 6. } else { 2. });
                     if i == lane {
                         if incoming {
                             window.paint_quad(fill(
@@ -4125,8 +4338,8 @@ fn graph_canvas(
                     } else {
                         base
                     };
-                    let vertical_width = px(if outline { 4. } else { 2. });
-                    let horizontal_width = px(if outline { 4. } else { 2. });
+                    let vertical_width = px(if outline { 6. } else { 2. });
+                    let horizontal_width = px(if outline { 6. } else { 2. });
                     let k = c.kind();
                     let top = graph_connects_top(k);
                     let bottom = matches!(
@@ -4209,6 +4422,13 @@ fn graph_canvas(
     // Fill the commit row so adjacent canvases meet without a vertical gap.
     .h_full()
     .flex_shrink_0()
+}
+
+fn graph_menu_branch_item(action: &Action, icon_name: &str, label: &str) -> bool {
+    icon_name == "branch"
+        || (matches!(action, Action::OpenProviderUrl(_)) && label != "Open commit online")
+        || matches!(action, Action::NewRequest(_))
+        || matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::Create | operations::Dialog::Rename | operations::Dialog::Delete | operations::Dialog::Merge | operations::Dialog::Rebase, ..)))
 }
 
 #[cfg(test)]

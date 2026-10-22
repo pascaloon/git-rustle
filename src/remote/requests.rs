@@ -5,6 +5,7 @@ pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};
 pub mod integration;
+#[cfg(test)]
 pub mod pipelines;
 pub mod target;
 

@@ -299,9 +299,9 @@ impl Desktop {
             self.restart_updated(cx);
             return;
         }
-        let Some(candidate) = self.updates.available.clone() else {
+        if self.updates.available.is_none() {
             return;
-        };
+        }
         let Some(exe) = self.updates.exe.clone() else {
             self.updates.error = "Cannot locate the running executable.".into();
             cx.notify();
@@ -312,12 +312,14 @@ impl Desktop {
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { update::install(&candidate, &exe) })
+                .spawn(async move { update::install(&exe) })
                 .await;
             let _ = view.update(cx, |v, cx| {
                 v.updates.installing = false;
                 match result {
-                    Ok(()) => {
+                    Ok(installed) => {
+                        v.updates.check_state = CheckState::Available(installed.version.clone());
+                        v.updates.available = Some(installed);
                         v.updates.installed = true;
                         // A queued operation may have started just before the modal appeared.
                         if !v.restart_busy() {
@@ -380,9 +382,9 @@ impl Desktop {
         let installing = self.updates.installing;
         Some(dialog_overlay(dialog_body("Update Git Rustle")
             .child(caption(format!("Version {} → {}", update::VERSION, available.version)))
-            .child(if installing { "Downloading and verifying the update…" }
+            .child(if installing { "Checking the latest release, downloading and verifying…" }
                 else if self.updates.installed { "The update is installed and ready to restart." }
-                else { "Download the latest release and restart Git Rustle." })
+                else { "Check again for the latest release, download it, and restart Git Rustle." })
             .child(caption("Your repository and commit draft will reopen. Other unsaved forms close on restart."))
             .when(busy, |s| s.child(caption("Waiting for the active operation to finish…")))
             .when(self.updates.fixture, |s| s.child(caption("Preview only — installation is disabled.")))

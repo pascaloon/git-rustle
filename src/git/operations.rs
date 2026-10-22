@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
+pub mod cherry_pick;
 pub mod cleanup;
 pub mod conflicts;
 pub mod stashes;
@@ -54,6 +55,7 @@ pub enum Request {
     },
     Pull,
     Merge(String),
+    CherryPick(Vec<String>),
     Rebase(String),
     Plan(String),
     Interactive {
@@ -1518,11 +1520,17 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
                 {
                     Err("The current branch changed. Open the action again to review its new target.".into())
                 } else {
-                    execute_inner(&context, &mut journal, request, &mut loaded_plan)
+                    execute_inner(
+                        &context,
+                        &mut journal,
+                        request,
+                        &mut loaded_plan,
+                        Some((branch, head)),
+                    )
                 }
             }
             Request::OnConflict { request, .. } => {
-                execute_inner(&context, &mut journal, request, &mut loaded_plan)
+                execute_inner(&context, &mut journal, request, &mut loaded_plan, None)
             }
             Request::PreviewPush => preview_push(&context.root).map(|p| {
                 push = Some(p);
@@ -1539,7 +1547,7 @@ pub fn execute(root: &Path, request: Request) -> Outcome {
                 original,
                 edited,
             } => save_conflict(&context, path, identity, original, edited),
-            _ => execute_inner(&context, &mut journal, &request, &mut loaded_plan),
+            _ => execute_inner(&context, &mut journal, &request, &mut loaded_plan, None),
         };
         let save = context.save(&journal);
         view = View {
@@ -1594,6 +1602,7 @@ fn execute_inner(
     journal: &mut Journal,
     request: &Request,
     loaded_plan: &mut Option<Plan>,
+    destination: Option<(&str, &str)>,
 ) -> Result<String> {
     match request {
         Request::OptimizeStorage => {
@@ -1741,6 +1750,7 @@ fn execute_inner(
         Request::Rename { old, new } => format!("Rename {old} to {new}"),
         Request::Pull => "Pull current upstream".into(),
         Request::Merge(target) => format!("Merge {target}"),
+        Request::CherryPick(commits) => format!("Cherry-pick {} commit(s)", commits.len()),
         Request::Rebase(target) => format!("Rebase onto {target}"),
         Request::Interactive { .. } => "Interactive rebase".into(),
         Request::Checkout(target) => format!("Checkout {}", target.label()),
@@ -1755,9 +1765,13 @@ fn execute_inner(
         before,
     });
     context.save(journal)?;
+    let mut cherry_pick_started = false;
     let result: Result<()> = (|| {
         match request {
             Request::CreateStash(message) => stashes::create(context, message.as_deref())?,
+            Request::CherryPick(commits) => {
+                cherry_pick::apply(context, commits, destination, &mut cherry_pick_started)?
+            }
             Request::Cleanup(plan) => cleanup::apply(context, plan)?,
             Request::ApplyStash(stash) => stashes::apply(context, stash)?,
             Request::PopStash(stash) => {
@@ -1831,6 +1845,19 @@ fn execute_inner(
         }
         Ok(())
     })();
+    if let (Request::CherryPick(_), false, Err(error)) = (request, cherry_pick_started, &result) {
+        // Preparation did not run Git. Never journal an external checkout or
+        // edit observed during that preparation as if cherry-pick created it.
+        if let Some(pending) = journal.pending.take()
+            && !context.snapshot()?.equivalent(&pending.before)
+        {
+            invalidate(
+                journal,
+                "Repository changed outside Git Rustle during cherry-pick preparation. Earlier history was invalidated.",
+            );
+        }
+        return Err(error.clone());
+    }
     if context.conflict()?.is_none() {
         if let Some(pending) = journal.pending.clone() {
             record(context, journal, pending)?;

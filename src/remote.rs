@@ -49,6 +49,16 @@ pub struct Update {
 pub enum Event {
     Configured(Vec<(String, String)>),
     Branches(Update),
+    /// Cache-only graph seed; never overwrites fresher in-memory verified heads.
+    HeadsCached {
+        update: Update,
+        scope: HashSet<String>,
+    },
+    /// A bounded batch of verified heads; omitted identities are still pending.
+    BranchesPartial {
+        update: Update,
+        scope: HashSet<String>,
+    },
     Status(String),
     Done,
 }
@@ -162,7 +172,15 @@ impl Remote {
 pub fn api_base(provider: Provider, value: &str) -> Result<String, String> {
     let url = url::Url::parse(value.trim())
         .map_err(|_| "Enter a valid HTTPS server or API URL".to_string())?;
-    if url.scheme() != "https"
+    // The private-desktop diagnostic owns this loopback server. Keep production
+    // configuration HTTPS-only, including every non-diagnostic launch.
+    let diagnostic_loopback = std::env::var("GIT_RUSTLE_SCENARIO").as_deref()
+        == Ok("refresh-native")
+        && url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port().is_some()
+        && url.path() == "/";
+    if (url.scheme() != "https" && !diagnostic_loopback)
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -172,6 +190,9 @@ pub fn api_base(provider: Provider, value: &str) -> Result<String, String> {
         return Err("Use an HTTPS URL without credentials, a query, or a fragment".into());
     }
     let base = url.as_str().trim_end_matches('/');
+    if diagnostic_loopback {
+        return Ok(base.into());
+    }
     if provider == Provider::Github
         && matches!(base, "https://github.com" | "https://api.github.com")
     {
@@ -872,6 +893,50 @@ fn load_cached(
 
 /// Graph startup asks only about actual local heads; the full branch list is lazy (b).
 #[allow(clippy::too_many_arguments)]
+fn read_head(
+    path: &Path,
+    remote: &Remote,
+    name: &str,
+    http: &Http,
+    token: &mut Option<String>,
+) -> Result<Option<Branch>, String> {
+    let url = format!("{}/{}", remote.endpoint, encode(name));
+    let mut response = http.get_url(remote, &url, None, token.as_deref())?;
+    if matches!(response.status, 401 | 403 | 404) && token.is_none() {
+        *token = helper_token(path, remote);
+        if token.is_some() {
+            response = http.get_url(remote, &url, None, token.as_deref())?;
+        }
+    }
+    if response.status == 404 {
+        // Distinguish a missing branch from an inaccessible private repository.
+        let root = remote.endpoint.strip_suffix("/branches").unwrap();
+        let root = if remote.provider == Provider::Gitlab {
+            root.strip_suffix("/repository").unwrap_or(root)
+        } else {
+            root
+        };
+        let access = http.get_url(remote, root, None, token.as_deref())?;
+        if access.status != 200 {
+            return Err(parse_page(remote.provider, access, None)
+                .err()
+                .unwrap_or_else(|| "Repository unavailable".into()));
+        }
+        return Ok(None);
+    }
+    if response.status == 200 {
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|_| "Invalid branch API response")?;
+        response.body = serde_json::to_vec(&vec![value]).unwrap();
+    }
+    Ok(parse_page(remote.provider, response, None)?
+        .branches
+        .into_iter()
+        .find(|b| b.name == name))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn load_heads(
     path: &Path,
     git_dir: &Path,
@@ -881,13 +946,50 @@ fn load_heads(
     emit: &(impl Fn(Event) + Sync),
     upstreams: &Upstreams,
 ) -> Result<(), String> {
-    let names = history::eligible_from_config(path, remote, upstreams)?;
+    load_heads_scoped(
+        path,
+        git_dir,
+        remote,
+        force,
+        no_cache,
+        emit,
+        upstreams,
+        &[],
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn load_heads_scoped(
+    path: &Path,
+    git_dir: &Path,
+    remote: &Remote,
+    force: bool,
+    no_cache: bool,
+    emit: &(impl Fn(Event) + Sync),
+    upstreams: &Upstreams,
+    requested: &[crate::branches::Target],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    let mut names = history::eligible_from_config(path, remote, upstreams)?;
+    let priority: HashSet<_> = requested
+        .iter()
+        .filter(|t| {
+            t.remote.as_ref() == Some(&remote.name)
+                && t.url.as_ref().is_none_or(|u| u == &remote.url)
+        })
+        .map(|t| t.name.as_str())
+        .collect();
+    names.extend(priority.iter().map(|s| s.to_string()));
     let mut token = cached_token(path, git_dir, remote)?;
     let mut sorted: Vec<_> = names.iter().collect();
     sorted.sort();
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     sorted.hash(&mut hash);
     let extension = format!("{:016x}.heads.json", hash.finish());
+    sorted.sort_by(|a, b| {
+        (!priority.contains(a.as_str()), a.as_str())
+            .cmp(&(!priority.contains(b.as_str()), b.as_str()))
+    });
     let location = if no_cache {
         None
     } else {
@@ -898,55 +1000,98 @@ fn load_heads(
     });
     if let Some(cached) = &cached {
         let fresh = now().saturating_sub(cached.saved) < TTL;
-        emit(Event::Branches(Update {
-            remote: remote.clone(),
-            branches: branches(&cached.pages)
-                .into_iter()
-                .filter(|b| names.contains(&b.name))
-                .collect(),
-            scoped: true,
-            cached: true,
-            stale: !fresh,
-        }));
+        emit(Event::HeadsCached {
+            update: Update {
+                remote: remote.clone(),
+                branches: branches(&cached.pages)
+                    .into_iter()
+                    .filter(|b| names.contains(&b.name))
+                    .collect(),
+                scoped: true,
+                cached: true,
+                stale: !fresh,
+            },
+            scope: names.clone(),
+        });
         if fresh && !force {
             return Ok(());
         }
     }
-    let http = Http::new();
     let mut found = Vec::new();
-    for name in sorted {
-        let url = format!("{}/{}", remote.endpoint, encode(name));
-        let mut response = http.get_url(remote, &url, None, token.as_deref())?;
-        if matches!(response.status, 401 | 403 | 404) && token.is_none() {
-            token = helper_token(path, remote);
-            if token.is_some() {
-                response = http.get_url(remote, &url, None, token.as_deref())?;
+    // Bound API fanout independently of branch count. Publish completed batches
+    // while slow branches are still being checked; no Git objects/refs are fetched.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (send, receive) = std::sync::mpsc::channel();
+    let initial_token = token.clone();
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..sorted.len().min(4) {
+            let send = send.clone();
+            let sorted = &sorted;
+            let next = &next;
+            let initial_token = &initial_token;
+            scope.spawn(move || {
+                let http = Http::new();
+                let mut worker_token = initial_token.clone();
+                loop {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        let _=send.send((Err("Remote head verification time budget reached; cached heads retained".into()),worker_token.clone()));
+                        break;
+                    }
+                    let index = next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                    let Some(name) = sorted.get(index) else { break; };
+                    let result = read_head(path, remote, name, &http, &mut worker_token);
+                    if send.send((result,worker_token.clone())).is_err() { break; }
+                }
+            });
+        }
+        drop(send);
+        let mut first_error = None;
+        let mut completed = 0;
+        let mut last_publish = std::time::Instant::now();
+        for (result, resolved_token) in receive {
+            completed += 1;
+            if resolved_token.is_some() {
+                token = resolved_token;
+            }
+            match result {
+                Ok(Some(branch)) => found.push(branch),
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+            // Throttle partial publication. The engine retains unchecked in-memory
+            // heads until the full set succeeds; this payload contains verified heads only.
+            if (completed == 1 || last_publish.elapsed() >= Duration::from_millis(80))
+                && completed < sorted.len()
+                && first_error.is_none()
+                && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                last_publish = std::time::Instant::now();
+                // Only verified heads belong in a network batch. Cache-only
+                // rows were seeded separately and must not overwrite newer memory.
+                let mut partial = found.clone();
+                partial.sort_by(|a, b| a.name.cmp(&b.name));
+                emit(Event::BranchesPartial {
+                    update: Update {
+                        remote: remote.clone(),
+                        branches: partial,
+                        scoped: true,
+                        cached: true,
+                        stale: true,
+                    },
+                    scope: names.clone(),
+                });
             }
         }
-        if response.status == 404 {
-            // A private/inaccessible repository must not masquerade as a deleted branch.
-            let root = remote.endpoint.strip_suffix("/branches").unwrap();
-            let root = if remote.provider == Provider::Gitlab {
-                root.strip_suffix("/repository").unwrap_or(root)
-            } else {
-                root
-            };
-            let access = http.get_url(remote, root, None, token.as_deref())?;
-            if access.status != 200 {
-                return Err(parse_page(remote.provider, access, None)
-                    .err()
-                    .unwrap_or_else(|| "Repository unavailable".into()));
-            }
-            continue;
-        }
-        if response.status == 200 {
-            let value: serde_json::Value = serde_json::from_slice(&response.body)
-                .map_err(|_| "Invalid branch API response")?;
-            response.body = serde_json::to_vec(&vec![value]).unwrap();
-        }
-        let page = parse_page(remote.provider, response, None)?;
-        found.extend(page.branches.into_iter().filter(|b| &b.name == name));
+        first_error.map_or(Ok(()), Err)
+    })?;
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Remote head check cancelled".into());
     }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
     emit(Event::Branches(Update {
         remote: remote.clone(),
         branches: found.clone(),
@@ -986,17 +1131,17 @@ fn load_heads(
 }
 
 /// At most four providers concurrently, and only one scan is scheduled by the UI.
-pub fn discover(
+#[allow(clippy::too_many_arguments)]
+pub fn discover_scoped(
     path: &Path,
     git_dir: &Path,
     force: bool,
     no_cache: bool,
     local_only: bool,
+    requested: &[crate::branches::Target],
+    cancel: &std::sync::atomic::AtomicBool,
     emit: impl Fn(Event) + Sync,
 ) {
-    if force {
-        clear_auth_cache();
-    }
     match configured(path) {
         Ok((remotes, unsupported, upstreams)) => {
             emit(Event::Configured(
@@ -1018,9 +1163,13 @@ pub fn discover(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(remote) = remotes.get(i) else { break };
+                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
                             if local_only {
-                                if let Err(error) = load_heads(
+                                if let Err(error) = load_heads_scoped(
                                     path, git_dir, remote, force, no_cache, &emit, &upstreams,
+                                    requested, cancel,
                                 ) {
                                     emit(Event::Status(format!(
                                         "{}: {error}",
@@ -1420,10 +1569,229 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(events.lock().unwrap().last(), Some(Event::Branches(Update { scoped: true, cached: true, branches, .. })) if branches.len() == 1)
+            matches!(events.lock().unwrap().last(), Some(Event::HeadsCached {update:Update { scoped: true, cached: true, branches, .. },..}) if branches.len() == 1)
         );
     }
 
+    fn parallel_heads_fixture() -> serde_json::Value {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q", "-b", "z-ghost"]).unwrap();
+        command::checked(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "root",
+            ],
+        )
+        .unwrap();
+        for n in 0..11 {
+            command::checked(dir.path(), &["branch", &format!("branch-{n:02}")]).unwrap();
+        }
+        let before = command::checked(dir.path(), &["show-ref"]).unwrap();
+        let objects = command::checked(dir.path(), &["count-objects", "-v"]).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/branches", listener.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (server_active, server_peak, server_requests) =
+            (active.clone(), peak.clone(), requests.clone());
+        let server = std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                for _ in 0..12 {
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(1))
+                            }
+                            Err(error) => panic!("head fixture: {error}"),
+                        }
+                    };
+                    let (active, peak, requests) = (
+                        server_active.clone(),
+                        server_peak.clone(),
+                        server_requests.clone(),
+                    );
+                    scope.spawn(move || {
+                        // Winsock accepted sockets may inherit the listener's
+                        // nonblocking mode. Timeouts alone do not make reads block.
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            assert!(
+                                request.len() < 16 * 1024,
+                                "fixture request header exceeds limit"
+                            );
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture request deadline exceeded"
+                            );
+                            socket.read_exact(&mut byte).unwrap();
+                            request.push(byte[0]);
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        let name = request
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap()
+                            .strip_prefix("/branches/")
+                            .unwrap()
+                            .to_string();
+                        requests.lock().unwrap().push(name.clone());
+                        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(if name == "z-ghost" {
+                            10
+                        } else {
+                            40
+                        }));
+                        let body = serde_json::to_vec(
+                            &serde_json::json!({"name":name,"commit":{"sha":"a".repeat(40)}}),
+                        )
+                        .unwrap();
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(header.as_bytes()).unwrap();
+                        socket.write_all(&body).unwrap();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        });
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = endpoint;
+        let repo = crate::git::open(dir.path()).unwrap();
+        let first = Mutex::new(None);
+        let updates = Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        let emit = |event| {
+            if let Event::Branches(update) | Event::BranchesPartial { update, .. } = event {
+                if update.branches.iter().any(|b| b.name == "z-ghost") {
+                    let mut first = first.lock().unwrap();
+                    if first.is_none() {
+                        *first = Some(started.elapsed().as_secs_f64() * 1000.);
+                    }
+                }
+                updates.lock().unwrap().push(update);
+            }
+        };
+        let target = crate::branches::Target {
+            name: "z-ghost".into(),
+            remote: Some("origin".into()),
+            url: Some(remote.url.clone()),
+            sha: "a".repeat(40),
+        };
+        let result = load_heads_scoped(
+            dir.path(),
+            &crate::git::git_dir(&repo),
+            &remote,
+            true,
+            true,
+            &emit,
+            &configuration_data(dir.path()).unwrap().1,
+            &[target],
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let final_ms = started.elapsed().as_secs_f64() * 1000.;
+        // Always join the owned fixture, including a failed client request.
+        let server_result = server.join();
+        result.unwrap();
+        server_result.unwrap();
+        let updates = updates.into_inner().unwrap();
+        assert_eq!(updates.last().unwrap().branches.len(), 12);
+        assert!(!updates.last().unwrap().stale);
+        assert!(updates.iter().any(|u| u.stale && !u.branches.is_empty()));
+        assert_eq!(requests.lock().unwrap().len(), 12);
+        assert!((2..=4).contains(&peak.load(Ordering::SeqCst)));
+        assert_eq!(command::checked(dir.path(), &["show-ref"]).unwrap(), before);
+        assert_eq!(
+            command::checked(dir.path(), &["count-objects", "-v"]).unwrap(),
+            objects
+        );
+        assert!(!repo.git_dir().join("FETCH_HEAD").exists());
+        serde_json::json!({"firstHeadMs":first.into_inner().unwrap().unwrap(),"finalHeadsMs":final_ms,"requests":12,"peakRequests":peak.load(Ordering::SeqCst)})
+    }
+    #[test]
+    fn scoped_head_checks_publish_ghost_early_with_bounded_parallelism_and_no_fetch() {
+        let result = parallel_heads_fixture();
+        assert!(result["firstHeadMs"].as_f64().unwrap() < result["finalHeadsMs"].as_f64().unwrap());
+    }
+    #[test]
+    #[ignore = "one warmup and fifteen controlled API head refresh samples"]
+    fn benchmark_scoped_head_refresh() {
+        for sample in -1..15 {
+            let mut result = parallel_heads_fixture();
+            result["sample"] = sample.into();
+            println!("{result}");
+        }
+    }
+    #[test]
+    fn cancelled_head_check_does_not_send_requests_or_publish_fresh_result() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.endpoint = "http://127.0.0.1:1/branches".into();
+        let target = crate::branches::Target {
+            name: "ghost".into(),
+            remote: Some("origin".into()),
+            url: Some(remote.url.clone()),
+            sha: "a".repeat(40),
+        };
+        let events = std::sync::Mutex::new(Vec::new());
+        let result = load_heads_scoped(
+            dir.path(),
+            &crate::git::git_dir(&repo),
+            &remote,
+            true,
+            true,
+            &|event| events.lock().unwrap().push(event),
+            &Upstreams::new(),
+            &[target],
+            &std::sync::atomic::AtomicBool::new(true),
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(events.lock().unwrap().is_empty());
+    }
     #[test]
     fn credential_helper_results_persist_in_the_resolved_token_partition() {
         let dir = tempfile::tempdir().unwrap();

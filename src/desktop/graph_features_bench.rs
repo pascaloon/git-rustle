@@ -24,6 +24,7 @@ impl Desktop {
                     | "dense-labels"
                     | "checkout-simple"
                     | "diff-base"
+                    | "diff-base-choose"
             )
         })
     }
@@ -44,7 +45,7 @@ impl Desktop {
         }
         if part == 5
             && match self.graph_feature_name().unwrap() {
-                "diff-base" | "stash-file" => {
+                "diff-base" | "diff-base-choose" | "stash-file" => {
                     !matches!(&self.engine.app.mode,Mode::Diff(view) if view.changes.loaded)
                 }
                 "checkout-simple" => {
@@ -129,7 +130,7 @@ impl Desktop {
                     self.action(Action::Checkout, window, cx);
                     assert!(self.engine.app.checkout_confirmation.is_none());
                 }
-                "diff-base" => {
+                "diff-base" | "diff-base-choose" => {
                     let target = self
                         .engine
                         .app
@@ -143,7 +144,16 @@ impl Desktop {
                         .id;
                     let index = self.engine.app.history.index_of(&target).unwrap();
                     self.action(Action::Select(index, false), window, cx);
-                    self.action(Action::DiffBase, window, cx);
+                    self.action(
+                        Action::Select((index + 1).min(self.engine.app.history.len() - 1), false),
+                        window,
+                        cx,
+                    );
+                    if name == "diff-base-choose" {
+                        self.start_base_diff_choose_for(target, cx);
+                    } else {
+                        self.start_base_diff_for(target, None, cx);
+                    }
                 }
                 "stash-preview" | "stash-file" | "stash-pop" => {
                     self.action(Action::Tab(Tab::Stashes), window, cx);
@@ -223,7 +233,11 @@ impl Desktop {
                 if name == "stash-pop" {
                     self.stash_action(stashes::Action::Pop(stash), window, cx);
                 } else {
-                    self.stash_action(stashes::Action::Expand(stash), window, cx);
+                    if let Some(other) = self.stash_entries().get(1).cloned() {
+                        self.stash_action(stashes::Action::Select(other), window, cx);
+                    }
+                    self.stash_action(stashes::Action::Select(stash.clone()), window, cx);
+                    assert_eq!(self.stash_selected_oid(), Some(stash.oid.as_str()));
                 }
                 self.graph_features.phase = 2;
                 self.graph_features.paints.borrow_mut().clear();
@@ -243,6 +257,38 @@ impl Desktop {
                     return;
                 };
                 assert!(files >= 2, "tracked and untracked stash preview");
+                assert_eq!(self.stash_selected_oid(), Some(stash.oid.as_str()));
+                let paints = self.graph_features.paints.borrow();
+                let Some(inspector) = paints.get(&(0, 9)) else {
+                    return;
+                };
+                let Some(file) = paints.get(&(0, 8)) else {
+                    return;
+                };
+                let (Some(avatar), Some(copy)) = (paints.get(&(0, 10)), paints.get(&(0, 11)))
+                else {
+                    return;
+                };
+                assert!((avatar.size.width - px(28.)).abs() <= px(1.));
+                assert!((avatar.size.height - px(28.)).abs() <= px(1.));
+                assert!(copy.size.width >= px(20.) && copy.size.height >= px(20.));
+                for control in [avatar, copy] {
+                    assert!(
+                        control.left() >= inspector.left() && control.right() <= inspector.right()
+                    );
+                    assert!(
+                        control.top() >= inspector.top()
+                            && control.bottom() <= inspector.top() + px(44.)
+                    );
+                }
+                assert!(
+                    avatar.right() <= copy.left(),
+                    "stash avatar and copy control do not overlap"
+                );
+                assert!(inspector.size.width >= px(240.));
+                assert!(file.left() >= inspector.left() && file.right() <= inspector.right());
+                assert!(inspector.right() <= window.viewport_size().width);
+                drop(paints);
                 if !self.graph_features.paints.borrow().contains_key(&(0, 8)) {
                     return;
                 }
@@ -280,7 +326,7 @@ impl Desktop {
             self.engine.mark("graph feature verified frame");
             return;
         }
-        if self.graph_features.phase != 1 {
+        if self.graph_features.phase != 1 && name != "diff-base-choose" {
             return;
         }
         if name == "checkout-simple" {
@@ -306,7 +352,45 @@ impl Desktop {
             if !self.graph_features.paints.borrow().contains_key(&(0, 5)) {
                 return;
             }
-        } else if name == "diff-base" {
+        } else if name == "diff-base" || name == "diff-base-choose" {
+            if name == "diff-base-choose" && self.graph_features.phase == 1 {
+                if self.base_diff.busy
+                    || self.base_diff.choices.is_empty()
+                    || !self.base_diff_scenario_filter("main", window, cx)
+                {
+                    return;
+                }
+                self.graph_features.phase = 2;
+                self.graph_features.paints.borrow_mut().clear();
+                return;
+            }
+            if name == "diff-base-choose" && self.graph_features.phase == 2 {
+                let paints = self.graph_features.paints.borrow();
+                let (Some(list), Some(cancel), Some(filter), Some(dialog), Some(compare)) = (
+                    paints.get(&(0, 12)),
+                    paints.get(&(0, 13)),
+                    paints.get(&(0, 14)),
+                    paints.get(&(0, 15)),
+                    paints.get(&(0, 16)),
+                ) else {
+                    return;
+                };
+                assert!(list.size.height <= px(281.) && list.size.height >= px(200.));
+                assert!(list.bottom() <= cancel.top() && list.bottom() <= compare.top());
+                assert!(filter.bottom() <= list.top());
+                assert!(cancel.bottom() <= dialog.bottom() && compare.right() <= dialog.right());
+                assert!(dialog.top() >= px(0.) && dialog.bottom() <= window.viewport_size().height);
+                drop(paints);
+                if std::env::var("GIT_RUSTLE_BASE_CHOOSER_CAPTURE").as_deref() == Ok("1") {
+                    self.graph_features.verified = true;
+                    self.engine.mark("graph feature verified frame");
+                    return;
+                }
+                self.base_diff_scenario_choose("main", cx);
+                self.graph_features.phase = 3;
+                self.graph_features.paints.borrow_mut().clear();
+                return;
+            }
             if self.base_diff.busy {
                 return;
             }
@@ -317,6 +401,20 @@ impl Desktop {
                 return;
             }
             assert!(view.changes.old.is_some());
+            assert!(
+                view.changes
+                    .files
+                    .iter()
+                    .any(|file| file.path == "file.txt")
+            );
+            assert!(
+                !view
+                    .changes
+                    .files
+                    .iter()
+                    .any(|file| file.path == "main.txt"),
+                "branch diff uses common ancestor rather than the advanced default tip"
+            );
             if !self.graph_features.paints.borrow().contains_key(&(0, 5)) {
                 return;
             }

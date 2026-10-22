@@ -52,7 +52,7 @@ impl AssetSource for Assets {
                 "<path d='m10 3 4 0 1 3 3 1 3 3-2 3 0 3-3 3-3-1-3 1-3-3 0-3-2-3 3-3 3-1z'/><circle cx='12' cy='12' r='3'/>"
             }
             "back" => "<path d='m15 5-7 7 7 7'/>",
-            "next" => "<path d='m9 5 7 7-7 7'/>",
+            "next" | "right" => "<path d='m9 5 7 7-7 7'/>",
             "expand" => "<path d='m7 8 5-5 5 5m-10 8 5 5 5-5M4 12h16'/>",
             "collapse" => "<path d='m7 3 5 5 5-5m-10 18 5-5 5 5M4 12h16'/>",
             "diff" => "<path d='M4 3h16v18H4zM12 3v18M6 8h4m-2-2v4m6 4h4'/>",

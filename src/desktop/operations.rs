@@ -22,6 +22,7 @@ pub(super) enum Action {
     Open(Dialog, String, String),
     Submit,
     Pull,
+    CherryPick(Vec<String>),
     StartPlan,
     ClosePlan,
     ResetPlan,
@@ -483,6 +484,38 @@ impl Desktop {
             Action::SaveConflict => self.conflict_save_request(cx),
             Action::SelectConflictFile(path) => self.select_conflict_file(path, window, cx),
             Action::ReloadConflict => self.reload_conflict_file(),
+            Action::CherryPick(commits) => {
+                if commits.is_empty()
+                    || self.engine.operation_busy
+                    || self.engine.operations.conflict.is_some()
+                {
+                    return;
+                }
+                let request = Request::OnBranch {
+                    branch: self.current_branch(),
+                    head: self
+                        .engine
+                        .app
+                        .head_id()
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    request: Box::new(Request::CherryPick(commits.clone())),
+                };
+                self.operations.confirmation = Some((
+                    request,
+                    format!(
+                        "Cherry-pick {} commit(s) onto {} in this order?\n{}\n\nPending changes must be committed or stashed first. Conflicts pause the sequence for Continue, Skip or Abort. Successful replay can be undone in History.",
+                        commits.len(),
+                        self.current_branch(),
+                        commits
+                            .iter()
+                            .map(|id| format!("• {id}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                ));
+                None
+            }
             Action::Pull => Some(Request::Pull),
             Action::ShowConflicts => {
                 self.operations.tab = Some(Tab::Conflicts);
@@ -1175,6 +1208,7 @@ impl Desktop {
                             .relative()
                             .children(self.todo_probe(7))
                             .children(self.branch_cleanup_probe(6))
+                            .children(self.graph_context_probe(4))
                             .children(self.conflicts_probe(9))
                             .w(px(600.))
                             .p_6()

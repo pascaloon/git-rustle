@@ -1,6 +1,6 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base'),
+    [string[]]$Scenarios=@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-commit-menu','graph-branch-menu','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [Parameter(Mandatory)][string]$OutputDirectory
@@ -12,7 +12,7 @@ $Candidate=(Resolve-Path -LiteralPath $Candidate).Path
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 if(Test-Path -LiteralPath $OutputDirectory){throw 'Retaining existing graph-feature run'}
 New-Item -ItemType Directory -Path $OutputDirectory|Out-Null
-$saved=@{};$names=@('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP')
+$saved=@{};$names=@('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_BASE_CHOOSER_CAPTURE')
 foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $results=[Collections.Generic.List[object]]::new()
 function Graph-Git([string]$Path,[string[]]$Arguments){$value=@(& git -C $Path @Arguments 2>&1);if($LASTEXITCODE-ne0){throw "Fixture Git failed: $($value-join' ')"};return ($value-join"`n")}
@@ -30,7 +30,7 @@ try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-commit-menu','graph-branch-menu','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
             Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
@@ -57,6 +57,7 @@ try{
                 }
             }
             $before=Graph-State $fixture;$before|Set-Content -LiteralPath (Join-Path $directory 'before.json')
+            $env:GIT_RUSTLE_BASE_CHOOSER_CAPTURE=if($Screenshots -and $scenario -eq 'diff-base-choose'){'1'}else{'0'}
             $env:GIT_RUSTLE_SCENARIO=$scenario;$env:GIT_RUSTLE_AUTOQUIT=if($Screenshots){'600000'}else{'100'};$env:GIT_RUSTLE_DUMP=Join-Path $directory 'state.txt'
             $log=Join-Path $directory 'app.log';$process=$null
             try{
@@ -67,7 +68,7 @@ try{
                     while([DateTime]::UtcNow-lt$deadline){
                         if($process.WaitForExit(0)){throw "Scenario exited before screenshot: $log"}
                         $observed=Read-GraphLiveLog $log
-                        if($observed-match'graph feature verified frame'){$ready=$true;break}
+                        if($observed-match'(graph feature|graph context) verified frame'){$ready=$true;break}
                         Start-Sleep -Milliseconds 50
                     }
                     if(!$ready){throw "Graph scenario paint timeout: $log"}
@@ -76,8 +77,8 @@ try{
                 if(!$process.WaitForExit(60000)){throw "Graph scenario timeout: $log"};if($process.ExitCode-ne0){throw "Graph scenario failed: $log"}
             }finally{if($null-ne$process){$process.Dispose()}}
             $text=Read-GraphLiveLog $log
-            if($text-notmatch'graph feature verified frame'){throw "Missing verified paint: $log"}
-            $start=[regex]::Match($text,'([0-9.]+) ms\s+graph feature requested');$end=[regex]::Match($text,'([0-9.]+) ms\s+graph feature verified frame')
+            if($text-notmatch'(graph feature|graph context) verified frame'){throw "Missing verified paint: $log"}
+            $start=[regex]::Match($text,'([0-9.]+) ms\s+(?:graph feature|graph context) requested');$end=[regex]::Match($text,'([0-9.]+) ms\s+(?:graph feature|graph context) verified frame')
             $after=Graph-State $fixture;$after|Set-Content -LiteralPath (Join-Path $directory 'after.json')
             $a=$after|ConvertFrom-Json;$b=$before|ConvertFrom-Json
             foreach($key in @('refs')){if($a.$key-cne$b.$key){throw "Graph feature changed unrelated $key"}}
@@ -95,7 +96,15 @@ try{
                 if($a.index-cne$b.index-or($a.files|ConvertTo-Json -Compress)-cne($b.files|ConvertTo-Json -Compress)){throw 'Read-only graph feature changed index or worktree'}
                 if($a.head-cne$b.head-or$a.branch-cne$b.branch){throw 'Read-only graph scenario changed HEAD'}
             }
-            $results.Add([pscustomobject]@{scenario=$scenario;sample=$sample;warmup=($sample-eq-1);ms=([double]$end.Groups[1].Value-[double]$start.Groups[1].Value);screenshot=$Screenshots})
+            $result=[ordered]@{scenario=$scenario;sample=$sample;warmup=($sample-eq-1);ms=([double]$end.Groups[1].Value-[double]$start.Groups[1].Value);screenshot=[bool]$Screenshots}
+            if($scenario -in @('cherry-pick-one','cherry-pick-many')){
+                $confirmed=[regex]::Match($text,'([0-9.]+) ms\s+cherry pick confirmed')
+                $applied=[regex]::Match($text,'([0-9.]+) ms\s+cherry pick applied frame')
+                if(!$confirmed.Success -or !$applied.Success){throw 'Missing cherry-pick action paint interval'}
+                $result.applyFrameMs=[double]$applied.Groups[1].Value-[double]$confirmed.Groups[1].Value
+                $result.undoFrameMs=[double]$end.Groups[1].Value-[double]$applied.Groups[1].Value
+            }
+            $results.Add([pscustomobject]$result)
             $results.ToArray()|ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $OutputDirectory 'samples.json')
         }
     }

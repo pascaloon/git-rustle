@@ -13,23 +13,18 @@ pub(super) enum Action {
     Apply(Stash),
     Pop(Stash),
     Delete(Stash),
-    Expand(Stash),
+    Select(Stash),
+    CopySha(Stash),
     File(Stash, usize),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StashRow {
-    Header(usize),
-    Actions(usize),
-    File(usize, usize),
-    Status(usize),
 }
 
 pub(super) struct State {
     pub open: bool,
     entries: Vec<Stash>,
-    rows: Vec<StashRow>,
-    expanded: HashSet<String>,
+    selected: Option<String>,
+    detail_oid: Option<String>,
+    detail_text: Option<Entity<TextBlock>>,
+    files_scroll: UniformListScrollHandle,
     previews: HashMap<String, Result<crate::git::operations::stashes::Preview, String>>,
     inflight: HashSet<String>,
     delete_armed: Option<Stash>,
@@ -57,8 +52,10 @@ impl Default for State {
         Self {
             open: false,
             entries: Vec::new(),
-            rows: Vec::new(),
-            expanded: HashSet::new(),
+            selected: None,
+            detail_oid: None,
+            detail_text: None,
+            files_scroll: UniformListScrollHandle::new(),
             previews: HashMap::new(),
             inflight: HashSet::new(),
             delete_armed: None,
@@ -90,23 +87,6 @@ impl State {
             entry.oid == frozen.oid && entry.subject == frozen.subject && entry.time == frozen.time
         })
     }
-    fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        for (i, stash) in self.entries.iter().enumerate() {
-            self.rows.push(StashRow::Header(i));
-            self.rows.push(StashRow::Actions(i));
-            if self.expanded.contains(&stash.oid) {
-                match self.previews.get(&stash.oid) {
-                    Some(Ok(preview)) if !preview.changes.files.is_empty() => {
-                        self.rows.extend(
-                            (0..preview.changes.files.len()).map(|file| StashRow::File(i, file)),
-                        );
-                    }
-                    _ => self.rows.push(StashRow::Status(i)),
-                }
-            }
-        }
-    }
     fn coalesce_status_refresh(&mut self, observed: Option<u64>) {
         if self.listed_stamp.is_some() && self.listed_stamp == observed {
             self.status_refresh = false;
@@ -123,6 +103,9 @@ impl Desktop {
             .get(&stash.oid)
             .and_then(|preview| preview.as_ref().ok())
             .map(|preview| preview.changes.files.len())
+    }
+    pub(super) fn stash_selected_oid(&self) -> Option<&str> {
+        self.stashes.selected.as_deref()
     }
     pub(super) fn stashes_ready(&self) -> bool {
         self.stashes.open
@@ -165,11 +148,9 @@ impl Desktop {
                         return;
                     }
                     v.stashes.inflight.remove(&stash.oid);
-                    if v.stashes.contains_identity(&stash)
-                        && v.stashes.expanded.contains(&stash.oid)
-                    {
+                    if v.stashes.contains_identity(&stash) {
                         v.stashes.previews.insert(stash.oid, result);
-                        v.stashes.rebuild_rows();
+                        v.sync_stash_details(cx);
                         cx.notify();
                     }
                 });
@@ -260,15 +241,19 @@ impl Desktop {
                     self.stashes.delete_armed = Some(stash);
                 }
             }
-            Action::Expand(stash) => {
-                self.stashes.delete_armed = None;
-                if !self.stashes.expanded.remove(&stash.oid) {
-                    self.stashes.expanded.insert(stash.oid.clone());
-                    self.load_stash_preview(stash, cx);
-                } else {
-                    self.stashes.previews.remove(&stash.oid);
+            Action::CopySha(stash) => {
+                if self.stashes.contains_identity(&stash) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(stash.oid));
                 }
-                self.stashes.rebuild_rows();
+            }
+            Action::Select(stash) => {
+                if self.stashes.contains_identity(&stash) {
+                    self.stashes.selected = Some(stash.oid.clone());
+                    self.stashes
+                        .files_scroll
+                        .scroll_to_item(0, ScrollStrategy::Top);
+                    self.load_stash_preview(stash, cx);
+                }
             }
             Action::File(stash, file) => {
                 if let Some(Ok(preview)) = self.stashes.previews.get(&stash.oid).cloned()
@@ -287,6 +272,7 @@ impl Desktop {
                 }
             }
         }
+        self.sync_stash_details(cx);
         cx.notify();
     }
     fn request_stashes(&mut self) {
@@ -368,7 +354,14 @@ impl Desktop {
             if let Some(entries) = &self.engine.operations.stashes {
                 self.stashes.entries = entries.clone();
                 let ids: HashSet<_> = entries.iter().map(|stash| stash.oid.clone()).collect();
-                self.stashes.expanded.retain(|id| ids.contains(id));
+                if self
+                    .stashes
+                    .selected
+                    .as_ref()
+                    .is_none_or(|id| !ids.contains(id))
+                {
+                    self.stashes.selected = entries.first().map(|stash| stash.oid.clone());
+                }
                 self.stashes.previews.retain(|id, _| ids.contains(id));
                 if self
                     .stashes
@@ -378,8 +371,16 @@ impl Desktop {
                 {
                     self.stashes.delete_armed = None;
                 }
-                self.stashes.rebuild_rows();
                 self.stashes.received = true;
+                if let Some(stash) = self
+                    .stashes
+                    .entries
+                    .iter()
+                    .find(|stash| Some(&stash.oid) == self.stashes.selected.as_ref())
+                    .cloned()
+                {
+                    self.load_stash_preview(stash, cx);
+                }
             }
             cx.notify();
         } else if self.stashes.requested
@@ -406,6 +407,7 @@ impl Desktop {
                 self.action(super::Action::Head, window, cx);
             }
         }
+        self.sync_stash_details(cx);
         if !self.stashes.requested
             && self.stashes.open
             && (self.stashes.want_refresh
@@ -414,6 +416,240 @@ impl Desktop {
         {
             self.request_stashes();
         }
+    }
+    fn sync_stash_details(&mut self, cx: &mut Context<Self>) {
+        let selected = self.stashes.selected.clone();
+        if self.stashes.detail_oid == selected {
+            return;
+        }
+        self.stashes.detail_oid = None;
+        self.stashes.detail_text = None;
+        let Some(oid) = selected else {
+            return;
+        };
+        let Some(Ok(preview)) = self.stashes.previews.get(&oid) else {
+            return;
+        };
+        let document = crate::desktop_details::document(&preview.details);
+        let text = cx.new(TextBlock::new);
+        text.update(cx, |text, cx| text.set_document(document, "", cx));
+        self.stashes.detail_text = Some(text);
+        self.stashes.detail_oid = Some(oid);
+    }
+    fn stash_inspector(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let stash = self
+            .stashes
+            .entries
+            .iter()
+            .find(|stash| Some(&stash.oid) == self.stashes.selected.as_ref());
+        let mut panel = column()
+            .relative()
+            .w(px(self.pane_width))
+            .flex_shrink_0()
+            .h_full()
+            .min_h_0()
+            .border_l_1()
+            .border_color(rgb(INSPECTOR_LINE))
+            .children(self.graph_feature_probe(0, 9));
+        let Some(stash) = stash else {
+            return panel
+                .child(caption("Select a stash to inspect its details").p_4())
+                .into_any_element();
+        };
+        let apply = stash.clone();
+        let pop = stash.clone();
+        let delete = stash.clone();
+        let armed = self.stashes.delete_armed.as_ref() == Some(stash);
+        let preview = self.stashes.previews.get(&stash.oid);
+        let copy = stash.clone();
+        let oid = gix::ObjectId::from_hex(stash.oid.as_bytes()).ok();
+        let author = preview
+            .and_then(|result| result.as_ref().ok())
+            .map(|preview| preview.details.author_name.as_str())
+            .unwrap_or("?");
+        panel = panel
+            .child(
+                row()
+                    .h(px(44.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(INSPECTOR_LINE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(caption("STASH DETAILS").text_color(rgb(INSPECTOR_MUTED))),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .children(self.graph_feature_probe(0, 10))
+                            .child(requests::avatar(
+                                oid.as_ref().and_then(|id| self.avatars.image(id)),
+                                author,
+                                28.,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .font_family("Cascadia Mono")
+                            .text_size(px(11.))
+                            .text_color(rgb(INSPECTOR_MUTED))
+                            .child(stash.oid.chars().take(8).collect::<String>()),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .children(self.graph_feature_probe(0, 11))
+                            .child(
+                                Button::new("stash-copy-sha")
+                                    .small()
+                                    .ghost()
+                                    .icon(gpui_component::Icon::default().path("rustle/copy"))
+                                    .tooltip("Copy stash SHA")
+                                    .on_click(cx.listener(move |v, _, w, cx| {
+                                        v.stash_action(Action::CopySha(copy.clone()), w, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                row()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("selected-stash-apply")
+                            .small()
+                            .ghost()
+                            .label("Apply…")
+                            .disabled(!enabled)
+                            .tooltip("Apply changes and keep this stash")
+                            .on_click(cx.listener(move |v, _, w, cx| {
+                                v.stash_action(Action::Apply(apply.clone()), w, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("selected-stash-pop")
+                            .small()
+                            .ghost()
+                            .label("Pop…")
+                            .disabled(!enabled)
+                            .tooltip("Remove the stash only after changes apply successfully")
+                            .on_click(cx.listener(move |v, _, w, cx| {
+                                v.stash_action(Action::Pop(pop.clone()), w, cx)
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("selected-stash-delete")
+                            .small()
+                            .ghost()
+                            .icon(gpui_component::Icon::default().path("rustle/trash"))
+                            .disabled(!enabled)
+                            .tooltip(if armed {
+                                "Confirm deleting this stash"
+                            } else {
+                                "Delete stash — two clicks"
+                            })
+                            .when(armed, |s| s.text_color(rgb(ACCENT)))
+                            .on_click(cx.listener(move |v, _, w, cx| {
+                                v.stash_action(Action::Delete(delete.clone()), w, cx)
+                            })),
+                    ),
+            )
+            .when(armed, |s| {
+                s.child(
+                    caption("Click trash again to delete this stash")
+                        .px_4()
+                        .pb_2(),
+                )
+            })
+            .child(caption(stash.selector.clone()).px_4().pb_2())
+            .child(
+                div()
+                    .h(px(240.))
+                    .flex_shrink_0()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .when_some(self.stashes.detail_text.as_ref(), |s, text| {
+                        s.child(text.clone())
+                    })
+                    .when(self.stashes.detail_text.is_none(), |s| {
+                        s.child(caption("Loading stash details…"))
+                    }),
+            )
+            .child(
+                row()
+                    .px_4()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(rgb(INSPECTOR_LINE))
+                    .child(caption("FILES")),
+            );
+        match preview {
+            Some(Ok(preview)) if !preview.changes.files.is_empty() => {
+                let oid = stash.oid.clone();
+                let count = preview.changes.files.len();
+                let list = uniform_list(
+                    "stash-inspector-files",
+                    count,
+                    cx.processor(move |v, range: std::ops::Range<usize>, _, cx| {
+                        let Some(stash) = v.stashes.entries.iter().find(|stash| stash.oid == oid)
+                        else {
+                            return Vec::new();
+                        };
+                        let Some(Ok(preview)) = v.stashes.previews.get(&oid) else {
+                            return Vec::new();
+                        };
+                        range
+                            .map(|file| {
+                                let change = &preview.changes.files[file];
+                                let open = stash.clone();
+                                row()
+                                    .relative()
+                                    .id(("stash-inspector-file", file))
+                                    .w_full()
+                                    .h(px(30.))
+                                    .px_3()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .children(v.graph_feature_probe(0, 8))
+                                    .child(caption(change.kind.letter().to_string()))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(change.path.clone()),
+                                    )
+                                    .on_click(cx.listener(move |v, _, w, cx| {
+                                        v.stash_action(Action::File(open.clone(), file), w, cx)
+                                    }))
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .size_full()
+                .track_scroll(self.stashes.files_scroll.clone());
+                panel = panel.child(self.scroll_region(
+                    6,
+                    list,
+                    Scrollbar::vertical(&self.stashes.files_scroll),
+                    cx,
+                ));
+            }
+            Some(Ok(_)) => panel = panel.child(caption("No file changes").p_4()),
+            Some(Err(error)) => panel = panel.child(caption(error.clone()).p_4()),
+            None => panel = panel.child(caption("Loading stash details and files…").p_4()),
+        }
+        panel.into_any_element()
     }
     pub(super) fn stash_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.stashes.open {
@@ -430,135 +666,46 @@ impl Desktop {
             && !self.engine.app.pending.snapshot.files.is_empty();
         let list = uniform_list(
             "stash-list",
-            self.stashes.rows.len(),
+            self.stashes.entries.len(),
             cx.processor(move |v, range: std::ops::Range<usize>, _, cx| {
                 range
                     .map(|row_index| {
-                        let kind = v.stashes.rows[row_index];
-                        let i = match kind {
-                            StashRow::Header(i)
-                            | StashRow::Actions(i)
-                            | StashRow::File(i, _)
-                            | StashRow::Status(i) => i,
-                        };
-                        let stash = &v.stashes.entries[i];
-                        let mut line = row()
+                        let stash = &v.stashes.entries[row_index];
+                        let select = stash.clone();
+                        let selected = v.stashes.selected.as_deref() == Some(&stash.oid);
+                        let line = row()
                             .id(("stash-row", row_index))
                             .relative()
                             .w_full()
-                            .h(px(36.))
+                            .h(px(40.))
                             .px_3()
-                            .gap_2();
-                        match kind {
-                            StashRow::Header(_) => {
-                                let expand = stash.clone();
-                                line = line
-                                    .children(v.todo_stash_probe(i, 2))
-                                    .children(v.todo_stash_probe(i, 0))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .child(if v.stashes.expanded.contains(&stash.oid) {
-                                        "▾"
-                                    } else {
-                                        "▸"
-                                    })
-                                    .child(icon("stash"))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(stash.subject.clone()),
-                                    )
-                                    .child(caption(stash.selector.clone()))
-                                    .child(caption(stash.oid.chars().take(7).collect::<String>()))
-                                    .on_click(cx.listener(move |v, _, w, cx| {
-                                        v.stash_action(Action::Expand(expand.clone()), w, cx)
-                                    }));
-                            }
-                            StashRow::Actions(_) => {
-                                let apply = stash.clone();
-                                let pop = stash.clone();
-                                let delete = stash.clone();
-                                let armed = v.stashes.delete_armed.as_ref() == Some(stash);
-                                line = line
-                                    .children(v.todo_stash_probe(i, 1))
-                                    .pl(px(34.))
-                                    .border_b_1()
-                                    .border_color(rgb(LINE))
-                                    .child(
-                                        Button::new(("apply-stash", i))
-                                            .xsmall()
-                                            .ghost()
-                                            .label("Apply…")
-                                            .disabled(!enabled)
-                                            .tooltip("Apply changes and keep this stash")
-                                            .on_click(cx.listener(move |v, _, w, cx| {
-                                                v.stash_action(Action::Apply(apply.clone()), w, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("pop-stash", i))
-                                            .xsmall()
-                                            .ghost()
-                                            .label("Pop…")
-                                            .disabled(!enabled)
-                                            .tooltip("Apply changes; remove stash only on success")
-                                            .on_click(cx.listener(move |v, _, w, cx| {
-                                                v.stash_action(Action::Pop(pop.clone()), w, cx)
-                                            })),
-                                    )
-                                    .child(div().flex_1())
-                                    .when(armed, |s| {
-                                        s.child(caption("Click trash again to delete"))
-                                    })
-                                    .child(
-                                        Button::new(("delete-stash", i))
-                                            .xsmall()
-                                            .ghost()
-                                            .child(icon("trash"))
-                                            .when(armed, |s| s.text_color(rgb(ACCENT)))
-                                            .disabled(!enabled)
-                                            .tooltip(if armed {
-                                                "Confirm deleting this stash"
-                                            } else {
-                                                "Delete stash — two clicks"
-                                            })
-                                            .on_click(cx.listener(move |v, _, w, cx| {
-                                                v.stash_action(
-                                                    Action::Delete(delete.clone()),
-                                                    w,
-                                                    cx,
-                                                )
-                                            })),
-                                    );
-                            }
-                            StashRow::File(_, file) => {
-                                let Some(Ok(preview)) = v.stashes.previews.get(&stash.oid) else {
-                                    return line.into_any_element();
-                                };
-                                let change = &preview.changes.files[file];
-                                let open = stash.clone();
-                                line = line
-                                    .children(v.graph_feature_probe(0, 8))
-                                    .pl(px(42.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .child(caption(change.kind.letter().to_string()))
-                                    .child(div().flex_1().truncate().child(change.path.clone()))
-                                    .on_click(cx.listener(move |v, _, w, cx| {
-                                        v.stash_action(Action::File(open.clone(), file), w, cx)
-                                    }));
-                            }
-                            StashRow::Status(_) => {
-                                let text = match v.stashes.previews.get(&stash.oid) {
-                                    Some(Err(error)) => error.clone(),
-                                    Some(Ok(_)) => "No file changes".into(),
-                                    None => "Loading stash files…".into(),
-                                };
-                                line = line.pl(px(42.)).child(caption(text));
-                            }
-                        }
+                            .gap_2()
+                            .children(v.todo_stash_probe(row_index, 0))
+                            .children(v.todo_stash_probe(row_index, 1))
+                            .children(v.todo_stash_probe(row_index, 2))
+                            .bg(rgb(if selected { SELECTED } else { BG }))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .child(icon("stash").text_color(rgb(if selected {
+                                ACCENT
+                            } else {
+                                MUTED
+                            })))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(stash.subject.clone()),
+                            )
+                            .child(caption(stash.selector.clone()).flex_shrink_0())
+                            .child(
+                                caption(stash.oid.chars().take(7).collect::<String>())
+                                    .flex_shrink_0(),
+                            )
+                            .on_click(cx.listener(move |v, _, w, cx| {
+                                v.stash_action(Action::Select(select.clone()), w, cx)
+                            }));
                         line.into_any_element()
                     })
                     .collect::<Vec<_>>()
@@ -677,7 +824,8 @@ impl Desktop {
                         .child(
                             Scrollbar::vertical(&self.stashes.scroll)
                                 .scrollbar_show(ScrollbarShow::Always),
-                        ),
+                        )
+                        .child(self.stash_inspector(enabled, cx)),
                 )
                 .into_any_element(),
         )
@@ -686,10 +834,10 @@ impl Desktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stash, StashRow, State};
+    use super::{Stash, State};
 
     #[test]
-    fn collapsed_stash_rows_are_bounded_and_expansion_shows_loading() {
+    fn stash_selection_keeps_a_single_row_per_entry_and_frozen_identity() {
         let stash = Stash {
             oid: "a".repeat(40),
             selector: "stash@{0}".into(),
@@ -700,15 +848,12 @@ mod tests {
             entries: vec![stash.clone()],
             ..State::default()
         };
-        state.rebuild_rows();
-        assert_eq!(state.rows, vec![StashRow::Header(0), StashRow::Actions(0)]);
-        state.expanded.insert(stash.oid.clone());
-        state.rebuild_rows();
-        assert_eq!(state.rows.last(), Some(&StashRow::Status(0)));
-        state.expanded.clear();
-        state.rebuild_rows();
-        assert_eq!(state.rows.len(), 2);
+        state.selected = Some(stash.oid.clone());
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.contains_identity(&stash));
         assert!(state.previews.is_empty());
+        state.entries[0].selector = "stash@{1}".into();
+        assert_eq!(state.selected.as_ref(), Some(&state.entries[0].oid));
     }
 
     #[test]

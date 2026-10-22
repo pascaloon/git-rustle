@@ -40,6 +40,7 @@ pub struct Preview {
     pub base: gix::ObjectId,
     pub oid: gix::ObjectId,
     pub changes: crate::diff::TreeDiff,
+    pub details: crate::git::CommitDetails,
 }
 pub fn preview(root: &Path, frozen: &Stash) -> Result<Preview> {
     let stash = current(root, frozen)?;
@@ -58,7 +59,12 @@ pub fn preview(root: &Path, frozen: &Stash) -> Result<Preview> {
         changes.files.sort_by(|a, b| a.path.cmp(&b.path));
         changes.files.dedup_by(|a, b| a.path == b.path);
     }
-    Ok(Preview { base, oid, changes })
+    Ok(Preview {
+        base,
+        oid,
+        changes,
+        details,
+    })
 }
 
 pub(super) fn create(context: &Context, message: Option<&str>) -> Result<()> {

@@ -2489,3 +2489,263 @@ fn stash_list_carries_the_version_read_before_listing() {
     assert_ne!(view.stash_stamp, Some(before));
     assert_eq!(view.stashes.unwrap().len(), 1);
 }
+
+#[test]
+fn cherry_pick_order_is_frozen_and_recovery_restores_refs_index_and_worktree() {
+    let f = Fixture::new();
+    let base = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "-c", "topic"]);
+    f.write("first.txt", "first\n");
+    f.commit("first pick");
+    let first = f.git(&["rev-parse", "HEAD"]);
+    f.write("second.txt", "depends on first\n");
+    f.commit("second pick");
+    let second = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "main"]);
+    f.write("unrelated.txt", "main only\n");
+    f.commit("destination");
+    let before = f.git(&["rev-parse", "HEAD"]);
+    let index = f.git(&["ls-files", "--stage"]);
+    f.run(Request::CherryPick(vec![first.clone(), second.clone()]));
+    assert_eq!(
+        f.git(&["log", "-2", "--format=%s"]),
+        "second pick\nfirst pick"
+    );
+    assert_eq!(f.git(&["show", "HEAD~2:unrelated.txt"]), "main only");
+    assert_eq!(f.git(&["rev-parse", "topic"]), second);
+    assert!(f.git(&["status", "--porcelain"]).is_empty());
+    let after = f.git(&["rev-parse", "HEAD"]);
+    f.run(Request::MoveTo(0));
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), before);
+    assert_eq!(f.git(&["ls-files", "--stage"]), index);
+    assert!(!f.root().join("first.txt").exists());
+    f.run(Request::MoveTo(1));
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), after);
+    assert_eq!(f.git(&["rev-parse", "topic~2"]), base);
+}
+
+#[test]
+fn cherry_pick_validates_entire_batch_and_destination_before_mutation() {
+    let f = Fixture::new();
+    f.git(&["switch", "-c", "topic"]);
+    f.write("new.txt", "topic\n");
+    f.commit("topic");
+    let tip = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "main"]);
+    let before = f.git(&["rev-parse", "HEAD"]);
+    for commits in [
+        vec![],
+        vec![tip.clone(), tip.clone()],
+        vec![tip.clone(), "missing".into()],
+        vec![tip.clone(), "1".repeat(40)],
+    ] {
+        assert!(
+            execute(f.root(), Request::CherryPick(commits))
+                .result
+                .is_err()
+        );
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), before);
+        assert!(!f.root().join("new.txt").exists());
+    }
+    f.write("pending.txt", "preserve\n");
+    assert!(
+        execute(f.root(), Request::CherryPick(vec![tip.clone()]))
+            .result
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(f.root().join("pending.txt")).unwrap(),
+        "preserve\n"
+    );
+    fs::remove_file(f.root().join("pending.txt")).unwrap();
+    assert!(
+        execute(
+            f.root(),
+            Request::OnBranch {
+                branch: "topic".into(),
+                head: before.clone(),
+                request: Box::new(Request::CherryPick(vec![tip]))
+            }
+        )
+        .result
+        .is_err()
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), before);
+}
+
+#[test]
+fn cherry_pick_conflict_continue_skip_abort_and_undo_preserve_sequence() {
+    for finish in ["continue", "skip", "abort"] {
+        let f = Fixture::new();
+        f.git(&["switch", "-c", "topic"]);
+        f.write("first.txt", "first\n");
+        f.commit("first");
+        let first = f.git(&["rev-parse", "HEAD"]);
+        f.write("file.txt", "incoming\n");
+        f.commit("conflict");
+        let conflict = f.git(&["rev-parse", "HEAD"]);
+        f.write("last.txt", "last\n");
+        f.commit("last");
+        let last = f.git(&["rev-parse", "HEAD"]);
+        f.git(&["switch", "main"]);
+        f.write("file.txt", "local\n");
+        f.commit("destination");
+        let before = f.git(&["rev-parse", "HEAD"]);
+        let paused = execute(
+            f.root(),
+            Request::CherryPick(vec![first, conflict, last.clone()]),
+        );
+        assert!(paused.result.is_err());
+        let state = paused.view.conflict.unwrap();
+        assert_eq!(state.kind, "Cherry-pick");
+        assert!(execute(f.root(), Request::Continue).result.is_err());
+        assert!(
+            execute(
+                f.root(),
+                Request::Create {
+                    name: "blocked".into(),
+                    target: "HEAD".into()
+                }
+            )
+            .result
+            .is_err()
+        );
+        match finish {
+            "continue" => {
+                f.write("file.txt", "resolved\n");
+                f.git(&["add", "file.txt"]);
+                f.run(Request::Continue);
+            }
+            "skip" => {
+                f.run(Request::Skip);
+            }
+            _ => {
+                f.run(Request::Abort);
+            }
+        }
+        assert!(!f.root().join(".git/CHERRY_PICK_HEAD").exists());
+        assert!(!f.root().join(".git/sequencer").exists());
+        assert_eq!(f.git(&["rev-parse", "topic"]), last);
+        if finish == "abort" {
+            assert_eq!(f.git(&["rev-parse", "HEAD"]), before);
+            assert!(!f.root().join("first.txt").exists());
+            assert!(!f.root().join("last.txt").exists());
+        } else {
+            assert!(f.root().join("first.txt").exists() && f.root().join("last.txt").exists());
+            assert_eq!(
+                fs::read_to_string(f.root().join("file.txt")).unwrap(),
+                if finish == "continue" {
+                    "resolved\n"
+                } else {
+                    "local\n"
+                }
+            );
+            f.run(Request::MoveTo(0));
+            assert_eq!(f.git(&["rev-parse", "HEAD"]), before);
+            assert!(!f.root().join("first.txt").exists());
+        }
+    }
+}
+
+#[test]
+fn cherry_pick_merge_is_rejected_without_mainline_before_any_pick() {
+    let f = Fixture::new();
+    f.git(&["switch", "-c", "topic"]);
+    f.write("topic.txt", "topic\n");
+    f.commit("topic");
+    let tip = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "main"]);
+    f.write("main.txt", "main\n");
+    f.commit("main");
+    f.git(&["merge", "--no-ff", "--no-edit", "topic"]);
+    let merge = f.git(&["rev-parse", "HEAD"]);
+    assert!(
+        execute(f.root(), Request::CherryPick(vec![tip, merge.clone()]))
+            .result
+            .is_err()
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), merge);
+    assert!(!f.root().join(".git/sequencer").exists());
+}
+
+#[test]
+fn cherry_pick_rechecks_frozen_destination_after_expensive_preparation() {
+    let f = Fixture::new();
+    f.git(&["switch", "-c", "topic"]);
+    f.write("pick.txt", "pick\n");
+    f.commit("pick");
+    let tip = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "main"]);
+    let before = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["branch", "other"]);
+    let context = Context::new(f.root()).unwrap();
+    let mut started = false;
+    let result = cherry_pick::apply_with_before_run(
+        &context,
+        &[tip],
+        Some(("main", &before)),
+        &mut started,
+        || {
+            f.git(&["switch", "other"]);
+        },
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .contains("changed during cherry-pick preparation")
+    );
+    assert!(!started);
+    assert_eq!(f.git(&["branch", "--show-current"]), "other");
+    assert_eq!(f.git(&["rev-parse", "main"]), before);
+    assert_eq!(f.git(&["rev-parse", "other"]), before);
+    assert!(!f.root().join("pick.txt").exists());
+    assert!(!f.root().join(".git/sequencer").exists());
+}
+
+#[test]
+fn cherry_pick_preparation_race_does_not_record_or_restore_external_checkout() {
+    let f = Fixture::new();
+    f.git(&["switch", "-c", "topic"]);
+    f.write("pick.txt", "pick\n");
+    f.commit("pick");
+    let tip = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "main"]);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["branch", "other"]);
+    f.run(Request::Create {
+        name: "history-marker".into(),
+        target: "HEAD".into(),
+    });
+    // A rejected invalid batch with unchanged repository preserves prior history.
+    let invalid = execute(f.root(), Request::CherryPick(vec!["invalid".into()]));
+    assert!(invalid.result.is_err());
+    assert_eq!(invalid.view.labels.len(), 1);
+    let root = f.root().to_path_buf();
+    cherry_pick::set_before_run(move || {
+        command::checked(&root, &["switch", "other"]).unwrap();
+    });
+    let result = execute(
+        f.root(),
+        Request::OnBranch {
+            branch: "main".into(),
+            head: head.clone(),
+            request: Box::new(Request::CherryPick(vec![tip])),
+        },
+    );
+    assert!(
+        result
+            .result
+            .unwrap_err()
+            .contains("changed during cherry-pick preparation")
+    );
+    assert!(result.view.labels.is_empty());
+    assert_eq!(result.view.cursor, 0);
+    assert!(result.view.boundary.contains("outside Git Rustle"));
+    assert_eq!(f.git(&["branch", "--show-current"]), "other");
+    assert_eq!(f.git(&["rev-parse", "main"]), head);
+    assert_eq!(f.git(&["rev-parse", "other"]), head);
+    assert!(!f.root().join("pick.txt").exists());
+    let journal = Context::new(f.root()).unwrap().load().unwrap();
+    assert!(journal.pending.is_none());
+    assert!(journal.entries.is_empty());
+}

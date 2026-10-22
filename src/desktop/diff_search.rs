@@ -44,7 +44,11 @@ impl Desktop {
                 window,
                 |v, input, event, window, cx| {
                     if matches!(event, InputEvent::Change) {
+                        let was_active = !v.diff_find.query.trim().is_empty();
                         v.diff_find.query = input.read(cx).value().to_string();
+                        if was_active && v.diff_find.query.trim().is_empty() {
+                            v.reveal_current_diff_file();
+                        }
                         if let Some(worker) = &v.diff_find.worker {
                             worker.cancel();
                         }
@@ -304,6 +308,7 @@ impl Desktop {
             self.engine.mark("diff search ready");
         }
         if auto_selected {
+            self.reset_diff_file_scroll();
             self.changed(cx);
             if self.ui_feature_name() == Some("diff-search") {
                 let Mode::Diff(view) = &mut self.engine.app.mode else {
@@ -380,15 +385,11 @@ impl Desktop {
                             }))
                             .hover(|s| s.bg(rgb(HOVER)))
                             .cursor_pointer()
+                            .min_w_0()
+                            .truncate()
                             .child(path)
                             .on_click(cx.listener(move |v, _, _, cx| {
-                                // Selecting a file should not retain a pending jump from another file.
-                                v.diff_find.jump = false;
-                                v.diff_find.selected = None;
-                                if let Mode::Diff(view) = &mut v.engine.app.mode {
-                                    view.show(Some(file));
-                                }
-                                v.changed(cx);
+                                v.select_diff_search_file(file, cx);
                             }))
                             .into_any_element()
                     })
@@ -421,12 +422,42 @@ impl Desktop {
             )
             .into_any_element()
     }
+    fn reset_diff_file_scroll(&mut self) {
+        self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.diff_horizontal.set_x(px(0.));
+        *self.selection.borrow_mut() = Default::default();
+        self.wrap_anchor = None;
+    }
+    fn select_diff_search_file(&mut self, file: usize, cx: &mut Context<Self>) {
+        self.diff_find.jump = false;
+        self.diff_find.selected = None;
+        if let Mode::Diff(view) = &mut self.engine.app.mode {
+            if file >= view.changes.files.len() {
+                return;
+            }
+            view.show(Some(file));
+        }
+        self.reset_diff_file_scroll();
+        self.changed(cx);
+    }
+    fn reveal_current_diff_file(&mut self) {
+        if let Mode::Diff(view) = &mut self.engine.app.mode
+            && let Some(row) = reveal_current_file(view)
+        {
+            self.diff_files_scroll
+                .scroll_to_item(row, ScrollStrategy::Center);
+        }
+    }
     fn select_diff_search_hit(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(hit) = self.diff_find.hits.get(index).cloned() else {
             return;
         };
         if let Mode::Diff(view) = &mut self.engine.app.mode {
+            let switching = view.current != Some(hit.file);
             view.show(Some(hit.file));
+            if switching {
+                self.reset_diff_file_scroll();
+            }
         }
         self.diff_find.selected = Some(hit);
         self.diff_find.jump = true;
@@ -490,6 +521,32 @@ impl Desktop {
                 .into_any_element(),
         )
     }
+}
+
+/// Restore the exact indexed file under a filtered sidebar, expanding only its
+/// ancestors. File indices and tree node indices are intentionally different.
+fn reveal_current_file(view: &mut crate::diffview::DiffView) -> Option<usize> {
+    let file = view.current?;
+    let node = view
+        .changes
+        .tree
+        .nodes
+        .iter()
+        .position(|node| node.file == Some(file))?;
+    let mut parent = view.changes.tree.nodes[node].parent;
+    while let Some(index) = parent {
+        view.changes.tree.nodes[index].expanded = true;
+        parent = view.changes.tree.nodes[index].parent;
+    }
+    view.changes.tree.rebuild_visible();
+    let row = view
+        .changes
+        .tree
+        .visible
+        .iter()
+        .position(|entry| entry.node == node)?;
+    view.cursor.select(&view.changes.tree, row);
+    Some(row)
 }
 
 // Native unattended scenarios. These dispatch GPUI events inside the isolated app;
@@ -982,9 +1039,119 @@ impl Desktop {
                 {
                     return;
                 }
-                self.ui_feature_finish();
+                self.ui_feature_query("needle-file-1", window, cx);
+                self.ui_feature_advance(15);
+            }
+            15 if !self.diff_find.busy
+                && self.diff_find.query == "needle-file-1"
+                && self.diff_find.matching_files.len() > 1 =>
+            {
+                let Mode::Diff(view) = &mut self.engine.app.mode else {
+                    unreachable!()
+                };
+                let file = view
+                    .changes
+                    .files
+                    .iter()
+                    .position(|file| file.path == "nested/needle-file-17.txt")
+                    .unwrap();
+                assert!(self.diff_find.matching_files.contains(&file));
+                view.changes.tree.set_all_expanded(false);
+                self.diff_horizontal.set_x(px(-800.));
+                self.select_diff_search_file(file, cx);
+                assert_eq!(
+                    self.diff_horizontal.x.get(),
+                    px(0.),
+                    "search file click resets actual horizontal scroll"
+                );
+                self.ui_feature_advance(16);
+            }
+            16 if matches!(&self.engine.app.mode, Mode::Diff(view) if view.diff_for == view.current && view.diff.is_some()) =>
+            {
+                assert_eq!(
+                    self.diff_scroll.0.borrow().base_handle.offset().y,
+                    px(0.),
+                    "search file click resets actual vertical scroll"
+                );
+                self.clear_diff_search(window, cx);
+                self.ui_feature_advance(17);
+            }
+            17 if !self.diff_search_active() => {
+                let Mode::Diff(view) = &self.engine.app.mode else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    view.current_change().unwrap().path,
+                    "nested/needle-file-17.txt"
+                );
+                assert_eq!(
+                    view.cursor.file(&view.changes.tree),
+                    view.current,
+                    "clear search restores exact file in expanded tree"
+                );
+                let node = view
+                    .changes
+                    .tree
+                    .nodes
+                    .iter()
+                    .position(|node| {
+                        node.file.is_some_and(|file| {
+                            view.changes.files[file].path == "nested/needle-file-16.txt"
+                        })
+                    })
+                    .unwrap();
+                self.action(Action::File(node), window, cx);
+                self.ui_feature_advance(18);
+            }
+            18 if matches!(&self.engine.app.mode, Mode::Diff(view) if view.diff_for == view.current && view.current_change().is_some_and(|file| file.path == "nested/needle-file-16.txt")) =>
+            {
+                self.ui_feature_query("MAGIC_NEEDLE", window, cx);
+                self.ui_feature_advance(19);
+            }
+            19 if !self.diff_find.busy && !self.diff_find.hits.is_empty() => {
+                self.ui_feature_finish()
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_current_file;
+    use crate::{
+        diff::{ChangeKind, FileChange, TreeDiff, changes::ChangeSet},
+        diffview::DiffView,
+    };
+    #[test]
+    fn clearing_filter_reveals_correct_file_through_collapsed_compacted_folders() {
+        let id = gix::ObjectId::from_bytes_or_panic(&[1; 20]);
+        let mut changes = ChangeSet::new(1, Some(id), id);
+        let files = ["root.txt", "src/nested/one.txt", "src/nested/two.txt"]
+            .into_iter()
+            .map(|path| FileChange {
+                path: path.into(),
+                old_path: None,
+                kind: ChangeKind::Modified,
+                old: None,
+                new: None,
+                remote: None,
+                worktree: false,
+            })
+            .collect();
+        changes.set_tree(Ok(TreeDiff { files }));
+        let mut view = DiffView::new(1, changes, None, 30);
+        view.changes.tree.set_all_expanded(false);
+        view.show(Some(2));
+        let row = reveal_current_file(&mut view).unwrap();
+        assert_eq!(
+            view.changes.tree.nodes[view.changes.tree.visible[row].node].file,
+            Some(2)
+        );
+        assert_eq!(view.cursor.file(&view.changes.tree), Some(2));
+        assert_ne!(
+            view.changes.tree.visible[row].node, 2,
+            "file list and tree node indices differ"
+        );
     }
 }

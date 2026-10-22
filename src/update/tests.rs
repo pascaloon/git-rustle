@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -12,6 +12,8 @@ struct Fixture {
     api: String,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    response: Arc<Mutex<(String, Vec<u8>)>>,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 impl Fixture {
     fn new(version: &str, asset: &str, bytes: Vec<u8>, digest: Option<&str>) -> Self {
@@ -25,6 +27,10 @@ impl Fixture {
             "assets": [{ "name": asset, "url": format!("{api}/asset"), "digest": digest }]
         })
         .to_string();
+        let response = Arc::new(Mutex::new((release, bytes)));
+        let replies = response.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let worker = thread::spawn(move || {
@@ -49,11 +55,14 @@ impl Fixture {
                     if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
                         break;
                     }
+                    request.push_str(&header);
                 }
+                received.lock().unwrap().push(request.clone());
+                let reply = replies.lock().unwrap();
                 let body = if request.starts_with("GET /asset ") {
-                    bytes.as_slice()
+                    reply.1.as_slice()
                 } else {
-                    release.as_bytes()
+                    reply.0.as_bytes()
                 };
                 write!(
                     stream,
@@ -68,7 +77,18 @@ impl Fixture {
             api,
             stop,
             worker: Some(worker),
+            response,
+            requests,
         }
+    }
+
+    fn publish(&self, version: &str, bytes: &[u8]) {
+        let mut response = self.response.lock().unwrap();
+        let mut release: serde_json::Value = serde_json::from_str(&response.0).unwrap();
+        release["tag_name"] = format!("v{version}").into();
+        release["name"] = version.into();
+        release["assets"][0]["digest"] = digest(bytes).into();
+        *response = (release.to_string(), bytes.to_vec());
     }
 }
 impl Drop for Fixture {
@@ -151,6 +171,56 @@ fn installs_a_verified_raw_executable_to_an_isolated_path() {
     let offered = check_at(&fixture.api, "0.1.0").unwrap().unwrap();
     install_at(&fixture.api, "0.1.0", &offered, &exe).unwrap();
     assert_eq!(fs::read(exe).unwrap(), b"new executable");
+}
+
+#[test]
+fn installation_rechecks_latest_instead_of_installing_the_stale_offer() {
+    let directory = tempfile::tempdir().unwrap();
+    let exe = directory.path().join("git-rustle.exe");
+    fs::write(&exe, b"original executable").unwrap();
+    let fixture = Fixture::new("0.2.0", ASSET, b"older".to_vec(), Some(&digest(b"older")));
+    let offered = check_at(&fixture.api, "0.1.0").unwrap().unwrap();
+    assert_eq!(offered.version, "0.2.0");
+    fixture.publish("0.3.0", b"newest verified executable");
+    let installed = install_latest_at(&fixture.api, "0.1.0", &exe).unwrap();
+    assert_eq!(installed.version, "0.3.0");
+    assert_eq!(fs::read(&exe).unwrap(), b"newest verified executable");
+    let requests = fixture.requests.lock().unwrap();
+    let latest: Vec<_> = requests
+        .iter()
+        .filter(|r| r.starts_with("GET /repos/pascaloon/git-rustle/releases/latest "))
+        .collect();
+    assert_eq!(latest.len(), 2);
+    assert!(
+        latest
+            .iter()
+            .all(|r| r.to_lowercase().contains("cache-control: no-cache"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("GET /repos/pascaloon/git-rustle/releases/tags/v0.3.0 "))
+    );
+    assert!(!requests.iter().any(|r| r.contains("/tags/v0.2.0")));
+}
+
+#[test]
+fn latest_check_failure_or_no_newer_release_never_replaces_the_executable() {
+    let directory = tempfile::tempdir().unwrap();
+    let exe = directory.path().join("git-rustle.exe");
+    fs::write(&exe, b"original executable").unwrap();
+    let fixture = Fixture::new("0.2.0", ASSET, b"older".to_vec(), Some(&digest(b"older")));
+    assert!(install_latest_at(&fixture.api, "0.3.0", &exe).is_err());
+    assert!(install_latest_at("not a URL", "0.1.0", &exe).is_err());
+    assert_eq!(fs::read(&exe).unwrap(), b"original executable");
+    assert!(
+        !fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.starts_with("GET /asset "))
+    );
 }
 
 #[test]
@@ -295,7 +365,19 @@ fn benchmark_update() {
         let start = std::time::Instant::now();
         install_at(&fixture.api, "0.1.0", &offered, &exe).unwrap();
         let install_ms = start.elapsed().as_secs_f64() * 1000.;
-        println!("{{\"sample\":{sample},\"check_ms\":{check_ms},\"install_ms\":{install_ms}}}");
+        let latest_exe = directory.path().join(format!("latest-update-{sample}.exe"));
+        fs::write(&latest_exe, b"old executable").unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            install_latest_at(&fixture.api, "0.1.0", &latest_exe)
+                .unwrap()
+                .version,
+            "0.2.0"
+        );
+        let latest_install_ms = start.elapsed().as_secs_f64() * 1000.;
+        println!(
+            "{{\"sample\":{sample},\"check_ms\":{check_ms},\"install_ms\":{install_ms},\"latest_install_ms\":{latest_install_ms}}}"
+        );
     }
 }
 

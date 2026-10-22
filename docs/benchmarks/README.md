@@ -87,6 +87,26 @@ can regenerate comparison tables without rerunning measurements. See the
 [workflow recipe](../benchmarking.md#gpui-desktop-current-implementation) for
 measurement boundaries, native input checks and limitations.
 
+[`benchmark-graph-features.ps1`](../../scripts/benchmark-graph-features.ps1)
+adds graph Commit/Branch submenu bounds, frozen single/multiple cherry-pick
+review/replay/Undo, selected stash right-hand inspector, and branch-base diff
+scenarios. Run fifteen retained timing samples and separate -Screenshots launches.
+Its final repository checks preserve ordinary refs, HEAD, index and worktree.
+New action costs have no equivalent old-binary baseline; the entire scripted
+request-to-verified-frame interval is not worker CPU.
+
+[`benchmark-graph-refresh.ps1`](../../scripts/benchmark-graph-refresh.ps1)
+uses [an owned loopback provider](../../scripts/graph-refresh-fixture.py) and the
+refresh-native scenario. Supply a bundled Python executable, final candidate and
+an instrumented baseline containing exactly the same diagnostic scenario/paint
+hooks, retaining the diagnostic-only patch and original baseline separately.
+Fifteen alternating samples measure first-new-ghost and settled paints; -Capture
+runs separately. It validates no ref fetch/writes and no graph pipeline requests,
+records request concurrency, and disposes its hidden fixture/app processes.
+See the [graph refresh workflow](../benchmarking.md#graph-refresh-context-menus-and-cherry-pick)
+for commands, comparison provenance and limits. Neither these recipes nor a
+successful launch establish a measured performance improvement.
+
 Each dated directory below contains `run-benchmarks.ps1` and `summarize.ps1`.
 These are preserved reproduction recipes with setup assumptions, rather than
 standalone replacements for the parameterized harnesses in `scripts/`.
