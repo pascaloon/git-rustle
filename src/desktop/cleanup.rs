@@ -27,12 +27,13 @@ pub(super) struct State {
     selected: HashSet<String>,
     collapsed: HashSet<String>,
     counts: std::collections::HashMap<String, (usize, usize)>,
-    rows: [Vec<TreeRow>; 3],
+    rows: [Vec<TreeRow>; 4],
     fetched_scroll: UniformListScrollHandle,
     message: String,
     waiting_epoch: Option<u64>,
     matching_scroll: UniformListScrollHandle,
     caution_scroll: UniformListScrollHandle,
+    missing_scroll: UniformListScrollHandle,
 }
 impl Desktop {
     pub(super) fn cleanup_mutation_started(&mut self) {
@@ -160,7 +161,7 @@ impl Desktop {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let text = format!(
-                    "Remove these {} local references?\n\nThis only changes references on this computer. No server branches will be deleted. Fetched references are local copies. Cleaning matching copies removes the local branch and any fetched reference shown below.\n\nCommits remain recoverable through Undo and History. Old local branches may contain unique work; review them carefully.\n\nExact references to remove:\n{names}",
+                    "Remove these {} local references?\n\nThis only changes references on this computer. No server branches will be deleted. Fetched references are local copies. Cleaning matching copies removes the local branch and any fetched reference shown below.\n\nCommits remain recoverable through Undo and History. Old local branches may contain unique work. Missing-on-server fetched references may be the last copy because their server branch no longer exists; review them carefully.\n\nExact references to remove:\n{names}",
                     branches.iter().flat_map(local_refs).count()
                 );
                 self.operations.confirmation = Some((Request::Cleanup(Plan { branches }), text));
@@ -182,6 +183,7 @@ impl Desktop {
             Section::FetchedOnly => &self.cleanup.fetched_scroll,
             Section::Matching => &self.cleanup.matching_scroll,
             Section::OldLocal => &self.cleanup.caution_scroll,
+            Section::MissingServer => &self.cleanup.missing_scroll,
         };
         let count = self.cleanup.rows[slot].len();
         let (selected, eligible) = self.cleanup.group_counts(section, "");
@@ -199,6 +201,11 @@ impl Desktop {
             Section::OldLocal => (
                 "Old local branches",
                 "Last commit at least 1 year ago · may contain unique work",
+                0xcf4949,
+            ),
+            Section::MissingServer => (
+                "Missing on server",
+                "Server branch no longer exists · this fetched reference may be the last copy",
                 0xcf4949,
             ),
         };
@@ -307,7 +314,7 @@ impl Desktop {
                                             })),
                                     )
                                     .child(
-                                        icon(if section == Section::FetchedOnly {
+                                        icon(if section.is_fetched_ref() {
                                             "computer"
                                         } else {
                                             "branch"
@@ -343,6 +350,8 @@ impl Desktop {
             .relative()
             .children(self.branch_cleanup_probe(if section == Section::Matching {
                 7
+            } else if section == Section::MissingServer {
+                10
             } else if section == Section::OldLocal {
                 8
             } else {
@@ -354,16 +363,18 @@ impl Desktop {
             .border_color(rgb(LINE))
             .child(
                 row()
-                    .h(px(34.))
+                    .h(px(28.))
                     .flex_shrink_0()
                     .px_4()
                     .gap_2()
                     .child(
-                        icon(if section == Section::OldLocal {
-                            "shield-alert"
-                        } else {
-                            "shield-check"
-                        })
+                        icon(
+                            if matches!(section, Section::OldLocal | Section::MissingServer) {
+                                "shield-alert"
+                            } else {
+                                "shield-check"
+                            },
+                        )
                         .text_color(rgb(color)),
                     )
                     .child(title)
@@ -390,8 +401,19 @@ impl Desktop {
                             })),
                     ),
             )
-            .child(caption(detail).px_4().pb_1())
-            .child(self.scroll_region(3 + slot, list, Scrollbar::vertical(scroll), cx))
+            .child(
+                caption(detail)
+                    .h(px(16.))
+                    .line_height(px(16.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .whitespace_nowrap()
+                    .truncate(),
+            )
+            .child(
+                self.scroll_region(3 + slot, list, Scrollbar::vertical(scroll), cx)
+                    .children(self.branch_cleanup_probe(11 + slot)),
+            )
             .into_any_element()
     }
     pub(super) fn cleanup_content(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -399,15 +421,13 @@ impl Desktop {
             self.cleanup.loading || self.engine.operation_busy || self.engine.repository_edit_busy;
         let analysis = self.cleanup.analysis.as_ref();
         column().relative().children(self.branch_cleanup_probe(3)).flex_1().min_h_0()
-            .child(row().px_4().py_3().gap_3().child(icon("broom")).child("Cleanup").child(div().flex_1())
+            .child(row().h(px(32.)).flex_shrink_0().px_4().gap_3().child(icon("broom")).child("Cleanup").child(div().flex_1())
                 .child(Button::new("cleanup-analyze").small().ghost().icon(gpui_component::Icon::default().path("rustle/refresh")).tooltip("Refresh cleanup analysis").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Analyze, w, cx))))
                 .child(Button::new("cleanup-optimize").small().ghost().label("Optimize storage…").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Optimize, w, cx)))))
-            .child(column().px_4().pb_3().gap_2()
-                .child(caption("Fetched references live on this computer. Matching copies are verified against the server during analysis."))
-                .child(caption("Only fetched-only references are selected initially. Everything here is local to this computer; server branches stay intact."))
-                .when_some(analysis, |s, a| s.child(caption(format!("{} candidates · {} checked-out branches excluded · Git object storage {} KiB", a.candidates.len(), a.excluded_worktrees, a.storage_kib))))
+            .child(column().px_4().pb_1().gap_1()
+                .child(caption(analysis.map(|a|format!("{} candidates · {} checked-out branches excluded · {} KiB · fetched only preselected · server branches stay intact",a.candidates.len(),a.excluded_worktrees,a.storage_kib)).unwrap_or_else(||"Local references only · fetched only preselected · server branches stay intact".into())).h(px(16.)).line_height(px(16.)).flex_shrink_0().whitespace_nowrap().truncate())
                 .when(analysis.is_some_and(|a| !a.warnings.is_empty()), |s| s
                     .child(caption(format!("{} analysis warning(s)", analysis.unwrap().warnings.len())))
                     .child(column().id("cleanup-warnings").max_h(px(96.)).overflow_y_scroll()
@@ -417,7 +437,8 @@ impl Desktop {
             .child(self.cleanup_section(Section::FetchedOnly, cx))
             .child(self.cleanup_section(Section::Matching, cx))
             .child(self.cleanup_section(Section::OldLocal, cx))
-            .child(row().relative().children(self.branch_cleanup_probe(9)).flex_shrink_0().px_4().py_3().gap_2().border_t_1().border_color(rgb(LINE))
+            .child(self.cleanup_section(Section::MissingServer, cx))
+            .child(row().relative().children(self.branch_cleanup_probe(9)).h(px(40.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(LINE))
                 .child(div().flex_1())
                 .child(Button::new("cleanup-review").small().primary().label(format!("Review selected ({})…", self.cleanup.selected.len())).disabled(busy || self.cleanup.selected.is_empty())
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Review, w, cx)))))
@@ -426,6 +447,48 @@ impl Desktop {
 }
 
 impl Desktop {
+    pub(super) fn cleanup_scenario_scroll_missing(&self, reset: bool) {
+        self.cleanup.missing_scroll.scroll_to_item(
+            if reset {
+                0
+            } else {
+                self.cleanup.rows[3].len().saturating_sub(1)
+            },
+            ScrollStrategy::Top,
+        );
+    }
+    pub(super) fn cleanup_scenario_assert_missing_scroll(&self) {
+        assert!(
+            self.cleanup
+                .missing_scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+                < px(0.),
+            "Missing-on-server list must scroll independently"
+        );
+        self.cleanup_scenario_assert_scroll(true);
+    }
+    pub(super) fn cleanup_scenario_assert_cached_presence(&self, present: bool) {
+        let repo = gix::open(self.engine.repository_root().unwrap()).unwrap();
+        for name in [
+            "refs/heads/fixes/task-123",
+            "refs/remotes/origin/fixes/task-123",
+            "refs/remotes/origin/zz-stale/missing",
+        ] {
+            assert_eq!(
+                repo.find_reference(name).is_ok(),
+                present,
+                "Exact cleanup/Undo reference state: {name}"
+            );
+        }
+        assert!(
+            repo.find_reference("refs/heads/zz-stale/missing").is_err(),
+            "Cached cleanup must never invent a local branch"
+        );
+    }
     pub(super) fn cleanup_scenario_scroll(&self, caution: bool, reset: bool) {
         let section = if caution {
             Section::OldLocal
@@ -529,7 +592,12 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for section in [Section::FetchedOnly, Section::Matching, Section::OldLocal] {
+        for section in [
+            Section::FetchedOnly,
+            Section::Matching,
+            Section::OldLocal,
+            Section::MissingServer,
+        ] {
             let total = self.cleanup.group_counts(section, "").1;
             assert!(total > 0);
             self.cleanup_action(Action::SelectSection(section, true), window, cx);
@@ -574,6 +642,30 @@ impl Desktop {
             assert_eq!(self.cleanup.rows[section_index(section)].len(), count);
             self.cleanup_action(Action::SelectSection(section, false), window, cx);
         }
+        self.cleanup_action(
+            Action::SelectSection(Section::MissingServer, true),
+            window,
+            cx,
+        );
+        self.cleanup_action(Action::Review, window, cx);
+        let (request, text) = self.operations.confirmation.as_ref().unwrap();
+        assert!(
+            text.contains("may be the last copy")
+                && text.contains("refs/remotes/origin/zz-stale/missing")
+        );
+        assert!(
+            !text.contains("refs/heads/"),
+            "Missing-server review must contain cached refs only"
+        );
+        assert!(
+            matches!(request,Request::Cleanup(plan) if plan.branches.iter().all(|c|c.section==Section::MissingServer))
+        );
+        self.operation_action(operations::Action::Cancel, window, cx);
+        self.cleanup_action(
+            Action::SelectSection(Section::MissingServer, false),
+            window,
+            cx,
+        );
         self.cleanup_action(
             Action::SelectSection(Section::FetchedOnly, true),
             window,
@@ -623,18 +715,19 @@ impl Desktop {
                 .contains(&candidate_key(stale_fetched)),
             "stale fetched reference must be preselected"
         );
+        let missing = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.name == "origin/zz-stale/missing")
+            .expect("Missing server branch must have a separate candidate");
+        assert_eq!(missing.section, Section::MissingServer);
         assert!(
-            !analysis
-                .candidates
-                .iter()
-                .any(|candidate| candidate.name == "origin/zz-stale/missing")
+            !self.cleanup.selected.contains(&candidate_key(missing)),
+            "Potential last copies must never be preselected"
         );
-        assert!(
-            analysis
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("server branches no longer exist")),
-            "missing server reference must have a retention warning"
+        assert_eq!(
+            local_refs(missing),
+            ["refs/remotes/origin/zz-stale/missing"]
         );
         assert!(!self.cleanup.selected.contains("refs/heads/fixes/task-123"));
         assert!(!self.cleanup.selected.contains("refs/heads/master"));
@@ -686,10 +779,11 @@ fn section_index(section: Section) -> usize {
         Section::FetchedOnly => 0,
         Section::Matching => 1,
         Section::OldLocal => 2,
+        Section::MissingServer => 3,
     }
 }
 fn candidate_key(c: &crate::git::operations::cleanup::Candidate) -> String {
-    if c.section == Section::FetchedOnly {
+    if c.section.is_fetched_ref() {
         format!("refs/remotes/{}", c.name)
     } else {
         format!("refs/heads/{}", c.name)
@@ -765,7 +859,12 @@ impl State {
     }
     fn rebuild_rows(&mut self) {
         self.rebuild_counts();
-        for section in [Section::FetchedOnly, Section::Matching, Section::OldLocal] {
+        for section in [
+            Section::FetchedOnly,
+            Section::Matching,
+            Section::OldLocal,
+            Section::MissingServer,
+        ] {
             let slot = section_index(section);
             let mut entries: Vec<_> = self
                 .analysis
@@ -896,5 +995,61 @@ mod tests {
             local_refs(&c),
             ["refs/heads/topic", "refs/remotes/origin/topic"]
         );
+    }
+    #[test]
+    fn all_four_sections_keep_selection_and_cached_ref_identity_separate() {
+        let mut analysis = Analysis::default();
+        for section in [
+            Section::FetchedOnly,
+            Section::Matching,
+            Section::OldLocal,
+            Section::MissingServer,
+        ] {
+            for name in ["origin/folder/a", "origin/folder/b"] {
+                analysis.candidates.push(candidate(name, section));
+            }
+        }
+        // A real candidate belongs to only one section; use distinct names for
+        // the two cached sections so this fixture models actual analysis.
+        for c in analysis
+            .candidates
+            .iter_mut()
+            .filter(|c| c.section == Section::MissingServer)
+        {
+            c.name = c.name.replace("folder", "missing");
+        }
+        let mut state = State {
+            selected: default_selection(&analysis),
+            analysis: Some(analysis),
+            ..State::default()
+        };
+        state.rebuild_rows();
+        assert_eq!(state.selected.len(), 2);
+        for section in [
+            Section::FetchedOnly,
+            Section::Matching,
+            Section::OldLocal,
+            Section::MissingServer,
+        ] {
+            state.select_group(section, "", true);
+            state.rebuild_counts();
+            assert_eq!(state.group_counts(section, ""), (2, 2));
+            let c = state
+                .analysis
+                .as_ref()
+                .unwrap()
+                .candidates
+                .iter()
+                .find(|c| c.section == section)
+                .unwrap();
+            state.selected.remove(&candidate_key(c));
+            state.rebuild_counts();
+            assert_eq!(state.group_counts(section, ""), (1, 2));
+            state.select_group(section, "", false);
+            state.rebuild_counts();
+            assert_eq!(state.group_counts(section, ""), (0, 2));
+        }
+        let c = candidate("origin/last-copy", Section::MissingServer);
+        assert_eq!(local_refs(&c), ["refs/remotes/origin/last-copy"]);
     }
 }

@@ -75,7 +75,18 @@ pub fn run(mut engine: Engine) {
         crate::desktop_text::init(cx);
         engine.mark("GPUI components ready");
         crate::desktop_theme::apply(cx);
-        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        // Opt-in native layout coverage; ordinary launches retain their size.
+        let minimum_cleanup_bench = std::env::var("GIT_RUSTLE_BENCH_WINDOW")
+            .is_ok_and(|value| value == "900x600")
+            && std::env::var("GIT_RUSTLE_SCENARIO").is_ok_and(|scenario| {
+                scenario.starts_with("cleanup-") || scenario == "branches-hierarchy"
+            });
+        let initial_size = if minimum_cleanup_bench {
+            size(px(900.), px(600.))
+        } else {
+            size(px(1440.), px(900.))
+        };
+        let bounds = Bounds::centered(None, initial_size, cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

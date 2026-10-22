@@ -7,6 +7,12 @@ pub enum Section {
     FetchedOnly,
     Matching,
     OldLocal,
+    MissingServer,
+}
+impl Section {
+    pub fn is_fetched_ref(self) -> bool {
+        matches!(self, Self::FetchedOnly | Self::MissingServer)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteCopy {
@@ -281,7 +287,6 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
             tracking: if matching { identity } else { None },
         });
     }
-    let mut missing_server_refs = 0usize;
     for ((r, b), id) in &cached {
         if associated.contains(&(r.clone(), b.clone())) || locals.contains(b) {
             continue;
@@ -289,13 +294,14 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
         let Some(server) = servers.get(r) else {
             continue;
         };
-        // This is a local cached copy. The server must still have that branch,
-        // but it may have advanced since the last fetch. Lease the cached OID
-        // independently; never write server refs or fetch branch objects here.
-        if !server.heads.contains_key(b) {
-            missing_server_refs += 1;
-            continue;
-        }
+        // A missing server branch is separately reviewable: its local ref may
+        // be the last copy. Both groups freeze the cached OID independently of
+        // server tips and mutate only local refs after fresh remote verification.
+        let section = if server.heads.contains_key(b) {
+            Section::FetchedOnly
+        } else {
+            Section::MissingServer
+        };
         if let std::collections::hash_map::Entry::Vacant(e) = details.entry(*id) {
             e.insert(super::super::commit_details(&repo, id).map_err(err)?);
         }
@@ -305,7 +311,7 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
             oid: id.to_string(),
             author: command::clean(&tip.author_name),
             time: tip.commit_time,
-            section: Section::FetchedOnly,
+            section,
             remote: Some(RemoteCopy {
                 name: r.clone(),
                 branch: b.clone(),
@@ -317,9 +323,6 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
             tracking: Some((r.clone(), b.clone())),
         });
     }
-    if missing_server_refs > 0 {
-        result.warnings.push(format!("{missing_server_refs} fetched reference(s) were retained because their server branches no longer exist; these local references may be the last copy."));
-    }
     let alias_targets: HashSet<_> = raw.iter().filter_map(|r| r.symbolic.as_deref()).collect();
     for candidate in &mut result.candidates {
         let local = format!("refs/heads/{}", candidate.name);
@@ -327,7 +330,7 @@ pub fn analyze(root: &Path, now: i64) -> Result<Analysis> {
             .tracking
             .as_ref()
             .map(|(r, b)| format!("refs/remotes/{r}/{b}"));
-        candidate.protected |= (candidate.section != Section::FetchedOnly
+        candidate.protected |= (!candidate.section.is_fetched_ref()
             && alias_targets.contains(local.as_str()))
             || tracking
                 .as_ref()
@@ -380,7 +383,7 @@ pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
                 candidate.name
             ));
         }
-        if candidate.section != Section::FetchedOnly {
+        if !candidate.section.is_fetched_ref() {
             deletions.insert(
                 format!("refs/heads/{}", candidate.name),
                 candidate.oid.clone(),
@@ -418,7 +421,7 @@ pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
     }
     let mut urls = HashMap::new();
     for candidate in &plan.branches {
-        if candidate.section != Section::FetchedOnly
+        if !candidate.section.is_fetched_ref()
             && (checked.contains(&format!("refs/heads/{}", candidate.name))
                 || refs.upstreams.get(&candidate.name) != candidate.upstream.as_ref())
         {
@@ -437,10 +440,10 @@ pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
         }
         if let Some(key) = &candidate.tracking
             && (owners.get(key).is_some_and(|names| {
-                names.iter().any(|name| {
-                    candidate.section == Section::FetchedOnly || *name != candidate.name
-                })
-            }) || ((candidate.section == Section::FetchedOnly || key.1 != candidate.name)
+                names
+                    .iter()
+                    .any(|name| candidate.section.is_fetched_ref() || *name != candidate.name)
+            }) || ((candidate.section.is_fetched_ref() || key.1 != candidate.name)
                 && final_locals.contains(key.1.as_str())))
         {
             return Err("Another local branch now tracks this remote ref. Analyze again.".into());
@@ -769,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn fetched_only_cleanup_includes_server_ahead_but_retains_missing_server_last_copy() {
+    fn fetched_only_cleanup_includes_server_ahead_and_separates_missing_server_last_copy() {
         let f = Fixture::new();
         let cached = f.git(&["rev-parse", "old/local"]);
         let ahead = f.git(&["rev-parse", "main"]);
@@ -787,17 +790,21 @@ mod tests {
         }
         command::checked(&f.bare, &["update-ref", "refs/heads/server-ahead", &ahead]).unwrap();
         let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
-        assert!(
-            analysis
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("1 fetched reference")
-                    && warning.contains("no longer exist"))
-        );
+        assert!(analysis.warnings.is_empty());
+        let missing = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.name == "origin/server-missing")
+            .unwrap();
+        assert_eq!(missing.section, Section::MissingServer);
+        assert_eq!(missing.oid, unique);
         let branches: Vec<_> = analysis
             .candidates
             .into_iter()
-            .filter(|c| c.name == "origin/server-ahead" || c.name == "origin/server-missing")
+            .filter(|c| {
+                c.section == Section::FetchedOnly
+                    && (c.name == "origin/server-ahead" || c.name == "origin/server-missing")
+            })
             .collect();
         assert_eq!(branches.len(), 1);
         assert!(branches.iter().all(|c| c.section == Section::FetchedOnly
@@ -833,6 +840,164 @@ mod tests {
             unique
         );
         assert_eq!(refs_at(&f.bare), server);
+    }
+
+    #[test]
+    fn optional_missing_server_cleanup_deletes_only_cached_ref_and_restores_exact_unique_tip() {
+        let f = Fixture::new();
+        let unique = f.git(&[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-m",
+            "unique missing-server work",
+        ]);
+        f.git(&["update-ref", "refs/remotes/origin/orphan", &unique]);
+        // A local branch with the same display label must never be deleted.
+        f.git(&["branch", "origin/orphan", "main"]);
+        let local = f.git(&["rev-parse", "refs/heads/origin/orphan"]);
+        let candidate = f.candidate("origin/orphan");
+        assert_eq!(candidate.section, Section::MissingServer);
+        assert!(candidate.section.is_fetched_ref());
+        assert!(!candidate.protected);
+        let before = refs_at(&f.bare);
+        let outcome = f.run(Plan {
+            branches: vec![candidate],
+        });
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert!(
+            command::checked(
+                &f.root,
+                &["show-ref", "--verify", "refs/remotes/origin/orphan"]
+            )
+            .is_err()
+        );
+        assert_eq!(f.git(&["rev-parse", "refs/heads/origin/orphan"]), local);
+        assert_eq!(refs_at(&f.bare), before);
+        assert!(execute(&f.root, Request::OptimizeStorage).result.is_ok());
+        f.git(&["cat-file", "-e", &unique]);
+        assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+        assert_eq!(f.git(&["rev-parse", "refs/remotes/origin/orphan"]), unique);
+        assert!(execute(&f.root, Request::MoveTo(1)).result.is_ok());
+        assert!(
+            command::checked(
+                &f.root,
+                &["show-ref", "--verify", "refs/remotes/origin/orphan"]
+            )
+            .is_err()
+        );
+        assert_eq!(f.git(&["rev-parse", "refs/heads/origin/orphan"]), local);
+        assert_eq!(refs_at(&f.bare), before);
+    }
+    #[test]
+    fn missing_server_cleanup_revalidates_reappearance_cached_oid_url_and_connectivity() {
+        let f = Fixture::new();
+        let old = f.git(&["rev-parse", "old/local"]);
+        let current = f.git(&["rev-parse", "main"]);
+        f.git(&["update-ref", "refs/remotes/origin/orphan", &old]);
+        let candidate = f.candidate("origin/orphan");
+        assert_eq!(candidate.section, Section::MissingServer);
+        command::checked(&f.bare, &["update-ref", "refs/heads/orphan", &current]).unwrap();
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err(),
+            "server reappearance must invalidate missing-server review"
+        );
+        command::checked(
+            &f.bare,
+            &["update-ref", "-d", "refs/heads/orphan", &current],
+        )
+        .unwrap();
+        let candidate = f.candidate("origin/orphan");
+        f.git(&["update-ref", "refs/remotes/origin/orphan", &current]);
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err()
+        );
+        let candidate = f.candidate("origin/orphan");
+        let other = f._dir.path().join("other.git");
+        fs::create_dir(&other).unwrap();
+        command::checked(&other, &["init", "--bare", "-q"]).unwrap();
+        f.git(&["config", "remote.origin.url", other.to_str().unwrap()]);
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err(),
+            "reachable replacement URL still invalidates review"
+        );
+        f.git(&["config", "remote.origin.url", f.bare.to_str().unwrap()]);
+        let candidate = f.candidate("origin/orphan");
+        let before = refs_at(&f.bare);
+        f.git(&[
+            "config",
+            "remote.origin.url",
+            f._dir.path().join("offline.git").to_str().unwrap(),
+        ]);
+        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+        assert!(!analysis.warnings.is_empty());
+        assert!(
+            !analysis
+                .candidates
+                .iter()
+                .any(|c| c.name == "origin/orphan")
+        );
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err()
+        );
+        assert_eq!(f.git(&["rev-parse", "refs/remotes/origin/orphan"]), current);
+        assert_eq!(refs_at(&f.bare), before);
+    }
+    #[test]
+    fn missing_server_cleanup_preserves_associated_and_symbolically_protected_refs() {
+        let f = Fixture::new();
+        let oid = f.git(&["rev-parse", "main"]);
+        for name in ["associated", "default-orphan"] {
+            f.git(&["update-ref", &format!("refs/remotes/origin/{name}"), &oid]);
+        }
+        f.git(&["branch", "local-associated", "main"]);
+        f.git(&["config", "branch.local-associated.remote", "origin"]);
+        f.git(&[
+            "config",
+            "branch.local-associated.merge",
+            "refs/heads/associated",
+        ]);
+        f.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/default-orphan",
+        ]);
+        let analysis = analyze(&f.root, crate::ui::time::now_unix()).unwrap();
+        assert!(
+            !analysis
+                .candidates
+                .iter()
+                .any(|c| c.name == "origin/associated")
+        );
+        let candidate = f.candidate("origin/default-orphan");
+        assert_eq!(candidate.section, Section::MissingServer);
+        assert!(candidate.protected);
+        assert!(
+            f.run(Plan {
+                branches: vec![candidate]
+            })
+            .result
+            .is_err()
+        );
+        assert_eq!(
+            f.git(&["rev-parse", "refs/remotes/origin/default-orphan"]),
+            oid
+        );
     }
     #[test]
     fn fetched_only_plan_leases_cached_ref_not_server_head_and_retains_unknown_server_refs() {

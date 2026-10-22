@@ -1365,19 +1365,35 @@ warmups and capture-only launches distinct. Record raw samples, medians/p95,
 fixture scale, binary hashes and any regressions in the run's Markdown report.
 New workflows have candidate-only absolute timings; do not invent a baseline.
 
-Cleanup's component benchmarks measure server verification, local and cached-ref
-transactions, and large cleanup batches. Candidate-only
-`benchmark_cleanup_large` covers 1,500 old-local refs;
-`benchmark_cleanup_matching_large` covers 1,500 matching local/cached pairs.
-Both retain analysis, deletion and Undo timings and verify unchanged server
-refs. The native fixture has 500 nested
-rows in each tree, matching/protected branches and a stale cached ref absent
-from the server. Native mutation scenarios verify exact local/cached ref
-restoration through journal Undo, plus unchanged server refs, HEAD, index and
-worktree. Server branches are never deleted. Component benchmarks exclude GPUI
-painting; retain their raw sample fields and fixture dimensions separately from
-the native request-to-paint intervals. Run screenshots separately to inspect
-all three trees, mixed folder checks and section selection controls.
+Cleanup's component benchmarks measure server verification, local/cached-ref
+transactions and large batches. With a preserved v013 test harness, use
+`benchmark-branch-cleanup.ps1 -Stages Components -ComponentSet Cleanup` and supply
+both `-BaselineHarness` and `-CandidateHarness`. The four shared cleanup cases
+retain identical fixtures and fifteen samples after warmup, including 1,500
+old-local refs and 1,500 matching local/cached pairs. Compare analysis, deletion
+and Undo with their actual fixture dimensions; these common fixtures exclude
+optional MissingServer deletion and do not benchmark that new action.
+
+The native fixture has 500 nested rows in each original tree and forty numbered
+missing-server cached refs plus the legacy named missing ref. The fourth
+MissingServer tree is optional, red and initially unchecked because cached refs
+may be the last copy. `cleanup-review` checks four independent trees, mixed folder
+selection and section controls. `cleanup-delete` explicitly selects MissingServer
+alongside matching refs, verifies actual local/cached-ref removal, then performs
+Undo, Redo and final Undo. Every launch checks unchanged server refs, HEAD,
+index/worktree and exact restored refs; no server branch is deleted. Candidate
+native timings are absolute costs, not a comparison with the old three-tree UI.
+Request-to-verified-frame includes worker, recovery, state and paint scheduling;
+component timings exclude GPUI painting.
+
+Run `-Stages Native -Samples 15` separately from `-Stages Screenshots`. Repeat
+screenshots with `-MinimumWindow` for diagnostic 900x600 logical initial bounds;
+this switch affects captures only, never timing launches. Capture the confirmation
+with `-ReviewDialogCapture` in another fresh output directory. Inspect actual app
+PNGs for all four trees, readable last-copy warning/red optional state, scroll and
+selection controls, footer and exact-ref confirmation bounds. Private-desktop
+handler/paint assertions and PNG review do not establish physical input or display
+scanout. Keep raw samples and hashes and report every joint regression crossing.
 
 
 ## Graph refresh, context menus and cherry-pick
