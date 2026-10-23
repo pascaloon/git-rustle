@@ -729,6 +729,19 @@ impl App {
     }
 
     /// The change set currently on screen (view or details panel).
+    pub fn active_changes(&self) -> Option<&ChangeSet> {
+        if self.inspection.is_none()
+            && matches!(self.mode, Mode::Graph)
+            && self.search.active()
+            && self.graph_len() == 0
+        {
+            return None;
+        }
+        match &self.mode {
+            Mode::Diff(view) => Some(&view.changes),
+            _ => self.details_changes.as_ref(),
+        }
+    }
     pub fn active_changes_mut(&mut self) -> Option<&mut ChangeSet> {
         if self.inspection.is_none()
             && matches!(self.mode, Mode::Graph)

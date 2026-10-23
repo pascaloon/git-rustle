@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[cfg(not(windows))]
 compile_error!("Git Rustle desktop currently supports Windows only.");
+mod ai;
 mod app;
 mod branches;
 mod cache;

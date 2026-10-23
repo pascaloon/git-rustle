@@ -656,6 +656,9 @@ impl Desktop {
             Action::Run(request) => Some(self.bind_conflict_request(request)),
         };
         if let Some(request) = request {
+            if request.changes_repository() {
+                self.clear_ai_feedback();
+            }
             if self
                 .engine
                 .app

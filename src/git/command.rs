@@ -127,11 +127,11 @@ pub fn clean(text: &str) -> String {
 }
 
 #[cfg(windows)]
-struct Job(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct Job(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl Job {
-    fn attach(child: &std::process::Child) -> Option<Self> {
+    pub(crate) fn attach(child: &std::process::Child) -> Option<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
         // SAFETY: valid owned handles and sized, initialized information structure.

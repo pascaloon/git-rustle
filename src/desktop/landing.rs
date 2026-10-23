@@ -14,6 +14,7 @@ impl Desktop {
             cx.notify();
             return;
         }
+        self.ai_repository_changed();
         self.engine = self.engine.open_directory(path);
         self.graph_hover = Default::default();
         // View IDs restart for each repository. Drop search results and cancel

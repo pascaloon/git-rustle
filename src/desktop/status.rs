@@ -194,7 +194,7 @@ impl Desktop {
         }
     }
 
-    fn status_messages(&self) -> [Option<Message<'_>>; 10] {
+    fn status_messages(&self) -> [Option<Message<'_>>; 11] {
         if self.engine.landing() {
             let mut messages = std::array::from_fn(|_| None);
             messages[0] = message("App", self.notice.as_str(), Level::Error);
@@ -213,11 +213,25 @@ impl Desktop {
         std::array::from_fn(|index| {
             if index < 9 {
                 base.next().unwrap()
-            } else {
+            } else if index == 9 {
                 refreshing.then(|| Message {
                     source: "Refresh",
                     text: "Refreshing repository…".into(),
                     level: Level::Working,
+                })
+            } else {
+                self.ai_status().and_then(|(text, busy, error)| {
+                    message(
+                        "AI",
+                        text,
+                        if error {
+                            Level::Error
+                        } else if busy {
+                            Level::Working
+                        } else {
+                            Level::Done
+                        },
+                    )
                 })
             }
         })
@@ -236,6 +250,8 @@ impl Desktop {
         self.refresh_feedback_rendered(working);
         row()
             .id("status-bar")
+            .relative()
+            .children(self.ai_probe(2))
             .h(px(HEIGHT))
             .flex_shrink_0()
             .px_3()
@@ -271,6 +287,9 @@ impl Desktop {
                         .child(level.label()),
                 )
             })
+            .when(primary.is_some_and(|m| m.source == "AI"), |s| {
+                s.child(icon("sparkles").text_color(rgb(level.color())))
+            })
             .child(
                 div()
                     .flex_1()
@@ -283,6 +302,7 @@ impl Desktop {
                     }))
                     .child(text.to_string()),
             )
+            .children(self.ai_status_controls(cx))
             .child(
                 Button::new("status-details")
                     .xsmall()
@@ -343,6 +363,7 @@ impl Desktop {
                                 .ghost()
                                 .label("Clear notifications")
                                 .on_click(cx.listener(|v, _, _, cx| {
+                                    v.clear_ai_feedback();
                                     if !v.engine.operation_busy {
                                         v.engine.operation_status.clear();
                                         v.engine.operation_error = false;

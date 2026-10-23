@@ -18,6 +18,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::time::{Duration, Instant};
+mod ai;
 mod base_diff;
 mod branch_views;
 mod cleanup;
@@ -79,7 +80,9 @@ pub fn run(mut engine: Engine) {
         let minimum_cleanup_bench = std::env::var("GIT_RUSTLE_BENCH_WINDOW")
             .is_ok_and(|value| value == "900x600")
             && std::env::var("GIT_RUSTLE_SCENARIO").is_ok_and(|scenario| {
-                scenario.starts_with("cleanup-") || scenario == "branches-hierarchy"
+                scenario.starts_with("cleanup-")
+                    || scenario.starts_with("ai-")
+                    || scenario == "branches-hierarchy"
             });
         let initial_size = if minimum_cleanup_bench {
             size(px(900.), px(600.))
@@ -159,6 +162,7 @@ fn refresh_action(control: bool) -> Action {
 
 #[derive(Clone)]
 enum Action {
+    Ai(ai::Action),
     OpenProviderUrl(String),
     NewRequest(String),
     Operation(Box<operations::Action>),
@@ -202,6 +206,7 @@ enum Action {
 }
 
 struct Desktop {
+    ai: ai::State,
     updates: update::Updates,
     composer: Option<requests::Composer>,
     avatars: requests::Avatars,
@@ -636,12 +641,26 @@ impl Desktop {
             items.push((
                 Action::Operation(Box::new(operations::Action::Open(
                     operations::Dialog::Plan,
-                    target,
-                    label,
+                    target.clone(),
+                    label.clone(),
                 ))),
                 "graph",
                 "Interactive rebase from here…".into(),
                 idle && attached && !self.operations.rebase_open,
+            ));
+            if app.head_id() != Some(id) {
+                items.push((
+                    Action::Ai(ai::Action::Merge(target.clone(), label.clone())),
+                    "sparkles",
+                    "Merge into current branch with AI".into(),
+                    idle && attached && !self.operations.rebase_open && self.ai_available(),
+                ));
+            }
+            items.push((
+                Action::Ai(ai::Action::Rebase(target, label)),
+                "sparkles",
+                "Rebase current branch onto this with AI".into(),
+                idle && attached && !self.operations.rebase_open && self.ai_available(),
             ));
             if let Some(refs) = &app.refs {
                 for branch in refs
@@ -967,6 +986,7 @@ impl Desktop {
     }
 
     fn new(mut engine: Engine, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let ai = ai::State::new(window, cx);
         let operations = operations::Panel::new(window, cx);
         engine.mark("GPUI window ready");
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search commits…"));
@@ -1046,6 +1066,7 @@ impl Desktop {
                         v.engine.tick(message);
                         v.poll_updates(cx);
                         v.sync_operations(window, cx);
+                        v.ai_tick(window, cx);
                         v.sync_stashes(window, cx);
                         v.sync_diff_search(window, cx);
                         v.sync_cleanup(cx);
@@ -1263,6 +1284,7 @@ impl Desktop {
                         v.improvement_scenario_tick(window, cx);
                         v.general_scenario_tick(window, cx);
                         v.tools_tick(window, cx);
+                        v.ai_scenario_tick(window, cx);
                         if v.scenario_started && v.scenario.as_deref() == Some("settings-cache-clear")
                             && !v.image_cache.busy && v.image_cache.stats.is_some()
                             && !v.image_cache.cleared
@@ -1352,6 +1374,7 @@ impl Desktop {
         let select_focus = cx.focus_handle();
         select_focus.focus(window);
         Self {
+            ai,
             updates: Default::default(),
             composer: None,
             avatars: Default::default(),
@@ -1665,6 +1688,24 @@ impl Desktop {
         cx.notify();
     }
     fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if let Action::Ai(action) = action {
+            self.ai_action(action, window, cx);
+            return;
+        }
+        if self.ai.show_result {
+            return;
+        }
+        if matches!(
+            action,
+            Action::Commit
+                | Action::Checkout
+                | Action::CheckoutCommit(_)
+                | Action::Confirm(_)
+                | Action::Refresh
+                | Action::ForceRefresh
+        ) {
+            self.clear_ai_feedback();
+        }
         if matches!(action, Action::DiffBaseChoose) {
             self.start_base_diff_choose(cx);
             return;
@@ -1820,6 +1861,7 @@ impl Desktop {
             app.begin_navigation();
         }
         match action {
+            Action::Ai(_) => unreachable!(),
             Action::OpenProviderUrl(_) => unreachable!(),
             Action::NewRequest(_) => unreachable!(),
             Action::Operation(_) => unreachable!(),
@@ -2023,7 +2065,7 @@ impl Desktop {
                 }
             }
             Action::SettingsTab(i) => {
-                if !app.settings.busy && i <= crate::settings::GENERAL_PAGE {
+                if !app.settings.busy && i <= ai::SETTINGS_PAGE {
                     app.settings.page = i;
                 }
             }
@@ -2941,7 +2983,16 @@ impl Desktop {
                 column()
                     .p_4()
                     .gap_3()
-                    .child(div().text_size(px(18.)).child("Commit changes"))
+                    .child(
+                        row()
+                            .child(div().flex_1().text_size(px(18.)).child("Commit changes"))
+                            .child(self.ai_button(
+                                "ai-commit",
+                                "Auto-fill",
+                                crate::ai::Task::Commit,
+                                cx,
+                            )),
+                    )
                     .child(
                         Input::new(&self.description)
                             .disabled(app.pending.busy)
@@ -3206,6 +3257,7 @@ impl Desktop {
                             .when_some(view.current_change(), |s, change| {
                                 s.child(self.tools_diff_button(change, cx))
                             })
+                            .child(self.ai_button("ai-diff-summary", "Summarize with AI", crate::ai::Task::Summary, cx))
                             .child(self.button("word-wrap", "", Action::Wrap, cx)),
                     )
                     .children(self.tools_notice())
@@ -3301,7 +3353,9 @@ impl Desktop {
     fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = &self.engine.app.settings;
         let mut form = column().w(px(700.)).max_w_full().flex_shrink_0().gap_3();
-        if settings.page == crate::settings::GENERAL_PAGE {
+        if settings.page == ai::SETTINGS_PAGE {
+            form = form.child(self.ai_settings(cx));
+        } else if settings.page == crate::settings::GENERAL_PAGE {
             form = form
                 .child(caption("General settings · shared by all repositories"))
                 .child(
@@ -3459,6 +3513,7 @@ impl Desktop {
                         (0, "Project"),
                         (1, "GitLab"),
                         (2, "GitHub"),
+                        (ai::SETTINGS_PAGE, "AI"),
                     ]
                     .into_iter()
                     .map(|(page, label)| {
@@ -3467,6 +3522,7 @@ impl Desktop {
                             settings.page == page,
                             !settings.busy,
                         )
+                        .when(page == ai::SETTINGS_PAGE, |s| s.child(icon("sparkles")))
                         .child(label)
                         .when(!settings.busy, |s| {
                             s.on_click(cx.listener(move |v, _, window, cx| {
@@ -3477,24 +3533,35 @@ impl Desktop {
                 ),
             )
             .child(form)
-            .when(settings.page != crate::settings::GENERAL_PAGE, |s| {
-                s.child(row().child(self.button(
-                    "save",
-                    if settings.saving { "Saving…" } else { "Save" },
-                    Action::SaveSettings,
-                    cx,
-                )))
-            })
-            .when(settings.page != crate::settings::GENERAL_PAGE, |s| {
-                s.child(
-                    div()
-                        .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
-                        .child(settings.status.clone()),
-                )
-            })
+            .when(
+                settings.page != crate::settings::GENERAL_PAGE
+                    && settings.page != ai::SETTINGS_PAGE,
+                |s| {
+                    s.child(row().child(self.button(
+                        "save",
+                        if settings.saving { "Saving…" } else { "Save" },
+                        Action::SaveSettings,
+                        cx,
+                    )))
+                },
+            )
+            .when(
+                settings.page != crate::settings::GENERAL_PAGE
+                    && settings.page != ai::SETTINGS_PAGE,
+                |s| {
+                    s.child(
+                        div()
+                            .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
+                            .child(settings.status.clone()),
+                    )
+                },
+            )
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if let Some(ready) = self.ai_scenario_ready() {
+            return ready;
+        }
         if self.scenario.as_deref() == Some("graph-polish") {
             return self.graph_polish.verified;
         }
@@ -3959,6 +4026,16 @@ impl Render for Desktop {
             .size_full()
             .track_focus(&self.select_focus)
             .capture_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
+                if v.ai.show_result {
+                    if e.keystroke.key == "escape" {
+                        v.ai_action(ai::Action::Close, window, cx);
+                    }
+                    if e.keystroke.modifiers.control && e.keystroke.key == "c" {
+                        v.ai_action(ai::Action::Copy, window, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if e.keystroke.key == "f5" && !e.keystroke.modifiers.alt {
                     v.action(refresh_action(e.keystroke.modifiers.control), window, cx);
                     cx.stop_propagation();
@@ -4132,6 +4209,7 @@ impl Render for Desktop {
             .children(self.discard_menu(window, cx))
             .children(self.update_dialog(cx))
             .children(self.ref_storage_confirmation(cx))
+            .children(self.ai_overlay(cx))
             .into_any_element()
     }
 }
@@ -4618,6 +4696,10 @@ fn graph_menu_branch_item(action: &Action, icon_name: &str, label: &str) -> bool
     icon_name == "branch"
         || (matches!(action, Action::OpenProviderUrl(_)) && label != "Open commit online")
         || matches!(action, Action::NewRequest(_))
+        || matches!(
+            action,
+            Action::Ai(ai::Action::Rebase(..) | ai::Action::Merge(..))
+        )
         || matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::Create | operations::Dialog::Rename | operations::Dialog::Delete | operations::Dialog::Merge | operations::Dialog::Rebase, ..)))
 }
 

@@ -17,6 +17,9 @@ impl AssetSource for Assets {
             _ => path.strip_prefix("rustle/").unwrap_or(""),
         };
         let body = match name {
+            "sparkles" => {
+                "<path d='m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4ZM20 2v4m-2-2h4M4 18v4m-2-2h4'/>"
+            }
             "trash" => "<path d='M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7'/>",
             "external-link" => "<path d='M14 3h7v7m0-7L10 14M10 3H3v18h18v-7'/>",
             "pipeline-pending" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>",

@@ -631,7 +631,8 @@ impl Desktop {
                         cx,
                     ))
                     .child(side_button("conflict-use-local", "Use local…", local, cx))
-                    .child(self.tools_merge_button(path, cx)),
+                    .child(self.tools_merge_button(path, cx))
+                    .child(self.ai_button("ai-resolve-conflict", "Resolve with AI", crate::ai::Task::Conflict, cx)),
             );
         if state.stale {
             editor = editor.child(row().flex_wrap().gap_2().flex_shrink_0()

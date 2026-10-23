@@ -136,6 +136,38 @@ interior pixels. The icon generator retains the resulting alpha channel.
 The former terminal navigation keys are not bound in the desktop. Normal text
 editing, selection, clipboard and input-method behavior remain available in fields.
 
+### AI integration
+
+**Settings → AI** selects **Codex CLI** or **Claude Code CLI**, a model name
+(blank uses the CLI's default), and five editable Markdown prompts in accordions.
+Save applies them globally in `%LOCALAPPDATA%\git-rustle\ai.json`.
+Install your chosen CLI on PATH and sign in from a terminal before using it.
+Native Windows installations and npm's Node launchers are supported.
+
+- **Resolve with AI** drafts the selected text file's resolution during merge,
+  rebase or pull conflicts. Review the draft, then **Save and mark resolved**.
+- **Rebase current branch onto this with AI** in a commit's context menu starts
+  the rebase immediately. AI resolves each conflicted text file, saves and stages
+  the resolutions, and continues through every replayed commit automatically.
+  Cancellation or a failed resolution leaves the rebase paused in **Conflicts**.
+  Completed rebases remain recoverable through Undo / Redo history.
+- **Merge into current branch with AI** in a commit's context menu merges the
+  selected commit into the current branch. AI resolves, saves and stages conflicts,
+  then completes the merge automatically. Cancellation or a failed resolution
+  leaves the merge paused in **Conflicts**. Completed merges support Undo / Redo.
+- **Summarize with AI** in the Diff toolbar explains the displayed file's changes.
+- **Auto-fill** beside the commit heading writes a description using only checked
+  files, including untracked files. Edit it before committing.
+
+Each action has a sparkle icon. Work runs in a hidden CLI process and can be
+cancelled. Requests time out after five minutes. Context is limited to 256 KiB;
+select fewer files or a smaller range for larger changes. CLI sessions use an
+isolated temporary directory; Codex uses its read-only sandbox and Claude has
+tools disabled. Automatic merges and rebases use the app's guarded Git operations to
+apply changes. Progress and **Cancel AI** appear inside the existing app status
+bar. Results that arrive after a manually edited draft changes do not overwrite it.
+Your selected provider receives the supplied source text through its CLI.
+
 ### Search
 
 Ctrl+F focuses the current graph, branch or diff search. Escape clears an active

@@ -44,6 +44,31 @@ do not use byte equality as a general visual regression oracle.
 
 ## Additional scenarios
 
+AI scenarios exercise real application handlers with deterministic external CLI
+executables; they do not contact a provider or require authentication:
+
+```powershell
+.\scripts\screenshot-app.ps1 -Candidate .\target\debug\git-rustle.exe `
+  -Scenarios @('ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error') `
+  -AiProvider Codex -OutputDirectory .\target\bench\ai-codex
+# Repeat with -AiProvider Claude and a new output directory.
+# Use -WindowSize 900x600 for AI layout checks at the minimum supported size.
+```
+
+The runner compiles `scripts/ai-cli-fixture.rs` into its ignored output directory,
+prepends only that fixture directory to PATH, seeds isolated global AI settings,
+and retains the submitted context. Native assertions wait for worker completion
+and actual GPUI paint bounds. They verify selected-file messages, editable
+resolutions, automatic rebase completion across commits/files, automatic merge
+completion with both parents preserved, global settings
+saves, cancellation, stale drafts and CLI errors. Every AI scenario asserts that
+the footer is the app's single 32-pixel status bar. Read-only scenarios check
+file contents, HEAD, refs, index and stashes remain unchanged. Automatic integration
+scenarios instead verify ancestry, resolved files, clean tracked state,
+unchanged unrelated refs/files/stashes, or preserved paused state after failure
+or cancellation. These checks cover integration plumbing; live authentication, model
+availability, provider responses and physical input still require separate use.
+
 Reuse the existing real action/paint harness for new views. Add a preset and a
 matching disposable fixture to `screenshot-app.ps1`, or call the capture helper
 from a dedicated visual scenario runner:

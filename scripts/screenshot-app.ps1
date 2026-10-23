@@ -1,9 +1,11 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
-    [ValidateSet('graph','branches','settings','diff','stash-panel','graph-selection-boundary')]
+    [ValidateSet('graph','branches','settings','diff','stash-panel','graph-selection-boundary','ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error')]
     [string[]]$Scenarios = @('graph','branches','settings','diff','stash-panel'),
     [string]$OutputDirectory = "$PSScriptRoot/../target/bench/screenshots-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))",
-    [ValidateRange(10,120)][int]$TimeoutSeconds = 30
+    [ValidateRange(10,120)][int]$TimeoutSeconds = 30,
+    [ValidateSet('Codex','Claude')][string]$AiProvider = 'Codex',
+    [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900'
 )
 $ErrorActionPreference = 'Stop'
 if('graph-selection-boundary' -in $Scenarios){
@@ -19,8 +21,8 @@ if (!$Scenarios.Count -or @($Scenarios | Select-Object -Unique).Count -ne $Scena
 New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
 $saved = @{}
 $names = @(@(Get-ChildItem Env: | Where-Object { $_.Name -match '^(GIT_|GIT_RUSTLE_)' } | ForEach-Object Name) + @(
-    'LOCALAPPDATA','APPDATA','GPUI_DISABLE_DIRECT_COMPOSITION','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_GLOBAL','GIT_TERMINAL_PROMPT',
-    'GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP'
+    'PATH','LOCALAPPDATA','APPDATA','GPUI_DISABLE_DIRECT_COMPOSITION','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_GLOBAL','GIT_TERMINAL_PROMPT',
+    'GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_AI_FIXTURE_LOG'
 ) | Select-Object -Unique)
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 $results = [Collections.Generic.List[object]]::new()
@@ -38,12 +40,22 @@ function Get-FixtureFingerprint([string]$Repository) {
         head = (Invoke-FixtureGit $Repository @('rev-parse','HEAD'))
         refs = (Invoke-FixtureGit $Repository @('show-ref'))
         status = (Invoke-FixtureGit $Repository @('status','--porcelain=v1'))
+        index = (Invoke-FixtureGit $Repository @('ls-files','--stage'))
         stash = (Invoke-FixtureGit $Repository @('stash','list','--format=%H'))
         files = $files
     } | ConvertTo-Json -Depth 5 -Compress
 }
 try {
-    foreach ($name in $names) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+    foreach ($name in $names | Where-Object { $_ -ne 'PATH' }) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+    if (@($Scenarios | Where-Object { $_ -like 'ai-*' }).Count) {
+        $bin = Join-Path $OutputDirectory 'fixture-bin'
+        New-Item -ItemType Directory -Path $bin | Out-Null
+        $fixtureExe = Join-Path $bin 'codex.exe'
+        & rustc --edition=2024 "$PSScriptRoot/ai-cli-fixture.rs" -o $fixtureExe
+        if ($LASTEXITCODE -ne 0) { throw 'Could not compile deterministic AI CLI fixture' }
+        Copy-Item -LiteralPath $fixtureExe -Destination (Join-Path $bin 'claude.exe')
+        $env:PATH = "$bin;$env:PATH"
+    }
     $env:GIT_CONFIG_NOSYSTEM = '1'
     $env:GIT_CONFIG_GLOBAL = Join-Path $OutputDirectory 'empty-gitconfig'
     [IO.File]::WriteAllText($env:GIT_CONFIG_GLOBAL,'')
@@ -75,11 +87,46 @@ try {
         }
         [IO.File]::AppendAllText((Join-Path $fixture 'README.md'),"`nPending documentation update`n")
         [IO.File]::WriteAllText((Join-Path $fixture 'notes.txt'),"Untracked fixture notes`n")
+        if ($scenario -like 'ai-*') {
+            [IO.File]::WriteAllText((Join-Path $fixture '.git/git-rustle-ai-fixture'),'disposable AI fixture')
+            $settingsDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
+            New-Item -ItemType Directory -Path $settingsDir | Out-Null
+            # Omitted prompts use the production defaults, proving backward-compatible loading.
+            @{ provider = $AiProvider; model = 'fixture-model' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir 'ai.json')
+            [IO.File]::WriteAllText((Join-Path $settingsDir 'tools.json'),'{"scanned":true,"tools":[]}')
+            $env:GIT_RUSTLE_AI_FIXTURE_LOG = Join-Path $directory 'ai-context.txt'
+            if ($scenario -like 'ai-rebase*' -or $scenario -like 'ai-merge*') {
+                [IO.File]::AppendAllText((Join-Path $fixture '.git/info/exclude'),"`nnotes.txt`n")
+                Invoke-FixtureGit $fixture @('restore','README.md') | Out-Null
+                Invoke-FixtureGit $fixture @('switch','-c','ai-destination') | Out-Null
+                foreach ($name in 'example.rs','README.md') { [IO.File]::WriteAllText((Join-Path $fixture $name),"destination change`n") }
+                Invoke-FixtureGit $fixture @('commit','-am','Destination change') | Out-Null
+                Invoke-FixtureGit $fixture @('switch','main') | Out-Null
+                foreach ($n in 'first','second') {
+                    foreach ($name in 'example.rs','README.md') { [IO.File]::WriteAllText((Join-Path $fixture $name),"local $n`n") }
+                    Invoke-FixtureGit $fixture @('commit','-am',"Local $n") | Out-Null
+                }
+            }
+            if ($scenario -like 'ai-conflict*') {
+                Invoke-FixtureGit $fixture @('restore','README.md') | Out-Null
+                Invoke-FixtureGit $fixture @('switch','-c','ai-incoming') | Out-Null
+                [IO.File]::WriteAllText((Join-Path $fixture 'example.rs'),"incoming change`n")
+                Invoke-FixtureGit $fixture @('commit','-am','Incoming change') | Out-Null
+                Invoke-FixtureGit $fixture @('switch','main') | Out-Null
+                [IO.File]::WriteAllText((Join-Path $fixture 'example.rs'),"local change`n")
+                Invoke-FixtureGit $fixture @('commit','-am','Local change') | Out-Null
+                if ($scenario -eq 'ai-conflict-rebase') { & git -C $fixture rebase ai-incoming 2>&1 | Out-Null }
+                elseif ($scenario -eq 'ai-conflict-pull') { & git -C $fixture pull --no-rebase . ai-incoming 2>&1 | Out-Null }
+                else { & git -C $fixture merge --no-edit ai-incoming 2>&1 | Out-Null }
+                if ($LASTEXITCODE -ne 1) { throw 'Expected a disposable merge/rebase/pull conflict' }
+            }
+        }
         $before = Get-FixtureFingerprint $fixture
         $before | Set-Content -LiteralPath (Join-Path $directory 'fixture-before.json')
         $env:GIT_RUSTLE_TIMING = '1'; $env:GIT_RUSTLE_TRACE = '1'
         # The capture worker requests normal application close after the screenshot.
         $env:GIT_RUSTLE_AUTOQUIT = '600000'
+        $env:GIT_RUSTLE_BENCH_WINDOW = $WindowSize
         if ($scenario -eq 'graph') { Remove-Item Env:GIT_RUSTLE_SCENARIO -ErrorAction SilentlyContinue }
         else { $env:GIT_RUSTLE_SCENARIO = $scenario }
         $log = Join-Path $directory 'app.log'
@@ -111,14 +158,51 @@ try {
             $after | Set-Content -LiteralPath (Join-Path $directory 'fixture-after.json')
             # Compare parsed values: JSON hashtable key order is not significant.
             $beforeState = $before | ConvertFrom-Json; $afterState = $after | ConvertFrom-Json
-            foreach ($key in 'head','refs','status','stash') {
+            $integration = $scenario -like 'ai-rebase*' -or $scenario -like 'ai-merge*'
+            $merging = $scenario -like 'ai-merge*'
+            foreach ($key in $(if ($integration) { @('stash') } else { @('head','refs','status','stash','index') })) {
                 if ($beforeState.$key -cne $afterState.$key) { throw "Visual scenario unexpectedly changed fixture $key" }
             }
             if ($beforeState.files.Count -ne $afterState.files.Count) { throw 'Visual scenario unexpectedly changed fixture file count' }
             for ($i = 0; $i -lt $beforeState.files.Count; $i++) {
+                if ($integration -and $beforeState.files[$i].name -in @('example.rs','README.md')) { continue }
                 if ($beforeState.files[$i].name -cne $afterState.files[$i].name -or $beforeState.files[$i].sha256 -cne $afterState.files[$i].sha256) { throw 'Visual scenario unexpectedly changed fixture files' }
             }
-            $result.fixtureUnchanged = $true
+            $result.fixtureUnchanged = !$integration
+            if ($integration) {
+                $pausedState = if ($merging) { '.git/MERGE_HEAD' } else { '.git/rebase-merge' }
+                $unmerged = Invoke-FixtureGit $fixture @('ls-files','-u')
+                if ($scenario -in @('ai-rebase','ai-merge')) {
+                    $branch = Invoke-FixtureGit $fixture @('symbolic-ref','--short','HEAD')
+                    if ($unmerged -or $branch -cne 'main' -or $afterState.head -ceq $beforeState.head) { throw 'AI integration did not finish on the current branch' }
+                    if ($afterState.status -cne $beforeState.status) { throw 'AI integration left unexpected pending changes' }
+                    foreach ($name in 'example.rs','README.md') {
+                        $expected = if ($merging) { "resolved AI merge fixture`n" } else { "resolved AI fixture second`n" }
+                        if ([IO.File]::ReadAllText((Join-Path $fixture $name)) -cne $expected) { throw 'AI did not resolve every conflicted file' }
+                    }
+                    Invoke-FixtureGit $fixture @('merge-base','--is-ancestor','ai-destination','HEAD') | Out-Null
+                    if ($merging) {
+                        $parents = (Invoke-FixtureGit $fixture @('rev-list','--parents','-n','1','HEAD')) -split ' '
+                        $incoming = Invoke-FixtureGit $fixture @('rev-parse','ai-destination')
+                        if ($parents.Count -ne 3 -or $parents[1] -cne $beforeState.head -or $parents[2] -cne $incoming) { throw 'AI merge did not preserve both parents' }
+                    }
+                    if (Test-Path -LiteralPath (Join-Path $fixture $pausedState)) { throw 'AI integration state was not cleared' }
+                } else {
+                    if (!$unmerged -or !(Test-Path -LiteralPath (Join-Path $fixture $pausedState))) { throw 'Cancelled/failed AI integration did not retain its paused state' }
+                }
+                foreach ($line in ($beforeState.refs -split "`n")) {
+                    if ($scenario -in @('ai-rebase','ai-merge') -and $line.EndsWith(' refs/heads/main')) { continue }
+                    if ($line -cnotin ($afterState.refs -split "`n")) { throw 'AI integration changed an unrelated branch or tag' }
+                }
+                $result['integrationPostconditionsVerified'] = $true
+            }
+            if ($scenario -like 'ai-*') {
+                if ((Get-Content -LiteralPath $log -Raw) -notmatch 'AI scenario verified after native paint') { throw 'AI actions were not verified after native paint' }
+                if ($scenario -eq 'ai-settings') {
+                    $ai = Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'git-rustle/ai.json') -Raw | ConvertFrom-Json
+                    if ($ai.provider -cne $AiProvider -or $ai.model -cne 'fixture-model' -or $ai.prompts.Count -ne 5 -or $ai.prompts[2] -notmatch 'behavior') { throw 'Global AI settings were not persisted correctly' }
+                } elseif ($scenario -ne 'ai-cancel' -and !(Test-Path -LiteralPath $env:GIT_RUSTLE_AI_FIXTURE_LOG)) { throw 'AI request did not invoke the deterministic CLI' }
+            }
         } finally {
             if ($null -ne $process) {
                 $process.Dispose()
