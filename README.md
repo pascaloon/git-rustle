@@ -28,6 +28,12 @@ It inherits the release settings with LTO disabled and 16 code-generation units.
 The first build creates a separate dependency cache. Use the release profile for
 shipping and runtime performance validation.
 
+Copy the executable from `target/release` when running on another PC. The default
+`cargo build` produces a larger development executable whose GPUI renderer reads
+shader source files from the build machine's Cargo registry at startup. Copying
+that development executable alone can fail with **Error creating
+DirectWriteTextSystem**. Both `release` and `fast` embed the compiled shaders.
+
 `PATH` can be a repository or a directory inside it; the default is the working
 directory. `--no-cache` disables persistent application caches. `--help` and
 `--version` are also available. When the directory is outside a repository, the
