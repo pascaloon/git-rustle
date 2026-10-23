@@ -1690,3 +1690,41 @@ The runner asserts repository files, index and refs remain intact, and disposes
 its private desktop and fixture process. Generated reports and diagnostics stay
 under ignored `target/bench/<run>` directories. Short runs are iteration checks,
 not the full 15-sample performance acceptance run.
+
+### Ghost comparison loading and recovery
+
+`ghost-files-gitlab` and `ghost-files-github` in
+`benchmark-graph-features.ps1` run a loopback API fixture on a private desktop.
+The real Select handlers choose two unfetched commits, hold their comparison
+response open, and switch to two other individual ghosts. Both file lists must
+finish and paint before the held response is released. The scenario then checks
+an HTTP 503, a successful selection afterward, and a successful two-ghost
+comparison. Loaded/error state, file names, selection count, paint bounds and
+unchanged repository state are asserted. Use `-Samples 15` for timing and capture
+separately with `screenshot-app.ps1 -Scenarios ghost-files-gitlab` (or the GitHub
+variant). Review the resulting PNG; action/paint assertions do not establish
+physical input or display scanout.
+
+The remote diff queue has two bounded workers, removes obsolete queued work and
+cancels superseded pagination between HTTP calls. Existing HTTP deadlines bound
+an already-running call; cancellation does not interrupt a synchronous socket
+read. Live parked Diff tabs retain their requests. GitLab same-project ghost
+pairs use [`straight=true`](https://docs.gitlab.com/api/repositories/#compare-branches-tags-or-commits)
+for exact endpoints only when `compare_timeout` is explicitly false. Incomplete
+or unspecified comparisons fall back to complete snapshot trees; mixed local or
+cross-project pairs retain their existing snapshot behavior.
+
+Run engine regressions `slow_ghost_pair_does_not_block_later_single_selections`
+and `parked_remote_diff_and_new_ghost_details_both_finish`, along with
+`remote::files::tests`. The former covers burst selection and error recovery for
+both providers while preserving refs and absent ghost objects. Retain the
+failing baseline reproduction. Use preserved baseline/candidate test executables
+for `engine::tests::benchmark_remote_diff_refresh` and
+`remote::files::tests::benchmark_remote_pairs`. Candidate-only
+`benchmark_gitlab_ghost_pair` compares the cached snapshot and straight paths on
+the same small fixture; it does not model large repositories or server latency.
+Measure shared startup and normal/searched scrolling with the app baseline.
+If a managed worktree shares the main checkout's Cargo target, pass that checkout
+as `-IdleWorkspaceRoot` to verify an existing waiting `cargo run` launcher against
+its actual app path; compiler/linker processes still reject timing.
+Keep raw output and limitations under the ignored `target/bench/<run>` tree.

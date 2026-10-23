@@ -3515,6 +3515,8 @@ impl Desktop {
             Some(
                 "graph-multiselect"
                     | "graph-selection-boundary"
+                    | "ghost-files-github"
+                    | "ghost-files-gitlab"
                     | "multi-details"
                     | "pending-graph"
                     | "stash-preview"
