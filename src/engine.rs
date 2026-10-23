@@ -939,9 +939,10 @@ impl Engine {
             {
                 let mode = self.next_remote_mode.take();
                 self.remote_explicit = mode.is_some();
-                // Graph startup and Smart Refresh reuse cached tag labels.
-                // Full Refresh still updates remote tags.
-                self.preview_cached_only = mode.is_some() || !app.branches.open;
+                // Startup, browser discovery and Smart Refresh hydrate commits
+                // with cached tags. Only explicit Full Refresh loads remote tag
+                // pages, after its branch discovery has completed.
+                self.preview_cached_only = true;
                 if mode != Some(RefreshMode::Smart) {
                     self.preview_epoch = self.preview_epoch.wrapping_add(1);
                     self.preview_cancel.store(true, Ordering::Relaxed);
@@ -957,8 +958,8 @@ impl Engine {
                 let tx = tx.clone();
                 let path = path.clone();
                 let scope = match mode {
-                    Some(RefreshMode::Smart) => remote::DiscoveryScope::Graph,
-                    Some(RefreshMode::Full) => remote::DiscoveryScope::All,
+                    Some(RefreshMode::Smart) if !app.branches.open => remote::DiscoveryScope::Graph,
+                    Some(RefreshMode::Full | RefreshMode::Smart) => remote::DiscoveryScope::All,
                     None if app.branches.open => remote::DiscoveryScope::All,
                     // Include fetched tips even without a local checkout.
                     None => remote::DiscoveryScope::Graph,
@@ -1038,6 +1039,7 @@ impl Engine {
                     .branches
                     .entries
                     .iter()
+                    .filter(|e| e.activity.is_none())
                     .map(|e| e.target.clone())
                     .collect::<Vec<_>>();
                 let r = r.clone();
@@ -1580,6 +1582,9 @@ impl Engine {
                                 update.branches.len()
                             ));
                             if changed {
+                                // Newly listed browser tips can already exist locally even
+                                // though they were absent from the initial graph scope.
+                                self.local_activity_done = None;
                                 app.branches.update(update, app.refs.as_ref());
                                 let next_graph = graph_updates(app);
                                 if !same_graph_updates(&previous_graph, &next_graph) {
@@ -1618,7 +1623,8 @@ impl Engine {
                             {
                                 app.branches.want_refresh = Some(false);
                             }
-                            if self.remote_explicit && !self.remote_scoped_request {
+                            if self.remote_explicit && self.refresh_mode == Some(RefreshMode::Full)
+                            {
                                 self.preview_cached_only = false;
                                 self.preview_wanted = true;
                                 self.preview_force = true;
@@ -2097,6 +2103,35 @@ mod tests {
                 && !e.refreshing
         });
         engine
+    }
+
+    #[test]
+    fn branches_smart_refresh_lists_all_heads_without_refreshing_tags() {
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        e.app.branches.last_check = None;
+        e.app.branches.show(e.app.refs.as_ref());
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert!(!e.remote_scoped_request);
+        assert!(e.preview_cached_only);
+        e.app.request_refresh(RefreshMode::Smart);
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert!(
+            !e.remote_scoped_request,
+            "browser Smart must check all server branches"
+        );
+        assert!(
+            e.preview_cached_only,
+            "browser Smart must not paginate tags"
+        );
+        e.app.request_refresh(RefreshMode::Full);
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert!(!e.preview_cached_only, "explicit Full still refreshes tags");
+        e.app.branches.open = false;
+        e.app.request_refresh(RefreshMode::Smart);
+        until(&mut e, |e| !e.refresh_in_progress());
+        assert!(e.remote_scoped_request, "graph Smart stays scoped");
+        assert!(e.preview_cached_only);
     }
 
     #[test]

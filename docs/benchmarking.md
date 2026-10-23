@@ -1665,3 +1665,28 @@ startup and graph-hover/scroll controls when no competing builds are active.
 Private-desktop paints and image review do not establish physical pointer input
 or display scanout. Retain raw samples, regression crossings and any validation
 limits under the ignored run directory.
+
+
+### Branches tab discovery and refresh
+
+`benchmark-graph-refresh.ps1 -RefreshCase branches -CandidateOnly` opens the
+Branches tab through its real action handler, waits for the full list and a
+visible row paint, then invokes the normal Smart Refresh toolbar action. It
+records `branchesOpenMs` separately from `settledMs`, and asserts the refreshed
+branch tip and its Last commit time after paint. This is not a scrolling test.
+Use `-Branches 64 -ServerOnlyBranches 1350 -Tags 1000` to exercise a complete
+listing substantially larger than the graph scope. The same `branches` harness
+must be built into a preserved baseline before comparing opening measurements.
+The older Smart path checked only graph heads, so its refresh time alone is not
+a comparison of equivalent complete-list behavior.
+
+For a separate functional run, add `-AdvanceBrowserHeads` (candidate-only,
+Branches case, at least two server-only branches). The fixture changes one
+server-only tip, removes another and adds a new branch after opening; the native
+scenario asserts all three changes. Repeat with `-ApiOnly` to verify full API
+pagination fallback. Successful HTTPS discovery should need one advertisement
+and no branch-list or tag pages. Explicit Full Refresh still checks remote tags.
+The runner asserts repository files, index and refs remain intact, and disposes
+its private desktop and fixture process. Generated reports and diagnostics stay
+under ignored `target/bench/<run>` directories. Short runs are iteration checks,
+not the full 15-sample performance acceptance run.
