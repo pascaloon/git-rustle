@@ -173,7 +173,9 @@ while filtering, even after focus moves elsewhere. The graph marks the checked-o
 commit with a high-contrast orange **HEAD** badge.
 
 PR/MR badges in the graph are informational. Use the commit context menu to open
-the associated request online.
+the associated request online. GitLab summaries request only the badge fields
+through read-only GraphQL queries, with REST fallback for unsupported or failed
+queries. Full Refresh updates these summaries; Smart Refresh keeps their cache.
 
 ### Pending changes and commits
 

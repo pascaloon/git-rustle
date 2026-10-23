@@ -1,5 +1,6 @@
 //! Read-only provider summaries. Call on workers; rendering uses an in-memory index.
 use super::*;
+mod graphql;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Association {
@@ -237,6 +238,12 @@ impl Client<'_> {
                 requests.retain(|request| request.number > 0 && safe_web_url(&request.url));
                 !branch.is_empty() && !branch.chars().any(char::is_control) && !requests.is_empty()
             });
+            return Ok(index);
+        }
+        if self.remote.provider == Provider::Gitlab
+            && let Ok(index) = graphql::load(self)
+        {
+            self.write("open-requests-v1", &index);
             return Ok(index);
         }
         let mut index = Index::new();
@@ -633,7 +640,9 @@ mod tests {
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", api.local_addr().unwrap());
         let dir = tempfile::tempdir().unwrap();
-        let remote = fixture(Provider::Gitlab, &url, dir.path());
+        let mut remote = fixture(Provider::Gitlab, &url, dir.path());
+        // Exercise the REST-only installation fallback while its list is blocked.
+        remote.endpoint = format!("{url}/rest-only/repository/branches");
         let project = Project {
             web_url: Some("https://code.example/project".into()),
             avatar: Some("https://private.example/icon.png".into()),
@@ -853,11 +862,12 @@ mod tests {
                     "X-Next-Page: 2\r\n",
                 )
             };
-            let (url, server) = server(vec![
-                (200, "", project),
-                (200, header, first),
-                (200, "", second),
-            ]);
+            let mut responses = vec![(200, "", project)];
+            if provider == Provider::Gitlab {
+                responses.push((404, "", json!({})));
+            }
+            responses.extend([(200, header, first), (200, "", second)]);
+            let (url, server) = server(responses);
             let dir = tempfile::tempdir().unwrap();
             let remote = fixture(provider, &url, dir.path());
             let mut client = client(dir.path(), &remote);
@@ -870,8 +880,9 @@ mod tests {
             let requests = client.open_requests(false).unwrap();
             assert_eq!(requests.len(), 2);
             let captured = server.join().unwrap();
-            assert!(captured[1].contains("per_page=100&page=1"));
-            assert!(captured[2].contains("per_page=100&page=2"));
+            let first_page = 1 + usize::from(provider == Provider::Gitlab);
+            assert!(captured[first_page].contains("per_page=100&page=1"));
+            assert!(captured[first_page + 1].contains("per_page=100&page=2"));
             // The listening socket is closed: these must read disk, never HTTP.
             assert_eq!(client.open_requests(false).unwrap(), requests);
             assert_eq!(client.project(false).unwrap().avatar, project.avatar);
