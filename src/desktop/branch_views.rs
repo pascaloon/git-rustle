@@ -1,5 +1,6 @@
 //! Flat and slash-folder branch views; projections are cached by Browser updates.
 use super::*;
+use crate::git::operations::cleanup::Section;
 
 pub(super) fn branch_row(selected: bool) -> Div {
     row()
@@ -10,7 +11,7 @@ pub(super) fn branch_row(selected: bool) -> Div {
         .hover(|s| s.bg(rgb(HOVER)))
 }
 
-type Paints = std::rc::Rc<std::cell::RefCell<[Option<(u64, Bounds<Pixels>)>; 15]>>;
+type Paints = std::rc::Rc<std::cell::RefCell<[Option<(u64, Bounds<Pixels>)>; 16]>>;
 #[derive(Default)]
 pub(super) struct State {
     bench: Option<Box<Bench>>,
@@ -414,7 +415,7 @@ impl Desktop {
             verified: false,
             started: Instant::now(),
             head: self.engine.app.head_id(),
-            paints: std::rc::Rc::new(std::cell::RefCell::new([None; 15])),
+            paints: std::rc::Rc::new(std::cell::RefCell::new([None; 16])),
         }));
         self.engine.mark("branch cleanup requested");
         self.action(
@@ -540,6 +541,7 @@ impl Desktop {
             && self.branch_cleanup_painted(8, window)
             && self.branch_cleanup_painted(9, window)
             && self.branch_cleanup_painted(10, window)
+            && self.branch_cleanup_painted(15, window)
             && (11..15).all(|part| self.branch_cleanup_painted(part, window))
         {
             let paints = self.branch_views.bench.as_ref().unwrap().paints.borrow();
@@ -549,6 +551,9 @@ impl Desktop {
             let caution = paints[8].unwrap().1;
             let missing = paints[10].unwrap().1;
             let footer = paints[9].unwrap().1;
+            let tag_option = paints[15].unwrap().1;
+            assert!(missing.bottom() <= tag_option.top());
+            assert!(tag_option.bottom() <= footer.top());
             assert!(fetched.size.height > px(60.));
             assert!(fetched.bottom() <= matching.top());
             assert!(matching.bottom() <= caution.top());
@@ -581,6 +586,71 @@ impl Desktop {
             }
             drop(paints);
             self.cleanup_scenario_assert_defaults();
+            self.cleanup_action(
+                cleanup::Action::ToggleSection(Section::Matching),
+                window,
+                cx,
+            );
+            self.cleanup_action(
+                cleanup::Action::ToggleSection(Section::OldLocal),
+                window,
+                cx,
+            );
+            self.branch_cleanup_advance(18);
+        } else if phase == 18
+            && self.branch_cleanup_painted(7, window)
+            && self.branch_cleanup_painted(8, window)
+            && self.branch_cleanup_painted(0, window)
+        {
+            let paints = self.branch_views.bench.as_ref().unwrap().paints.borrow();
+            for part in [7, 8] {
+                let bounds = paints[part].unwrap().1;
+                assert!(
+                    bounds.size.height <= px(30.),
+                    "Collapsed section must paint only its header: {bounds:?}"
+                );
+            }
+            for part in [12, 13] {
+                assert!(
+                    paints[part].is_none_or(
+                        |(epoch, _)| epoch != self.branch_views.bench.as_ref().unwrap().epoch
+                    ),
+                    "Collapsed list must not paint"
+                );
+            }
+            assert!(
+                paints[0].unwrap().1.size.height > px(100.),
+                "Expanded section receives reclaimed space"
+            );
+            drop(paints);
+            for section in [Section::FetchedOnly, Section::MissingServer] {
+                self.cleanup_action(cleanup::Action::ToggleSection(section), window, cx);
+            }
+            self.branch_cleanup_advance(21);
+        } else if phase == 21
+            && [0, 3, 7, 8, 9, 10, 15]
+                .into_iter()
+                .all(|part| self.branch_cleanup_painted(part, window))
+        {
+            let paints = self.branch_views.bench.as_ref().unwrap().paints.borrow();
+            for part in [0, 7, 8, 10] {
+                assert!(paints[part].unwrap().1.size.height <= px(30.));
+            }
+            assert!(
+                (paints[9].unwrap().1.bottom() - paints[3].unwrap().1.bottom()).abs() <= px(1.),
+                "Footer stays anchored with every section collapsed"
+            );
+            drop(paints);
+            for section in [
+                Section::FetchedOnly,
+                Section::Matching,
+                Section::OldLocal,
+                Section::MissingServer,
+            ] {
+                self.cleanup_action(cleanup::Action::ToggleSection(section), window, cx);
+            }
+            self.branch_cleanup_advance(19);
+        } else if phase == 19 && (11..15).all(|part| self.branch_cleanup_painted(part, window)) {
             self.cleanup_scenario_exercise_selection(window, cx);
             if name == "cleanup-review" {
                 self.cleanup_scenario_scroll_fetched(false);
@@ -597,21 +667,8 @@ impl Desktop {
                     window,
                     cx,
                 );
+                self.cleanup_action(cleanup::Action::RemoveTags(true), window, cx);
                 self.cleanup_action(cleanup::Action::Review, window, cx);
-                assert!(
-                    self.operations
-                        .confirmation
-                        .as_ref()
-                        .unwrap()
-                        .1
-                        .contains("refs/remotes/origin/fixes/task-123")
-                );
-                let review = &self.operations.confirmation.as_ref().unwrap().1;
-                assert!(
-                    review.contains("refs/remotes/origin/zz-stale/missing")
-                        && review.contains("may be the last copy")
-                );
-                assert!(!review.contains("refs/heads/origin/zz-stale/missing"));
                 self.branch_cleanup_advance(2);
             }
         } else if phase == 9 && self.branch_cleanup_painted(0, window) {
@@ -646,16 +703,58 @@ impl Desktop {
             if name == "cleanup-review"
                 && std::env::var("GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE").as_deref() == Ok("1")
             {
+                self.cleanup_action(cleanup::Action::Clear, window, cx);
+                self.cleanup_action(
+                    cleanup::Action::Toggle("refs/heads/fixes/task-123".into()),
+                    window,
+                    cx,
+                );
+                self.cleanup_action(
+                    cleanup::Action::Toggle("refs/remotes/origin/zz-stale/missing".into()),
+                    window,
+                    cx,
+                );
+                self.cleanup_action(cleanup::Action::RemoveTags(true), window, cx);
                 self.cleanup_action(cleanup::Action::Review, window, cx);
-                assert!(self.operations.confirmation.is_some());
                 self.branch_cleanup_advance(13);
+            } else if std::env::var("GIT_RUSTLE_CLEANUP_COLLAPSED_CAPTURE").as_deref() == Ok("1") {
+                self.cleanup_action(
+                    cleanup::Action::ToggleSection(Section::Matching),
+                    window,
+                    cx,
+                );
+                self.cleanup_action(
+                    cleanup::Action::ToggleSection(Section::OldLocal),
+                    window,
+                    cx,
+                );
+                self.cleanup_action(cleanup::Action::RemoveTags(true), window, cx);
+                self.branch_cleanup_advance(20);
             } else {
                 self.branch_cleanup_finish();
             }
-        } else if phase == 13 && name == "cleanup-review" && self.branch_cleanup_painted(6, window)
+        } else if (phase == 20
+            && self.branch_cleanup_painted(7, window)
+            && self.branch_cleanup_painted(8, window)
+            && self.branch_cleanup_painted(9, window))
+            || (phase == 13 && name == "cleanup-review" && self.branch_cleanup_painted(6, window))
         {
             self.branch_cleanup_finish();
         } else if phase == 2 && self.branch_cleanup_painted(6, window) {
+            let (request, review) = self.operations.confirmation.as_ref().unwrap();
+            assert!(review.contains("refs/remotes/origin/fixes/task-123"));
+            assert!(
+                review.contains("refs/remotes/origin/zz-stale/missing")
+                    && review.contains("may be the last copy")
+            );
+            assert!(!review.contains("refs/heads/origin/zz-stale/missing"));
+            assert!(
+                review.contains("refs/tags/cleanup-only-annotated")
+                    && review.contains("refs/tags/cleanup-only-lightweight")
+            );
+            assert!(
+                matches!(request, crate::git::operations::Request::Cleanup(plan) if plan.tags.len() == 2)
+            );
             self.engine.mark("cleanup delete requested");
             self.operation_action(operations::Action::Confirm, window, cx);
             self.branch_cleanup_advance(3);
@@ -663,6 +762,7 @@ impl Desktop {
             && !self.engine.operation_busy
             && self.cleanup_scenario_ready()
             && self.cleanup_scenario_deleted()
+            && self.cleanup_scenario_graph_matches(false)
             && self.branch_cleanup_painted(3, window)
             && self.branch_cleanup_painted(8, window)
         {
@@ -684,6 +784,7 @@ impl Desktop {
             && !self.engine.operation_busy
             && self.cleanup_scenario_ready()
             && !self.cleanup_scenario_deleted()
+            && self.cleanup_scenario_graph_matches(true)
             && self.branch_cleanup_painted(7, window)
         {
             assert!(
@@ -703,6 +804,7 @@ impl Desktop {
             && !self.engine.operation_busy
             && self.cleanup_scenario_ready()
             && self.cleanup_scenario_deleted()
+            && self.cleanup_scenario_graph_matches(false)
             && self.branch_cleanup_painted(3, window)
         {
             assert!(
@@ -722,6 +824,7 @@ impl Desktop {
             && !self.engine.operation_busy
             && self.cleanup_scenario_ready()
             && !self.cleanup_scenario_deleted()
+            && self.cleanup_scenario_graph_matches(true)
             && self.branch_cleanup_painted(3, window)
         {
             assert!(

@@ -1610,3 +1610,34 @@ Shared startup and scrolling remain baseline/candidate controls. Native toolbar
 request-to-paint intervals include fixture worker/child completion and are not
 isolated icon extraction CPU measurements. No recipe alone establishes an
 improvement; retain all raw samples and review separately captured app PNGs.
+
+
+### Cleanup sections and exclusive local tags
+
+Cleanup section headers collapse independently while retaining selection and
+counts. The unchecked **Remove local tags unique to selected branches** option
+adds exact local tag refs to review. A single batched ancestry walk includes tags
+on selected branch history only when no retained local/fetched branch or worktree
+HEAD reaches that commit. Shared release tags, unrelated orphan tags, non-commit
+tags and symbolic tag aliases stay intact. Server refs are never mutated; server
+tags may reappear after fetching. Existing recovery pins do not count as retained
+branches. Annotated and nested tag object IDs are preserved through Undo/Redo.
+The worker revalidates reviewed tags and branch refs before one expected-OID
+transaction; newly eligible tags require another review. Another Git client can
+still create a new reference or move a detached worktree HEAD during the final
+transaction; this does not impose a global lock on other clients.
+
+Use `benchmark-branch-cleanup.ps1 -Stages Native -Samples 15` for real action,
+worker, collapse/expand paint, tag deletion and exact Undo/Redo checks. Its
+missing-server fixture has two unique prerelease commits, lightweight and
+annotated tags, a shared release tag and unchanged server tags. Use
+`-Stages Components -ComponentSet Cleanup` with preserved baseline and candidate
+test harnesses for the four shared branch-only controls and candidate-only
+`benchmark_cleanup_tags` (1,503 exclusive tags, one warm-up plus 15 samples).
+
+Run `-Stages Screenshots`, `-Stages Screenshots -CollapsedCapture` and
+`-Stages Screenshots -ReviewDialogCapture` separately in fresh output directories;
+repeat with `-MinimumWindow` to inspect 900x600 bounds. Review each cleanup PNG
+for section headers, checked/unchecked option, reclaimed space and exact tag refs
+in confirmation. Captures are excluded from performance samples. Use the shared
+startup and normal/searched-scroll runners with the preserved app baseline.

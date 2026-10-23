@@ -2,7 +2,7 @@
 use super::*;
 use crate::git::operations::{
     Request,
-    cleanup::{Analysis, Plan, Section},
+    cleanup::{Analysis, Plan, Section, Tag},
 };
 use std::collections::HashSet;
 
@@ -14,6 +14,8 @@ pub(super) enum Action {
     SelectSection(Section, bool),
     Folder(Section, String),
     Collapse(Section, String),
+    ToggleSection(Section),
+    RemoveTags(bool),
     Clear,
     Review,
     Optimize,
@@ -26,6 +28,8 @@ pub(super) struct State {
     generation: u64,
     selected: HashSet<String>,
     collapsed: HashSet<String>,
+    collapsed_sections: HashSet<Section>,
+    remove_tags: bool,
     counts: std::collections::HashMap<String, (usize, usize)>,
     rows: [Vec<TreeRow>; 4],
     fetched_scroll: UniformListScrollHandle,
@@ -129,6 +133,12 @@ impl Desktop {
                     self.cleanup.selected.insert(name);
                 }
             }
+            Action::ToggleSection(section) => {
+                if !self.cleanup.collapsed_sections.remove(&section) {
+                    self.cleanup.collapsed_sections.insert(section);
+                }
+            }
+            Action::RemoveTags(value) if idle => self.cleanup.remove_tags = value,
             Action::Clear if idle => self.cleanup.selected.clear(),
             Action::SelectSection(section, selected) if idle => {
                 self.cleanup.select_group(section, "", selected)
@@ -154,17 +164,47 @@ impl Desktop {
                     .filter(|c| self.cleanup.selected.contains(&candidate_key(c)) && !c.protected)
                     .cloned()
                     .collect();
-                let names = branches
-                    .iter()
-                    .flat_map(local_refs)
-                    .map(|name| format!("• {name}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let text = format!(
-                    "Remove these {} local references?\n\nThis only changes references on this computer. No server branches will be deleted. Fetched references are local copies. Cleaning matching copies removes the local branch and any fetched reference shown below.\n\nCommits remain recoverable through Undo and History. Old local branches may contain unique work. Missing-on-server fetched references may be the last copy because their server branch no longer exists; review them carefully.\n\nExact references to remove:\n{names}",
-                    branches.iter().flat_map(local_refs).count()
-                );
-                self.operations.confirmation = Some((Request::Cleanup(Plan { branches }), text));
+                if self.cleanup.remove_tags {
+                    let Some(path) = self
+                        .engine
+                        .repository_root()
+                        .map(std::path::Path::to_path_buf)
+                    else {
+                        return;
+                    };
+                    self.cleanup.loading = true;
+                    let session = self.engine.messages();
+                    let generation = self.cleanup.generation;
+                    cx.spawn(async move |view, cx| {
+                        let source = path.clone();
+                        let (branches, result) = cx
+                            .background_executor()
+                            .spawn(async move {
+                                let result = crate::git::operations::cleanup::exclusive_tags(
+                                    &path, &branches,
+                                );
+                                (branches, result)
+                            })
+                            .await;
+                        let _ = view.update(cx, |v, cx| {
+                            if !session.same_channel(&v.engine.messages())
+                                || v.engine.repository_root() != Some(source.as_path())
+                                || v.cleanup.generation != generation
+                            {
+                                return;
+                            }
+                            v.cleanup.loading = false;
+                            match result {
+                                Ok(tags) => v.show_cleanup_review(branches, tags),
+                                Err(error) => v.cleanup.message = error,
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    self.show_cleanup_review(branches, Vec::new());
+                }
             }
             Action::Optimize if idle => {
                 self.operations.confirmation = Some((Request::OptimizeStorage,
@@ -174,6 +214,28 @@ impl Desktop {
         }
         self.cleanup.rebuild_counts();
         cx.notify();
+    }
+    fn show_cleanup_review(
+        &mut self,
+        branches: Vec<crate::git::operations::cleanup::Candidate>,
+        tags: Vec<Tag>,
+    ) {
+        let refs: Vec<_> = branches
+            .iter()
+            .flat_map(local_refs)
+            .chain(tags.iter().map(|t| t.name.clone()))
+            .collect();
+        let names = refs
+            .iter()
+            .map(|name| format!("• {name}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!(
+            "Remove these {} local references ({} tags)?\n\nExact references to remove:\n{names}\n\nOnly the listed local branches, fetched copies and tags will be removed. Server branches and tags stay intact. Tags shared with retained local or fetched branches, or a worktree HEAD, are preserved.\n\nUndo and History restore commits and tags. Old local branches may contain unique work. Missing-on-server fetched references may be the last copy; review them carefully.",
+            refs.len(),
+            tags.len()
+        );
+        self.operations.confirmation = Some((Request::Cleanup(Plan { branches, tags }), text));
     }
     fn cleanup_section(&self, section: Section, cx: &mut Context<Self>) -> AnyElement {
         let busy =
@@ -185,6 +247,7 @@ impl Desktop {
             Section::OldLocal => &self.cleanup.caution_scroll,
             Section::MissingServer => &self.cleanup.missing_scroll,
         };
+        let collapsed = self.cleanup.collapsed_sections.contains(&section);
         let count = self.cleanup.rows[slot].len();
         let (selected, eligible) = self.cleanup.group_counts(section, "");
         let (title, detail, color) = match section {
@@ -357,7 +420,8 @@ impl Desktop {
             } else {
                 0
             }))
-            .flex_1()
+            .when(!collapsed, |s| s.flex_1())
+            .flex_shrink_0()
             .min_h_0()
             .border_t_1()
             .border_color(rgb(LINE))
@@ -377,7 +441,25 @@ impl Desktop {
                         )
                         .text_color(rgb(color)),
                     )
-                    .child(title)
+                    .child(
+                        Button::new(SharedString::from(format!("cleanup-section-toggle-{slot}")))
+                            .small()
+                            .ghost()
+                            .icon(gpui_component::Icon::default().path(if collapsed {
+                                "rustle/next"
+                            } else {
+                                "rustle/down"
+                            }))
+                            .label(title)
+                            .tooltip(if collapsed {
+                                "Expand section"
+                            } else {
+                                "Collapse section"
+                            })
+                            .on_click(cx.listener(move |v, _, w, cx| {
+                                v.cleanup_action(Action::ToggleSection(section), w, cx)
+                            })),
+                    )
                     .child(caption(format!("{selected}/{eligible} selected")))
                     .child(div().flex_1())
                     .child(
@@ -401,19 +483,21 @@ impl Desktop {
                             })),
                     ),
             )
-            .child(
-                caption(detail)
-                    .h(px(16.))
-                    .line_height(px(16.))
-                    .flex_shrink_0()
-                    .px_4()
-                    .whitespace_nowrap()
-                    .truncate(),
-            )
-            .child(
-                self.scroll_region(3 + slot, list, Scrollbar::vertical(scroll), cx)
-                    .children(self.branch_cleanup_probe(11 + slot)),
-            )
+            .when(!collapsed, |s| {
+                s.child(
+                    caption(detail)
+                        .h(px(16.))
+                        .line_height(px(16.))
+                        .flex_shrink_0()
+                        .px_4()
+                        .whitespace_nowrap()
+                        .truncate(),
+                )
+                .child(
+                    self.scroll_region(3 + slot, list, Scrollbar::vertical(scroll), cx)
+                        .children(self.branch_cleanup_probe(11 + slot)),
+                )
+            })
             .into_any_element()
     }
     pub(super) fn cleanup_content(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -432,12 +516,18 @@ impl Desktop {
                     .child(caption(format!("{} analysis warning(s)", analysis.unwrap().warnings.len())))
                     .child(column().id("cleanup-warnings").max_h(px(96.)).overflow_y_scroll()
                         .children(analysis.into_iter().flat_map(|a| &a.warnings).cloned().map(caption)))))
-            .when(self.cleanup.loading, |s| s.child(row().px_4().py_3().child(gpui_component::spinner::Spinner::new().small()).child("Analyzing branches and storage…")))
+            .when(self.cleanup.loading, |s| s.child(row().px_4().py_3().child(gpui_component::spinner::Spinner::new().small()).child("Analyzing cleanup…")))
             .when(!self.cleanup.message.is_empty(), |s| s.child(caption(self.cleanup.message.clone()).px_4().py_2()))
             .child(self.cleanup_section(Section::FetchedOnly, cx))
             .child(self.cleanup_section(Section::Matching, cx))
             .child(self.cleanup_section(Section::OldLocal, cx))
             .child(self.cleanup_section(Section::MissingServer, cx))
+            .when(self.cleanup.collapsed_sections.len() == 4, |s| s.child(div().flex_1().min_h_0()))
+            .child(row().relative().children(self.branch_cleanup_probe(15)).h(px(30.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(LINE))
+                .child(Checkbox::new("cleanup-remove-tags").checked(self.cleanup.remove_tags)
+                    .label("Remove local tags unique to selected branches")
+                    .disabled(busy)
+                    .on_click(cx.listener(|v, checked: &bool, w, cx| v.cleanup_action(Action::RemoveTags(*checked), w, cx)))))
             .child(row().relative().children(self.branch_cleanup_probe(9)).h(px(40.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(LINE))
                 .child(div().flex_1())
                 .child(Button::new("cleanup-review").small().primary().label(format!("Review selected ({})…", self.cleanup.selected.len())).disabled(busy || self.cleanup.selected.is_empty())
@@ -471,12 +561,22 @@ impl Desktop {
         );
         self.cleanup_scenario_assert_scroll(true);
     }
+    pub(super) fn cleanup_scenario_graph_matches(&self, present: bool) -> bool {
+        let history = &self.engine.app.history;
+        history.complete
+            && (0..history.len())
+                .filter(|&i| history.subject(i).starts_with("Unique prerelease"))
+                .count()
+                == if present { 2 } else { 0 }
+    }
     pub(super) fn cleanup_scenario_assert_cached_presence(&self, present: bool) {
         let repo = gix::open(self.engine.repository_root().unwrap()).unwrap();
         for name in [
             "refs/heads/fixes/task-123",
             "refs/remotes/origin/fixes/task-123",
             "refs/remotes/origin/zz-stale/missing",
+            "refs/tags/cleanup-only-lightweight",
+            "refs/tags/cleanup-only-annotated",
         ] {
             assert_eq!(
                 repo.find_reference(name).is_ok(),
@@ -484,6 +584,7 @@ impl Desktop {
                 "Exact cleanup/Undo reference state: {name}"
             );
         }
+        assert!(repo.find_reference("refs/tags/cleanup-shared").is_ok());
         assert!(
             repo.find_reference("refs/heads/zz-stale/missing").is_err(),
             "Cached cleanup must never invent a local branch"

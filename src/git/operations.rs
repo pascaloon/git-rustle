@@ -1741,7 +1741,11 @@ fn execute_inner(
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
         Request::CreateStash(_) => "Stash pending changes".into(),
-        Request::Cleanup(plan) => format!("Cleanup {} branch entries", plan.branches.len()),
+        Request::Cleanup(plan) => format!(
+            "Cleanup {} branch entries and {} tags",
+            plan.branches.len(),
+            plan.tags.len()
+        ),
         Request::ApplyStash(stash) => format!("Apply stash {}", stash.subject),
         Request::PopStash(stash) => format!("Pop stash {}", stash.subject),
         Request::DropStash(stash) => format!("Delete stash {}", stash.subject),

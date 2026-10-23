@@ -43,6 +43,107 @@ pub struct Analysis {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub branches: Vec<Candidate>,
+    /// Exact local tag objects reviewed by the user, never server tags.
+    pub tags: Vec<Tag>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Tag {
+    pub name: String,
+    pub oid: String,
+}
+
+fn branch_deletions(branches: &[Candidate]) -> BTreeMap<String, String> {
+    let mut refs = BTreeMap::new();
+    for c in branches {
+        if !c.section.is_fetched_ref() {
+            refs.insert(format!("refs/heads/{}", c.name), c.oid.clone());
+        }
+        if let (Some((remote, branch)), Some(oid)) = (&c.tracking, &c.tracking_oid) {
+            refs.insert(format!("refs/remotes/{remote}/{branch}"), oid.clone());
+        }
+    }
+    refs
+}
+
+/// A tag belongs exclusively to this cleanup when its peeled commit is reachable
+/// from a removed local/cached branch, but from no retained local/cached branch
+/// or worktree HEAD. Recovery pins and other tags must not keep these graph rows
+/// alive. One batched walk avoids a Git process (and history walk) per tag.
+pub fn exclusive_tags(root: &Path, branches: &[Candidate]) -> Result<Vec<Tag>> {
+    let repo = super::super::open(root).map_err(err)?;
+    let raw = super::super::refs::raw_refs(&repo)?;
+    exclusive_tags_at(root, &repo, &raw, &branch_deletions(branches))
+}
+fn exclusive_tags_at(
+    root: &Path,
+    repo: &gix::Repository,
+    raw: &[super::super::refs::RawRef],
+    deletions: &BTreeMap<String, String>,
+) -> Result<Vec<Tag>> {
+    if deletions.is_empty() || !raw.iter().any(|r| r.name.starts_with("refs/tags/")) {
+        return Ok(Vec::new());
+    }
+    let mut revisions: BTreeSet<String> = deletions.values().cloned().collect();
+    for r in raw {
+        if (r.name.starts_with("refs/heads/") || r.name.starts_with("refs/remotes/"))
+            && !deletions.contains_key(&r.name)
+            && r.symbolic.is_none()
+            && let Some(id) = r.id
+        {
+            revisions.insert(format!("^{id}"));
+        }
+    }
+    // Includes detached HEADs on other worktrees as well as this checkout.
+    let worktrees = command::checked(root, &["worktree", "list", "--porcelain", "-z"])?;
+    for head in worktrees
+        .split(|b| *b == 0)
+        .filter_map(|s| s.strip_prefix(b"HEAD "))
+    {
+        let id = gix::ObjectId::from_hex(head).map_err(err)?;
+        if !id.is_null() {
+            revisions.insert(format!("^{id}"));
+        }
+    }
+    let input = revisions.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+    let out = command::run(
+        root,
+        &["rev-list", "--stdin"],
+        Some(input.as_bytes()),
+        Duration::from_secs(30),
+    )?;
+    if !out.status.success() {
+        return Err(command::clean(&String::from_utf8_lossy(&out.stderr)));
+    }
+    let text = std::str::from_utf8(&out.stdout).map_err(err)?;
+    let exclusive: HashSet<_> = text.lines().collect();
+    let aliases: HashSet<_> = raw.iter().filter_map(|r| r.symbolic.as_deref()).collect();
+    let mut tags = Vec::new();
+    for r in raw {
+        if !r.name.starts_with("refs/tags/")
+            || r.symbolic.is_some()
+            || aliases.contains(r.name.as_str())
+        {
+            continue;
+        }
+        let Some(id) = r.id else { continue };
+        // Preserve raw annotated/nested tag OIDs for exact Undo, comparing only
+        // peeled commits. Tree/blob tags cannot belong to a branch's history.
+        let Some(commit) = repo
+            .find_object(id)
+            .ok()
+            .and_then(|o| o.peel_to_kind(gix::object::Kind::Commit).ok())
+        else {
+            continue;
+        };
+        if exclusive.contains(commit.id.to_string().as_str()) {
+            tags.push(Tag {
+                name: r.name.clone(),
+                oid: id.to_string(),
+            });
+        }
+    }
+    tags.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tags)
 }
 
 fn checked_out(root: &Path) -> Result<HashSet<String>> {
@@ -398,6 +499,21 @@ pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
     let repo = super::super::open(&context.root).map_err(err)?;
     let refs = super::super::snapshot_refs(&repo).map_err(err)?;
     let final_raw = super::super::refs::raw_refs(&repo)?;
+    if !plan.tags.is_empty() {
+        let eligible: HashSet<_> = exclusive_tags_at(&context.root, &repo, &final_raw, &deletions)?
+            .into_iter()
+            .collect();
+        let mut seen = HashSet::new();
+        for tag in &plan.tags {
+            if !seen.insert(&tag.name) || !eligible.contains(tag) {
+                return Err(format!(
+                    "{} changed or is now reachable from a retained branch. Review cleanup again.",
+                    tag.name
+                ));
+            }
+            deletions.insert(tag.name.clone(), tag.oid.clone());
+        }
+    }
     let final_locals: HashSet<_> = final_raw
         .iter()
         .filter_map(|r| r.name.strip_prefix("refs/heads/"))
@@ -461,6 +577,18 @@ pub(super) fn apply(context: &Context, plan: &Plan) -> Result<()> {
                 "verify refs/remotes/{remote}/{branch} {}\n",
                 "0".repeat(candidate.oid.len())
             );
+        }
+    }
+    if !plan.tags.is_empty() {
+        for reference in &final_raw {
+            if (reference.name.starts_with("refs/heads/")
+                || reference.name.starts_with("refs/remotes/"))
+                && reference.symbolic.is_none()
+                && !deletions.contains_key(&reference.name)
+                && let Some(id) = reference.id
+            {
+                input += &format!("verify {} {id}\n", reference.name);
+            }
         }
     }
     for (name, oid) in deletions {
@@ -562,6 +690,249 @@ mod tests {
         }
     }
 
+    fn ordinary_refs(root: &Path) -> String {
+        output(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+        )
+        .unwrap()
+    }
+
+    fn unique_tagged_branch(f: &Fixture) -> Candidate {
+        let date = OsStr::new("2000-02-01T00:00:00Z");
+        let base = f.git(&["rev-parse", "main"]);
+        let tree = f.git(&["rev-parse", "main^{tree}"]);
+        let mut parent = base;
+        for message in ["prerelease ancestor", "prerelease tip"] {
+            let out = command::run_env(
+                &f.root,
+                &["commit-tree", &tree, "-p", &parent, "-m", message],
+                None,
+                Duration::from_secs(30),
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            )
+            .unwrap();
+            assert!(out.status.success());
+            parent = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        }
+        f.git(&["branch", "obsolete", &parent]);
+        f.git(&["tag", "pre-light", "obsolete~1"]);
+        f.git(&["tag", "-a", "pre-annotated", "obsolete", "-m", "prerelease"]);
+        f.git(&["tag", "-a", "pre-nested", "pre-annotated", "-m", "nested"]);
+        f.git(&["tag", "shared-release", "main"]);
+        f.git(&["tag", "tree-tag", "main^{tree}"]);
+        let unrelated = f.git(&["commit-tree", &tree, "-m", "unrelated"]);
+        f.git(&["tag", "unrelated", &unrelated]);
+        f.candidate("obsolete")
+    }
+
+    #[test]
+    fn cleanup_exclusive_tags_opt_in_and_exact_undo_redo_with_pending_work() {
+        for reftable in [false, true] {
+            let f = Fixture::new();
+            let branch = unique_tagged_branch(&f);
+            if reftable {
+                f.git(&["refs", "migrate", "--ref-format=reftable"]);
+            }
+            let before = ordinary_refs(&f.root);
+            let server = refs_at(&f.bare);
+            fs::write(f.root.join("file.txt"), "saved stash work\n").unwrap();
+            f.git(&["stash", "push", "-m", "unrelated saved work"]);
+            let stash = f.git(&["stash", "list", "--format=%H"]);
+            fs::write(f.root.join("file.txt"), "staged work\n").unwrap();
+            f.git(&["add", "file.txt"]);
+            fs::write(f.root.join("file.txt"), "unstaged work\n").unwrap();
+            fs::write(f.root.join("untracked.txt"), "keep me\n").unwrap();
+            let index = f.git(&["ls-files", "--stage"]);
+            // Default branch-only cleanup leaves all tags intact.
+            assert!(
+                f.run(Plan {
+                    branches: vec![branch.clone()],
+                    tags: Vec::new()
+                })
+                .result
+                .is_ok()
+            );
+            assert!(
+                f.git(&["show-ref", "--tags"])
+                    .contains("refs/tags/pre-light")
+            );
+            assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+            let tags = exclusive_tags(&f.root, std::slice::from_ref(&branch)).unwrap();
+            assert_eq!(
+                tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                [
+                    "refs/tags/pre-annotated",
+                    "refs/tags/pre-light",
+                    "refs/tags/pre-nested"
+                ]
+            );
+            assert!(
+                f.run(Plan {
+                    branches: vec![branch],
+                    tags
+                })
+                .result
+                .is_ok()
+            );
+            for cursor in [0, 1, 0] {
+                assert!(execute(&f.root, Request::MoveTo(cursor)).result.is_ok());
+                if cursor == 0 {
+                    assert_eq!(ordinary_refs(&f.root), before);
+                } else {
+                    assert!(!ordinary_refs(&f.root).contains("refs/tags/pre-"));
+                    for tag in ["shared-release", "tree-tag", "unrelated"] {
+                        f.git(&["rev-parse", &format!("refs/tags/{tag}")]);
+                    }
+                }
+                assert_eq!(f.git(&["ls-files", "--stage"]), index);
+                assert_eq!(f.git(&["stash", "list", "--format=%H"]), stash);
+                assert_eq!(
+                    fs::read_to_string(f.root.join("file.txt")).unwrap(),
+                    "unstaged work\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(f.root.join("untracked.txt")).unwrap(),
+                    "keep me\n"
+                );
+                assert_eq!(refs_at(&f.bare), server);
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_tags_preserve_retained_local_cached_and_detached_worktree_history() {
+        let f = Fixture::new();
+        let branch = unique_tagged_branch(&f);
+        for name in ["refs/heads/keep", "refs/remotes/origin/keep"] {
+            f.git(&["update-ref", name, &branch.oid]);
+            assert!(
+                exclusive_tags(&f.root, std::slice::from_ref(&branch))
+                    .unwrap()
+                    .is_empty()
+            );
+            f.git(&["update-ref", "-d", name]);
+        }
+        f.git(&["symbolic-ref", "refs/keep-tag", "refs/tags/pre-light"]);
+        assert_eq!(
+            exclusive_tags(&f.root, std::slice::from_ref(&branch))
+                .unwrap()
+                .len(),
+            2
+        );
+        f.git(&["symbolic-ref", "--delete", "refs/keep-tag"]);
+        let other = f._dir.path().join("detached");
+        f.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            other.to_str().unwrap(),
+            &branch.oid,
+        ]);
+        assert!(
+            exclusive_tags(&f.root, std::slice::from_ref(&branch))
+                .unwrap()
+                .is_empty()
+        );
+        f.git(&["worktree", "remove", other.to_str().unwrap()]);
+        assert_eq!(exclusive_tags(&f.root, &[branch]).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cleanup_tags_reject_moved_tag_or_new_retained_branch_without_deleting_anything() {
+        for change in ["moved-tag", "new-branch", "cached-branch"] {
+            let f = Fixture::new();
+            let branch = unique_tagged_branch(&f);
+            let tags = exclusive_tags(&f.root, std::slice::from_ref(&branch)).unwrap();
+            match change {
+                "moved-tag" => {
+                    f.git(&["tag", "-f", "pre-light", "main"]);
+                }
+                "new-branch" => {
+                    f.git(&["branch", "keep", "obsolete"]);
+                }
+                _ => {
+                    f.git(&["update-ref", "refs/remotes/origin/keep", &branch.oid]);
+                }
+            }
+            let before = ordinary_refs(&f.root);
+            assert!(
+                f.run(Plan {
+                    branches: vec![branch],
+                    tags
+                })
+                .result
+                .is_err()
+            );
+            assert_eq!(ordinary_refs(&f.root), before);
+        }
+    }
+
+    #[test]
+    fn cleanup_tags_require_all_branches_sharing_unique_history_to_be_selected() {
+        let f = Fixture::new();
+        let branch = unique_tagged_branch(&f);
+        f.git(&["branch", "obsolete-too", "obsolete"]);
+        assert!(
+            exclusive_tags(&f.root, std::slice::from_ref(&branch))
+                .unwrap()
+                .is_empty()
+        );
+        let branches = vec![branch, f.candidate("obsolete-too")];
+        let tags = exclusive_tags(&f.root, &branches).unwrap();
+        assert_eq!(tags.len(), 3);
+        assert!(f.run(Plan { branches, tags }).result.is_ok());
+        assert!(!ordinary_refs(&f.root).contains("refs/tags/pre-"));
+    }
+
+    #[test]
+    #[ignore = "one warmup and fifteen batched tag analysis/delete samples"]
+    fn benchmark_cleanup_tags() {
+        for sample in -1..15 {
+            let f = Fixture::new();
+            let branch = unique_tagged_branch(&f);
+            let mut input = String::new();
+            for i in 0..1500 {
+                input += &format!("create refs/tags/prerelease/{i:04} {}\n", branch.oid);
+            }
+            run(
+                &f.root,
+                &["update-ref", "--stdin"],
+                Some(input.as_bytes()),
+                &[],
+            )
+            .unwrap();
+            let before = ordinary_refs(&f.root);
+            let start = std::time::Instant::now();
+            let tags = exclusive_tags(&f.root, std::slice::from_ref(&branch)).unwrap();
+            let analysis_ms = start.elapsed().as_secs_f64() * 1000.;
+            assert_eq!(tags.len(), 1503);
+            let start = std::time::Instant::now();
+            assert!(
+                f.run(Plan {
+                    branches: vec![branch],
+                    tags
+                })
+                .result
+                .is_ok()
+            );
+            let delete_ms = start.elapsed().as_secs_f64() * 1000.;
+            let start = std::time::Instant::now();
+            assert!(execute(&f.root, Request::MoveTo(0)).result.is_ok());
+            assert_eq!(ordinary_refs(&f.root), before);
+            println!(
+                "{}",
+                serde_json::json!({"sample":sample,"tags":1503,"analysisMs":analysis_ms,"deleteMs":delete_ms,"undoMs":start.elapsed().as_secs_f64()*1000.})
+            );
+        }
+    }
+
     #[test]
     fn cleanup_matching_preserves_stale_cache_oid_through_undo_and_accepts_missing_cache() {
         let f = Fixture::new();
@@ -573,6 +944,7 @@ mod tests {
         let server = refs_at(&f.bare);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![branch.clone()]
             })
             .result
@@ -589,6 +961,7 @@ mod tests {
         assert!(branch.tracking_oid.is_none());
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![branch]
             })
             .result
@@ -624,6 +997,7 @@ mod tests {
         ]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![matched]
             })
             .result
@@ -632,6 +1006,7 @@ mod tests {
         assert!(f.git(&["rev-parse", "refs/heads/fixes/task-123"]).len() > 10);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![f.candidate("master")]
             })
             .result
@@ -647,6 +1022,7 @@ mod tests {
         let server = refs_at(&f.bare);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate.clone()]
             })
             .result
@@ -704,7 +1080,14 @@ mod tests {
             })
             .collect();
         assert_eq!(branches.len(), 300);
-        assert!(f.run(Plan { branches }).result.is_ok());
+        assert!(
+            f.run(Plan {
+                branches,
+                tags: Vec::new()
+            })
+            .result
+            .is_ok()
+        );
         assert!(
             f.git(&["for-each-ref", "refs/remotes/origin/fetched-batch/"])
                 .is_empty()
@@ -736,6 +1119,7 @@ mod tests {
         let server = refs_at(&f.bare);
         fs::write(f.root.join("unrelated.txt"), "preserved").unwrap();
         let outcome = f.run(Plan {
+            tags: Vec::new(),
             branches: vec![fetched, matched, old],
         });
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
@@ -811,7 +1195,14 @@ mod tests {
             && !c.protected
             && c.tracking_oid.as_deref() == Some(c.oid.as_str())));
         let server = refs_at(&f.bare);
-        assert!(f.run(Plan { branches }).result.is_ok());
+        assert!(
+            f.run(Plan {
+                branches,
+                tags: Vec::new()
+            })
+            .result
+            .is_ok()
+        );
         assert!(
             command::checked(
                 &f.root,
@@ -861,6 +1252,7 @@ mod tests {
         assert!(!candidate.protected);
         let before = refs_at(&f.bare);
         let outcome = f.run(Plan {
+            tags: Vec::new(),
             branches: vec![candidate],
         });
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
@@ -899,6 +1291,7 @@ mod tests {
         command::checked(&f.bare, &["update-ref", "refs/heads/orphan", &current]).unwrap();
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -914,6 +1307,7 @@ mod tests {
         f.git(&["update-ref", "refs/remotes/origin/orphan", &current]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -926,6 +1320,7 @@ mod tests {
         f.git(&["config", "remote.origin.url", other.to_str().unwrap()]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -950,6 +1345,7 @@ mod tests {
         );
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -989,6 +1385,7 @@ mod tests {
         assert!(candidate.protected);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -1019,6 +1416,7 @@ mod tests {
         let server = refs_at(&f.bare);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -1034,6 +1432,7 @@ mod tests {
         ]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -1051,6 +1450,7 @@ mod tests {
         .unwrap();
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -1082,6 +1482,7 @@ mod tests {
         );
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![candidate]
             })
             .result
@@ -1097,6 +1498,7 @@ mod tests {
     fn cleanup_server_stale_missing_and_offline_refs_are_not_matching() {
         let f = Fixture::new();
         let plan = Plan {
+            tags: Vec::new(),
             branches: vec![f.candidate("fixes/task-123")],
         };
         let old = f.git(&["rev-parse", "old/local"]);
@@ -1139,6 +1541,7 @@ mod tests {
             || c.name == "origin/fixes/task-123"));
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![branch]
             })
             .result
@@ -1149,6 +1552,7 @@ mod tests {
         f.git(&["worktree", "add", worktree.to_str().unwrap(), "old/local"]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![old]
             })
             .result
@@ -1195,6 +1599,7 @@ mod tests {
         f.git(&["update-ref", "refs/remotes/origin/fixes/task-123", &old.oid]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![matched, old.clone()]
             })
             .result
@@ -1214,6 +1619,7 @@ mod tests {
         ]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![matched]
             })
             .result
@@ -1247,7 +1653,14 @@ mod tests {
             .filter(|c| c.name.starts_with("large-cleanup/"))
             .collect();
         assert_eq!(branches.len(), 300);
-        assert!(f.run(Plan { branches }).result.is_ok());
+        assert!(
+            f.run(Plan {
+                branches,
+                tags: Vec::new()
+            })
+            .result
+            .is_ok()
+        );
         assert!(
             f.git(&["for-each-ref", "refs/heads/large-cleanup/"])
                 .is_empty()
@@ -1269,6 +1682,7 @@ mod tests {
         let dangling = f.git(&["commit-tree", "HEAD^{tree}", "-m", "preserve"]);
         assert!(
             f.run(Plan {
+                tags: Vec::new(),
                 branches: vec![branch.clone()]
             })
             .result
@@ -1352,7 +1766,10 @@ mod tests {
                 })
                 .collect();
             let start = std::time::Instant::now();
-            let result = f.run(Plan { branches });
+            let result = f.run(Plan {
+                branches,
+                tags: Vec::new(),
+            });
             assert!(result.result.is_ok(), "{:?}", result.result);
             let delete_ms = start.elapsed().as_secs_f64() * 1000.;
             assert_eq!(refs_at(&f.bare), server);

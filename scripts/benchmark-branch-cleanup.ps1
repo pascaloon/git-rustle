@@ -5,8 +5,10 @@ param(
     [string]$BaselineHarness,
     [string]$Repository,
     [ValidateRange(1,100)][int]$Samples=15,
+    [ValidateSet('branches-hierarchy','cleanup-review','cleanup-delete')][string[]]$Scenarios=@('branches-hierarchy','cleanup-review','cleanup-delete'),
     [switch]$ReviewDialogCapture,
     [switch]$MinimumWindow,
+    [switch]$CollapsedCapture,
     [ValidateSet('All','Cleanup')][string]$ComponentSet='All',
     [ValidateSet('Native','Components','Screenshots')][string[]]$Stages=@('Native','Components')
 )
@@ -20,7 +22,7 @@ $allowed=Join-Path $sourceRoot 'target/bench'
 if(!$OutputDirectory.StartsWith($allowed+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'Use workspace target/bench/<run>'}
 New-Item -ItemType Directory -Path $OutputDirectory -Force|Out-Null
 $saved=@{}
-$names=@(@(Get-ChildItem Env:|Where-Object Name -Match '^(GIT_|GIT_RUSTLE_)'|ForEach-Object Name)+@('LOCALAPPDATA','APPDATA','TEMP','TMP','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE','GIT_RUSTLE_DUMP','GIT_RUSTLE_BENCH_REPO','GIT_RUSTLE_BENCH_BRANCHES','GIT_RUSTLE_BENCH_WINDOW')|Select-Object -Unique)
+$names=@(@(Get-ChildItem Env:|Where-Object Name -Match '^(GIT_|GIT_RUSTLE_)'|ForEach-Object Name)+@('LOCALAPPDATA','APPDATA','TEMP','TMP','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE','GIT_RUSTLE_CLEANUP_COLLAPSED_CAPTURE','GIT_RUSTLE_DUMP','GIT_RUSTLE_BENCH_REPO','GIT_RUSTLE_BENCH_BRANCHES','GIT_RUSTLE_BENCH_WINDOW')|Select-Object -Unique)
 foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 function Git([string]$Path,[string[]]$Arguments){$lines=@(& git.exe -C $Path @Arguments 2>&1);if($LASTEXITCODE-ne0){throw "Fixture Git failed: $Arguments $($lines-join' ')"};($lines-join"`n").TrimEnd()}
 function Write-FixtureRefs([string]$Path,[string[]]$Commands){
@@ -77,7 +79,15 @@ function Fixture([string]$Root){
     # Optional last-copy cleanup is a separate unchecked fourth tree.
     # Forty numbered entries plus the legacy named ref exercise its own scrolling.
     foreach($index in 0..39){$localCommands.Add("create refs/remotes/origin/zz-stale/{0:d3} $old"-f$index)}
-    $localCommands.Add("create refs/remotes/origin/zz-stale/missing $old")
+    # Unique prerelease history on the selected missing-server ref. Other stale
+    # refs still point at old/main history, so the shared release must survive.
+    $pre=Git $working @('commit-tree','HEAD^{tree}','-p',$current,'-m','Unique prerelease ancestor')
+    $preTip=Git $working @('commit-tree','HEAD^{tree}','-p',$pre,'-m','Unique prerelease tip')
+    $localCommands.Add("create refs/remotes/origin/zz-stale/missing $preTip")
+    Git $working @('tag','cleanup-only-lightweight',$pre)|Out-Null
+    Git $working @('tag','-a','cleanup-only-annotated',$preTip,'-m','Prerelease')|Out-Null
+    Git $working @('tag','cleanup-shared',$current)|Out-Null
+    Git $working @('push','-q','origin','--tags')|Out-Null
     Write-FixtureRefs $working $localCommands.ToArray()
     Write-FixtureRefs $bare $serverCommands.ToArray()
     [IO.File]::WriteAllText((Join-Path $working '.git/git-rustle-cleanup-fixture'),'disposable branch cleanup fixture')
@@ -87,7 +97,9 @@ function Fingerprint([string]$Working){
     [pscustomobject]@{head=(Git $Working @('rev-parse','HEAD'));refs=(Git $Working @('for-each-ref','--format=%(refname) %(objectname)','refs/heads','refs/remotes','refs/tags'));status=(Git $Working @('status','--porcelain=v1'));index=(Git $Working @('ls-files','--stage'));file=(Get-FileHash (Join-Path $Working 'file.txt')).Hash;remote=(Git (Join-Path (Split-Path $Working) 'origin.git') @('for-each-ref','--format=%(refname) %(objectname)'))}
 }
 function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture){
-    Assert-Idle
+    # Captures are correctness/visual runs, never timing samples; unrelated
+    # compilation need not block private-desktop image review.
+    if(!$Capture){Assert-Idle}
     $launch=Join-Path $Directory "$Scenario-$Sample";New-Item -ItemType Directory -Path $launch|Out-Null
     $working=Fixture (Join-Path $launch 'fixture');$before=Fingerprint $working
     $env:LOCALAPPDATA=Join-Path $launch 'app-data';$env:APPDATA=Join-Path $launch 'roaming';New-Item -ItemType Directory -Path $env:LOCALAPPDATA,$env:APPDATA|Out-Null
@@ -97,6 +109,7 @@ function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture
     $env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_SCENARIO=$Scenario;$env:GIT_RUSTLE_AUTOQUIT=if($Capture){'60000'}else{'100'}
     if($Capture -and $ReviewDialogCapture -and $Scenario -eq 'cleanup-review'){$env:GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE='1'}else{Remove-Item Env:GIT_RUSTLE_CLEANUP_REVIEW_CAPTURE -ErrorAction SilentlyContinue}
     if($Capture){$env:GIT_RUSTLE_TRACE='1'}else{Remove-Item Env:GIT_RUSTLE_TRACE -ErrorAction SilentlyContinue}
+    if($Capture -and $CollapsedCapture){$env:GIT_RUSTLE_CLEANUP_COLLAPSED_CAPTURE='1'}else{Remove-Item Env:GIT_RUSTLE_CLEANUP_COLLAPSED_CAPTURE -ErrorAction SilentlyContinue}
     $env:GIT_RUSTLE_DUMP=Join-Path $launch 'state.txt';$log=Join-Path $launch 'app.log';$process=$null
     try{
         $process=Start-BenchmarkNativeProcess -FilePath $Candidate -ArgumentList @('"'+$working+'"','--no-cache') -RedirectStandardError $log
@@ -128,7 +141,7 @@ function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture
         $marks=@{};foreach($m in [regex]::Matches($text,'([\d.]+) ms  ([^\r\n]+)')){if(!$marks.ContainsKey($m.Groups[2].Value)){$marks[$m.Groups[2].Value]=[double]::Parse($m.Groups[1].Value,[cultureinfo]::InvariantCulture)}}
         if(!$marks.ContainsKey('branch cleanup requested')-or!$marks.ContainsKey('branch cleanup verified frame')){throw 'Missing measured native marks'}
         [pscustomobject]@{sample=$Sample;scenario=$Scenario;binary='candidate';minimumWindow=[bool]($Capture-and$MinimumWindow);workerMs=$marks['branch cleanup verified frame']-$marks['branch cleanup requested'];deleteMs=if($Scenario-eq'cleanup-delete'){$marks['cleanup delete frame']-$marks['cleanup delete requested']}else{$null};log=$log;capture=$Capture}
-    }finally{if($null-ne$process){$process.Dispose()};Assert-Idle}
+    }finally{if($null-ne$process){$process.Dispose()};if(!$Capture){Assert-Idle}}
 }
 function Harness([string]$Exe,[string]$Test,[string]$Log){Assert-Idle;& $Exe $Test --ignored --exact --nocapture 2>&1|Tee-Object -FilePath $Log;if($LASTEXITCODE-ne0){throw "Harness failed: $Log"};$text=Get-Content $Log -Raw;if($text-notmatch'running 1 test'-or$text-notmatch'test result: ok\. 1 passed;'){throw "Expected one passing harness: $Log"};Assert-Idle}
 try{
@@ -140,7 +153,7 @@ try{
     $sourceFiles=@(Get-ChildItem src,scripts -Recurse -File|Sort-Object FullName|ForEach-Object{[pscustomobject]@{path=$_.FullName;sha256=(Get-FileHash $_.FullName).Hash}})
     $hash=(Get-FileHash $Candidate).Hash
     [pscustomobject]@{candidate=$Candidate;sha256=$hash;samples=$Samples;stages=$Stages;componentSet=$ComponentSet;minimumWindow=[bool]$MinimumWindow;source=$sourceFiles}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $OutputDirectory "provenance-$([Guid]::NewGuid().ToString('N')).json")
-    if('Native'-in$Stages){$directory=New-Stage 'native';$rows=@();foreach($scenario in 'branches-hierarchy','cleanup-review','cleanup-delete'){Native $scenario -1 $directory $false|Out-Null;for($sample=0;$sample-lt$Samples;$sample++){$rows+=Native $scenario $sample $directory $false;$rows|ConvertTo-Json -Depth 6|Set-Content (Join-Path $directory 'samples.json')}}}
+    if('Native'-in$Stages){$directory=New-Stage 'native';$rows=@();foreach($scenario in $Scenarios){Native $scenario -1 $directory $false|Out-Null;for($sample=0;$sample-lt$Samples;$sample++){$rows+=Native $scenario $sample $directory $false;$rows|ConvertTo-Json -Depth 6|Set-Content (Join-Path $directory 'samples.json')}}}
     if('Components'-in$Stages){
         if(!$CandidateHarness){throw 'Components requires CandidateHarness'};$CandidateHarness=(Resolve-Path $CandidateHarness).Path;$directory=New-Stage 'components'
         $env:GIT_RUSTLE_BENCH_BRANCHES='1000';if($Repository){$env:GIT_RUSTLE_BENCH_REPO=(Resolve-Path $Repository).Path}
@@ -157,7 +170,8 @@ try{
             foreach($role in $roles){$exe=if($role-eq'baseline'){$BaselineHarness}else{$CandidateHarness};Harness $exe $test (Join-Path $directory "$role-$($test-replace'::','-').txt")}
         }
     }
-    if('Screenshots'-in$Stages){$directory=New-Stage 'screenshots';foreach($scenario in 'branches-hierarchy','cleanup-review'){Native $scenario 0 $directory $true|ConvertTo-Json -Depth 5|Set-Content (Join-Path $directory "$scenario.json")}}
+    if('Components'-in$Stages){Harness $CandidateHarness 'git::operations::cleanup::tests::benchmark_cleanup_tags' (Join-Path $directory 'candidate-cleanup-tags.txt')}
+    if('Screenshots'-in$Stages){$directory=New-Stage 'screenshots';foreach($scenario in $Scenarios){Native $scenario 0 $directory $true|ConvertTo-Json -Depth 5|Set-Content (Join-Path $directory "$scenario.json")}}
     $after=@(Get-ChildItem src,scripts -Recurse -File|Sort-Object FullName|ForEach-Object{[pscustomobject]@{path=$_.FullName;sha256=(Get-FileHash $_.FullName).Hash}})
     if((ConvertTo-Json -InputObject $sourceFiles -Compress)-cne(ConvertTo-Json -InputObject $after -Compress)-or(Get-FileHash $Candidate).Hash-cne$hash){throw 'Source or binary changed during run'}
     $limitations='Native features are candidate-only absolute costs. Fixtures use local bare remotes; every scenario verifies unchanged server refs. Missing-server cached refs are optional and initially unchecked; explicitly selected orphan cleanup is local-only. Mutation scenarios verify deletion and restore exact local/cached refs through Undo, Redo and final Undo. Native request-to-verified-frame intervals include recovery/state/paint scheduling, not just worker CPU. Minimum-window captures use900x600 diagnostic logical bounds and never enter timing samples. Repack retains recovery/unreachable objects; reported storage is Git-reported KiB, not physical allocated disk bytes. Screenshot launches are excluded from timing. Shared component controls retain baseline/candidate raw logs. These fixtures do not establish network behavior, physical input or display scanout.'
