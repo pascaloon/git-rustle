@@ -173,7 +173,7 @@ fn settings_file() -> Result<PathBuf, String> {
 
 pub fn prompt(settings: &Settings, task: Task, context: &str) -> Result<String, String> {
     settings.validate()?;
-    if context.len() > MAX_CONTEXT {
+    if task != Task::Summary && context.len() > MAX_CONTEXT {
         return Err("These changes exceed the AI context limit (256 KiB). Select fewer files or a smaller diff.".into());
     }
     Ok(format!(
@@ -184,14 +184,18 @@ pub fn prompt(settings: &Settings, task: Task, context: &str) -> Result<String, 
     ))
 }
 
-/// Collect the complete comparison, independently of the selected file or UI filters.
+/// Collect all changed hunks without duplicating entire before/after files.
+/// Summary input limits belong to the chosen CLI/model, not an arbitrary byte cap.
 pub fn diff_context(
     root: &Path,
     files: &[crate::diff::FileChange],
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     let repo = gix::open(root).map_err(|e| e.to_string())?;
-    let mut context = format!("Scope: Entire diff ({} files)\n", files.len());
+    let mut context = format!(
+        "Scope: Entire diff ({} files)\nFormat: Unified patches with three lines of unchanged context.\n",
+        files.len()
+    );
     for file in files {
         if cancel.load(Ordering::Acquire) {
             return Err("AI request cancelled".into());
@@ -200,22 +204,65 @@ pub fn diff_context(
         if let Some(old_path) = &file.old_path {
             context.push_str(&format!("Previous path: {old_path}\n"));
         }
+        if file.old.map(|side| side.kind) != file.new.map(|side| side.kind) {
+            context.push_str(&format!(
+                "File types/modes: {:?} -> {:?}\n",
+                file.old.map(|side| side.kind),
+                file.new.map(|side| side.kind)
+            ));
+        }
         let (old, new) = crate::diff::external_contents(&repo, file)
             .map_err(|e| format!("Cannot read {} for the whole diff summary: {e}", file.path))?;
+        context.push_str(&format!("File: {}\n", file.path));
         if old.contains(&0)
             || new.contains(&0)
             || std::str::from_utf8(&old).is_err()
             || std::str::from_utf8(&new).is_err()
         {
-            context.push_str(&format!("File: {}\nBinary or non-UTF-8 content; contents unavailable for summary. Before: {} bytes; after: {} bytes.\n", file.path, old.len(), new.len()));
+            context.push_str(&format!("Binary or non-UTF-8 content; contents unavailable for summary. Before: {} bytes; after: {} bytes.\n", old.len(), new.len()));
         } else {
-            context.push_str(&file_context(&file.path, &old, &new).map_err(|_| "The entire diff exceeds the AI context limit (256 KiB). Open a smaller comparison to summarize.".to_string())?);
-        }
-        if context.len() > MAX_CONTEXT {
-            return Err("The entire diff exceeds the AI context limit (256 KiB). Open a smaller comparison to summarize.".into());
+            let old = std::str::from_utf8(&old).unwrap();
+            let new = std::str::from_utf8(&new).unwrap();
+            let old_path = if file.old.is_none() {
+                "/dev/null"
+            } else {
+                file.old_path.as_deref().unwrap_or(&file.path)
+            };
+            let new_path = if file.kind == crate::diff::ChangeKind::Deleted {
+                "/dev/null"
+            } else {
+                &file.path
+            };
+            context.push_str(&format!("--- {old_path}\n+++ {new_path}\n"));
+            context.push_str(&unified_patch(old, new));
         }
     }
     Ok(context)
+}
+
+fn unified_patch(old: &str, new: &str) -> String {
+    use imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
+    let input = InternedInput::new(old, new);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    if diff.hunks().next().is_none() {
+        return "No textual changes (rename, mode/type change, or empty file).\n".into();
+    }
+    let mut patch = diff
+        .unified_diff(
+            &BasicLineDiffPrinter(&input.interner),
+            UnifiedDiffConfig::default(),
+            &input,
+        )
+        .to_string();
+    if old.ends_with('\n') != new.ends_with('\n') {
+        patch.push_str(&format!(
+            "End-of-file newline: {} -> {}\n",
+            old.ends_with('\n'),
+            new.ends_with('\n')
+        ));
+    }
+    patch
 }
 
 pub fn file_context(path: &str, old: &[u8], new: &[u8]) -> Result<String, String> {
@@ -516,7 +563,8 @@ mod tests {
         let text = prompt(&settings, Task::Conflict, "source data").unwrap();
         assert!(text.contains("Custom instructions"));
         assert!(text.contains(Task::Conflict.contract()));
-        assert!(prompt(&settings, Task::Summary, &"x".repeat(MAX_CONTEXT + 1)).is_err());
+        assert!(prompt(&settings, Task::Commit, &"x".repeat(MAX_CONTEXT + 1)).is_err());
+        assert!(prompt(&settings, Task::Summary, &"x".repeat(MAX_CONTEXT + 1)).is_ok());
     }
     #[test]
     fn whole_diff_reads_historical_files_renames_deletions_and_binary_metadata() {
@@ -571,7 +619,7 @@ mod tests {
             "deleted content",
             "Previous path: old-name.txt",
             "File: new-name.txt",
-            "rename content",
+            "No textual changes (rename, mode/type change, or empty file)",
             "File: image.bin",
             "Binary or non-UTF-8",
             "Before: 2 bytes; after: 3 bytes",
@@ -581,7 +629,7 @@ mod tests {
         assert!(!context.contains("unrelated live edit"));
     }
     #[test]
-    fn whole_diff_context_rejects_aggregate_overflow_and_cancellation() {
+    fn whole_diff_context_accepts_large_patches_and_cancellation() {
         let dir = tempfile::tempdir().unwrap();
         gix::init(dir.path()).unwrap();
         let files = ["first.txt", "second.txt"].map(|path| {
@@ -597,16 +645,40 @@ mod tests {
             }
         });
         assert!(diff_context(dir.path(), &files[..1], &AtomicBool::new(false)).is_ok());
-        assert!(
-            diff_context(dir.path(), &files, &AtomicBool::new(false))
-                .unwrap_err()
-                .contains("entire diff exceeds")
-        );
+        let context = diff_context(dir.path(), &files, &AtomicBool::new(false)).unwrap();
+        assert!(context.len() > MAX_CONTEXT);
+        let request = prompt(&Settings::default(), Task::Summary, &context).unwrap();
+        assert!(request.contains("File: first.txt") && request.contains("File: second.txt"));
         assert!(
             diff_context(dir.path(), &files, &AtomicBool::new(true))
                 .unwrap_err()
                 .contains("cancelled")
         );
+    }
+    #[test]
+    fn summary_patch_omits_large_unchanged_regions_and_keeps_every_hunk() {
+        let before = (0..30000)
+            .map(|n| format!("original line {n:05} with unchanged context\n"))
+            .collect::<String>();
+        let after = before
+            .replace("original line 10000", "first meaningful edit")
+            .replace("original line 20000", "second meaningful edit");
+        assert!(before.len() + after.len() > MAX_CONTEXT * 8);
+        let patch = unified_patch(&before, &after);
+        assert!(patch.len() < 2048);
+        assert_eq!(patch.matches("@@ -").count(), 2);
+        for text in [
+            "-original line 10000",
+            "+first meaningful edit",
+            "-original line 20000",
+            "+second meaningful edit",
+            " original line 09999",
+            " original line 20001",
+        ] {
+            assert!(patch.contains(text), "Missing {text}: {patch}");
+        }
+        assert!(!patch.contains("original line 15000"));
+        assert!(unified_patch("old", "new\n").contains("End-of-file newline: false -> true"));
     }
     #[test]
     fn process_drains_both_pipes_and_reports_failures() {

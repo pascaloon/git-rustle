@@ -41,6 +41,10 @@ fn main() {
         assert!(input.contains("Pending documentation update"));
         assert!(input.contains("File: notes.txt"));
         assert!(input.contains("Untracked fixture notes"));
+        assert!(input.len() > 256 * 1024, "Large summaries must reach the CLI");
+        assert!(input.contains("@@ -"));
+        assert!(!input.contains("--- BEFORE ---"));
+        assert!(input.contains("+Expanded AI summary fixture line 9999 with relevant changes"));
         "Summary fixture\n\n- Update the documentation and add supporting notes.\n- Summarize the complete comparison across both files.".into()
     };
     if codex {

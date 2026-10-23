@@ -157,14 +157,15 @@ Native Windows installations and npm's Node launchers are supported.
   leaves the merge paused in **Conflicts**. Completed merges support Undo / Redo.
 - **Summarize all files with AI** in the overall Diff toolbar summarizes every
   file in the current comparison together, including files hidden by search or
-  unchecked for commit. Binary changes are included as metadata. Comparisons
-  exceeding the 256 KiB context limit require a smaller comparison.
+  unchecked for commit. It sends unified diff hunks with nearby context instead
+  of complete file snapshots. Binary changes are included as metadata. Summaries
+  have no app-imposed total input limit; the chosen CLI/model's context limit applies.
 - **Auto-fill** beside the commit heading writes a description using only checked
   files, including untracked files. Edit it before committing.
 
 Each action has a sparkle icon. Work runs in a hidden CLI process and can be
-cancelled. Requests time out after five minutes. Context is limited to 256 KiB;
-select fewer files or a smaller range for larger changes. CLI sessions use an
+cancelled. Requests time out after five minutes. Other AI actions retain a
+256 KiB context limit. CLI sessions use an
 isolated temporary directory; Codex uses its read-only sandbox and Claude has
 tools disabled. Automatic merges and rebases use the app's guarded Git operations to
 apply changes. Progress and **Cancel AI** appear inside the existing app status

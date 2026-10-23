@@ -60,6 +60,7 @@ prepends only that fixture directory to PATH, seeds isolated global AI settings,
 and retains the submitted context. Native assertions wait for worker completion
 and actual GPUI paint bounds. They verify selected-file messages, editable
 resolutions, whole-diff summaries including unchecked/search-hidden files,
+summary patches larger than the former 256 KiB cap reaching the CLI intact,
 automatic rebase completion across commits/files, automatic merge
 completion with both parents preserved, global settings
 saves, cancellation, stale drafts and CLI errors. Every AI scenario asserts that

@@ -118,6 +118,11 @@ try {
             @{ provider = $AiProvider; model = 'fixture-model' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir 'ai.json')
             [IO.File]::WriteAllText((Join-Path $settingsDir 'tools.json'),'{"scanned":true,"tools":[]}')
             $env:GIT_RUSTLE_AI_FIXTURE_LOG = Join-Path $directory 'ai-context.txt'
+            if ($scenario -eq 'ai-summary') {
+                # A real patch larger than the former 256 KiB cap must reach the CLI intact.
+                $summaryNotes = "Untracked fixture notes`n" + ((0..9999 | ForEach-Object { "Expanded AI summary fixture line $_ with relevant changes`n" }) -join '')
+                [IO.File]::WriteAllText((Join-Path $fixture 'notes.txt'),$summaryNotes)
+            }
             if ($scenario -like 'ai-rebase*' -or $scenario -like 'ai-merge*') {
                 [IO.File]::AppendAllText((Join-Path $fixture '.git/info/exclude'),"`nnotes.txt`n")
                 Invoke-FixtureGit $fixture @('restore','README.md') | Out-Null
