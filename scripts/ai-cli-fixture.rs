@@ -8,6 +8,15 @@ fn main() {
         assert!(args.windows(2).any(|a| a == ["--sandbox", "read-only"]));
         assert!(args.iter().any(|a| a == "--ephemeral"));
     } else {
+        let safe_mode = args.iter().any(|a| a == "--safe-mode");
+        let log = PathBuf::from(std::env::var_os("GIT_RUSTLE_AI_FIXTURE_LOG").unwrap()).with_extension("invocations.txt");
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+        writeln!(log, "safe-mode={safe_mode}").unwrap();
+        if std::env::var_os("GIT_RUSTLE_AI_FIXTURE_LEGACY").is_some() {
+            if safe_mode { eprintln!("error: unknown option '--safe-mode'"); std::process::exit(1); }
+        } else {
+            assert!(safe_mode, "Supported Claude must use safe mode");
+        }
         assert!(args.iter().any(|a| a == "--print"));
         assert!(args.windows(2).any(|a| a[0] == "--tools" && a[1].is_empty()));
         assert!(args.iter().any(|a| a == "--strict-mcp-config"));

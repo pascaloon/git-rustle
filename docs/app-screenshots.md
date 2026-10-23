@@ -52,6 +52,7 @@ executables; they do not contact a provider or require authentication:
   -Scenarios @('ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error') `
   -AiProvider Codex -OutputDirectory .\target\bench\ai-codex
 # Repeat with -AiProvider Claude and a new output directory.
+# Add -LegacyClaude with the Claude fixture to test older CLI flag fallback.
 # Use -WindowSize 900x600 for AI layout checks at the minimum supported size.
 ```
 

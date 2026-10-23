@@ -168,7 +168,10 @@ cancelled. Requests time out after five minutes. Other AI actions retain a
 256 KiB context limit. CLI sessions use an
 isolated temporary directory; Codex uses its read-only sandbox and Claude has
 tools disabled. Automatic merges and rebases use the app's guarded Git operations to
-apply changes. Progress and **Cancel AI** appear inside the existing app status
+apply changes. Claude uses safe mode to reduce customization startup while keeping
+its normal authentication and managed policy enforcement. Older CLIs that reject
+the flag fall back automatically; that decision is remembered until the app restarts.
+Progress and **Cancel AI** appear inside the existing app status
 bar. Results that arrive after a manually edited draft changes do not overwrite it.
 Your selected provider receives the supplied source text through its CLI.
 

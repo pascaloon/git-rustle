@@ -6,9 +6,11 @@ param(
     [ValidateRange(10,120)][int]$TimeoutSeconds = 30,
     [ValidateSet('Codex','Claude')][string]$AiProvider = 'Codex',
     [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
+    [switch]$LegacyClaude,
     [switch]$DisableDirectComposition
 )
 $ErrorActionPreference = 'Stop'
+if ($LegacyClaude -and $AiProvider -ne 'Claude') { throw 'LegacyClaude requires the Claude fixture provider' }
 if($Scenarios -contains 'remote-checkout'){
     if($Scenarios.Count-ne1){throw 'Capture remote checkout separately'}
     & "$PSScriptRoot/benchmark-remote-checkout.ps1" -Candidate $Candidate -Screenshots -OutputDirectory $OutputDirectory
@@ -28,7 +30,7 @@ New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
 $saved = @{}
 $names = @(@(Get-ChildItem Env: | Where-Object { $_.Name -match '^(GIT_|GIT_RUSTLE_)' } | ForEach-Object Name) + @(
     'PATH','LOCALAPPDATA','APPDATA','GPUI_DISABLE_DIRECT_COMPOSITION','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_GLOBAL','GIT_TERMINAL_PROMPT',
-    'GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_AI_FIXTURE_LOG'
+    'GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_AI_FIXTURE_LOG','GIT_RUSTLE_AI_FIXTURE_LEGACY'
 ) | Select-Object -Unique)
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 $results = [Collections.Generic.List[object]]::new()
@@ -118,6 +120,7 @@ try {
             @{ provider = $AiProvider; model = 'fixture-model' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir 'ai.json')
             [IO.File]::WriteAllText((Join-Path $settingsDir 'tools.json'),'{"scanned":true,"tools":[]}')
             $env:GIT_RUSTLE_AI_FIXTURE_LOG = Join-Path $directory 'ai-context.txt'
+            if ($LegacyClaude) { $env:GIT_RUSTLE_AI_FIXTURE_LEGACY = '1' }
             if ($scenario -eq 'ai-summary') {
                 # A real patch larger than the former 256 KiB cap must reach the CLI intact.
                 $summaryNotes = "Untracked fixture notes`n" + ((0..9999 | ForEach-Object { "Expanded AI summary fixture line $_ with relevant changes`n" }) -join '')
@@ -230,6 +233,14 @@ try {
                     $ai = Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'git-rustle/ai.json') -Raw | ConvertFrom-Json
                     if ($ai.provider -cne $AiProvider -or $ai.model -cne 'fixture-model' -or $ai.prompts.Count -ne 5 -or $ai.prompts[2] -notmatch 'behavior') { throw 'Global AI settings were not persisted correctly' }
                 } elseif ($scenario -ne 'ai-cancel' -and !(Test-Path -LiteralPath $env:GIT_RUSTLE_AI_FIXTURE_LOG)) { throw 'AI request did not invoke the deterministic CLI' }
+                if ($AiProvider -eq 'Claude' -and $scenario -ne 'ai-settings') {
+                    $invocations=[IO.File]::ReadAllLines([IO.Path]::ChangeExtension($env:GIT_RUSTLE_AI_FIXTURE_LOG,'invocations.txt'))
+                    if ($LegacyClaude) {
+                        if ($invocations.Count -lt 2 -or $invocations[0] -cne 'safe-mode=true' -or @($invocations | Select-Object -Skip 1 | Where-Object { $_ -cne 'safe-mode=false' }).Count) { throw 'Legacy Claude did not fall back once and remember the unsupported flag' }
+                        if ($scenario -eq 'ai-merge' -and $invocations.Count -ne 3) { throw 'Legacy Claude repeated the unsupported flag probe for another conflict file' }
+                    } elseif (@($invocations | Where-Object { $_ -cne 'safe-mode=true' }).Count) { throw 'Supported Claude did not use safe mode' }
+                    $result['claudeSafeModeVerified']=$true
+                }
             }
         } finally {
             if ($null -ne $process) {
@@ -252,6 +263,7 @@ try {
         schemaVersion = 1; success = ($null -eq $failure); error = $failure
         candidate = $Candidate; sha256 = (Get-FileHash -LiteralPath $Candidate).Hash
         directCompositionDisabled = [bool]$DisableDirectComposition
+        legacyClaudeFixture = [bool]$LegacyClaude
         scenarios = @($results.ToArray())
         limitations = 'Inspect PNGs for appearance. Capture sanity checks cannot prove complete rendering or interaction feel. These runs are excluded from performance comparisons.'
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.json') -Encoding utf8

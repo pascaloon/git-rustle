@@ -15,6 +15,8 @@ use std::{
 pub const MAX_CONTEXT: usize = 256 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(300);
+// Remember legacy CLI support for this app process, avoiding a probe on every request.
+static CLAUDE_SAFE_MODE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provider {
@@ -342,47 +344,57 @@ pub fn run(
     context: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
-    let input = prompt(settings, task, context)?;
+    let input: Arc<str> = prompt(settings, task, context)?.into();
     let scratch = Scratch::new()?;
     let answer = scratch.0.join("answer.txt");
-    let mut command = cli_command(settings.provider)?;
-    match settings.provider {
-        Provider::Codex => {
-            command
-                .args([
-                    "exec",
-                    "--sandbox",
-                    "read-only",
-                    "--skip-git-repo-check",
-                    "--ephemeral",
-                    "--color",
-                    "never",
-                    "--output-last-message",
-                ])
-                .arg(&answer);
+    let execute = |safe_mode: bool| {
+        let mut command = cli_command(settings.provider)?;
+        match settings.provider {
+            Provider::Codex => {
+                command
+                    .args([
+                        "exec",
+                        "--sandbox",
+                        "read-only",
+                        "--skip-git-repo-check",
+                        "--ephemeral",
+                        "--color",
+                        "never",
+                        "--output-last-message",
+                    ])
+                    .arg(&answer);
+            }
+            Provider::Claude => {
+                if safe_mode {
+                    command.arg("--safe-mode");
+                }
+                command.args([
+                    "--print",
+                    "--output-format",
+                    "text",
+                    "--tools",
+                    "",
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    "{\"mcpServers\":{}}",
+                    "--no-session-persistence",
+                ]);
+            }
         }
-        Provider::Claude => {
-            command.args([
-                "--print",
-                "--output-format",
-                "text",
-                "--tools",
-                "",
-                "--strict-mcp-config",
-                "--mcp-config",
-                "{\"mcpServers\":{}}",
-                "--no-session-persistence",
-            ]);
+        if !settings.model.trim().is_empty() {
+            command.arg("--model").arg(settings.model.trim());
         }
-    }
-    if !settings.model.trim().is_empty() {
-        command.arg("--model").arg(settings.model.trim());
-    }
-    if settings.provider == Provider::Codex {
-        command.arg("-");
-    }
-    command.current_dir(&scratch.0);
-    let output = run_process(command, input, cancel, TIMEOUT)?;
+        if settings.provider == Provider::Codex {
+            command.arg("-");
+        }
+        command.current_dir(&scratch.0);
+        run_process(command, input.clone(), cancel.clone(), TIMEOUT)
+    };
+    let output = if settings.provider == Provider::Claude {
+        run_claude_with_compatibility(&CLAUDE_SAFE_MODE_UNSUPPORTED, execute)?
+    } else {
+        execute(false)?
+    };
     let text = if settings.provider == Provider::Codex {
         let file = std::fs::File::open(&answer)
             .map_err(|e| format!("Codex did not return a final response: {e}"))?;
@@ -403,9 +415,33 @@ pub fn run(
     Ok(text)
 }
 
+fn run_claude_with_compatibility(
+    unsupported: &AtomicBool,
+    execute: impl Fn(bool) -> Result<String, String>,
+) -> Result<String, String> {
+    let safe_mode = !unsupported.load(Ordering::Acquire);
+    match execute(safe_mode) {
+        Err(error)
+            if safe_mode
+                && error.starts_with("AI CLI failed (")
+                && [
+                    "error: unknown option '--safe-mode'",
+                    "error: unknown argument '--safe-mode'",
+                    "error: unrecognized option '--safe-mode'",
+                ]
+                .iter()
+                .any(|diagnostic| error.contains(diagnostic)) =>
+        {
+            unsupported.store(true, Ordering::Release);
+            execute(false)
+        }
+        result => result,
+    }
+}
+
 fn run_process(
     mut command: Command,
-    input: String,
+    input: Arc<str>,
     cancel: Arc<AtomicBool>,
     timeout: Duration,
 ) -> Result<String, String> {
@@ -517,6 +553,62 @@ fn run_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supported_claude_uses_safe_mode_without_a_help_probe() {
+        let unsupported = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            run_claude_with_compatibility(&unsupported, |safe| {
+                assert!(safe);
+                calls.set(calls.get() + 1);
+                Ok("answer".into())
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.get(), 2);
+    }
+    #[test]
+    fn legacy_claude_retries_unsupported_flag_once_and_remembers_it() {
+        let unsupported = AtomicBool::new(false);
+        let calls = std::cell::RefCell::new(Vec::new());
+        for _ in 0..2 {
+            run_claude_with_compatibility(&unsupported, |safe| {
+                calls.borrow_mut().push(safe);
+                if safe {
+                    Err("AI CLI failed (exit code: 1). error: unknown option '--safe-mode'".into())
+                } else {
+                    Ok("answer".into())
+                }
+            })
+            .unwrap();
+        }
+        assert_eq!(*calls.borrow(), [true, false, false]);
+    }
+    #[test]
+    fn claude_runtime_errors_are_never_retried_or_downgraded() {
+        for error in [
+            "AI CLI failed (exit code: 1). Sign in first",
+            "AI request cancelled",
+            "AI request timed out after five minutes",
+            "Cannot start AI CLI: file not found",
+            "AI CLI failed (exit code: 1). error: unknown option '--different-flag'",
+            "error: unknown option '--safe-mode'",
+        ] {
+            let unsupported = AtomicBool::new(false);
+            let calls = std::cell::Cell::new(0);
+            assert_eq!(
+                run_claude_with_compatibility(&unsupported, |safe| {
+                    assert!(safe);
+                    calls.set(calls.get() + 1);
+                    Err(error.into())
+                })
+                .unwrap_err(),
+                error
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(!unsupported.load(Ordering::Acquire));
+        }
+    }
     #[test]
     fn global_settings_round_trip_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -702,9 +794,14 @@ mod tests {
             "[Console]::Error.Write('Sign in first'); exit 1",
         ]);
         assert!(
-            run_process(cmd, String::new(), Arc::default(), Duration::from_secs(15))
-                .unwrap_err()
-                .contains("Sign in first")
+            run_process(
+                cmd,
+                String::new().into(),
+                Arc::default(),
+                Duration::from_secs(15)
+            )
+            .unwrap_err()
+            .contains("Sign in first")
         );
     }
     #[test]
@@ -719,7 +816,7 @@ mod tests {
         assert!(
             run_process(
                 cmd,
-                String::new(),
+                String::new().into(),
                 Arc::default(),
                 Duration::from_millis(100)
             )
@@ -727,9 +824,14 @@ mod tests {
         );
         let cancel = Arc::new(AtomicBool::new(true));
         assert!(
-            run_process(Command::new("nonexistent"), String::new(), cancel, TIMEOUT)
-                .unwrap_err()
-                .contains("cancelled")
+            run_process(
+                Command::new("nonexistent"),
+                String::new().into(),
+                cancel,
+                TIMEOUT
+            )
+            .unwrap_err()
+            .contains("cancelled")
         );
     }
 }
