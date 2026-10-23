@@ -1,9 +1,10 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
+    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-polish-detached','graph-commit-menu','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [switch]$DisableDirectComposition,
+    [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
     [string]$IdleWorkspaceRoot="$PSScriptRoot/..",
     [Parameter(Mandatory)][string]$OutputDirectory
 )
@@ -52,11 +53,13 @@ function New-SelectionBoundaryFixture([string]$Fixture){
     }finally{$env:GIT_AUTHOR_DATE=$previousAuthorDate;$env:GIT_COMMITTER_DATE=$previousCommitterDate}
 }
 try{
+    $previousBenchWindow=$env:GIT_RUSTLE_BENCH_WINDOW
+    $env:GIT_RUSTLE_BENCH_WINDOW=$WindowSize
     if($DisableDirectComposition){$env:GPUI_DISABLE_DIRECT_COMPOSITION='1'}
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-polish-detached','graph-commit-menu','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
             if(!$Screenshots){Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path $IdleWorkspaceRoot).Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
@@ -75,11 +78,12 @@ try{
             if($scenario-eq'graph-branch-menu-edge'){
                 foreach($n in 0..15){Graph-Git $fixture @('update-ref',("refs/heads/long-menu-{0:d2}" -f $n),'topic')|Out-Null}
             }
-            if($scenario-eq'graph-polish'){
+            if($scenario-like'graph-polish*'){
                 Graph-Git $fixture @('merge','--no-ff','topic','-m','Merge dense graph fixture')|Out-Null
                 Graph-Git $fixture @('update-ref','refs/remotes/origin/fetched','HEAD')|Out-Null
                 Graph-Git $fixture @('config','branch.main.remote','origin')|Out-Null
                 Graph-Git $fixture @('config','branch.main.merge','refs/heads/server-only')|Out-Null
+                if($scenario-eq'graph-polish-detached'){Graph-Git $fixture @('checkout','--detach','main')|Out-Null}
                 Set-Content -LiteralPath (Join-Path $fixture 'pending.txt') -Value 'Pending graph polish fixture'
             }
             if($scenario-eq'detached-commit'){
@@ -91,6 +95,12 @@ try{
                 Graph-Git $fixture @('update-ref','refs/remotes/origin/main','HEAD')|Out-Null
                 Graph-Git $fixture @('reset','--hard','HEAD~1')|Out-Null
                 Set-Content -LiteralPath (Join-Path $fixture 'pending.txt') -Value 'Pending beside incoming remote history'
+            }
+            if($scenario-like'graph-new-branch*'){
+                Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value 'staged branch work'
+                Graph-Git $fixture @('add','file.txt')|Out-Null
+                Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value 'unstaged branch work'
+                Set-Content -LiteralPath (Join-Path $fixture 'untracked.txt') -Value 'untracked branch work'
             }
             if($scenario-like'stash-*'){
                 foreach($stashNumber in 1..3){
@@ -159,6 +169,7 @@ try{
         }
     }
 }finally{
+    $env:GIT_RUSTLE_BENCH_WINDOW=$previousBenchWindow
     foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}
     @{candidate=$Candidate;sha256=(Get-FileHash -LiteralPath $Candidate).Hash;screenshots=$Screenshots;directCompositionDisabled=[bool]$DisableDirectComposition;limitations='Candidate-only real actions through verified GPUI paint on private desktops. Capture runs are separate from timing. Does not measure physical input, scanout or employer network.'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
 }

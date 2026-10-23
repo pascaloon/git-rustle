@@ -973,10 +973,10 @@ impl App {
                     .collect(),
             );
         }
-        if let Some(id) = refs.head_id {
+        if let Some(id) = refs.head_id.filter(|_| refs.head_branch.is_none()) {
             let head_labels = labels.entry(id).or_default();
-            // Keep HEAD explicit and first even when the checked-out branch has
-            // a long name. Detached snapshots already contain this label.
+            // Only detached checkouts need an explicit HEAD label. Attached
+            // checkouts use their highlighted local branch name instead.
             if !head_labels
                 .iter()
                 .any(|label| label.kind == RefKind::Head && label.name == "HEAD")
@@ -2383,7 +2383,7 @@ mod tests {
     }
 
     #[test]
-    fn head_badge_is_visible_attached_detached_and_after_ref_updates() {
+    fn checkout_badge_uses_branch_when_attached_and_head_only_when_detached() {
         use crate::git::RefEntry;
         let mut app = app_with(3);
         let first = app.history.commits[0].id;
@@ -2400,8 +2400,9 @@ mod tests {
             ..Default::default()
         });
         let labels = &app.labels[&first];
-        assert_eq!(labels[0].name, "HEAD");
-        assert_eq!(labels[1].name, branch);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].name, branch);
+        assert_eq!(labels[0].kind, RefKind::Head);
         // The badge is display metadata, not a new branch or checkout target.
         assert_eq!(app.refs.as_ref().unwrap().refs.len(), 1);
         app.branches.show(app.refs.as_ref());
@@ -2413,12 +2414,18 @@ mod tests {
             crate::ui::list::draw(&mut app, &mut screen, Rect::new(0, 0, width, 3), 0);
             let row = &screen.test_cells()[..width as usize];
             let text: String = row.iter().map(|cell| cell.ch).collect();
-            let pos = row
-                .windows(4)
-                .position(|cells| cells.iter().map(|cell| cell.ch).eq("HEAD".chars()));
-            let pos = pos.unwrap_or_else(|| panic!("Missing HEAD at width {width}: {text}"));
-            for cell in &row[pos..pos + 4] {
-                assert_eq!(cell.style.bg, crate::ui::theme::FG_HEAD);
+            assert!(!text.contains("HEAD"));
+            let highlighted: Vec<_> = row
+                .iter()
+                .filter(|cell| {
+                    cell.style.bg == crate::ui::theme::FG_HEAD && !cell.ch.is_whitespace()
+                })
+                .collect();
+            assert!(
+                !highlighted.is_empty(),
+                "Missing checkout badge at width {width}: {text}"
+            );
+            for cell in highlighted {
                 assert_ne!(cell.style.attrs & crate::term::screen::BOLD, 0);
             }
             let other_row: String = screen.test_cells()[width as usize..width as usize * 2]
@@ -2449,6 +2456,18 @@ mod tests {
             .map(|cell| cell.ch)
             .collect();
         assert_eq!(text.matches("HEAD").count(), 1);
+        app.set_refs(RefSnapshot {
+            head_id: Some(last),
+            head_branch: Some("topic".into()),
+            refs: vec![RefEntry {
+                name: "topic".into(),
+                id: last,
+                kind: RefKind::Head,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(app.labels[&last].len(), 1);
+        assert_eq!(app.labels[&last][0].name, "topic");
         app.set_refs(RefSnapshot::default());
         assert!(app.labels.is_empty()); // Unborn HEAD has no commit to label.
     }

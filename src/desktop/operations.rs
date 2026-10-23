@@ -1,7 +1,8 @@
 //! Contextual graph actions and focused recovery views.
 use super::rebase::{CommitAction, Draft};
 use super::*;
-use crate::git::operations::{PushPreview, PushRisk, Request, Resolution};
+use crate::git::operations::{PushPreview, PushRisk, Request, ResetMode, Resolution};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use std::collections::HashMap;
 mod history;
@@ -12,6 +13,7 @@ pub(super) enum Dialog {
     CreateTag,
     Rename,
     Delete,
+    Reset,
     Merge,
     Rebase,
     Plan,
@@ -21,6 +23,8 @@ pub(super) enum Dialog {
 pub(super) enum Action {
     Open(Dialog, String, String),
     Submit,
+    ResetMode(ResetMode),
+    ForceDelete(bool),
     Pull,
     CherryPick(Vec<String>),
     StartPlan,
@@ -52,6 +56,8 @@ pub(super) struct Panel {
     current_branch: String,
     current_head: String,
     dialog: Option<Dialog>,
+    reset_mode: ResetMode,
+    force_delete: bool,
     push: Option<PushPreview>,
     push_pending: bool,
     pub rebase_open: bool,
@@ -138,6 +144,8 @@ impl Panel {
             current_branch: String::new(),
             current_head: String::new(),
             dialog: None,
+            reset_mode: ResetMode::Mixed,
+            force_delete: false,
             push: None,
             push_pending: false,
             rebase_open: false,
@@ -164,6 +172,18 @@ impl Panel {
     }
 }
 impl Desktop {
+    pub(super) fn set_branch_scenario_name(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert_eq!(self.operations.dialog, Some(Dialog::Create));
+        self.operations.name.update(cx, |state, cx| {
+            state.set_value(name.to_string(), window, cx)
+        });
+    }
+
     pub(super) fn set_tag_scenario_inputs(
         &mut self,
         name: &str,
@@ -339,8 +359,18 @@ impl Desktop {
             return;
         }
         let request = match action {
+            Action::ResetMode(mode) => {
+                self.operations.reset_mode = mode;
+                None
+            }
+            Action::ForceDelete(force) => {
+                self.operations.force_delete = force;
+                None
+            }
             Action::Open(dialog, target, label) => {
                 self.operations.dialog = Some(dialog);
+                self.operations.reset_mode = ResetMode::Mixed;
+                self.operations.force_delete = false;
                 self.operations.dialog_error = None;
                 self.operations.target = target;
                 self.operations.label = label;
@@ -386,7 +416,7 @@ impl Desktop {
                 let target = self.operations.target.clone();
                 let name = self.operations.name.read(cx).value().trim().to_string();
                 let request = match self.operations.dialog {
-                    Some(Dialog::Create) => Some(Request::Create { name, target }),
+                    Some(Dialog::Create) => Some(Request::CreateAndCheckout { name, target }),
                     Some(Dialog::CreateTag) => {
                         let message = self
                             .operations
@@ -408,7 +438,11 @@ impl Desktop {
                     }),
                     Some(Dialog::Delete) => Some(Request::Delete {
                         name: target,
-                        force: false,
+                        force: self.operations.force_delete,
+                    }),
+                    Some(Dialog::Reset) => Some(Request::Reset {
+                        target,
+                        mode: self.operations.reset_mode,
                     }),
                     Some(Dialog::Merge) => Some(Request::Merge(target)),
                     Some(Dialog::Rebase) => Some(Request::Rebase(target)),
@@ -427,7 +461,13 @@ impl Desktop {
                     None => None,
                 };
                 let request = request.map(|r| {
-                    if matches!(r, Request::Merge(_) | Request::Rebase(_) | Request::Plan(_)) {
+                    if matches!(
+                        r,
+                        Request::Merge(_)
+                            | Request::Rebase(_)
+                            | Request::Plan(_)
+                            | Request::Reset { .. }
+                    ) {
                         Request::OnBranch {
                             branch: self.operations.current_branch.clone(),
                             head: self.operations.current_head.clone(),
@@ -1029,10 +1069,10 @@ impl Desktop {
                 Dialog::Create => (
                     "Create branch",
                     format!(
-                        "Create a local branch at {}. Your current checkout stays on {}.",
-                        op.label, op.current_branch
+                        "Create and switch to a local branch at {}. Pending changes will be carried over when safe; Git will refuse if files would be overwritten.",
+                        op.label
                     ),
-                    "Create branch",
+                    "Create and checkout",
                 ),
                 Dialog::CreateTag => (
                     "Create tag",
@@ -1053,10 +1093,18 @@ impl Desktop {
                 Dialog::Delete => (
                     "Delete branch",
                     format!(
-                        "Remove local branch {}. Git will refuse if it has unmerged commits or is checked out. Its remote branch stays intact.",
+                        "Remove local branch {}. Checked-out branches cannot be deleted. Its remote branch stays intact. Undo can restore the local branch.",
                         op.label
                     ),
                     "Delete branch",
+                ),
+                Dialog::Reset => (
+                    "Reset current branch",
+                    format!(
+                        "Move {} to {}. Choose how to handle the index and working files. Undo can restore the previous state.",
+                        op.current_branch, op.label
+                    ),
+                    "Reset branch",
                 ),
                 Dialog::Merge => (
                     "Merge into your branch",
@@ -1136,6 +1184,52 @@ impl Desktop {
                 }
             } else {
                 body = body.child(detail);
+                if dialog == Dialog::Delete {
+                    body = body.child(
+                        Checkbox::new("delete-unmerged")
+                            .checked(op.force_delete)
+                            .label("Delete even if the branch has unmerged commits")
+                            .on_click(cx.listener(|v, checked: &bool, w, cx| {
+                                v.operation_action(Action::ForceDelete(*checked), w, cx)
+                            })),
+                    );
+                }
+                if dialog == Dialog::Reset {
+                    for (mode, title, description) in [
+                        (
+                            ResetMode::Soft,
+                            "Soft",
+                            "Keep staged changes and working files.",
+                        ),
+                        (
+                            ResetMode::Mixed,
+                            "Mixed",
+                            "Unstage changes and keep working files.",
+                        ),
+                        (
+                            ResetMode::Hard,
+                            "Hard",
+                            "Discard staged and working changes. Untracked files in the way may be removed.",
+                        ),
+                    ] {
+                        body = body.child(
+                            column()
+                                .gap_1()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "reset-{}",
+                                        mode.flag()
+                                    )))
+                                    .label(title)
+                                    .selected(op.reset_mode == mode)
+                                    .on_click(cx.listener(move |v, _, w, cx| {
+                                        v.operation_action(Action::ResetMode(mode), w, cx)
+                                    })),
+                                )
+                                .child(caption(description)),
+                        );
+                    }
+                }
                 if matches!(dialog, Dialog::Create | Dialog::CreateTag | Dialog::Rename) {
                     body = body.child(Input::new(&op.name));
                 }

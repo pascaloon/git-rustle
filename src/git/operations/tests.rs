@@ -1,5 +1,251 @@
 use super::*;
 
+#[test]
+fn new_branch_checks_out_and_recovers_staged_unstaged_and_untracked_changes() {
+    for detached in [false, true] {
+        let f = Fixture::new();
+        if detached {
+            f.git(&["checkout", "--detach"]);
+        }
+        let head = f.git(&["rev-parse", "HEAD"]);
+        f.write("file.txt", "staged\n");
+        f.git(&["add", "file.txt"]);
+        f.write("file.txt", "unstaged\n");
+        f.write("untracked.txt", "preserve\n");
+        let context = Context::new(f.root()).unwrap();
+        let before = context.snapshot().unwrap();
+        let created = f.run(Request::CreateAndCheckout {
+            name: "new-topic".into(),
+            target: head.clone(),
+        });
+        assert_eq!(created.cursor, 1);
+        assert_eq!(created.labels.len(), 1);
+        let after = context.snapshot().unwrap();
+        assert_eq!(after.symbolic.as_deref(), Some("refs/heads/new-topic"));
+        assert_eq!(after.head, head);
+        assert_eq!(after.index, before.index);
+        assert_eq!(after.tree, before.tree);
+        assert_eq!(f.git(&["rev-parse", "main"]), head);
+        assert_eq!(f.git(&["show", ":file.txt"]), "staged");
+        assert_eq!(
+            fs::read_to_string(f.root().join("file.txt")).unwrap(),
+            "unstaged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root().join("untracked.txt")).unwrap(),
+            "preserve\n"
+        );
+        f.run(Request::MoveTo(0));
+        assert!(before.equivalent(&context.snapshot().unwrap()));
+        f.run(Request::MoveTo(1));
+        assert!(after.equivalent(&context.snapshot().unwrap()));
+    }
+}
+
+#[test]
+fn new_branch_at_an_older_commit_switches_files_and_undo_restores_original_branch() {
+    let f = Fixture::new();
+    let base = f.git(&["rev-parse", "HEAD"]);
+    f.write("file.txt", "newer\n");
+    f.commit("newer");
+    let original = f.git(&["rev-parse", "HEAD"]);
+    f.run(Request::CreateAndCheckout {
+        name: "old-base".into(),
+        target: base.clone(),
+    });
+    assert_eq!(f.git(&["branch", "--show-current"]), "old-base");
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), base);
+    assert_eq!(f.git(&["rev-parse", "main"]), original);
+    assert_eq!(f.git(&["show", ":file.txt"]), "base");
+    assert_eq!(
+        fs::read_to_string(f.root().join("file.txt")).unwrap(),
+        "base\n"
+    );
+    f.run(Request::MoveTo(0));
+    assert_eq!(f.git(&["branch", "--show-current"]), "main");
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), original);
+    assert_eq!(
+        fs::read_to_string(f.root().join("file.txt")).unwrap(),
+        "newer\n"
+    );
+    assert!(f.git(&["branch", "--list", "old-base"]).is_empty());
+    f.run(Request::MoveTo(1));
+    assert_eq!(f.git(&["branch", "--show-current"]), "old-base");
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+}
+
+#[test]
+fn new_branch_checkout_failure_does_not_leave_a_branch_or_change_pending_files() {
+    let f = Fixture::new();
+    let base = f.git(&["rev-parse", "HEAD"]);
+    f.write("file.txt", "newer\n");
+    f.commit("newer");
+    f.write("file.txt", "pending\n");
+    let context = Context::new(f.root()).unwrap();
+    let before = context.snapshot().unwrap();
+    for (name, target) in [
+        ("blocked", base.as_str()),
+        ("main", "HEAD"),
+        ("-invalid", "HEAD"),
+        ("missing-target", "missing"),
+    ] {
+        let failed = execute(
+            f.root(),
+            Request::CreateAndCheckout {
+                name: name.into(),
+                target: target.into(),
+            },
+        );
+        assert!(failed.result.is_err(), "accepted {name}");
+        assert!(failed.view.labels.is_empty());
+        assert!(before.equivalent(&context.snapshot().unwrap()));
+    }
+    assert!(f.git(&["branch", "--list", "blocked"]).is_empty());
+}
+
+#[test]
+fn branch_reset_modes_preserve_expected_changes_and_support_recovery() {
+    for mode in [ResetMode::Soft, ResetMode::Mixed, ResetMode::Hard] {
+        let f = Fixture::new();
+        let base = f.git(&["rev-parse", "HEAD"]);
+        f.git(&["branch", "unrelated"]);
+        f.write("file.txt", "tip\n");
+        f.commit("tip");
+        let tip = f.git(&["rev-parse", "HEAD"]);
+        f.write("file.txt", "staged\n");
+        f.git(&["add", "file.txt"]);
+        f.write("file.txt", "unstaged\n");
+        f.write("untracked.txt", "preserve\n");
+        let status = f.git(&["status", "--porcelain"]);
+        f.run(Request::OnBranch {
+            branch: "main".into(),
+            head: tip.clone(),
+            request: Box::new(Request::Reset {
+                target: base.clone(),
+                mode,
+            }),
+        });
+        let verify = || {
+            assert_eq!(f.git(&["rev-parse", "HEAD"]), base);
+            assert_eq!(
+                f.git(&["show", ":file.txt"]),
+                if mode == ResetMode::Soft {
+                    "staged"
+                } else {
+                    "base"
+                }
+            );
+            assert_eq!(
+                fs::read_to_string(f.root().join("file.txt")).unwrap(),
+                if mode == ResetMode::Hard {
+                    "base\n"
+                } else {
+                    "unstaged\n"
+                }
+            );
+            assert_eq!(f.git(&["rev-parse", "unrelated"]), base);
+            assert_eq!(
+                fs::read_to_string(f.root().join("untracked.txt")).unwrap(),
+                "preserve\n"
+            );
+        };
+        verify();
+        f.run(Request::MoveTo(0));
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), tip);
+        assert_eq!(f.git(&["status", "--porcelain"]), status);
+        assert_eq!(f.git(&["show", ":file.txt"]), "staged");
+        assert_eq!(
+            fs::read_to_string(f.root().join("file.txt")).unwrap(),
+            "unstaged\n"
+        );
+        f.run(Request::MoveTo(1));
+        verify();
+    }
+}
+
+#[test]
+fn branch_reset_rejects_stale_review_detached_head_and_invalid_target() {
+    let f = Fixture::new();
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let reset = || Request::Reset {
+        target: head.clone(),
+        mode: ResetMode::Hard,
+    };
+    f.git(&["switch", "-c", "other"]);
+    assert!(
+        execute(
+            f.root(),
+            Request::OnBranch {
+                branch: "main".into(),
+                head: head.clone(),
+                request: Box::new(reset())
+            }
+        )
+        .result
+        .is_err()
+    );
+    f.git(&["checkout", "--detach"]);
+    assert!(execute(f.root(), reset()).result.is_err());
+    f.git(&["switch", "main"]);
+    assert!(
+        execute(
+            f.root(),
+            Request::Reset {
+                target: "--hard".into(),
+                mode: ResetMode::Hard
+            }
+        )
+        .result
+        .is_err()
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+}
+
+#[test]
+fn branch_delete_requires_force_for_unmerged_and_recovers_exact_tip() {
+    let f = Fixture::new();
+    let main = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["switch", "-c", "topic"]);
+    f.write("file.txt", "topic\n");
+    f.commit("topic");
+    let topic = f.git(&["rev-parse", "HEAD"]);
+    assert!(
+        execute(
+            f.root(),
+            Request::Delete {
+                name: "topic".into(),
+                force: true
+            }
+        )
+        .result
+        .is_err()
+    );
+    f.git(&["switch", "main"]);
+    assert!(
+        execute(
+            f.root(),
+            Request::Delete {
+                name: "topic".into(),
+                force: false
+            }
+        )
+        .result
+        .is_err()
+    );
+    f.run(Request::Delete {
+        name: "topic".into(),
+        force: true,
+    });
+    assert!(f.git(&["branch", "--list", "topic"]).is_empty());
+    f.run(Request::MoveTo(0));
+    assert_eq!(f.git(&["rev-parse", "topic"]), topic);
+    f.run(Request::MoveTo(1));
+    assert!(f.git(&["branch", "--list", "topic"]).is_empty());
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), main);
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
 }

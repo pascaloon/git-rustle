@@ -30,6 +30,16 @@ impl Desktop {
             .is_some_and(|name| name.starts_with("graph-request-"));
         let safe = if request_case {
             matches!(action, Action::NewRequest(_))
+        } else if self
+            .graph_context_name()
+            .is_some_and(|n| n.starts_with("graph-reset"))
+        {
+            matches!(action, Action::Operation(op) if matches!(op.as_ref(), operations::Action::Open(operations::Dialog::Reset, ..)))
+        } else if self
+            .graph_context_name()
+            .is_some_and(|n| n.starts_with("graph-delete"))
+        {
+            matches!(action, Action::Operation(op) if matches!(op.as_ref(), operations::Action::Open(operations::Dialog::Delete, ..)))
         } else {
             matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::CreateTag | operations::Dialog::Rename, ..)))
         };
@@ -44,6 +54,12 @@ impl Desktop {
             matches!(
                 *s,
                 "graph-commit-menu"
+                    | "graph-new-branch"
+                    | "graph-new-branch-review"
+                    | "graph-reset"
+                    | "graph-reset-review"
+                    | "graph-delete"
+                    | "graph-delete-review"
                     | "graph-request-menu"
                     | "graph-request-compose"
                     | "graph-branch-menu"
@@ -58,6 +74,15 @@ impl Desktop {
     pub(super) fn graph_context_ready(&self) -> Option<bool> {
         self.graph_context_name()
             .map(|_| self.graph_context.verified)
+    }
+    pub(super) fn graph_context_branch_probe(&self, name: &str) -> Option<AnyElement> {
+        if !self
+            .graph_context_name()
+            .is_some_and(|scenario| scenario.starts_with("graph-new-branch"))
+        {
+            return None;
+        }
+        self.graph_context_probe(if name == "bench-new-branch" { 11 } else { 12 })
     }
     pub(super) fn graph_context_probe(&self, part: u8) -> Option<AnyElement> {
         self.graph_context_name()?;
@@ -97,6 +122,14 @@ impl Desktop {
     fn graph_context_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.graph_context_name().unwrap().to_owned();
         let phase = self.graph_context.phase;
+        if (name.starts_with("graph-reset")
+            || name.starts_with("graph-delete")
+            || name.starts_with("graph-new-branch"))
+            && phase > 0
+        {
+            self.graph_branch_mutation_tick(&name, window, cx);
+            return;
+        }
         if name.starts_with("graph-request-") && phase > 0 {
             if phase == 1 || phase == 3 {
                 let paints = self.graph_context.paints.borrow();
@@ -325,6 +358,27 @@ impl Desktop {
                 self.action(Action::Select(row, true), window, cx);
             }
             self.engine.mark("graph context requested");
+            if name.starts_with("graph-new-branch") {
+                let root = self.engine.repository_root().unwrap();
+                self.graph_context.expected = [
+                    vec!["status", "--porcelain"],
+                    vec!["write-tree"],
+                    vec!["show", ":file.txt"],
+                ]
+                .iter()
+                .map(|args| {
+                    String::from_utf8(crate::git::command::checked(root, args).unwrap())
+                        .unwrap()
+                        .trim()
+                        .to_string()
+                })
+                .collect();
+                self.action(self.new_branch_action(), window, cx);
+                self.set_branch_scenario_name("bench-new-branch", window, cx);
+                self.graph_context.paints.borrow_mut().clear();
+                self.graph_context.phase = 20;
+                return;
+            }
             if name.starts_with("graph-") {
                 self.context_menu = Some(if name.ends_with("-edge") {
                     point(
@@ -528,5 +582,160 @@ impl Desktop {
             self.graph_context.verified = true;
             self.engine.mark("graph context verified frame");
         }
+    }
+
+    fn graph_branch_mutation_tick(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::git::operations::{Request, ResetMode};
+        let phase = self.graph_context.phase;
+        if phase == 1 {
+            let paints = self.graph_context.paints.borrow();
+            let (Some(root), Some(item)) = (paints.get(&1), paints.get(&8)) else {
+                return;
+            };
+            assert!(item.top() >= root.top() && item.bottom() <= root.bottom());
+            assert!(
+                root.right() <= window.viewport_size().width
+                    && root.bottom() <= window.viewport_size().height
+            );
+            drop(paints);
+            let action = self.graph_context.safe_action.borrow().clone().unwrap();
+            self.graph_menu_activate(action, window, cx);
+            self.graph_context.paints.borrow_mut().clear();
+            self.graph_context.phase = 20;
+            return;
+        }
+        if phase == 20 {
+            let Some(bounds) = self.graph_context.paints.borrow().get(&9).copied() else {
+                return;
+            };
+            assert!(bounds.left() >= px(0.) && bounds.top() >= px(0.));
+            assert!(
+                bounds.right() <= window.viewport_size().width
+                    && bounds.bottom() <= window.viewport_size().height
+            );
+            if name.ends_with("-review") {
+                self.graph_context.verified = true;
+                self.engine.mark("graph context verified frame");
+                return;
+            }
+            if name.starts_with("graph-reset") {
+                self.operation_action(operations::Action::ResetMode(ResetMode::Hard), window, cx);
+            } else if !name.starts_with("graph-new-branch") {
+                self.operation_action(operations::Action::ForceDelete(true), window, cx);
+            }
+            self.operation_action(operations::Action::Submit, window, cx);
+            self.graph_context.paints.borrow_mut().clear();
+            self.graph_context.phase = 21;
+            return;
+        }
+        if self.engine.operation_busy || !self.engine.app.history.complete {
+            return;
+        }
+        assert!(
+            !self.engine.operation_error,
+            "{}",
+            self.engine.operation_status
+        );
+        if !self.graph_context.paints.borrow().contains_key(&3) {
+            return;
+        }
+        let root = self.engine.repository_root().unwrap();
+        let git = |args: &[&str]| {
+            String::from_utf8(crate::git::command::checked(root, args).unwrap())
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let original = self.graph_context.head.unwrap().to_string();
+        let applied = phase == 21 || phase == 23;
+        if name.starts_with("graph-new-branch") {
+            let Some(bounds) = self
+                .graph_context
+                .paints
+                .borrow()
+                .get(&if applied { 11 } else { 12 })
+                .copied()
+            else {
+                return;
+            };
+            assert!((f32::from(bounds.size.height) - 22.).abs() <= 1.);
+            assert!(bounds.left() >= px(0.) && bounds.right() <= window.viewport_size().width);
+            assert!(bounds.top() >= px(0.) && bounds.bottom() <= window.viewport_size().height);
+            assert_eq!(
+                git(&["branch", "--show-current"]),
+                if applied { "bench-new-branch" } else { "main" }
+            );
+            assert_eq!(
+                git(&["branch", "--list", "bench-new-branch"]).is_empty(),
+                !applied
+            );
+            assert_eq!(git(&["rev-parse", "HEAD"]), original);
+            assert_eq!(git(&["rev-parse", "main"]), original);
+            assert_eq!(
+                git(&["status", "--porcelain"]),
+                self.graph_context.expected[0]
+            );
+            assert_eq!(git(&["write-tree"]), self.graph_context.expected[1]);
+            assert_eq!(git(&["show", ":file.txt"]), self.graph_context.expected[2]);
+            assert_eq!(
+                std::fs::read_to_string(root.join("file.txt"))
+                    .unwrap()
+                    .trim(),
+                "unstaged branch work"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("untracked.txt"))
+                    .unwrap()
+                    .trim(),
+                "untracked branch work"
+            );
+            assert_eq!(
+                self.engine
+                    .app
+                    .refs
+                    .as_ref()
+                    .unwrap()
+                    .head_branch
+                    .as_deref(),
+                Some(if applied { "bench-new-branch" } else { "main" })
+            );
+        } else if name.starts_with("graph-reset") {
+            assert_eq!(
+                git(&["rev-parse", "HEAD"]),
+                if applied {
+                    git(&["rev-parse", "topic"])
+                } else {
+                    original.clone()
+                }
+            );
+            assert_eq!(git(&["write-tree"]), git(&["rev-parse", "HEAD^{tree}"]));
+            assert_eq!(
+                std::fs::read_to_string(root.join("file.txt"))
+                    .unwrap()
+                    .trim(),
+                if applied { "topic 1" } else { "base 3" }
+            );
+        } else {
+            assert_eq!(git(&["rev-parse", "HEAD"]), original);
+            assert_eq!(git(&["branch", "--list", "topic"]).is_empty(), applied);
+        }
+        if !name.starts_with("graph-new-branch") {
+            assert_eq!(git(&["status", "--porcelain"]), "");
+        }
+        if phase == 24 {
+            self.graph_context.verified = true;
+            self.engine.mark("graph context verified frame");
+            return;
+        }
+        // Apply, Undo, Redo, Undo: the fixture must finish with its original state.
+        let cursor = if phase == 22 { 1 } else { 0 };
+        self.operation_action(operations::Action::Run(Request::MoveTo(cursor)), window, cx);
+        self.graph_context.paints.borrow_mut().clear();
+        self.graph_context.phase += 1;
     }
 }

@@ -1,5 +1,61 @@
 # Benchmark workflow for agents
 
+### New branch creates and checks out
+
+The New branch dialog submits one create-and-switch operation. Git's transactional
+`switch -c` leaves no new branch if switching fails; safe pending changes carry
+over. One recovery entry restores both checkout and branch creation with Undo/Redo.
+The internal branch-only operation remains available for workflows that need it.
+
+Run `benchmark-graph-features.ps1 -Candidate <candidate> -Scenarios
+graph-new-branch -Samples 15 -OutputDirectory target/bench/<run>`. It invokes the
+shared toolbar action, fills the real input, awaits the review dialog paint,
+submits, and verifies the newly checked-out branch badge paint. Apply/Undo/Redo/Undo
+check HEAD, original branch, staged and unstaged content, untracked content and
+final fixture preservation. This new scenario is candidate-only; use the shared
+graph-polish scenario and its first-frame logs against a preserved baseline.
+Capture `screenshot-app.ps1 -Scenarios graph-new-branch-review` separately and
+inspect its explanatory text and Create and checkout button. Keep all generated
+logs, raw samples, PNGs and reports under ignored target/bench directories.
+
+### Checked-out branch badges
+
+Attached graph rows highlight the current local branch name using the orange
+checkout pill. A separate HEAD pill is reserved for detached checkouts. Run
+`benchmark-graph-features.ps1 -Scenarios graph-polish,graph-polish-detached
+-Candidate <candidate> -Samples 15 -OutputDirectory target/bench/<run>` for
+actual badge and remote-icon paint bounds with unchanged repository state.
+The attached scenario is also available on the preserved baseline; the detached
+scenario extends the harness and is candidate-only. Capture separately through
+`screenshot-app.ps1 -Scenarios graph-polish,graph-polish-detached` and inspect
+the PNGs for the bright branch pill, absent attached HEAD pill, detached HEAD
+pill, adjacent remote badges and truncation. Use fresh baseline/candidate
+startup and scroll controls; retain raw results and limitations under target.
+
+### Graph branch reset and deletion
+
+Right-click a local commit to reset the current branch with Soft, Mixed or Hard
+semantics. Mixed is the default; Hard explicitly discards staged and working
+changes. Right-click a local branch tip to delete it; deleting unmerged commits
+requires an explicit checkbox, and checked-out branches remain protected by Git.
+Both actions use persistent recovery checkpoints for Undo/Redo.
+
+Run `scripts/benchmark-graph-features.ps1 -Candidate <candidate> -Scenarios
+graph-reset,graph-delete,graph-branch-menu-edge -Samples 15 -OutputDirectory
+target/bench/<run>`. The disposable fixtures invoke the painted graph actions,
+await the review dialog, apply, Undo, Redo and Undo again, checking branch tips,
+HEAD, index, files and final fixture preservation. The edge case verifies the
+scrolling submenu still fits. New mutation scenarios are candidate-only and
+include recovery round trips; use preserved baseline/candidate executables with
+`benchmark-desktop.ps1` for shared startup and scroll controls.
+
+Capture separately with `scripts/screenshot-app.ps1 -Candidate <candidate>
+-Scenarios graph-reset-review,graph-delete-review -OutputDirectory
+target/bench/<capture>` and repeat with `-WindowSize 900x600`. Inspect the PNGs
+for mode clarity, checkbox visibility, text wrapping and complete dialog bounds.
+Private-desktop actions and paint assertions do not establish physical input or
+display scanout. Keep raw samples, screenshot findings and limitations ignored.
+
 Remote branch checkout offers Detached HEAD and Pull branch choices for fetched
 and ghost tips. `scripts/benchmark-remote-checkout.ps1` uses marked local bare
 remotes and a loopback metadata API. It compares existing/new local tracking

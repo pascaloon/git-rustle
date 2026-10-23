@@ -2,6 +2,7 @@
 use super::*;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 type BadgePaints = Rc<RefCell<HashMap<String, (bool, Bounds<Pixels>)>>>;
+type CheckoutPaint = Rc<RefCell<Option<(String, bool, Bounds<Pixels>)>>>;
 #[derive(Clone, Default)]
 pub(super) struct PaintTrace(Rc<RefCell<(usize, usize, bool)>>);
 impl PaintTrace {
@@ -24,10 +25,39 @@ pub(super) struct State {
     prepared: bool,
     traces: RefCell<HashMap<usize, PaintTrace>>,
     badges: BadgePaints,
+    checkout: CheckoutPaint,
 }
 impl Desktop {
+    fn graph_polish_scenario(&self) -> bool {
+        matches!(
+            self.scenario.as_deref(),
+            Some("graph-polish" | "graph-polish-detached")
+        )
+    }
+    pub(super) fn graph_polish_checkout_probe(
+        &self,
+        name: &str,
+        detached: bool,
+    ) -> Option<AnyElement> {
+        if !self.graph_polish_scenario() {
+            return None;
+        }
+        let checkout = self.graph_polish.checkout.clone();
+        let name = name.to_owned();
+        Some(
+            canvas(
+                |bounds, _, _| bounds,
+                move |bounds, _, _, _| {
+                    *checkout.borrow_mut() = Some((name.clone(), detached, bounds));
+                },
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+        )
+    }
     pub(super) fn graph_polish_trace(&self, row: usize) -> Option<PaintTrace> {
-        (self.scenario.as_deref() == Some("graph-polish")).then(|| {
+        self.graph_polish_scenario().then(|| {
             self.graph_polish
                 .traces
                 .borrow_mut()
@@ -41,7 +71,7 @@ impl Desktop {
         name: &str,
         remote_only: bool,
     ) -> Option<AnyElement> {
-        if self.scenario.as_deref() != Some("graph-polish") {
+        if !self.graph_polish_scenario() {
             return None;
         }
         let badges = self.graph_polish.badges.clone();
@@ -59,7 +89,7 @@ impl Desktop {
         )
     }
     pub(super) fn graph_polish_schedule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.scenario.as_deref() != Some("graph-polish")
+        if !self.graph_polish_scenario()
             || !self.scenario_started
             || self.graph_polish.verified
             || self.graph_polish.scheduled
@@ -85,6 +115,10 @@ impl Desktop {
                     );
                     assert!(root.join(".git/refs/remotes/origin/fetched").is_file());
                     assert!(!root.join(".git/refs/remotes/origin/server-only").exists());
+                    let detached = v.scenario.as_deref() == Some("graph-polish-detached");
+                    assert_eq!(v.engine.app.refs.as_ref().unwrap().head_branch.is_none(), detached);
+                    let head_labels = &v.engine.app.labels[&v.engine.app.head_id().unwrap()];
+                    assert_eq!(head_labels.iter().filter(|label| label.name == "HEAD").count(), usize::from(detached));
                     let index = (0..v.engine.app.history.len())
                         .find(|i| v.engine.app.history.subject(*i) == "Merge dense graph fixture")
                         .unwrap();
@@ -96,7 +130,7 @@ impl Desktop {
                         vec![
                             crate::app::Label {
                                 name: "main".into(),
-                                kind: crate::git::RefKind::Branch,
+                                kind: if detached { crate::git::RefKind::Branch } else { crate::git::RefKind::Head },
                                 remote_only: false,
                             },
                             crate::app::Label {
@@ -118,6 +152,7 @@ impl Desktop {
                     v.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
                     v.graph_polish.prepared = true;
                     v.graph_polish.traces.borrow_mut().clear();
+                    v.graph_polish.checkout.borrow_mut().take();
                     v.engine.mark("graph polish requested");
                     cx.notify();
                     return;
@@ -144,6 +179,15 @@ impl Desktop {
                     return;
                 };
                 assert!(!fetched.0 && server.0);
+                let checkout = v.graph_polish.checkout.borrow();
+                let Some((name, detached, bounds)) = checkout.as_ref() else { cx.notify(); return; };
+                let expected_detached = v.scenario.as_deref() == Some("graph-polish-detached");
+                assert_eq!(*detached, expected_detached);
+                assert_eq!(name, if expected_detached { "HEAD" } else { "main" });
+                assert!((f32::from(bounds.size.height) - 22.).abs() <= 1.);
+                assert!(bounds.size.width >= px(40.));
+                assert!(bounds.left() >= px(0.) && bounds.right() <= window.viewport_size().width);
+                assert!(bounds.top() >= px(0.) && bounds.bottom() <= window.viewport_size().height);
                 for (_, bounds) in [fetched, server] {
                     assert!(
                         (f32::from(bounds.size.width)-14.).abs()<=1. && (f32::from(bounds.size.height)-14.).abs()<=1.,

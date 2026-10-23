@@ -82,6 +82,8 @@ pub fn run(mut engine: Engine) {
             && std::env::var("GIT_RUSTLE_SCENARIO").is_ok_and(|scenario| {
                 scenario.starts_with("cleanup-")
                     || scenario.starts_with("ai-")
+                    || scenario.starts_with("graph-reset")
+                    || scenario.starts_with("graph-delete")
                     || scenario == "branches-hierarchy"
             });
         let initial_size = if minimum_cleanup_bench {
@@ -501,6 +503,18 @@ impl Desktop {
             )
             .into_any_element()
     }
+    fn new_branch_action(&self) -> Action {
+        Action::Operation(Box::new(operations::Action::Open(
+            operations::Dialog::Create,
+            self.engine
+                .app
+                .head_id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "HEAD".into()),
+            format!("{} (HEAD)", self.current_branch()),
+        )))
+    }
+
     fn create_tag_action(&self) -> Option<(Action, bool)> {
         let app = &self.engine.app;
         if app.pending.selected {
@@ -618,6 +632,16 @@ impl Desktop {
                 && self.engine.operations.conflict.is_none()
                 && !app.ghosts.contains_key(&id);
             let attached = app.refs.as_ref().is_some_and(|r| r.head_branch.is_some());
+            items.push((
+                Action::Operation(Box::new(operations::Action::Open(
+                    operations::Dialog::Reset,
+                    target.clone(),
+                    label.clone(),
+                ))),
+                "branch",
+                "Reset current branch here…".into(),
+                idle && attached,
+            ));
             if app.head_id() != Some(id) {
                 for (dialog, title) in [
                     (operations::Dialog::Merge, "Merge into current branch…"),
@@ -674,11 +698,6 @@ impl Desktop {
                         format!("Create PR / MR from {}…", branch.name),
                         true,
                     ));
-                    // HEAD marks the checked-out branch; include its request
-                    // action without changing the existing mutation menu.
-                    if branch.kind != crate::git::RefKind::Branch {
-                        continue;
-                    }
                     for (dialog, verb) in [
                         (operations::Dialog::Rename, "Rename"),
                         (operations::Dialog::Delete, "Delete"),
@@ -2404,22 +2423,7 @@ impl Desktop {
                 ))),
                 cx,
             ))
-            .child(
-                self.button(
-                    "create-branch",
-                    "New branch",
-                    Action::Operation(Box::new(operations::Action::Open(
-                        operations::Dialog::Create,
-                        self.engine
-                            .app
-                            .head_id()
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "HEAD".into()),
-                        format!("{} (HEAD)", self.current_branch()),
-                    ))),
-                    cx,
-                ),
-            )
+            .child(self.button("create-branch", "New branch", self.new_branch_action(), cx))
             .when(
                 self.selected_commits
                     .ids(self.engine.app.selected_id())
@@ -3576,7 +3580,10 @@ impl Desktop {
         if let Some(ready) = self.ai_scenario_ready() {
             return ready;
         }
-        if self.scenario.as_deref() == Some("graph-polish") {
+        if matches!(
+            self.scenario.as_deref(),
+            Some("graph-polish" | "graph-polish-detached")
+        ) {
             return self.graph_polish.verified;
         }
         if self.scenario.as_deref() == Some("refresh-native") {
@@ -4741,7 +4748,8 @@ fn graph_menu_top_item(action: &Action, request_count: usize) -> bool {
             | Action::DiffBaseChoose
             | Action::Checkout
             | Action::Stashes(_)
-    ) || (request_count == 1 && matches!(action, Action::NewRequest(_)))
+    ) || matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::Reset, ..)) || (request_count == 1 && matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::Delete, ..))))
+        || (request_count == 1 && matches!(action, Action::NewRequest(_)))
 }
 
 #[cfg(test)]

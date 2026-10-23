@@ -40,6 +40,10 @@ pub enum Request {
         name: String,
         target: String,
     },
+    CreateAndCheckout {
+        name: String,
+        target: String,
+    },
     CreateTag {
         name: String,
         target: String,
@@ -48,6 +52,10 @@ pub enum Request {
     Delete {
         name: String,
         force: bool,
+    },
+    Reset {
+        target: String,
+        mode: ResetMode,
     },
     Rename {
         old: String,
@@ -82,6 +90,22 @@ pub enum Request {
     Commit(crate::pending::Request),
     DiscardFile(super::worktree::DiscardRequest),
     DiscardFiles(Vec<super::worktree::DiscardRequest>),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResetMode {
+    Soft,
+    #[default]
+    Mixed,
+    Hard,
+}
+impl ResetMode {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Soft => "--soft",
+            Self::Mixed => "--mixed",
+            Self::Hard => "--hard",
+        }
+    }
 }
 impl Request {
     pub fn changes_repository(&self) -> bool {
@@ -1740,6 +1764,7 @@ fn execute_inner(
     }
     let label = match request {
         Request::Create { name, .. } => format!("Create branch {name}"),
+        Request::CreateAndCheckout { name, .. } => format!("Create and checkout branch {name}"),
         Request::CreateStash(_) => "Stash pending changes".into(),
         Request::Cleanup(plan) => format!(
             "Cleanup {} branch entries and {} tags",
@@ -1751,6 +1776,7 @@ fn execute_inner(
         Request::DropStash(stash) => format!("Delete stash {}", stash.subject),
         Request::CreateTag { name, .. } => format!("Create tag {name}"),
         Request::Delete { name, .. } => format!("Delete branch {name}"),
+        Request::Reset { target, mode } => format!("Reset {} to {target}", mode.flag()),
         Request::Rename { old, new } => format!("Rename {old} to {new}"),
         Request::Pull => "Pull current upstream".into(),
         Request::Merge(target) => format!("Merge {target}"),
@@ -1783,11 +1809,28 @@ fn execute_inner(
                 stashes::drop_stash(context, stash)?;
             }
             Request::DropStash(stash) => stashes::drop_stash(context, stash)?,
-            Request::Create { name, target } => {
+            Request::Create { name, target } | Request::CreateAndCheckout { name, target } => {
                 validate_name(&context.root, name)?;
                 super::refs::ensure_case_safe(&context.root, &[&format!("refs/heads/{name}")])?;
                 let target = revision(&context.root, target)?;
-                command::checked(&context.root, &["branch", "--", name, &target])?;
+                if matches!(request, Request::CreateAndCheckout { .. }) {
+                    // Git only creates the branch when checkout succeeds. Keep
+                    // both changes in one recovery entry and never force edits.
+                    command::checked(
+                        &context.root,
+                        &[
+                            "switch",
+                            "--no-guess",
+                            "--no-track",
+                            "-c",
+                            name,
+                            "--",
+                            &target,
+                        ],
+                    )?;
+                } else {
+                    command::checked(&context.root, &["branch", "--", name, &target])?;
+                }
             }
             Request::CreateTag {
                 name,
@@ -1802,6 +1845,16 @@ fn execute_inner(
                     &context.root,
                     &["branch", if *force { "-D" } else { "-d" }, "--", name],
                 )?;
+            }
+            Request::Reset { target, mode } => {
+                if output(&context.root, &["symbolic-ref", "--quiet", "HEAD"])
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err("Check out a local branch before resetting it".into());
+                }
+                let target = revision(&context.root, target)?;
+                command::checked(&context.root, &["reset", mode.flag(), &target, "--"])?;
             }
             Request::Rename { old, new } => {
                 validate_name(&context.root, old)?;

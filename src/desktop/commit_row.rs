@@ -102,7 +102,12 @@ impl Desktop {
             .min_w_0()
             .overflow_hidden();
         let mut badges = row().max_w(relative(0.65)).min_w_0().overflow_hidden();
-        if app.head_id() == Some(id) {
+        if app.head_id() == Some(id)
+            && app
+                .refs
+                .as_ref()
+                .is_some_and(|refs| refs.head_branch.is_none())
+        {
             badges = badges.child(
                 row()
                     .id(("head-badge", row_index))
@@ -117,10 +122,11 @@ impl Desktop {
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .children(self.filter_head_probe())
+                    .children(self.graph_polish_checkout_probe("HEAD", true))
                     .child(icon("head").size(px(14.)).text_color(rgb(BG)))
                     .child("HEAD")
                     .tooltip(|window, cx| {
-                        gpui_component::tooltip::Tooltip::new("Current checkout (HEAD)")
+                        gpui_component::tooltip::Tooltip::new("Detached HEAD · current checkout")
                             .build(window, cx)
                     }),
             );
@@ -133,11 +139,29 @@ impl Desktop {
                 .enumerate()
             {
                 let remote = label.kind == crate::git::RefKind::Remote;
-                let color = if remote { REMOTE_TEXT } else { SEARCH_TEXT };
+                let current = !remote
+                    && matches!(
+                        label.kind,
+                        crate::git::RefKind::Branch | crate::git::RefKind::Head
+                    )
+                    && app.head_id() == Some(id)
+                    && app
+                        .refs
+                        .as_ref()
+                        .and_then(|refs| refs.head_branch.as_deref())
+                        == Some(label.name.as_str());
+                let color = if current {
+                    BG
+                } else if remote {
+                    REMOTE_TEXT
+                } else {
+                    SEARCH_TEXT
+                };
                 badges = badges
                     .child(
                         row()
                             .id(("ref-badge", label_index))
+                            .relative()
                             .tooltip({
                                 let name = label.name.clone();
                                 move |w, cx| {
@@ -150,6 +174,19 @@ impl Desktop {
                             .flex_shrink_0()
                             .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
                             .text_color(rgb(color))
+                            .when(current, |badge| {
+                                badge
+                                    .h(px(22.))
+                                    .px_2()
+                                    .rounded_full()
+                                    .bg(rgb(ACCENT))
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .children(self.filter_head_probe())
+                                    .children(self.graph_polish_checkout_probe(&label.name, false))
+                                    .children(self.graph_context_branch_probe(&label.name))
+                                    .child(icon("head").size(px(14.)).text_color(rgb(BG)))
+                            })
                             .max_w(px(170.))
                             .overflow_hidden()
                             .whitespace_nowrap()
@@ -172,7 +209,11 @@ impl Desktop {
                                         ),
                                 )
                             })
-                            .child(self.matches.styled(label.name.clone())),
+                            .child(div().min_w_0().truncate().child(if current {
+                                gpui::StyledText::new(label.name.clone())
+                            } else {
+                                self.matches.styled(label.name.clone())
+                            })),
                     )
                     .children(self.provider_badge(id, label.kind, &label.name, cx));
             }
