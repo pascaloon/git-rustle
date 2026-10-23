@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "git-rustle"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-channel 2.5.0",
  "base64 0.22.1",
