@@ -1641,3 +1641,27 @@ repeat with `-MinimumWindow` to inspect 900x600 bounds. Review each cleanup PNG
 for section headers, checked/unchecked option, reclaimed space and exact tag refs
 in confirmation. Captures are excluded from performance samples. Use the shared
 startup and normal/searched-scroll runners with the preserved app baseline.
+
+### Selected paths across recycled graph lanes
+
+`graph::hover::tests::backward_trace_stops_before_a_previous_branch_ended_in_the_reused_lane`
+reproduces a branch ending just above an unrelated branch reusing its column.
+The companion disconnected-root regression includes repeated palette colors.
+Both viewport hover flags and cached whole-graph selection flags must stop at
+these boundaries; geometry, rather than color identity, determines continuity.
+
+Run `benchmark-graph-features.ps1 -Scenarios graph-selection-boundary -Samples 15`
+with the final candidate. Its eight-commit disposable fixture reproduces the
+convergence, immediate lane reuse and parallel third branch. The actual Select
+handler chooses the new topic, the ended topic, then the new topic again. Each
+step awaits all SHA paint bounds and checks highlighted nodes against the
+selected commit's first-parent ancestry, preserving all repository state.
+Capture separately through `screenshot-app.ps1 -Scenarios graph-selection-boundary`
+and inspect the PNG: only Selected topic and Shared root have highlighted SHAs.
+Use preserved baseline/candidate test executables for `graph::hover::tests::benchmark_hover`,
+`desktop::hover::tests::benchmark_selected_path` and
+`desktop::hover::tests::benchmark_multi_selected_paths`; collect fresh shared
+startup and graph-hover/scroll controls when no competing builds are active.
+Private-desktop paints and image review do not establish physical pointer input
+or display scanout. Retain raw samples, regression crossings and any validation
+limits under the ignored run directory.

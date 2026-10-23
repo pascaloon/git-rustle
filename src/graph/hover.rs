@@ -7,6 +7,9 @@ use super::layout::{CellKind, GraphCell};
 
 pub const GLYPH: u8 = 1;
 pub const CONNECTOR: u8 = 2;
+// Temporary per-build traversal marks, stripped before exposing render flags.
+const FORWARD_VISITED: u8 = 4;
+const REVERSE_VISITED: u8 = 8;
 
 #[derive(Clone, Copy)]
 pub struct Row<'a> {
@@ -47,8 +50,18 @@ impl FlatFlags {
         }
         self.flags.clear();
         self.flags.resize(total, 0);
+        let shared_paths = anchors.len() > 1;
         for &anchor in anchors {
-            follow(count, anchor, &row_at, self);
+            if shared_paths {
+                follow::<true>(count, anchor, &row_at, self);
+            } else {
+                follow::<false>(count, anchor, &row_at, self);
+            }
+        }
+        if shared_paths {
+            for flag in &mut self.flags {
+                *flag &= GLYPH | CONNECTOR;
+            }
         }
     }
     pub fn row(&self, index: usize) -> &[u8] {
@@ -82,7 +95,7 @@ impl FlagRows for Vec<Vec<u8>> {
 
 pub fn trace(rows: &[Row<'_>], anchor: usize) -> Vec<Vec<u8>> {
     let mut flags: Vec<_> = rows.iter().map(|row| vec![0; row.cells.len()]).collect();
-    follow(
+    follow::<false>(
         rows.len(),
         anchor,
         |index| rows.get(index).copied(),
@@ -91,7 +104,7 @@ pub fn trace(rows: &[Row<'_>], anchor: usize) -> Vec<Vec<u8>> {
     flags
 }
 
-fn follow<'a>(
+fn follow<'a, const SHARED_PATHS: bool>(
     count: usize,
     anchor: usize,
     row_at: impl Fn(usize) -> Option<Row<'a>>,
@@ -116,18 +129,40 @@ fn follow<'a>(
                 break;
             };
             let mark = flags.row_mut(index);
+            let visited = if SHARED_PATHS {
+                if reverse {
+                    REVERSE_VISITED
+                } else {
+                    FORWARD_VISITED
+                }
+            } else {
+                0
+            };
+            if SHARED_PATHS && mark[lane] & visited != 0 {
+                break;
+            }
             use CellKind::*;
             match cell.kind() {
                 Empty | Horizontal => break,
                 Node | MergeNode => {
-                    mark[lane] |= GLYPH;
-                    if !reverse && !row.has_parents {
-                        break;
+                    // Only roots need the extra reverse-boundary check. Keep
+                    // the common parent-bearing node path to one test.
+                    if !row.has_parents {
+                        if !reverse {
+                            mark[lane] |= GLYPH | visited;
+                            break;
+                        }
+                        // The anchor root is ours; any earlier root is a
+                        // disconnected lane occupant with no outgoing edge.
+                        if step != 0 {
+                            break;
+                        }
                     }
+                    mark[lane] |= GLYPH | visited;
                 }
                 Vertical | Cross | JoinFromLeft | JoinFromRight => mark[lane] |= GLYPH,
                 EndFromLeft | EndFromRight if !reverse => {
-                    mark[lane] |= GLYPH;
+                    mark[lane] |= GLYPH | visited;
                     span(row.cells, mark, lane, row.node_lane);
                     lane = row.node_lane;
                     mark[lane] |= GLYPH;
@@ -135,8 +170,11 @@ fn follow<'a>(
                         break;
                     }
                 }
-                EndFromLeft | EndFromRight => mark[lane] |= GLYPH,
+                // Backward traversal must not enter a previous lane occupant
+                // that already terminated here before our branch began.
+                EndFromLeft | EndFromRight => break,
                 StartToLeft | StartToRight if reverse => {
+                    mark[lane] |= visited;
                     span(row.cells, mark, lane, row.node_lane);
                     mark[row.node_lane] |= GLYPH;
                     break;
@@ -164,14 +202,84 @@ mod tests {
         gix::ObjectId::from_bytes_or_panic(&[n; 20])
     }
 
+    fn assert_path_nodes(definitions: &[(u8, &[u8])], anchor: usize, expected: &[u8]) {
+        let mut layout = Layout::new();
+        let geometry: Vec<_> = definitions
+            .iter()
+            .map(|(n, parents)| {
+                layout.push(&id(*n), &parents.iter().map(|n| id(*n)).collect::<Vec<_>>())
+            })
+            .collect();
+        let rows: Vec<_> = geometry
+            .iter()
+            .zip(definitions)
+            .map(|(row, (_, parents))| Row {
+                cells: &row.cells,
+                node_lane: row.node_lane as usize,
+                has_parents: !parents.is_empty(),
+            })
+            .collect();
+        let flags = trace(&rows, anchor);
+        let mut flat = FlatFlags::default();
+        flat.trace_many(rows.len(), &[anchor, anchor], |i| rows.get(i).copied());
+        for (i, (commit, _)) in definitions.iter().enumerate() {
+            assert_eq!(
+                flags[i][rows[i].node_lane] & GLYPH != 0,
+                expected.contains(commit),
+                "hover: anchor={} commit={commit}",
+                definitions[anchor].0
+            );
+            assert_eq!(
+                flat.row(i)[rows[i].node_lane] & GLYPH != 0,
+                expected.contains(commit),
+                "selection: anchor={} commit={commit}",
+                definitions[anchor].0
+            );
+        }
+    }
+
+    #[test]
+    fn backward_trace_stops_before_a_previous_branch_ended_in_the_reused_lane() {
+        // Branch 8 -> 7 joins 9 -> 6 at 6, freeing lane 1. A different
+        // branch (5 -> 1) reuses lane 1 immediately on the following row.
+        let definitions: &[(u8, &[u8])] = &[
+            (9, &[6]),
+            (8, &[7]),
+            (7, &[6]),
+            (6, &[1]),
+            (5, &[1]),
+            (4, &[2]),
+            (2, &[1]),
+            (1, &[]),
+        ];
+        assert_path_nodes(definitions, 4, &[5, 1]);
+        assert_path_nodes(definitions, 1, &[8, 7, 6, 1]);
+    }
+
+    #[test]
+    fn backward_trace_stops_before_a_disconnected_root_even_when_colors_repeat() {
+        let definitions: Vec<_> = (1..=24).rev().map(|n| (n, &[][..])).collect();
+        for anchor in 0..definitions.len() {
+            assert_path_nodes(&definitions, anchor, &[definitions[anchor].0]);
+        }
+        assert_path_nodes(
+            &[(9, &[]), (8, &[7]), (7, &[]), (6, &[5]), (5, &[])],
+            2,
+            &[8, 7],
+        );
+    }
+
     #[test]
     fn multi_anchor_flat_flags_equal_the_union_of_independent_paths() {
         let mut layout = Layout::new();
         let definitions = [
+            (9, vec![7, 6]),
+            (8, vec![6]),
+            (7, vec![5]),
             (6, vec![4]),
             (5, vec![3]),
-            (4, vec![2]),
-            (3, vec![1]),
+            (4, vec![3]),
+            (3, vec![2]),
             (2, vec![1]),
             (1, vec![]),
         ];
@@ -190,13 +298,21 @@ mod tests {
                 has_parents: !parents.is_empty(),
             })
             .collect();
-        let left = trace(&rows, 0);
-        let right = trace(&rows, 1);
         let mut flat = FlatFlags::default();
-        flat.trace_many(rows.len(), &[0, 1], |index| rows.get(index).copied());
-        for row in 0..rows.len() {
-            for col in 0..rows[row].cells.len() {
-                assert_eq!(flat.row(row)[col], left[row][col] | right[row][col]);
+        for a in 0..rows.len() {
+            let left = trace(&rows, a);
+            for b in 0..rows.len() {
+                let right = trace(&rows, b);
+                flat.trace_many(rows.len(), &[a, b], |index| rows.get(index).copied());
+                for row in 0..rows.len() {
+                    for col in 0..rows[row].cells.len() {
+                        assert_eq!(
+                            flat.row(row)[col],
+                            left[row][col] | right[row][col],
+                            "anchors={a},{b}, row={row}, col={col}"
+                        );
+                    }
+                }
             }
         }
         flat.trace_many(rows.len(), &[], |index| rows.get(index).copied());

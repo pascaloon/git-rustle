@@ -1,6 +1,6 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
+    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [Parameter(Mandatory)][string]$OutputDirectory
@@ -26,19 +26,43 @@ function Read-GraphLiveLog([string]$Path){
     finally{if($null-ne$reader){$reader.Dispose()}elseif($null-ne$stream){$stream.Dispose()}}
 }
 function Graph-State([string]$Path){return @{head=Graph-Git $Path @('rev-parse','HEAD');branch=Graph-Git $Path @('branch','--show-current');refs=Graph-Git $Path @('for-each-ref','--format=%(objectname) %(refname)','refs/heads','refs/remotes','refs/tags');stashes=Graph-Git $Path @('stash','list','--format=%H %s');status=Graph-Git $Path @('status','--porcelain=v1');index=Graph-Git $Path @('write-tree');files=@(Get-ChildItem -LiteralPath $Path -File|ForEach-Object{@{name=$_.Name;sha=(Get-FileHash -LiteralPath $_.FullName).Hash}})}|ConvertTo-Json -Depth 5 -Compress}
+function New-SelectionBoundaryFixture([string]$Fixture){
+    $previousAuthorDate=$env:GIT_AUTHOR_DATE;$previousCommitterDate=$env:GIT_COMMITTER_DATE
+    try{
+    Set-Content -LiteralPath (Join-Path $Fixture '.git/git-rustle-graph-fixture') -Value 'disposable graph feature fixture'
+    $oids=@{}
+    Set-Content -LiteralPath (Join-Path $Fixture 'file.txt') -Value 'Read-only lane reuse fixture'
+    Graph-Git $Fixture @('add','.')|Out-Null
+    $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE='2001-01-01T00:00:01Z'
+    Graph-Git $Fixture @('commit','-m','Shared root')|Out-Null
+    $oids[1]=Graph-Git $Fixture @('rev-parse','HEAD')
+    $tree=Graph-Git $Fixture @('rev-parse','HEAD^{tree}')
+    foreach($entry in @(@(2,1,'Parallel side ancestor'),@(4,2,'Parallel side tip'),@(6,1,'Unrelated branch convergence'),@(7,6,'Ended branch ancestor'),@(8,7,'Ended branch tip'),@(9,6,'Main parallel tip'),@(5,1,'Selected topic'))){
+        $n=[int]$entry[0];$parent=[int]$entry[1]
+        $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE=('2001-01-01T00:00:{0:d2}Z'-f$n)
+        $oids[$n]=Graph-Git $Fixture @('commit-tree',$tree,'-p',$oids[$parent],'-m',$entry[2])
+    }
+    Graph-Git $Fixture @('update-ref','refs/heads/main',$oids[9])|Out-Null
+    Graph-Git $Fixture @('branch','ended-topic',$oids[8])|Out-Null
+    Graph-Git $Fixture @('branch','selected-topic',$oids[5])|Out-Null
+    Graph-Git $Fixture @('branch','parallel-side',$oids[4])|Out-Null
+    Graph-Git $Fixture @('reset','--hard','main')|Out-Null
+    }finally{$env:GIT_AUTHOR_DATE=$previousAuthorDate;$env:GIT_COMMITTER_DATE=$previousCommitterDate}
+}
 try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
-            Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
+            if(!$Screenshots){Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
             $directory=Join-Path $OutputDirectory "$scenario-$sample";New-Item -ItemType Directory -Path $directory|Out-Null
             $fixture=Join-Path $directory 'repository';New-Item -ItemType Directory -Path $fixture|Out-Null
             $env:LOCALAPPDATA=Join-Path $directory 'app-data';$env:APPDATA=$env:LOCALAPPDATA;New-Item -ItemType Directory -Path $env:LOCALAPPDATA|Out-Null
             Graph-Git $fixture @('init','-b','main')|Out-Null
             foreach($config in @(@('user.name','Graph Fixture'),@('user.email','graph@example.test'),@('commit.gpgSign','false'),@('core.hooksPath','disabled-fixture-hooks'),@('core.autocrlf','false'))){Graph-Git $fixture @('config',$config[0],$config[1])|Out-Null}
+            if($scenario-eq'graph-selection-boundary'){New-SelectionBoundaryFixture $fixture}else{
             Set-Content -LiteralPath (Join-Path $fixture '.git/git-rustle-graph-fixture') -Value 'disposable graph feature fixture'
             foreach($n in 0..3){Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value "base $n";Graph-Git $fixture @('add','.')|Out-Null;Graph-Git $fixture @('commit','-m',"Base commit $n with a useful long subject for graph layout validation")|Out-Null}
             Graph-Git $fixture @('checkout','-b','topic')|Out-Null
@@ -65,6 +89,7 @@ try{
                     Set-Content -LiteralPath (Join-Path $fixture 'saved-untracked.txt') -Value "saved untracked change $stashNumber"
                     Graph-Git $fixture @('stash','push','-u','-m',"Saved work $stashNumber")|Out-Null
                 }
+            }
             }
             $before=Graph-State $fixture;$before|Set-Content -LiteralPath (Join-Path $directory 'before.json')
             $env:GIT_RUSTLE_BASE_CHOOSER_CAPTURE=if($Screenshots -and $scenario -eq 'diff-base-choose'){'1'}else{'0'}

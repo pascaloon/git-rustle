@@ -3514,6 +3514,7 @@ impl Desktop {
             self.scenario.as_deref(),
             Some(
                 "graph-multiselect"
+                    | "graph-selection-boundary"
                     | "multi-details"
                     | "pending-graph"
                     | "stash-preview"

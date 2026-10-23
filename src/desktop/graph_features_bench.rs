@@ -16,6 +16,7 @@ impl Desktop {
             matches!(
                 *name,
                 "graph-multiselect"
+                    | "graph-selection-boundary"
                     | "multi-details"
                     | "pending-graph"
                     | "stash-preview"
@@ -106,6 +107,21 @@ impl Desktop {
             self.graph_features.head = self.engine.app.head_id();
             self.engine.mark("graph feature requested");
             match name.as_str() {
+                "graph-selection-boundary" => {
+                    let app = &self.engine.app;
+                    let target = app
+                        .refs
+                        .as_ref()
+                        .unwrap()
+                        .refs
+                        .iter()
+                        .find(|r| r.name == "selected-topic")
+                        .unwrap()
+                        .id;
+                    let index = app.history.index_of(&target).unwrap();
+                    self.action(Action::Select(index, false), window, cx);
+                    self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                }
                 "checkout-simple" => {
                     let root = self.engine.repository_root().unwrap();
                     assert_eq!(
@@ -217,6 +233,77 @@ impl Desktop {
             }
             self.graph_features.paints.borrow_mut().clear();
             self.graph_features.phase = 1;
+            return;
+        }
+        if name == "graph-selection-boundary" {
+            let app = &self.engine.app;
+            assert!(app.history.complete);
+            let selected = app.selected_id().unwrap();
+            let mut expected_ids = std::collections::HashSet::new();
+            let mut cursor = Some(selected);
+            while let Some(id) = cursor {
+                assert!(expected_ids.insert(id));
+                cursor = app
+                    .history
+                    .index_of(&id)
+                    .and_then(|i| app.history.parents(i).first().copied());
+            }
+            let mut highlighted = 0;
+            let paints = self.graph_features.paints.borrow();
+            for (index, record) in app.history.commits.iter().enumerate() {
+                assert!(!app.pending.exists());
+                let row = index;
+                let Some(bounds) = paints.get(&(row, 0)) else {
+                    return;
+                };
+                assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+                assert!(bounds.left() >= px(0.) && bounds.top() >= px(0.));
+                assert!(
+                    bounds.right() <= window.viewport_size().width
+                        && bounds.bottom() <= window.viewport_size().height
+                );
+                let expected = expected_ids.contains(&record.id);
+                let actual = self
+                    .graph_selected_path
+                    .node_on_path(row, record.node_lane as usize);
+                assert_eq!(
+                    actual,
+                    expected,
+                    "Unrelated SHA highlighted: {}",
+                    app.history.subject(index)
+                );
+                highlighted += usize::from(actual);
+            }
+            assert_eq!(
+                highlighted,
+                if self.graph_features.phase == 2 { 4 } else { 2 }
+            );
+            assert_eq!(self.selected_commits.count(app.selected_id()), 1);
+            assert_eq!(app.head_id(), self.graph_features.head);
+            drop(paints);
+            if self.graph_features.phase < 3 {
+                let name = if self.graph_features.phase == 1 {
+                    "ended-topic"
+                } else {
+                    "selected-topic"
+                };
+                let target = app
+                    .refs
+                    .as_ref()
+                    .unwrap()
+                    .refs
+                    .iter()
+                    .find(|r| r.name == name)
+                    .unwrap()
+                    .id;
+                let index = app.history.index_of(&target).unwrap();
+                self.action(Action::Select(index, false), window, cx);
+                self.graph_features.paints.borrow_mut().clear();
+                self.graph_features.phase += 1;
+                return;
+            }
+            self.graph_features.verified = true;
+            self.engine.mark("graph feature verified frame");
             return;
         }
         if name.starts_with("stash-") {

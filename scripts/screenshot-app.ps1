@@ -1,11 +1,16 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
-    [ValidateSet('graph','branches','settings','diff','stash-panel')]
+    [ValidateSet('graph','branches','settings','diff','stash-panel','graph-selection-boundary')]
     [string[]]$Scenarios = @('graph','branches','settings','diff','stash-panel'),
     [string]$OutputDirectory = "$PSScriptRoot/../target/bench/screenshots-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))",
     [ValidateRange(10,120)][int]$TimeoutSeconds = 30
 )
 $ErrorActionPreference = 'Stop'
+if('graph-selection-boundary' -in $Scenarios){
+    if($Scenarios.Count-ne1){throw 'Capture graph-selection-boundary separately from other views'}
+    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios graph-selection-boundary -Screenshots -OutputDirectory $OutputDirectory
+    return
+}
 . "$PSScriptRoot/benchmark-screenshot.ps1"
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
