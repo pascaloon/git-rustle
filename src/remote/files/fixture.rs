@@ -59,6 +59,9 @@ impl Api {
                 assert!(q.fetch_add(1, Ordering::Relaxed) < 128);
                 let (b, r, s) = (b.clone(), r.clone(), s.clone());
                 clients.push(thread::spawn(move || {
+                    // Winsock inherits the listener's nonblocking mode. Each
+                    // client worker reads complete HTTP lines with timeouts.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                     stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                     let mut reader=BufReader::new(stream.try_clone().unwrap());
@@ -156,4 +159,63 @@ pub(crate) fn install(app: &mut crate::app::App, remote: &Remote) {
     }
     app.history = history;
     app.needs_redraw = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Read, net::TcpStream, time::Instant};
+
+    #[test]
+    fn fixture_handles_delayed_and_split_request_headers() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            let api = Api::start(provider);
+            let endpoint = url::Url::parse(&api.remote.endpoint).unwrap();
+            let mut stream = TcpStream::connect(("127.0.0.1", endpoint.port().unwrap())).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while api.requests.load(Ordering::Acquire) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not accept the client"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            // A connected client may not send its headers immediately. Neither
+            // the request line nor later header lines must require one packet.
+            thread::sleep(Duration::from_millis(100));
+            write!(stream, "GET /git/trees/{} HTTP/1.1\r\nHost:", id(3)).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            stream
+                .write_all(b" localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut status = String::new();
+            reader.read_line(&mut status).unwrap();
+            assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+            let mut length = None;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.strip_prefix("Content-Length: ") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.expect("response Content-Length")];
+            reader.read_exact(&mut body).unwrap();
+            assert!(
+                String::from_utf8(body)
+                    .unwrap()
+                    .contains("remote-example.txt")
+            );
+        }
+    }
 }
