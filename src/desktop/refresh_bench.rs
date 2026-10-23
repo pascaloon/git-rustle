@@ -130,6 +130,15 @@ impl Desktop {
                 expected == old || !self.engine.app.ghosts.contains_key(&expected),
                 "fixture advanced before Refresh"
             );
+            let initial = self.refresh_bench.paints.borrow()[&old];
+            let viewport = self.graph_scroll.0.borrow().base_handle.bounds();
+            assert!(initial.bounds.size.width > px(0.) && initial.bounds.size.height > px(0.));
+            assert!(
+                initial.bounds.bottom() > viewport.top()
+                    && initial.bounds.top() < viewport.bottom(),
+                "initial server tip must be painted before Refresh"
+            );
+            self.engine.mark("refresh native startup ghost frame");
             let control =
                 std::env::var("GIT_RUSTLE_REFRESH_CONTROL").expect("refresh fixture control URL");
             let url = url::Url::parse(&control).expect("fixture control URL");

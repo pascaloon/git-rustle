@@ -1,7 +1,8 @@
 """Owned localhost API fixture for graph-refresh benchmarks; never uses real credentials.
 Launch hidden with the bundled Python runtime. Writes manifest after configuring an
 isolated disposable repository; POST /control/advance, GET /control/stats, and
-POST /control/stop are exclusively fixture controls. No Git server is started.
+POST /control/stop are exclusively fixture controls. The Git endpoint advertises
+refs only; upload-pack/object transfer is deliberately unsupported.
 """
 import argparse
 import json
@@ -16,9 +17,16 @@ from urllib.parse import unquote, urlparse, parse_qs
 parser = argparse.ArgumentParser()
 parser.add_argument('--directory', required=True)
 parser.add_argument('--branches', type=int, default=12)
+parser.add_argument('--tags', type=int, default=0)
+parser.add_argument('--unrelated-first', action='store_true')
 parser.add_argument('--delay-ms', type=int, default=60)
 parser.add_argument('--server-only', type=int, default=1000)
 parser.add_argument('--unchanged', action='store_true')
+parser.add_argument('--api-only', action='store_true')
+parser.add_argument('--git-cli-only', action='store_true')
+parser.add_argument('--tracking-only-ghost', action='store_true')
+parser.add_argument('--malformed-advertisement', action='store_true')
+parser.add_argument('--unicode-tag-advertisement', action='store_true')
 args = parser.parse_args()
 owned = Path(args.directory).resolve()
 owned.mkdir(parents=True, exist_ok=False)
@@ -28,7 +36,7 @@ env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', GI
 def git(*arguments):
     return subprocess.check_output(['git', '-C', str(repo), *arguments], env=env, stderr=subprocess.PIPE,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).decode().strip()
-git('init', '-q', '-b', 'z-ghost')
+git('init', '-q', '-b', 'branch-000' if args.tracking_only_ghost else 'z-ghost')
 git('config', 'user.name', 'Graph Refresh Fixture')
 git('config', 'user.email', 'graph-refresh@example.invalid')
 git('config', 'credential.helper', '')
@@ -36,8 +44,16 @@ git('config', 'credential.helper', '')
 git('add', 'tracked.txt')
 git('commit', '--allow-empty', '-qm', 'Local fixture base')
 base = git('rev-parse', 'HEAD')
-for index in range(args.branches-1):
-    git('branch', f'branch-{index:03}')
+refs = ''.join(f'create refs/heads/branch-{index:03} {base}\n'
+               for index in range(int(args.tracking_only_ghost), args.branches-1))
+if args.tracking_only_ghost:
+    # No local branch or upstream names z-ghost: startup must discover its newer
+    # server tip from this fetched remote-tracking ref, before any Refresh action.
+    refs += f'create refs/remotes/origin/z-ghost {base}\n'
+refs += ''.join(f'create refs/tags/tag-{index:05} {base}\n' for index in range(args.tags))
+subprocess.run(['git', '-C', str(repo), 'update-ref', '--stdin'], input=refs.encode(), env=env,
+    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
 (repo/'tracked.txt').write_text('retained unstaged content\n')
 (repo/'staged.txt').write_text('retained staged content\n')
 git('add', 'staged.txt')
@@ -52,6 +68,7 @@ def commit(sha, parent):
         'committer': {'name': 'Fixture', 'email': 'fixture@example.invalid', 'date': '2026-01-01T00:00:00Z'},
         'message': 'Changed ghost' if sha == new else 'Initial ghost'}}
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
     def log_message(self, *_):
         pass
     def response(self, status, value):
@@ -86,24 +103,56 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             state['active'] += 1
             state['peakRequests'] = max(state['peakRequests'], state['active'])
-            state['requests'].append({'path': self.path, 'at': time.monotonic(), 'advanced': state['advanced']})
+            state['requests'].append({'path': self.path, 'at': time.monotonic(), 'advanced': state['advanced'],
+                                      'nativeHttp': self.headers.get('User-Agent', '').startswith('git-rustle/')})
             advanced = state['advanced']
         try:
             root = '/repos/team/repo'
-            if parsed.path.startswith(root+'/branches/'):
+            if parsed.path == '/team/repo/info/refs':
+                time.sleep(args.delay_ms/1000)
+                if args.api_only or (args.git_cli_only and self.headers.get('User-Agent', '').startswith('git-rustle/')):
+                    self.response(403, {})
+                    return
+                def pkt(value):
+                    body = value.encode()
+                    return f'{len(body)+4:04x}'.encode()+body
+                body = pkt('# service=git-upload-pack\n')+b'0000'
+                names = local_names + [f'server-only-{i:05}' for i in range(args.server_only)]
+                for index, name in enumerate(names):
+                    sha = (new if advanced else old) if name == 'z-ghost' else base
+                    capabilities = '\x00multi_ack' if index == 0 else ''
+                    body += pkt(f'{sha} refs/heads/{name}{capabilities}\n')
+                    if index == 0 and args.malformed_advertisement and self.headers.get('User-Agent', '').startswith('git-rustle/'):
+                        # Native parsing must reject the malformed response,
+                        # then fall back to the unmodified Git advertisement.
+                        body += pkt(f'{base} private-parser-sentinel\n')
+                if args.unicode_tag_advertisement:
+                    body += pkt(f'{base} refs/tags/unicode-\u0085-tag\n')
+                body += b'0000'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-git-upload-pack-advertisement')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif parsed.path.startswith(root+'/branches/'):
                 name = unquote(parsed.path[len(root+'/branches/'):])
                 time.sleep(args.delay_ms/1000)
                 self.response(200, {'name': name, 'commit': {'sha': (new if advanced else old) if name == 'z-ghost' else base}})
             elif parsed.path == root+'/branches':
+                time.sleep(args.delay_ms/1000)
                 page = int(parse_qs(parsed.query).get('page', ['1'])[0])
-                names = local_names + [f'server-only-{i:05}' for i in range(args.server_only)]
+                unrelated = [f'server-only-{i:05}' for i in range(args.server_only)]
+                names = unrelated + local_names if args.unrelated_first else local_names + unrelated
                 batch = names[(page-1)*100:page*100]
                 self.response(200, [{'name':name,'commit':{'sha':(new if advanced else old) if name=='z-ghost' else base}} for name in batch])
             elif parsed.path == root+'/commits':
                 sha = parse_qs(parsed.query).get('sha', [''])[0]
                 self.response(200, [commit(new, old), commit(old, base)] if sha == new and new != old else [commit(old, base)])
             elif parsed.path == root+'/tags':
-                self.response(200, [])
+                time.sleep(args.delay_ms/1000)
+                page = int(parse_qs(parsed.query).get('page', ['1'])[0])
+                self.response(200, [{'name': f'tag-{i:05}', 'commit': {'sha': base}}
+                    for i in range((page-1)*100, min(page*100, args.tags))])
             elif parsed.path == root+'/actions/runs':
                 with lock:
                     state['pipelineRequests'] += 1
@@ -132,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 server.daemon_threads = True
 endpoint = f'http://127.0.0.1:{server.server_address[1]}'
-git('config', 'remote.origin.url', 'https://graph-refresh-fixture.invalid/team/repo')
+git('config', 'remote.origin.url', endpoint+'/team/repo')
 git('config', 'remote.origin.rustle-provider', 'github')
 git('config', 'remote.origin.rustle-api-url', endpoint)
 def fingerprint():
@@ -142,7 +191,7 @@ def fingerprint():
             'files':{str(p.relative_to(repo)):p.read_bytes().hex() for p in repo.rglob('*') if p.is_file() and '.git' not in p.relative_to(repo).parts}}
 original_refs = git('show-ref')
 original_state = fingerprint()
-manifest = {'repository': str(repo), 'controlUrl': endpoint+'/control', 'baseOid': base, 'oldGhostOid': old, 'newGhostOid': new, 'branches': args.branches, 'delayMs': args.delay_ms, 'pid': os.getpid()}
+manifest = {'repository': str(repo), 'controlUrl': endpoint+'/control', 'baseOid': base, 'oldGhostOid': old, 'newGhostOid': new, 'branches': args.branches, 'trackingOnlyGhost': args.tracking_only_ghost, 'delayMs': args.delay_ms, 'pid': os.getpid()}
 (owned/'manifest.json').write_text(json.dumps(manifest, indent=2))
 try:
     server.serve_forever(poll_interval=0.05)

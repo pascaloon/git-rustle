@@ -234,9 +234,13 @@ retains recovered untracked files.
 ### Remotes
 
 GitHub and GitLab branches, tags, missing commits and remote diffs load through
-read-only provider APIs. Browsing and previews do not fetch Git objects or alter
-repository refs/worktrees. Startup checks configured local upstreams; opening the
-branch browser requests the full listing. Remote enrichment prioritizes selected
+read-only provider APIs. Graph refreshes check branch tips through the provider's
+HTTPS ref advertisement, reusing connections and the existing provider token.
+Git's normal transport (including SSH) and branch APIs remain fallback paths.
+Browsing and previews do not fetch Git objects or alter
+repository refs/worktrees. Startup checks configured local upstreams and fetched
+remote-tracking branches; opening the branch browser requests the full listing.
+Remote enrichment prioritizes selected
 branches and bounds background work. Activity uses the latest 100 first-parent
 commits and counts commits from the past seven days.
 

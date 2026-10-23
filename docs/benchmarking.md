@@ -1477,7 +1477,7 @@ separate directories, with `-Samples 15`. The new cases cannot be compared
 against a binary lacking their scenario. The fixture defaults to 1,000 unrelated
 server-only branches. `after-branches` loads that complete browser snapshot
 before returning to Graph; smart checks must preserve those entries and issue
-no full-list, tag, project or request-list calls after Refresh. Full refresh must
+no full-list, tag, project or request-list calls after Refresh for small scopes. Full refresh must
 issue all those call types. Unchanged refresh asserts stable history storage,
 label revision and selection. Test missing/changed ancestry and partial errors
 with the functional harness too.
@@ -1508,6 +1508,73 @@ and distinguish head paint from background tag completion. Private-desktop
 painting excludes physical input, interactive composition, scanout and live
 provider/network behavior. Never combine screenshot intervals with timing.
 
+
+### Large graph refresh
+
+For four or more scoped heads, startup and Smart Refresh first request Git's
+smart-HTTP v0 ref advertisement directly from the configured provider's HTTPS
+installation. Connections are reused; each request uses the current provider
+token with HTTP Basic authentication. SSH remotes retain their configured URL.
+Only the known GitHub API-to-web host mapping can move credentials between
+origins; custom installation prefixes are preserved. Redirects are rejected.
+A complete pkt-line response, including its final flush, is required to verify
+missing heads. HTML, errors, malformed or truncated responses trigger fallback.
+
+For 64 or more scoped heads, fallback first uses a read-only Git ref
+advertisement (`ls-remote --heads --refs`) through normal Git credentials.
+Neither path transfers objects or writes local refs or FETCH_HEAD.
+Each transport probe has a three-second budget. Failure falls back to branch API pages
+(100 heads per page, four concurrent requests); further transport probes are
+suppressed for 60 seconds in that process. All results are filtered to requested
+graph identities. Small scopes fall back to individual head checks. A complete listing
+is required before missing heads are removed; partial failures retain unchecked
+heads. Enumeration stops early when all requested heads have been found.
+The page probe is capped at twice the scoped page count (at least four pages);
+remaining identities then use exact endpoints. Exercise this fallback with
+`-CandidateOnly -ApiOnly -Branches 64 -ServerOnlyBranches 10000 -UnrelatedFirst`.
+The default fixture supports persistent HTTP advertisement connections;
+`-ApiOnly` rejects both advertisements, while `-GitCliOnly` rejects the native
+HTTP client to verify Git transport fallback and failed-probe cooldown.
+Normal refresh with four or more heads must use one native HTTP advertisement and
+zero branch API calls; failed advertisements must never prove branch deletions.
+Graph startup uses cached remote tag labels. Full Refresh updates remote tags;
+local Git tag labels are always loaded from the reference snapshot.
+
+For Git-valid Unicode reference names, add `-UnicodeTagAdvertisement` to the
+cache-enabled graph refresh comparison. It appends an unrelated tag containing
+U+0085 to both native and Git advertisements. The candidate must accept it through
+native HTTP on startup and Refresh; the old parser falls back to Git. Unit tests
+also parse real Git upload-pack output with C1 characters, accept U+0080-U+009F
+in requested heads/unrelated tags, and reject every ASCII control plus space.
+Git's reference rules prohibit ASCII control bytes, not all Unicode controls
+(see https://git-scm.com/docs/git-check-ref-format).
+For malformed-response fallback, use `-MalformedAdvertisement -CandidateOnly
+-Branches 100 -EnableCache`. The fixture inserts an unsupported reference into
+the native HTTP response only. The runner checks successful Git fallback,
+failed-probe cooldown, startup/refresh paint and repository preservation.
+
+For startup coverage of fetched branches without local checkouts, add
+`-TrackingOnlyGhost -CandidateOnly` to the graph refresh runner. The fixture has
+`refs/remotes/origin/z-ghost` but no local branch or configured upstream naming
+that branch. The native scenario must paint its newer server tip before advancing
+the provider and invoking Refresh, then paint the changed tip afterward. Run with
+and without `-EnableCache`; optional `-GitCliOnly` exercises the transport fallback.
+Startup and Smart Refresh share the graph discovery scope, including fetched
+remote-tracking names. Server-only branches remain in the lazy branch browser.
+
+Use `benchmark-graph-refresh.ps1 -BaselineSmart` to compare the preserved
+baseline build with the candidate on the same Smart Refresh action. Run the
+12-head control and a 100-head comparison with 15 samples, then
+`-CandidateOnly -Branches 1370 -Tags 5638 -Samples 15` for the large scope.
+The fixture applies `-DelayMs` to advertisements, branch pages, individual heads
+and tag pages. Discovery reuses the completed
+local reference snapshot instead of scanning it a second time.
+It retains unrelated server-only heads and verifies repository postconditions.
+Run unchanged, after-branches and Full cases too, plus shared startup and
+normal/searched scrolling. Record startupGraphMs (first graph frame),
+startupReadyMs (initial work settled before the fixture advance), localFrameMs,
+firstGhostMs and settledMs separately. These small-history API fixtures do not
+reproduce the topology, disk/cache state or network of a work repository.
 
 ### Graph polish and direct external-tool controls
 

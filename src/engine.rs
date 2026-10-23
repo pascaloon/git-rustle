@@ -939,7 +939,9 @@ impl Engine {
             {
                 let mode = self.next_remote_mode.take();
                 self.remote_explicit = mode.is_some();
-                self.preview_cached_only = mode.is_some();
+                // Graph startup and Smart Refresh reuse cached tag labels.
+                // Full Refresh still updates remote tags.
+                self.preview_cached_only = mode.is_some() || !app.branches.open;
                 if mode != Some(RefreshMode::Smart) {
                     self.preview_epoch = self.preview_epoch.wrapping_add(1);
                     self.preview_cancel.store(true, Ordering::Relaxed);
@@ -958,9 +960,12 @@ impl Engine {
                     Some(RefreshMode::Smart) => remote::DiscoveryScope::Graph,
                     Some(RefreshMode::Full) => remote::DiscoveryScope::All,
                     None if app.branches.open => remote::DiscoveryScope::All,
-                    None => remote::DiscoveryScope::Startup,
+                    // Include fetched tips even without a local checkout.
+                    None => remote::DiscoveryScope::Graph,
                 };
                 let local_only = scope != remote::DiscoveryScope::All;
+                // Reuse the local worker snapshot instead of enumerating refs again.
+                let refs = app.refs.clone();
                 let mut requested = app.branches.preview_targets.clone();
                 for (id, label) in &app.ghost_branches {
                     if let Some(source) = app.ghost_sources.get(id)
@@ -986,6 +991,7 @@ impl Engine {
                         force,
                         no_cache,
                         scope,
+                        refs.as_ref(),
                         &requested,
                         &cancel,
                         |event| {

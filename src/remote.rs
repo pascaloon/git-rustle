@@ -7,8 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::git::command;
 use serde::{Deserialize, Serialize};
 
+mod advertisement;
 mod avatars;
 pub mod files;
+mod heads;
 pub mod history;
 pub mod requests;
 
@@ -929,7 +931,7 @@ fn load_cached(
     }
 }
 
-/// Graph startup asks only about actual local heads; the full branch list is lazy (b).
+/// Read one eligible graph head; the full server branch list is lazy (b).
 #[allow(clippy::too_many_arguments)]
 fn read_head(
     path: &Path,
@@ -1057,19 +1059,49 @@ fn load_heads_scoped(
     }
     let mut found = Vec::new();
     let mut verified = HashSet::new();
+    // Individual endpoints are cheap for a handful of heads, but thousands of
+    // tracking refs turn that into minutes of round trips. Enumerate in pages
+    // above this crossover, publishing only identities in the graph's scope.
+    let bulk = names.len() >= heads::BULK_THRESHOLD;
     // Bound API fanout independently of branch count. Publish completed batches
     // while slow branches are still being checked; no Git objects/refs are fetched.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let (send, receive) = std::sync::mpsc::channel();
     let initial_token = token.clone();
     let started = std::time::Instant::now();
-    let failure = std::thread::scope(|scope| {
-        for _ in 0..sorted.len().min(4) {
-            let send = send.clone();
-            let sorted = &sorted;
-            let next = &next;
-            let initial_token = &initial_token;
-            scope.spawn(move || {
+    let advertised = (names.len() >= advertisement::MIN_HEADS)
+        .then(|| advertisement::read(remote, token.as_deref(), &names, cancel))
+        .flatten()
+        .or_else(|| {
+            bulk.then(|| heads::advertise(path, remote, &names, cancel))
+                .flatten()
+        });
+    let failure = if let Some(branches) = advertised {
+        found = branches;
+        verified = names.clone();
+        None
+    } else if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        Some("Remote head check cancelled".into())
+    } else if bulk {
+        heads::load(
+            path,
+            remote,
+            &names,
+            &mut token,
+            cancel,
+            &mut found,
+            &mut verified,
+            emit,
+        )
+        .err()
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..sorted.len().min(4) {
+                let send = send.clone();
+                let sorted = &sorted;
+                let next = &next;
+                let initial_token = &initial_token;
+                scope.spawn(move || {
                 let http = Http::new();
                 let mut worker_token = initial_token.clone();
                 loop {
@@ -1084,53 +1116,54 @@ fn load_heads_scoped(
                     if send.send(((*name).clone(),result,worker_token.clone())).is_err() { break; }
                 }
             });
-        }
-        drop(send);
-        let mut first_error = None;
-        let mut completed = 0;
-        let mut last_publish = std::time::Instant::now();
-        for (name, result, resolved_token) in receive {
-            completed += 1;
-            if resolved_token.is_some() {
-                token = resolved_token;
             }
-            match result {
-                Ok(Some(branch)) => {
-                    verified.insert(name);
-                    found.push(branch);
+            drop(send);
+            let mut first_error = None;
+            let mut completed = 0;
+            let mut last_publish = std::time::Instant::now();
+            for (name, result, resolved_token) in receive {
+                completed += 1;
+                if resolved_token.is_some() {
+                    token = resolved_token;
                 }
-                Ok(None) => {
-                    verified.insert(name);
+                match result {
+                    Ok(Some(branch)) => {
+                        verified.insert(name);
+                        found.push(branch);
+                    }
+                    Ok(None) => {
+                        verified.insert(name);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
-                Err(error) => {
-                    first_error.get_or_insert(error);
+                // Throttle partial publication. The engine retains unchecked in-memory
+                // heads until the full set succeeds; this payload contains verified heads only.
+                if (completed == 1 || last_publish.elapsed() >= Duration::from_millis(80))
+                    && completed < sorted.len()
+                    && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    last_publish = std::time::Instant::now();
+                    // Only verified heads belong in a network batch. Cache-only
+                    // rows were seeded separately and must not overwrite newer memory.
+                    let mut partial = found.clone();
+                    partial.sort_by(|a, b| a.name.cmp(&b.name));
+                    emit(Event::HeadsVerified {
+                        update: Update {
+                            remote: remote.clone(),
+                            branches: partial,
+                            scoped: true,
+                            cached: true,
+                            stale: true,
+                        },
+                        scope: verified.clone(),
+                    });
                 }
             }
-            // Throttle partial publication. The engine retains unchecked in-memory
-            // heads until the full set succeeds; this payload contains verified heads only.
-            if (completed == 1 || last_publish.elapsed() >= Duration::from_millis(80))
-                && completed < sorted.len()
-                && !cancel.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                last_publish = std::time::Instant::now();
-                // Only verified heads belong in a network batch. Cache-only
-                // rows were seeded separately and must not overwrite newer memory.
-                let mut partial = found.clone();
-                partial.sort_by(|a, b| a.name.cmp(&b.name));
-                emit(Event::HeadsVerified {
-                    update: Update {
-                        remote: remote.clone(),
-                        branches: partial,
-                        scoped: true,
-                        cached: true,
-                        stale: true,
-                    },
-                    scope: verified.clone(),
-                });
-            }
-        }
-        first_error
-    });
+            first_error
+        })
+    };
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Remote head check cancelled".into());
     }
@@ -1181,7 +1214,6 @@ fn load_heads_scoped(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiscoveryScope {
-    Startup,
     Graph,
     All,
 }
@@ -1194,6 +1226,7 @@ pub fn discover_scoped(
     force: bool,
     no_cache: bool,
     discovery_scope: DiscoveryScope,
+    refs: Option<&crate::git::RefSnapshot>,
     requested: &[crate::branches::Target],
     cancel: &std::sync::atomic::AtomicBool,
     emit: impl Fn(Event) + Sync,
@@ -1214,8 +1247,7 @@ pub fn discover_scoped(
             }
             let mut requested = requested.to_vec();
             if discovery_scope == DiscoveryScope::Graph
-                && let Ok(repo) = crate::git::open(path)
-                && let Ok(refs) = crate::git::snapshot_refs(&repo)
+                && let Some(refs) = refs
             {
                 for remote in &remotes {
                     let prefix = format!("{}/", remote.name);
