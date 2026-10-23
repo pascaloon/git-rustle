@@ -4,9 +4,11 @@ pub(crate) use super::avatars::Stats as PhotoStats;
 pub use super::avatars::image_format;
 use super::*;
 use serde_json::{Value, json};
+pub mod branch_choices;
 pub mod integration;
 #[cfg(test)]
 pub mod pipelines;
+#[cfg(test)]
 pub mod target;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

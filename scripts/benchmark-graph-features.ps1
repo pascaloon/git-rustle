@@ -1,8 +1,9 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
+    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
+    [switch]$DisableDirectComposition,
     [Parameter(Mandatory)][string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
@@ -12,7 +13,7 @@ $Candidate=(Resolve-Path -LiteralPath $Candidate).Path
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 if(Test-Path -LiteralPath $OutputDirectory){throw 'Retaining existing graph-feature run'}
 New-Item -ItemType Directory -Path $OutputDirectory|Out-Null
-$saved=@{};$names=@('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_BASE_CHOOSER_CAPTURE')
+$saved=@{};$names=@('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_AUTHOR_DATE','GIT_COMMITTER_DATE','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_BASE_CHOOSER_CAPTURE','GPUI_DISABLE_DIRECT_COMPOSITION')
 foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $results=[Collections.Generic.List[object]]::new()
 function Graph-Git([string]$Path,[string[]]$Arguments){$value=@(& git -C $Path @Arguments 2>&1);if($LASTEXITCODE-ne0){throw "Fixture Git failed: $($value-join' ')"};return ($value-join"`n")}
@@ -50,10 +51,11 @@ function New-SelectionBoundaryFixture([string]$Fixture){
     }finally{$env:GIT_AUTHOR_DATE=$previousAuthorDate;$env:GIT_COMMITTER_DATE=$previousCommitterDate}
 }
 try{
+    if($DisableDirectComposition){$env:GPUI_DISABLE_DIRECT_COMPOSITION='1'}
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
             if(!$Screenshots){Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
@@ -145,5 +147,5 @@ try{
     }
 }finally{
     foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}
-    @{candidate=$Candidate;sha256=(Get-FileHash -LiteralPath $Candidate).Hash;screenshots=$Screenshots;limitations='Candidate-only real actions through verified GPUI paint on private desktops. Capture runs are separate from timing. Does not measure physical input, scanout or employer network.'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
+    @{candidate=$Candidate;sha256=(Get-FileHash -LiteralPath $Candidate).Hash;screenshots=$Screenshots;directCompositionDisabled=[bool]$DisableDirectComposition;limitations='Candidate-only real actions through verified GPUI paint on private desktops. Capture runs are separate from timing. Does not measure physical input, scanout or employer network.'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
 }

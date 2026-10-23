@@ -647,7 +647,7 @@ impl Desktop {
                 for branch in refs
                     .refs
                     .iter()
-                    .filter(|r| r.id == id && r.kind == crate::git::RefKind::Branch)
+                    .filter(|r| graph_request_branch(refs, r, id))
                 {
                     items.push((
                         Action::NewRequest(branch.name.clone()),
@@ -655,6 +655,11 @@ impl Desktop {
                         format!("Create PR / MR from {}…", branch.name),
                         true,
                     ));
+                    // HEAD marks the checked-out branch; include its request
+                    // action without changing the existing mutation menu.
+                    if branch.kind != crate::git::RefKind::Branch {
+                        continue;
+                    }
                     for (dialog, verb) in [
                         (operations::Dialog::Rename, "Rename"),
                         (operations::Dialog::Delete, "Delete"),
@@ -705,15 +710,12 @@ impl Desktop {
         let mut top = Vec::new();
         let mut commit = Vec::new();
         let mut branch = Vec::new();
+        let request_count = items
+            .iter()
+            .filter(|item| matches!(item.0, Action::NewRequest(_)))
+            .count();
         for item in items {
-            if matches!(
-                item.0,
-                Action::Diff
-                    | Action::DiffBase
-                    | Action::DiffBaseChoose
-                    | Action::Checkout
-                    | Action::Stashes(_)
-            ) {
+            if graph_menu_top_item(&item.0, request_count) {
                 top.push(item);
             } else if graph_menu_branch_item(&item.0, item.1, &item.2) {
                 branch.push(item);
@@ -1240,6 +1242,9 @@ impl Desktop {
                                         v.action(Action::Select(local_row, true), window, cx);
                                     }
                                     v.action(Action::Diff, window, cx);
+                                }
+                                Some("request-branches" | "request-branches-menu") => {
+                                    v.action(Action::NewRequest("FeatureA".into()), window, cx);
                                 }
                                 Some("request-open") => {
                                     let source = v.engine.app.refs.as_ref()
@@ -3583,6 +3588,7 @@ impl Desktop {
                     && self.operations.rebase_open
                     && !self.engine.operation_busy
             }
+            Some("request-branches" | "request-branches-menu") => self.request_branches_ready(),
             Some("request-compose" | "request-open") => self.composer.is_some(),
             Some("settings-cache" | "settings-cache-clear") => {
                 !app.settings.busy
@@ -3771,6 +3777,7 @@ impl Render for Desktop {
         self.branch_cleanup_schedule(window, cx);
         self.ui_feature_schedule(window, cx);
         self.refresh_bench_schedule(window, cx);
+        self.request_branches_schedule(window, cx);
         let app = &self.engine.app;
         let dialog = app.checkout_confirmation.as_ref().map(|d| {
             dialog_overlay(
@@ -4621,13 +4628,83 @@ fn graph_menu_branch_item(action: &Action, icon_name: &str, label: &str) -> bool
         || matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::Create | operations::Dialog::Rename | operations::Dialog::Delete | operations::Dialog::Merge | operations::Dialog::Rebase, ..)))
 }
 
+fn graph_request_branch(
+    refs: &crate::git::RefSnapshot,
+    branch: &crate::git::RefEntry,
+    selected: gix::ObjectId,
+) -> bool {
+    branch.id == selected
+        && (branch.kind == crate::git::RefKind::Branch
+            || (branch.kind == crate::git::RefKind::Head
+                && refs.head_branch.as_deref() == Some(branch.name.as_str())))
+}
+
+fn graph_menu_top_item(action: &Action, request_count: usize) -> bool {
+    matches!(
+        action,
+        Action::Diff
+            | Action::DiffBase
+            | Action::DiffBaseChoose
+            | Action::Checkout
+            | Action::Stashes(_)
+    ) || (request_count == 1 && matches!(action, Action::NewRequest(_)))
+}
+
 #[cfg(test)]
 mod graph_tests {
-    use super::{CellKind, GraphCell, pending_graph_cells};
+    use super::{
+        Action, CellKind, GraphCell, graph_menu_top_item, graph_request_branch, pending_graph_cells,
+    };
     use crate::graph::layout::Layout;
 
     fn id(n: u8) -> gix::ObjectId {
         gix::ObjectId::from_bytes_or_panic(&[n; 20])
+    }
+
+    #[test]
+    fn graph_request_menu_includes_current_and_other_local_branches_but_not_detached_head() {
+        use crate::git::{RefEntry, RefKind, RefSnapshot};
+        let mut refs = RefSnapshot {
+            head_branch: Some("Feature".into()),
+            ..Default::default()
+        };
+        for (name, kind, wanted) in [
+            ("Feature", RefKind::Head, true),
+            ("Dev", RefKind::Branch, true),
+            ("HEAD", RefKind::Head, false),
+            ("origin/Feature", RefKind::Remote, false),
+            ("v1", RefKind::Tag, false),
+        ] {
+            let branch = RefEntry {
+                name: name.into(),
+                id: id(1),
+                kind,
+            };
+            assert_eq!(
+                graph_request_branch(&refs, &branch, id(1)),
+                wanted,
+                "{name}"
+            );
+            assert!(!graph_request_branch(&refs, &branch, id(2)));
+        }
+        refs.head_branch = None;
+        assert!(!graph_request_branch(
+            &refs,
+            &RefEntry {
+                name: "HEAD".into(),
+                id: id(1),
+                kind: RefKind::Head
+            },
+            id(1)
+        ));
+    }
+
+    #[test]
+    fn graph_request_menu_is_direct_for_one_branch_and_grouped_for_shared_tips() {
+        let request = Action::NewRequest("Feature".into());
+        assert!(graph_menu_top_item(&request, 1));
+        assert!(!graph_menu_top_item(&request, 2));
+        assert!(graph_menu_top_item(&Action::Diff, 2));
     }
 
     #[test]

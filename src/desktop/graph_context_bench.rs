@@ -25,8 +25,15 @@ impl Desktop {
         if self.graph_context.safe_action.borrow().is_some() {
             return None;
         }
-        if !matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::CreateTag | operations::Dialog::Rename, ..)))
-        {
+        let request_case = self
+            .graph_context_name()
+            .is_some_and(|name| name.starts_with("graph-request-"));
+        let safe = if request_case {
+            matches!(action, Action::NewRequest(_))
+        } else {
+            matches!(action, Action::Operation(operation) if matches!(operation.as_ref(), operations::Action::Open(operations::Dialog::CreateTag | operations::Dialog::Rename, ..)))
+        };
+        if !safe {
             return None;
         }
         *self.graph_context.safe_action.borrow_mut() = Some(action.clone());
@@ -37,6 +44,8 @@ impl Desktop {
             matches!(
                 *s,
                 "graph-commit-menu"
+                    | "graph-request-menu"
+                    | "graph-request-compose"
                     | "graph-branch-menu"
                     | "graph-commit-menu-edge"
                     | "graph-branch-menu-edge"
@@ -88,6 +97,54 @@ impl Desktop {
     fn graph_context_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.graph_context_name().unwrap().to_owned();
         let phase = self.graph_context.phase;
+        if name.starts_with("graph-request-") && phase > 0 {
+            if phase == 1 || phase == 3 {
+                let paints = self.graph_context.paints.borrow();
+                let (Some(root), Some(item)) = (paints.get(&1), paints.get(&8)) else {
+                    return;
+                };
+                assert_eq!(
+                    self.context_menu_group, None,
+                    "Request action must be directly available in the row menu"
+                );
+                assert_eq!(item.size.height, px(36.));
+                assert!(item.top() >= root.top() && item.bottom() <= root.bottom());
+                assert!(item.right() <= window.viewport_size().width);
+                drop(paints);
+                if phase == 3 {
+                    self.graph_context.verified = true;
+                    self.engine.mark("graph context verified frame");
+                    return;
+                }
+                let action = self.graph_context.safe_action.borrow().clone().unwrap();
+                assert!(
+                    matches!(&action,Action::NewRequest(source) if source == &self.graph_context.expected[0])
+                );
+                self.graph_context.menu_position = self.context_menu;
+                self.graph_context.paints.borrow_mut().clear();
+                self.graph_menu_activate(action, window, cx);
+                assert!(self.context_menu.is_none());
+                self.graph_context.phase = 2;
+                return;
+            }
+            if phase == 2 {
+                if !self.graph_request_source_painted(&self.graph_context.expected[0], cx) {
+                    return;
+                }
+                self.engine.mark("graph request composer verified frame");
+                if name == "graph-request-compose" {
+                    self.graph_context.verified = true;
+                    self.engine.mark("graph context verified frame");
+                } else {
+                    self.composer = None;
+                    self.context_menu = self.graph_context.menu_position;
+                    self.context_menu_group = None;
+                    self.graph_context.paints.borrow_mut().clear();
+                    self.graph_context.phase = 3;
+                }
+                return;
+            }
+        }
         if phase == 10 {
             let expected = if name.starts_with("graph-commit-") {
                 "Commit"
@@ -218,6 +275,30 @@ impl Desktop {
                 "disposable graph feature fixture"
             );
             self.graph_context.head = self.engine.app.head_id();
+            if name.starts_with("graph-request-") {
+                let source = self
+                    .engine
+                    .app
+                    .refs
+                    .as_ref()
+                    .unwrap()
+                    .head_branch
+                    .clone()
+                    .unwrap();
+                let selected = self.engine.app.head_id().unwrap();
+                let index = self.engine.app.history.index_of(&selected).unwrap();
+                let row = (0..self.engine.app.graph_len())
+                    .find(|row| self.engine.app.history_index(*row) == Some(index))
+                    .unwrap();
+                self.action(Action::Select(row, false), window, cx);
+                self.graph_context.expected = vec![source];
+                self.engine.mark("graph context requested");
+                self.context_menu = Some(point(px(220.), px(210.)));
+                self.context_menu_group = None;
+                self.graph_context.paints.borrow_mut().clear();
+                self.graph_context.phase = 1;
+                return;
+            }
             let first = self.engine.app.history.commits[(0..self.engine.app.history.len())
                 .find(|i| self.engine.app.history.subject(*i) == "Topic commit 0")
                 .unwrap()]

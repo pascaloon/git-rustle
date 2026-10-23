@@ -683,6 +683,42 @@ scrolling remains fast; moving to GPU rendering does not imply faster startup.
 
 ### Provider composition and photos
 
+Graph-row request commands have two focused native scenarios:
+`graph-request-menu` verifies a directly painted request item on the checked-out
+branch, activates the real menu handler, waits for the composer and its selected
+source to paint, then returns to the menu. `graph-request-compose` retains the
+composer after the same action. Use `benchmark-graph-features.ps1` for timing and
+`screenshot-app.ps1 -Scenarios graph-request-menu,graph-request-compose` separately
+for PNG review. Both use marked disposable repositories and preserve HEAD, refs,
+index, worktree and stashes. Compare the existing `graph-branch-menu` control with
+a preserved executable and run `graph-branch-menu-edge` for shared-tip overflow
+and menu navigation. A single local branch exposes its create action directly;
+several local names at the same tip retain the per-branch submenu. Named HEAD is
+a request source; detached HEAD is not a branch.
+
+For branch selectors, preserve the starting executable, then compare the existing
+`request-compose,request-edit,request-tabs` scenarios and warm/uncached startup.
+The candidate-only `request-branches` and `request-branches-menu` scenarios invoke
+the source/target selection subscriptions, await real reference/ancestry workers,
+verify FeatureA -> Dev and Dev -> Main, preserve a manual target during refresh,
+and verify that changing the source restores automatic selection. They assert
+painted selector bounds; the menu case additionally opens the real selector with
+its registered action and checks that Dev paints above Main.
+
+Use `scripts/screenshot-app.ps1 -Scenarios request-branches,request-branches-menu`
+for separate visual captures (see the screenshot workflow's DirectComposition
+capture limitation and diagnostic switch). It prepares marked local/fetched refs, a remote-only
+branch and an excluded other-remote branch; it verifies unchanged repository
+postconditions after normal close. Reuse the resulting marked fixture with
+`benchmark-desktop.ps1 -Scenarios request-branches,request-branches-menu -Samples 15`
+for timing without capture. These scenarios use an offline provider overlay and
+never submit requests. Run `remote::requests::branch_choices::tests::benchmark_branch_ordering`
+and `desktop::requests::tests::benchmark_branch_search` in an optimized test harness
+after building: one warmup plus fifteen retained samples cover worker ordering at
+1,000 branch names and in-memory filtering at 10,000 branch names. Keep their raw
+output and comparison report under ignored `target/bench/<run>`. Native action/
+paint checks exclude physical typing, pointer behavior and live provider latency.
+
 For empty-description regressions, also run candidate-only
 `benchmark-desktop.ps1 -Scenarios request-open,request-clear` on a disposable local
 repository with one commit and no provider remote. `request-open` uses the actual
