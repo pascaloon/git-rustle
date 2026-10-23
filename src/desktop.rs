@@ -3529,6 +3529,7 @@ impl Desktop {
                     | "stash-pop"
                     | "dense-labels"
                     | "checkout-simple"
+                    | "detached-commit"
                     | "diff-base"
                     | "diff-base-choose"
             )

@@ -28,6 +28,7 @@ impl Desktop {
                     | "stash-pop"
                     | "dense-labels"
                     | "checkout-simple"
+                    | "detached-commit"
                     | "diff-base"
                     | "diff-base-choose"
             )
@@ -241,6 +242,10 @@ impl Desktop {
 
     fn graph_feature_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.graph_feature_name().unwrap().to_owned();
+        if name == "detached-commit" {
+            self.detached_commit_tick(window, cx);
+            return;
+        }
         if name.starts_with("ghost-files-") {
             self.ghost_files_tick(window, cx);
             return;
@@ -723,6 +728,66 @@ impl Desktop {
         if name != "checkout-simple" {
             assert_eq!(self.engine.app.head_id(), self.graph_features.head);
         }
+        self.graph_features.verified = true;
+        self.engine.mark("graph feature verified frame");
+    }
+
+    fn detached_commit_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app = &self.engine.app;
+        if !app.history.complete || !app.pending.known || app.pending.busy {
+            return;
+        }
+        if self.graph_features.phase == 0 {
+            if !app.pending.selected || !app.details_changes.as_ref().is_some_and(|c| c.loaded) {
+                return;
+            }
+            let root = self.engine.repository_root().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join(".git/git-rustle-graph-fixture"))
+                    .unwrap()
+                    .trim(),
+                "disposable graph feature fixture"
+            );
+            assert!(app.refs.as_ref().unwrap().head_branch.is_none());
+            self.graph_features.head = app.head_id();
+            self.engine.app.pending.description.value =
+                "Detached commit stays above its parent".into();
+            self.engine.app.pending.branch.value.clear();
+            self.engine.mark("graph feature requested");
+            self.action(Action::Commit, window, cx);
+            assert!(self.engine.app.pending.request.is_some() || self.engine.app.pending.busy);
+            self.graph_features.phase = 1;
+            return;
+        }
+        assert!(!app.pending.error, "{}", app.pending.status);
+        let Some(head) = app.head_id() else { return };
+        if Some(head) == self.graph_features.head || app.pending.request.is_some() {
+            return;
+        }
+        let Some(row) = app.history.index_of(&head) else {
+            return;
+        };
+        let parent_row = app
+            .history
+            .index_of(&self.graph_features.head.unwrap())
+            .unwrap();
+        assert!(row < parent_row, "detached commit must precede its parent");
+        assert_eq!(row, 0, "newest detached commit belongs at the top");
+        assert!(app.refs.as_ref().unwrap().head_branch.is_none());
+        if self.graph_features.phase == 1 {
+            self.action(Action::Select(row, false), window, cx);
+            self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            self.graph_features.paints.borrow_mut().clear();
+            self.graph_features.phase = 2;
+            return;
+        }
+        let paints = self.graph_features.paints.borrow();
+        let (Some(sha), Some(subject)) = (paints.get(&(row, 0)), paints.get(&(row, 1))) else {
+            return;
+        };
+        assert!(sha.size.width > px(0.) && subject.size.width > px(0.));
+        assert!(sha.right() <= subject.left() + px(1.));
+        assert!(subject.right() <= window.viewport_size().width);
         self.graph_features.verified = true;
         self.engine.mark("graph feature verified frame");
     }

@@ -96,10 +96,15 @@ the startup cost of expanding an unusually large timestamp frontier.
 The latter two components establish candidate costs; preserved baseline native
 startup and scrolling remain the shared comparisons. The history-cache version
 changes, so distinguish fresh candidate cache creation from warmed reopening.
-Detached HEAD history unreachable from references is appended after reference
-history to avoid a second ancestry pass; reference-reachable checkout preserves
-existing rows even with equal timestamps or clock skew. This is a display-order
-policy, not a new strict topological-order guarantee.
+Detached HEAD history unreachable from references participates in the normal
+date-ordered frontier. Detached checkouts require an ancestry query to distinguish
+new tips from reference-reachable ancestors; attached checkouts retain one pass.
+Reference-reachable checkout preserves existing rows even with equal timestamps
+or clock skew. This is a display-order policy, not a new strict topological-order
+guarantee. `benchmark-graph-features.ps1 -Scenarios detached-commit` commits pending
+content through the real action and verifies the new HEAD row above its parent
+after paint, plus files, index and unchanged branch references. Use
+`screenshot-app.ps1 -Scenarios detached-commit` separately for image review.
 
 
 ## GPUI desktop (current implementation)

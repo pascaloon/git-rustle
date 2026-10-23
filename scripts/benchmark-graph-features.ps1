@@ -1,6 +1,6 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
+    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [switch]$DisableDirectComposition,
@@ -56,10 +56,11 @@ try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
             if(!$Screenshots){Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path $IdleWorkspaceRoot).Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
+            $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE='2026-01-01T12:00:00+0000'
             $directory=Join-Path $OutputDirectory "$scenario-$sample";New-Item -ItemType Directory -Path $directory|Out-Null
             $fixture=Join-Path $directory 'repository';New-Item -ItemType Directory -Path $fixture|Out-Null
             $env:LOCALAPPDATA=Join-Path $directory 'app-data';$env:APPDATA=$env:LOCALAPPDATA;New-Item -ItemType Directory -Path $env:LOCALAPPDATA|Out-Null
@@ -80,6 +81,11 @@ try{
                 Graph-Git $fixture @('config','branch.main.remote','origin')|Out-Null
                 Graph-Git $fixture @('config','branch.main.merge','refs/heads/server-only')|Out-Null
                 Set-Content -LiteralPath (Join-Path $fixture 'pending.txt') -Value 'Pending graph polish fixture'
+            }
+            if($scenario-eq'detached-commit'){
+                Graph-Git $fixture @('checkout','--detach','main~1')|Out-Null
+                Set-Content -LiteralPath (Join-Path $fixture 'file.txt') -Value 'detached pending change'
+                $env:GIT_AUTHOR_DATE=$env:GIT_COMMITTER_DATE='2026-01-02T12:00:00+0000'
             }
             if($scenario-eq'pending-graph'){
                 Graph-Git $fixture @('update-ref','refs/remotes/origin/main','HEAD')|Out-Null
@@ -120,10 +126,16 @@ try{
             $after=Graph-State $fixture;$after|Set-Content -LiteralPath (Join-Path $directory 'after.json')
             $a=$after|ConvertFrom-Json;$b=$before|ConvertFrom-Json
             foreach($key in @('refs')){if($a.$key-cne$b.$key){throw "Graph feature changed unrelated $key"}}
-            if($scenario-ne'stash-pop'-and($a.status-cne$b.status-or$a.stashes-cne$b.stashes)){throw 'Graph feature changed unrelated status or stashes'}
+            if($scenario-notin@('stash-pop','detached-commit')-and($a.status-cne$b.status-or$a.stashes-cne$b.stashes)){throw 'Graph feature changed unrelated status or stashes'}
             if($scenario-eq'checkout-simple'){
                 if($a.branch-cne'topic'){throw 'Checkout failed to attach topic'}
                 if($a.index-cne(Graph-Git $fixture @('rev-parse','HEAD^{tree}'))){throw 'Checkout index differs from target tree'}
+            }elseif($scenario-eq'detached-commit'){
+                if($a.branch-cne''-or$a.head-ceq$b.head){throw 'Detached commit did not advance detached HEAD'}
+                if((Graph-Git $fixture @('rev-parse','HEAD^'))-cne$b.head){throw 'Detached commit has wrong parent'}
+                if($a.status-cne''-or$a.stashes-cne$b.stashes){throw 'Detached commit did not preserve expected repository state'}
+                if($a.index-cne(Graph-Git $fixture @('rev-parse','HEAD^{tree}'))){throw 'Detached commit index differs from committed tree'}
+                if((Graph-Git $fixture @('show','HEAD:file.txt')).Trim()-cne'detached pending change'){throw 'Detached commit lost pending content'}
             }elseif($scenario-eq'stash-pop'){
                 if($a.index-cne$b.index-or$a.head-cne$b.head-or$a.branch-cne$b.branch){throw 'Stash Pop changed HEAD or index'}
                 if((Graph-Git $fixture @('stash','list','--format=%s'))-match'Saved work 3'){throw 'Successful Pop did not drop selected stash'}

@@ -1,14 +1,14 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
-    [ValidateSet('graph','branches','settings','diff','stash-panel','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','request-branches','request-branches-menu','graph-request-menu','graph-request-compose')]
+    [ValidateSet('graph','branches','settings','diff','stash-panel','detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','request-branches','request-branches-menu','graph-request-menu','graph-request-compose')]
     [string[]]$Scenarios = @('graph','branches','settings','diff','stash-panel'),
     [string]$OutputDirectory = "$PSScriptRoot/../target/bench/screenshots-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))",
     [ValidateRange(10,120)][int]$TimeoutSeconds = 30,
     [switch]$DisableDirectComposition
 )
 $ErrorActionPreference = 'Stop'
-if(@($Scenarios|Where-Object{$_-in@('graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose')}).Count){
-    if(@($Scenarios|Where-Object{$_-notin@('graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose')}).Count){throw 'Capture graph harness scenarios separately from other views'}
+if(@($Scenarios|Where-Object{$_-in@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose')}).Count){
+    if(@($Scenarios|Where-Object{$_-notin@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose')}).Count){throw 'Capture graph harness scenarios separately from other views'}
     & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios $Scenarios -Screenshots -DisableDirectComposition:$DisableDirectComposition -OutputDirectory $OutputDirectory
     return
 }
