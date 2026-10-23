@@ -3222,7 +3222,10 @@ impl Desktop {
         )
         .track_scroll(self.diff_scroll.clone())
         .size_full();
-        column().flex_1().min_h_0().child(self.diff_search_bar(cx)).child(row().relative().children(self.todo_probe(5))
+        column().flex_1().min_h_0().child(row().w_full().flex_shrink_0()
+            .child(div().flex_1().min_w_0().child(self.diff_search_bar(cx)))
+            .child(self.ai_button("ai-diff-summary", "Summarize all files with AI", crate::ai::Task::Summary, cx)))
+            .child(row().relative().children(self.todo_probe(5))
             .flex_1()
             .min_h_0()
             .items_start()
@@ -3269,7 +3272,6 @@ impl Desktop {
                             .when_some(view.current_change(), |s, change| {
                                 s.child(self.tools_diff_button(change, cx))
                             })
-                            .child(self.ai_button("ai-diff-summary", "Summarize with AI", crate::ai::Task::Summary, cx))
                             .child(self.button("word-wrap", "", Action::Wrap, cx)),
                     )
                     .children(self.tools_notice())

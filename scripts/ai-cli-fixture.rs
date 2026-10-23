@@ -35,7 +35,14 @@ fn main() {
     } else if input.contains("Return only a Git commit message") {
         assert!(input.contains("File: README.md")); assert!(!input.contains("File: notes.txt"));
         "Describe selected documentation\n\nExplain the pending README update.".into()
-    } else { "Summary fixture\n\n- Explain the selected change.\n- Preserve unrelated files.".into() };
+    } else {
+        assert!(input.contains("Scope: Entire diff (2 files)"));
+        assert!(input.contains("File: README.md"));
+        assert!(input.contains("Pending documentation update"));
+        assert!(input.contains("File: notes.txt"));
+        assert!(input.contains("Untracked fixture notes"));
+        "Summary fixture\n\n- Update the documentation and add supporting notes.\n- Summarize the complete comparison across both files.".into()
+    };
     if codex {
         let output = args.windows(2).find(|a| a[0] == "--output-last-message").unwrap();
         std::fs::write(&output[1], &response).unwrap();

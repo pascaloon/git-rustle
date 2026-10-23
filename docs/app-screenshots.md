@@ -59,7 +59,8 @@ The runner compiles `scripts/ai-cli-fixture.rs` into its ignored output director
 prepends only that fixture directory to PATH, seeds isolated global AI settings,
 and retains the submitted context. Native assertions wait for worker completion
 and actual GPUI paint bounds. They verify selected-file messages, editable
-resolutions, automatic rebase completion across commits/files, automatic merge
+resolutions, whole-diff summaries including unchecked/search-hidden files,
+automatic rebase completion across commits/files, automatic merge
 completion with both parents preserved, global settings
 saves, cancellation, stale drafts and CLI errors. Every AI scenario asserts that
 the footer is the app's single 32-pixel status bar. Read-only scenarios check

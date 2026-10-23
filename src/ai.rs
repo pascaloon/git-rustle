@@ -74,7 +74,7 @@ impl Task {
                 "Resolve this file so the automatic Git operation can continue. Return only a JSON object with resolved (boolean), content (the complete resolved file as a string, or null), and reason (an explanation if unresolved, or null). When uncertain return resolved:false, content:null and a reason. Do not return Markdown fences. Preserve the intent of both sides and unrelated content; remove all conflict markers. Git Rustle will save, stage and continue automatically. Do not run commands."
             }
             Self::Summary => {
-                "Return a concise Markdown summary explaining what changed, why it matters, and any concrete concerns visible in the diff."
+                "Return one concise Markdown summary of the entire supplied diff across all files. Explain the overall change and connections between files, why it matters, and concrete concerns supported by the changes. Mention binary changes only by their supplied metadata."
             }
             Self::Commit => {
                 "Return only a Git commit message: a concise imperative subject, then an optional blank line and body. No Markdown fences or introductory text. Describe only the supplied selected changes."
@@ -182,6 +182,40 @@ pub fn prompt(settings: &Settings, task: Task, context: &str) -> Result<String, 
         task.contract(),
         context
     ))
+}
+
+/// Collect the complete comparison, independently of the selected file or UI filters.
+pub fn diff_context(
+    root: &Path,
+    files: &[crate::diff::FileChange],
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let repo = gix::open(root).map_err(|e| e.to_string())?;
+    let mut context = format!("Scope: Entire diff ({} files)\n", files.len());
+    for file in files {
+        if cancel.load(Ordering::Acquire) {
+            return Err("AI request cancelled".into());
+        }
+        context.push_str(&format!("\nChange: {}\n", file.kind.letter()));
+        if let Some(old_path) = &file.old_path {
+            context.push_str(&format!("Previous path: {old_path}\n"));
+        }
+        let (old, new) = crate::diff::external_contents(&repo, file)
+            .map_err(|e| format!("Cannot read {} for the whole diff summary: {e}", file.path))?;
+        if old.contains(&0)
+            || new.contains(&0)
+            || std::str::from_utf8(&old).is_err()
+            || std::str::from_utf8(&new).is_err()
+        {
+            context.push_str(&format!("File: {}\nBinary or non-UTF-8 content; contents unavailable for summary. Before: {} bytes; after: {} bytes.\n", file.path, old.len(), new.len()));
+        } else {
+            context.push_str(&file_context(&file.path, &old, &new).map_err(|_| "The entire diff exceeds the AI context limit (256 KiB). Open a smaller comparison to summarize.".to_string())?);
+        }
+        if context.len() > MAX_CONTEXT {
+            return Err("The entire diff exceeds the AI context limit (256 KiB). Open a smaller comparison to summarize.".into());
+        }
+    }
+    Ok(context)
 }
 
 pub fn file_context(path: &str, old: &[u8], new: &[u8]) -> Result<String, String> {
@@ -483,6 +517,96 @@ mod tests {
         assert!(text.contains("Custom instructions"));
         assert!(text.contains(Task::Conflict.contract()));
         assert!(prompt(&settings, Task::Summary, &"x".repeat(MAX_CONTEXT + 1)).is_err());
+    }
+    #[test]
+    fn whole_diff_reads_historical_files_renames_deletions_and_binary_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            String::from_utf8(crate::git::command::checked(root, args).unwrap())
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        git(&["init", "-b", "main"]);
+        for (key, value) in [
+            ("user.name", "AI fixture"),
+            ("user.email", "ai@example.invalid"),
+            ("commit.gpgsign", "false"),
+            ("core.autocrlf", "false"),
+            ("core.hooksPath", "disabled-fixture-hooks"),
+        ] {
+            git(&["config", key, value]);
+        }
+        for (path, contents) in [
+            ("change.txt", "before change\n"),
+            ("old-name.txt", "rename content\n"),
+            ("deleted.txt", "deleted content\n"),
+        ] {
+            std::fs::write(root.join(path), contents).unwrap();
+        }
+        std::fs::write(root.join("image.bin"), [0, 1]).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "Before"]);
+        let before: gix::ObjectId = git(&["rev-parse", "HEAD"]).parse().unwrap();
+        git(&["mv", "old-name.txt", "new-name.txt"]);
+        git(&["rm", "deleted.txt"]);
+        std::fs::write(root.join("change.txt"), "after change\n").unwrap();
+        std::fs::write(root.join("image.bin"), [0, 2, 3]).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "After"]);
+        let after = git(&["rev-parse", "HEAD"]).parse().unwrap();
+        let repo = gix::open(root).unwrap();
+        let files = crate::diff::tree_diff(&repo, Some(&before), &after)
+            .unwrap()
+            .files;
+        // Working-tree edits after the comparison must not leak into historical summaries.
+        std::fs::write(root.join("change.txt"), "unrelated live edit\n").unwrap();
+        let context = diff_context(root, &files, &AtomicBool::new(false)).unwrap();
+        for expected in [
+            "Entire diff (4 files)",
+            "before change",
+            "after change",
+            "File: deleted.txt",
+            "deleted content",
+            "Previous path: old-name.txt",
+            "File: new-name.txt",
+            "rename content",
+            "File: image.bin",
+            "Binary or non-UTF-8",
+            "Before: 2 bytes; after: 3 bytes",
+        ] {
+            assert!(context.contains(expected), "Missing {expected}: {context}");
+        }
+        assert!(!context.contains("unrelated live edit"));
+    }
+    #[test]
+    fn whole_diff_context_rejects_aggregate_overflow_and_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let files = ["first.txt", "second.txt"].map(|path| {
+            std::fs::write(dir.path().join(path), vec![b'a'; 140 * 1024]).unwrap();
+            crate::diff::FileChange {
+                path: path.into(),
+                worktree: true,
+                remote: None,
+                old_path: None,
+                kind: crate::diff::ChangeKind::Added,
+                old: None,
+                new: None,
+            }
+        });
+        assert!(diff_context(dir.path(), &files[..1], &AtomicBool::new(false)).is_ok());
+        assert!(
+            diff_context(dir.path(), &files, &AtomicBool::new(false))
+                .unwrap_err()
+                .contains("entire diff exceeds")
+        );
+        assert!(
+            diff_context(dir.path(), &files, &AtomicBool::new(true))
+                .unwrap_err()
+                .contains("cancelled")
+        );
     }
     #[test]
     fn process_drains_both_pipes_and_reports_failures() {

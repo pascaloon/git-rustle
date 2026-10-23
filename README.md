@@ -155,7 +155,10 @@ Native Windows installations and npm's Node launchers are supported.
   selected commit into the current branch. AI resolves, saves and stages conflicts,
   then completes the merge automatically. Cancellation or a failed resolution
   leaves the merge paused in **Conflicts**. Completed merges support Undo / Redo.
-- **Summarize with AI** in the Diff toolbar explains the displayed file's changes.
+- **Summarize all files with AI** in the overall Diff toolbar summarizes every
+  file in the current comparison together, including files hidden by search or
+  unchecked for commit. Binary changes are included as metadata. Comparisons
+  exceeding the 256 KiB context limit require a smaller comparison.
 - **Auto-fill** beside the commit heading writes a description using only checked
   files, including untracked files. Edit it before committing.
 

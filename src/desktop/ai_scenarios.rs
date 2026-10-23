@@ -196,6 +196,23 @@ impl Desktop {
                     {
                         return;
                     }
+                    // Only README is checked and visible, but summary must include notes too.
+                    self.prepare_diff_search(window, cx);
+                    if self.diff_find.query != "README.md" {
+                        let input = self.diff_find.input.clone().unwrap();
+                        input.update(cx, |s, cx| s.set_value("README.md", window, cx));
+                        return;
+                    }
+                    if self.diff_find.busy
+                        || self.diff_find.matching_files.len() != 1
+                        || !self.ai_painted(3, window)
+                    {
+                        return;
+                    }
+                    let Mode::Diff(view) = &self.engine.app.mode else {
+                        unreachable!()
+                    };
+                    assert_eq!(view.changes.files.len(), 2);
                     self.ai_action(Action::Run(Task::Summary), window, cx);
                     self.ai.scenario.phase = 3;
                 } else if name == "ai-stale" {
@@ -223,6 +240,8 @@ impl Desktop {
                     }
                     "ai-summary" => {
                         assert!(self.ai.show_result);
+                        assert!(!self.ai.error, "{}", self.ai.result);
+                        assert_eq!(self.ai.result_title, "Whole diff summary");
                         assert!(self.ai.result.contains("Summary fixture"));
                         5
                     }

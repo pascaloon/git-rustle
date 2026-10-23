@@ -350,7 +350,9 @@ impl Desktop {
                         );
                     }
                 }
-                if !files.is_empty() {
+                if task == Task::Summary {
+                    context.push_str(&ai::diff_context(&root, &files, &cancel)?);
+                } else if !files.is_empty() {
                     let repo = gix::open(&root).map_err(|e| e.to_string())?;
                     for file in files {
                         if cancel.load(Ordering::Acquire) {
@@ -388,18 +390,30 @@ impl Desktop {
                 let Mode::Diff(view) = &self.engine.app.mode else {
                     return Err("Open a diff first".into());
                 };
-                let file = view.current_change().ok_or("Select a changed file first")?;
-                let diff = view.diff.as_ref().ok_or("Wait for the diff to load")?;
-                if view.diff_for != view.current {
-                    return Err("Wait for the selected diff to load".into());
+                if !view.changes.loaded {
+                    return Err("Wait for the diff's file list to load".into());
                 }
-                if diff.source.iter().all(|s| s.is_empty()) {
-                    return Err("This diff has no text content to summarize".into());
+                if let Some(error) = &view.changes.error {
+                    return Err(format!("Cannot summarize this diff: {error}"));
+                }
+                if view.changes.files.is_empty() {
+                    return Err("This diff has no changed files to summarize".into());
                 }
                 Ok((
-                    ai::file_context(&file.path, &diff.source[0], &diff.source[1])?,
+                    format!(
+                        "Base: {}\nTarget: {}\n",
+                        view.changes
+                            .old
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "empty tree".into()),
+                        if view.changes.files.iter().any(|file| file.worktree) {
+                            "working tree".into()
+                        } else {
+                            view.changes.new.to_string()
+                        }
+                    ),
                     Destination::Summary,
-                    vec![],
+                    view.changes.files.as_ref().clone(),
                 ))
             }
             Task::Commit => {
@@ -615,7 +629,7 @@ impl Desktop {
     ) {
         let result = match destination {
             Some(Destination::Summary) => {
-                self.show_ai_result("Diff summary", text, false, cx);
+                self.show_ai_result("Whole diff summary", text, false, cx);
                 return;
             }
             Some(Destination::Commit {
