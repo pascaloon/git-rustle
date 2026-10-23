@@ -1,6 +1,6 @@
 [package]
 name = "git-rustle"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 description = "Fast Windows-native GPU-accelerated Git client"
 license = "GPL-3.0-only"
