@@ -1,5 +1,14 @@
 # Benchmark workflow for agents
 
+Remote branch checkout offers Detached HEAD and Pull branch choices for fetched
+and ghost tips. `scripts/benchmark-remote-checkout.ps1` uses marked local bare
+remotes and a loopback metadata API. It compares existing/new local tracking
+branches against a preserved baseline and checks detached branch fetch separately.
+Each native action awaits modal and final graph paints and verifies HEAD, index,
+worktree and the unrelated main branch. Use 15 samples and a fresh ignored
+`target/bench/<run>` directory; `screenshot-app.ps1 -Scenarios remote-checkout`
+captures the two choices separately from timing runs.
+
 Git Rustle prioritizes speed. Use this workflow to detect regressions before
 delivering notable changes. Commands below run in PowerShell from the repository
 root. Keep benchmark instructions, scripts and harness code in version control;

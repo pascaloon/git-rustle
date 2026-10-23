@@ -1288,6 +1288,15 @@ impl App {
         self.branches.pending_jump = None;
         self.dragging_splitter = false;
         self.checkout_notice = None;
+        let choices = choices
+            .into_iter()
+            .flat_map(|choice| match choice {
+                crate::checkout::Request::Branch(target) => {
+                    crate::checkout::branch_requests(target)
+                }
+                other => vec![other],
+            })
+            .collect();
         self.checkout_confirmation = Some(crate::checkout::Confirmation::new(choices));
         self.needs_redraw = true;
     }
@@ -1317,13 +1326,7 @@ impl App {
         branches.sort_by_key(|t| (t.remote.is_some(), current != Some(&t.name), t.label()));
         let mut choices = branches
             .into_iter()
-            .map(|target| {
-                if target.remote.is_some() && self.ghosts.contains_key(&id) {
-                    crate::checkout::Request::FetchBranch(target)
-                } else {
-                    crate::checkout::Request::Branch(target)
-                }
-            })
+            .flat_map(crate::checkout::branch_requests)
             .collect::<Vec<_>>();
         if choices.is_empty() {
             choices.push(crate::checkout::Request::Commit {
@@ -2849,6 +2852,12 @@ mod tests {
         );
         app.ghost_sources.insert(id, remote.clone());
         app.confirm_commit_checkout(id);
+        let dialog = app.checkout_confirmation.as_mut().unwrap();
+        assert_eq!(dialog.choices.len(), 2);
+        assert!(matches!(&dialog.choices[0], Request::DetachedBranch(t) if t.sha == sha));
+        dialog.selected = 1;
+        dialog.ready = true;
+        app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.checkout_request.as_ref().unwrap(),
             Request::FetchBranch(t) if t.name == "topic/nested"
                 && t.remote.as_deref() == Some("origin")
@@ -2878,8 +2887,8 @@ mod tests {
         );
         app.confirm_commit_checkout(id);
         assert!(matches!(
-            app.checkout_request.as_ref().unwrap(),
-            Request::Branch(_)
+            &app.checkout_confirmation.as_ref().unwrap().choices[0],
+            Request::DetachedBranch(_)
         ));
     }
 

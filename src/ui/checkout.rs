@@ -32,7 +32,9 @@ pub fn draw(dialog: &mut Confirmation, screen: &mut Screen) {
     let x = r.x + 2;
     let width = r.w - 4;
     let title = match dialog.chosen() {
-        Request::Branch(_) | Request::FetchBranch(_) => " Checkout branch? ",
+        Request::Branch(_) | Request::FetchBranch(_) | Request::DetachedBranch(_) => {
+            " Checkout branch? "
+        }
         Request::Commit { .. } => " Checkout commit? ",
     };
     screen.put_str(x, r.y, title, text.bold(), width);
@@ -57,7 +59,10 @@ pub fn draw(dialog: &mut Confirmation, screen: &mut Screen) {
             text
         };
         let label = match choice {
-            Request::Branch(t) | Request::FetchBranch(t) => format!(
+            Request::FetchBranch(_) | Request::DetachedBranch(_) => {
+                format!("{} {}", if active { '>' } else { ' ' }, choice.label())
+            }
+            Request::Branch(t) => format!(
                 "{} {} branch: {}",
                 if active { '>' } else { ' ' },
                 if t.remote.is_some() {
@@ -78,6 +83,9 @@ pub fn draw(dialog: &mut Confirmation, screen: &mut Screen) {
     }
     let effect = match dialog.chosen() {
         Request::FetchBranch(_) => "Fetch this branch; fast-forward its tracker and check out.",
+        Request::DetachedBranch(_) => {
+            "Detach at the selected tip; fetch its branch if objects are missing."
+        }
         Request::Branch(t) if t.remote.is_some() => {
             "Use/create a local tracking branch; may download commits."
         }

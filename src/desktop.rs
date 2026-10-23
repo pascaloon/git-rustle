@@ -1110,7 +1110,7 @@ impl Desktop {
                                 }
                                 Some("general-settings" | "general-tabs") => v.general_scenario_start(window, cx),
                                 Some("branches-hierarchy" | "cleanup-review" | "cleanup-delete") => v.branch_cleanup_start(window, cx),
-                                Some("ghost-checkout-existing" | "ghost-checkout-new") => v.ghost_checkout_start(cx),
+                                Some("ghost-checkout-existing" | "ghost-checkout-new" | "ghost-checkout-detached" | "ghost-checkout-menu") => v.ghost_checkout_start(cx),
                                 Some("conflicts-merge" | "conflicts-rebase" | "conflicts-stash" | "conflicts-abort") => v.conflicts_start(cx),
                                 Some("filter-visuals") => v.filter_scenario_start(window, cx),
                                 Some("todo-graph" | "branch-sort" | "graph-hover" | "stash-panel" | "stash-apply" | "stash-delete" | "stash-create" | "external-tools" | "ref-storage") => v.todo_scenario_start(window, cx),
@@ -2145,10 +2145,17 @@ impl Desktop {
             ),
             Request::FetchBranch(t) => (
                 "cloud",
-                "FETCH & CHECKOUT BRANCH",
-                t.label(),
+                "PULL BRANCH",
+                format!("Pull {}", t.name),
                 "Fetch latest changes and check out this branch. Local updates must fast-forward.",
                 true,
+            ),
+            Request::DetachedBranch(t) => (
+                "commit",
+                "DETACHED HEAD",
+                t.label(),
+                "Inspect the selected tip. Fetch this branch if its objects are missing.",
+                false,
             ),
             Request::Commit { id, remote } => (
                 "commit",

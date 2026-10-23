@@ -23,7 +23,7 @@ struct Api {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Api {
-    fn start(tip: gix::ObjectId) -> (String, Self) {
+    fn start() -> (String, Self) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/fixture/branches", listener.local_addr().unwrap());
@@ -50,9 +50,10 @@ impl Api {
                 reader.read_line(&mut request).unwrap();
                 total_requests += 1;
                 assert!(total_requests <= 16, "Fixture HTTP request loop");
-                let body = if request
-                    .starts_with(&format!("GET /fixture/commits/{tip}?per_page=100&page=1 "))
-                {
+                // The inspector may ask for the selected tip and its local
+                // parent while the modal is open. Both have an empty API diff
+                // in this checkout-only fixture; Git owns the real file proof.
+                let body = if request.starts_with("GET /fixture/commits/") {
                     count.fetch_add(1, Ordering::Release);
                     r#"{"files":[]}"#
                 } else if request.starts_with("GET /fixture/tags?per_page=100&page=1 ") {
@@ -178,7 +179,7 @@ fn seed(
         history.complete && history.len() <= 32,
         "native fixture must remain small"
     );
-    let (endpoint, api) = Api::start(tip);
+    let (endpoint, api) = Api::start();
     let provider = remote::Remote {
         name: "origin".into(),
         url: source.to_str().unwrap().into(),
@@ -218,6 +219,8 @@ impl Desktop {
         let case = match self.scenario.as_deref() {
             Some("ghost-checkout-existing") => "existing",
             Some("ghost-checkout-new") => "new",
+            Some("ghost-checkout-detached") => "detached",
+            Some("ghost-checkout-menu") => "menu",
             _ => return,
         };
         assert!(self.ghost_checkout_bench.run.is_none());
@@ -326,10 +329,18 @@ impl Desktop {
                         v.action(Action::Select(row, false), window, cx);
                         v.engine.mark("desktop scenario requested");
                         v.engine.mark("ghost checkout requested");
-                        v.engine.mark("ghost checkout confirmed");
                         v.action(Action::Checkout, window, cx);
-                        assert!(v.engine.app.checkout_confirmation.is_none());
-                        v.ghost_checkout_bench.run.as_mut().unwrap().phase = 3;
+                        let choices = &v.engine.app.checkout_confirmation.as_ref().unwrap().choices;
+                        assert_eq!(choices.len(), 2);
+                        assert!(matches!(
+                            choices[0],
+                            crate::checkout::Request::DetachedBranch(_)
+                        ));
+                        assert!(matches!(
+                            choices[1],
+                            crate::checkout::Request::FetchBranch(_)
+                        ));
+                        v.ghost_checkout_bench.run.as_mut().unwrap().phase = 2;
                         cx.notify();
                     });
                 })
@@ -342,10 +353,42 @@ impl Desktop {
                     && b.bottom() <= window.viewport_size().height
             }) =>
             {
+                if run.case == "menu" {
+                    self.engine.mark("ghost checkout final frame");
+                    let run = self.ghost_checkout_bench.run.as_mut().unwrap();
+                    run.checks = 2;
+                    run.verified = true;
+                    return;
+                }
                 let sha = run.tip.to_string();
-                let choice = self.engine.app.checkout_confirmation.as_ref().unwrap().choices.iter().position(|choice| {
-                    matches!(choice, crate::checkout::Request::FetchBranch(t) if t.name == run.branch && t.sha == sha && t.remote.as_deref() == Some("origin") && t.url.as_deref() == run.source.to_str())
-                }).expect("ghost branch must offer Fetch & checkout");
+                let choice = self
+                    .engine
+                    .app
+                    .checkout_confirmation
+                    .as_ref()
+                    .unwrap()
+                    .choices
+                    .iter()
+                    .position(|choice| {
+                        let target = match choice {
+                            crate::checkout::Request::DetachedBranch(t)
+                                if run.case == "detached" =>
+                            {
+                                Some(t)
+                            }
+                            crate::checkout::Request::FetchBranch(t) if run.case != "detached" => {
+                                Some(t)
+                            }
+                            _ => None,
+                        };
+                        target.is_some_and(|t| {
+                            t.name == run.branch
+                                && t.sha == sha
+                                && t.remote.as_deref() == Some("origin")
+                                && t.url.as_deref() == run.source.to_str()
+                        })
+                    })
+                    .expect("remote branch must offer detached and Pull choices");
                 self.engine.mark("ghost checkout modal painted");
                 self.engine.mark("ghost checkout confirmed");
                 self.action(Action::Confirm(choice), window, cx);
@@ -380,7 +423,11 @@ impl Desktop {
                         .unwrap()
                         .head_branch
                         .as_deref(),
-                    Some(run.branch.as_str())
+                    if run.case == "detached" {
+                        None
+                    } else {
+                        Some(run.branch.as_str())
+                    }
                 );
                 assert!(!self.engine.app.pending.exists());
                 assert!(
@@ -448,6 +495,9 @@ impl Desktop {
     pub(super) fn ghost_checkout_assert(&self) {
         if let Some(run) = &self.ghost_checkout_bench.run {
             assert!(run.verified && run.checks > 0);
+            if run.case == "menu" {
+                return;
+            }
             assert_eq!(self.engine.app.head_id(), Some(run.tip));
             assert!(!self.engine.app.ghosts.contains_key(&run.tip));
         }

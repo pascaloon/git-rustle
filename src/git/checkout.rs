@@ -8,6 +8,45 @@ pub fn execute(path: &Path, request: &crate::checkout::Request) -> Result<String
     match request {
         crate::checkout::Request::Branch(target) => checkout(path, target),
         crate::checkout::Request::FetchBranch(target) => checkout_inner(path, target, true),
+        crate::checkout::Request::DetachedBranch(target) => {
+            let remote = target.remote.as_deref().ok_or("Missing remote branch")?;
+            if remote.is_empty() || remote.starts_with('-') {
+                return Err("Invalid remote name".into());
+            }
+            let branch = format!("refs/heads/{}", target.name);
+            output(path, &["check-ref-format", &branch])?;
+            let id = gix::ObjectId::from_hex(target.sha.as_bytes())
+                .map_err(|_| "Invalid remote commit ID".to_string())?;
+            let url = output(path, &["config", "--get", &format!("remote.{remote}.url")])?;
+            if target.url.as_ref().is_some_and(|expected| expected != &url) {
+                return Err("Remote URL changed; refresh before checking out".into());
+            }
+            let object = command::run(
+                path,
+                &["cat-file", "-e", &format!("{id}^{{commit}}")],
+                None,
+                Duration::from_secs(10),
+            )?;
+            if !object.status.success() {
+                output(
+                    path,
+                    &[
+                        "-c",
+                        "fetch.writeCommitGraph=false",
+                        "fetch",
+                        "--no-tags",
+                        "--no-recurse-submodules",
+                        "--no-write-fetch-head",
+                        "--no-prune",
+                        "--refmap=",
+                        "--",
+                        remote,
+                        &branch,
+                    ],
+                )?;
+            }
+            execute(path, &crate::checkout::Request::Commit { id, remote: None })
+        }
         crate::checkout::Request::Commit { id, remote } => {
             if output(path, &["rev-parse", "--is-bare-repository"])? == "true" {
                 return Err("Checkout needs a working tree; this is a bare repository".into());
@@ -113,7 +152,7 @@ fn fetch_selected(
 }
 
 fn checkout_inner(path: &Path, target: &Target, fetch_and_ff: bool) -> Result<String, String> {
-    if fetch_and_ff && (target.remote.is_none() || target.url.is_none()) {
+    if fetch_and_ff && target.remote.is_none() {
         return Err(
             "Remote branch details are unavailable; refresh before fetching and checking out"
                 .into(),
@@ -1036,6 +1075,50 @@ mod tests {
         assert_ne!(
             output(&path, &["rev-parse", "refs/heads/CaseFeature"]).unwrap(),
             output(&path, &["rev-parse", "refs/heads/casefeature"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn remote_branch_options_detach_without_local_refs_and_pull_without_api_metadata() {
+        let f = Fixture::new();
+        let original_refs = output(&f.repo, &["show-ref"]).unwrap();
+        std::fs::write(f.repo.join("unrelated.txt"), "keep me\n").unwrap();
+        execute(
+            &f.repo,
+            &crate::checkout::Request::DetachedBranch(f.remote()),
+        )
+        .unwrap();
+        assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), f.topic);
+        assert!(
+            output(&f.repo, &["branch", "--show-current"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(output(&f.repo, &["show-ref"]).unwrap(), original_refs);
+        assert!(!f.repo.join(".git/FETCH_HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(f.repo.join("unrelated.txt")).unwrap(),
+            "keep me\n"
+        );
+        let mut target = f.remote();
+        target.url = None; // A fetched origin/... row has no API metadata.
+        execute(&f.repo, &crate::checkout::Request::FetchBranch(target)).unwrap();
+        assert_eq!(
+            output(&f.repo, &["branch", "--show-current"]).unwrap(),
+            "topic/nested"
+        );
+        assert_eq!(
+            output(&f.repo, &["rev-parse", "@{upstream}"]).unwrap(),
+            f.topic
+        );
+        let next = f.advance("latest branch content\n");
+        let mut target = f.remote();
+        target.url = None;
+        execute(&f.repo, &crate::checkout::Request::FetchBranch(target)).unwrap();
+        assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), next);
+        assert_eq!(
+            std::fs::read_to_string(f.repo.join("unrelated.txt")).unwrap(),
+            "keep me\n"
         );
     }
 
