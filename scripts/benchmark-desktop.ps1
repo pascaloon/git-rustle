@@ -211,6 +211,10 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         ($state -notmatch 'request_open=true request_members=10000 request_sending=false' -or $text -match 'POST ')) {
         throw "Expected a retained composer with 10,000 members and no submission: $log"
     }
+    if ($scenario -in @('request-branches','request-branches-menu') -and
+        ($state -notmatch 'request_source=FeatureA request_target=Dev request_branches=[1-9][0-9]* request_branches_verified=true' -or $text -match 'POST ')) {
+        throw "Expected verified branch selection, closest Dev target and no submission: $log"
+    }
     if ($scenario -in @('request-open','request-clear') -and
         ($state -notmatch 'request_open=true .*request_sending=false request_body_bytes=0' -or $text -match 'POST ')) {
         throw "Expected an open composer with an empty description and no submission: $log"
@@ -257,6 +261,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'desktop scenario frame' }
         'request-compose' { 'request composer ready' }
         'request-open' { 'desktop scenario frame' }
+        { $_ -in 'request-branches','request-branches-menu' } { 'request branches verified frame' }
         'request-clear' { 'desktop scroll done' }
         'request-edit' { 'desktop scroll done' }
         'request-tabs' { 'desktop scroll done' }
@@ -296,6 +301,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         { $_ -in 'avatar-cache','avatar-cache-busy' } { 'avatar cache requested' }
         'request-compose' { 'request composer requested' }
         'request-open' { 'request composer requested' }
+        { $_ -in 'request-branches','request-branches-menu' } { 'request source change requested' }
         'branches' { 'branch activity requested' }
         'diff' { 'file diff requested' }
         'search' {

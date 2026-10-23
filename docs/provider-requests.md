@@ -1,15 +1,34 @@
 # Pull requests, merge requests and author photos
 
 Open **PR / MR** in the graph toolbar, choose **Create PR / MR** for the selected
-branch in Branches, or use a local branch's graph context menu. The composer opens
+branch in Branches, or right-click a local branch row in Graph and choose
+**Create PR / MR from <branch>…**. This includes the checked-out branch. A row with
+one local branch shows the action directly; when several branches share its commit,
+the per-branch actions appear in the **Branch** submenu. The composer opens
 in its own tab. Switching back to Graph, Diff, Branches or Settings keeps the
 draft, description and selected people. Closing the composer tab discards it.
 
 Select the project, check source and target, and enter a title. Push the source
 branch first with the existing Push action. This composer creates requests between
 branches in the selected project; cross-project/fork requests are not yet supported.
-The target starts with the project's default branch. Project selection clears
-people and the target so identities cannot leak between projects.
+Source and target are searchable branch selectors. Choices come from local branches
+and the selected remote's fetched branches; they exclude tags, symbolic aliases and
+other remotes. A fetched tip takes precedence over a local branch with the same name.
+Fetch first if a branch is missing or its history is out of date, then use
+**Refresh branches** to update choices without losing an explicit target selection.
+
+Targets exclude the source and are ordered by the nearest shared ancestor on the
+source's first-parent history, then the distance from the target to that ancestor.
+For example, a feature branched from Dev prefers Dev over Main, including when Dev
+has advanced since the fork. Equal scores prefer the project's default branch,
+then branch name. Descendants and unrelated or unavailable history follow known
+bases. Walks are bounded; incomplete history is indicated beside the form.
+
+Opening the form or changing the source/project selects the first ranked target.
+An explicit target choice stays selected during member refreshes. Changing the
+source resets that choice and ranks again. Project selection clears people and
+the target so identities cannot leak between projects. Branch work runs separately
+from provider member requests; filtering an open selector performs no I/O.
 
 Assignees and reviewers are searchable by name or username, with keyboard
 navigation and removable selections (up to ten per field). GitHub suggestions use

@@ -1,5 +1,6 @@
 //! Event-driven orchestration shared by the GPUI view and integration harness.
 use crate::diffview::DiffReq;
+mod remote_diff;
 use crate::model::History;
 use crate::{
     app::{self, App, LoadState, RefreshMode},
@@ -421,7 +422,7 @@ pub struct Engine {
     search_tx: Option<std::sync::mpsc::Sender<search::Request>>,
     file_search_tx: Option<std::sync::mpsc::Sender<search::Request>>,
     search_latest: Arc<std::sync::atomic::AtomicU64>,
-    remote_diff_tx: Option<std::sync::mpsc::Sender<DiffReq>>,
+    remote_diff_tx: Option<remote_diff::Worker>,
     stats_tx: Option<std::sync::mpsc::Sender<StatsReq>>,
     stats_latest: Arc<AtomicU32>,
     stats_sent_for: Option<u32>,
@@ -1157,6 +1158,7 @@ impl Engine {
             }
             app.sync_details_changes();
             let reqs = app.pending_requests();
+            let mut remote_reqs = Vec::new();
             if !reqs.is_empty() {
                 for req in reqs {
                     if matches!(req, DiffReq::Tree { .. }) {
@@ -1168,15 +1170,22 @@ impl Engine {
                         DiffReq::Tree { remote, .. } => remote.is_some(),
                         DiffReq::File { change, .. } => change.remote.is_some(),
                     };
-                    let worker = if remote_request {
-                        &mut self.remote_diff_tx
+                    if remote_request {
+                        remote_reqs.push(req);
                     } else {
-                        &mut self.diff_tx
-                    };
-                    let dtx = worker
-                        .get_or_insert_with(|| spawn_diff_worker(r.clone(), tx.clone(), no_cache));
-                    let _ = dtx.send(req);
+                        let dtx = self.diff_tx.get_or_insert_with(|| {
+                            spawn_diff_worker(r.clone(), tx.clone(), no_cache)
+                        });
+                        let _ = dtx.send(req);
+                    }
                 }
+            }
+            if !remote_reqs.is_empty() && self.remote_diff_tx.is_none() {
+                self.remote_diff_tx =
+                    Some(remote_diff::Worker::new(r.clone(), tx.clone(), no_cache));
+            }
+            if let Some(worker) = &mut self.remote_diff_tx {
+                worker.update(app, remote_reqs);
             }
             // Line counts for whichever change set is on screen.
             let want = app
@@ -2793,6 +2802,109 @@ mod tests {
         assert_eq!(e.app.head_id(), head);
         assert_eq!(e.app.history.len(), 2);
         assert!(e.operations.labels.is_empty());
+    }
+
+    #[test]
+    fn slow_ghost_pair_does_not_block_later_single_selections() {
+        use remote::files::fixture::{Api, id};
+        for provider in [remote::Provider::Github, remote::Provider::Gitlab] {
+            let dir = fixture();
+            let mut e = quiet_engine(dir.path());
+            let head = e.app.head_id().unwrap();
+            e.app.select(e.app.history.index_of(&head).unwrap());
+            until(&mut e, |e| {
+                e.app.details.as_ref().is_some_and(|d| d.id == head)
+            });
+            let api = Api::start(provider);
+            remote::files::fixture::install(&mut e.app, &api.remote);
+            let before = git::command::checked(dir.path(), &["show-ref"]).unwrap();
+            e.app.select(e.app.history.index_of(&id(2)).unwrap());
+            e.app.set_details_selection(&[id(1), id(2)]);
+            until(&mut e, |_| api.blocked.load(Ordering::Acquire));
+            e.app.set_details_selection(&[]);
+            e.app.select(e.app.history.index_of(&id(3)).unwrap());
+            // A burst must remain bounded and finish the newest selection.
+            for n in 0..24 {
+                let target = if n % 2 == 0 { id(2) } else { id(3) };
+                e.app.select(e.app.history.index_of(&target).unwrap());
+                e.tick(None);
+                e.presented();
+            }
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(800);
+            while Instant::now() < deadline
+                && !e
+                    .app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|c| c.loaded && c.new == id(3))
+            {
+                e.tick(None);
+                e.presented();
+                thread::sleep(Duration::from_millis(2));
+            }
+            let recovered = e.app.details_changes.as_ref().is_some_and(|c| {
+                c.loaded && c.error.is_none() && c.new == id(3) && c.files.len() == 1
+            });
+            api.unblock();
+            assert!(
+                recovered,
+                "new ghost selection waited behind an obsolete pair ({provider:?})"
+            );
+            e.app.select(e.app.history.index_of(&id(4)).unwrap());
+            until(&mut e, |e| {
+                e.app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|c| c.loaded && c.new == id(4))
+            });
+            assert!(e.app.details_changes.as_ref().unwrap().error.is_some());
+            e.app.select(e.app.history.index_of(&id(2)).unwrap());
+            until(&mut e, |e| {
+                e.app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|c| c.loaded && c.new == id(2))
+            });
+            assert!(e.app.details_changes.as_ref().unwrap().error.is_none());
+            assert!(e.repo.as_ref().unwrap().find_object(id(2)).is_err());
+            assert_eq!(
+                git::command::checked(dir.path(), &["show-ref"]).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn parked_remote_diff_and_new_ghost_details_both_finish() {
+        use remote::files::fixture::{Api, id};
+        let dir = fixture();
+        let mut e = quiet_engine(dir.path());
+        let head = e.app.head_id().unwrap();
+        e.app.select(e.app.history.index_of(&head).unwrap());
+        until(&mut e, |e| {
+            e.app.details.as_ref().is_some_and(|d| d.id == head)
+        });
+        let api = Api::start(remote::Provider::Gitlab);
+        remote::files::fixture::install(&mut e.app, &api.remote);
+        e.app.open_parent_diff(id(2));
+        e.app.park_diff();
+        e.app.select(e.app.history.index_of(&id(3)).unwrap());
+        until(&mut e, |e| {
+            e.app.parked_diff.as_ref().is_some_and(|v| v.changes.loaded)
+                && e.app
+                    .details_changes
+                    .as_ref()
+                    .is_some_and(|c| c.loaded && c.new == id(3))
+        });
+        assert!(e.app.parked_diff.as_ref().unwrap().changes.error.is_none());
+        assert!(e.app.details_changes.as_ref().unwrap().error.is_none());
+        e.app.resume_diff();
+        until(
+            &mut e,
+            |e| matches!(&e.app.mode,app::Mode::Diff(v) if v.diff.as_ref().is_some_and(|d|d.syntax.is_some())),
+        );
+        assert!(e.repo.as_ref().unwrap().find_object(id(2)).is_err());
     }
 
     fn remote_diff_after_local_refresh(pair: bool) -> f64 {

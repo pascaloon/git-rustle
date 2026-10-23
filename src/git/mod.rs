@@ -285,7 +285,7 @@ fn snapshot_reftable(repo: &gix::Repository) -> Result<RefSnapshot> {
 fn fingerprint(snap: &RefSnapshot) -> u64 {
     // DefaultHasher::new() uses fixed keys, so this is stable across runs of the same build.
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    1u32.hash(&mut h); // walk semantics version
+    2u32.hash(&mut h); // walk semantics version
     snap.head_id.map(|id| id.as_bytes().to_vec()).hash(&mut h);
     snap.head_branch.hash(&mut h);
     let mut pairs: Vec<(&str, &[u8])> = snap
@@ -386,8 +386,8 @@ fn subject_of(msg: &[u8]) -> &[u8] {
 
 /// Walk commits reachable from reference `tips`, newest committer-time first, laying
 /// out the graph as rows and handing them to `emit` in growing batches.
-/// Detached HEAD is a fallback after reference history, so checking out an
-/// already-reachable ancestor cannot change ordering or lane assignment.
+/// An unreachable detached HEAD participates as a normal tip. Reachable HEADs
+/// are not additional seeds, preserving rows and lanes across checkouts.
 /// `emit` returns `false` to cancel.
 pub fn walk(
     repo: &gix::Repository,
@@ -399,7 +399,6 @@ pub fn walk(
     let mut pending: HashMap<ObjectId, Parsed> = HashMap::with_capacity(1024);
     let mut queue: BinaryHeap<QueueEntry> = BinaryHeap::with_capacity(1024);
     let mut layout = Layout::new();
-    let mut check_fallback_head = true;
 
     let enqueue = |id: ObjectId,
                    seen: &mut HashSet<ObjectId>,
@@ -422,6 +421,24 @@ pub fn walk(
         enqueue(*tip, &mut seen, &mut pending, &mut queue, &mut buf);
     }
 
+    let head = refs::head(repo)?;
+    if head.branch.is_none()
+        && let Some(id) = head.id
+        && !tips.contains(&id)
+    {
+        // Do not use a timestamp cutoff: a reachable ancestor can have a newer
+        // timestamp than its descendants. Only detached checkouts need this
+        // ancestry query; attached startup keeps its single streaming walk.
+        let reachable = repo
+            .rev_walk(tips.iter().copied())
+            .all()?
+            .filter_map(std::result::Result::ok)
+            .any(|commit| commit.id().detach() == id);
+        if !reachable {
+            enqueue(id, &mut seen, &mut pending, &mut queue, &mut buf);
+        }
+    }
+
     let mut chunk = History::default();
     let mut batch_size = 64usize;
     let mut graph_parents: Vec<ObjectId> = Vec::new();
@@ -433,12 +450,6 @@ pub fn walk(
             .is_some_and(|entry| !pending.contains_key(&entry.id))
         {
             queue.pop();
-        }
-        if queue.is_empty() && ready.is_empty() && check_fallback_head {
-            check_fallback_head = false;
-            if let Some(head) = refs::head(repo)?.id {
-                enqueue(head, &mut seen, &mut pending, &mut queue, &mut buf);
-            }
         }
         if ready.is_empty() {
             let Some(first) = queue.pop() else { break };
@@ -781,10 +792,40 @@ mod graph_order_tests {
             git(path, &["checkout", "--quiet", target]);
             assert_eq!(graph(), expected, "checkout {target}");
         }
+        // A commit made while inspecting an ancestor is a new history tip,
+        // despite having no branch reference. It must precede its parent.
+        git(path, &["checkout", "--quiet", "--detach", &middle]);
+        let detached = make("detached work", Some(&middle), "2000000200 +0000");
+        git(path, &["update-ref", "HEAD", &detached]);
+        let after_commit = graph();
+        assert_eq!(after_commit[0].0.to_string(), detached);
+        assert_eq!(after_commit.len(), expected.len() + 1);
+        let parent_row = after_commit
+            .iter()
+            .position(|row| row.0 == ObjectId::from_hex(middle.as_bytes()).unwrap())
+            .unwrap();
+        assert!(parent_row > 0);
+        assert!(
+            after_commit[0]
+                .2
+                .iter()
+                .any(|cell| *cell != crate::graph::layout::GraphCell::EMPTY)
+        );
+        // Same-second detached commits must also stay above their ancestors.
+        let second = make("second detached work", Some(&detached), "2000000200 +0000");
+        git(path, &["update-ref", "HEAD", &second]);
+        let after_second = graph();
+        assert_eq!(after_second[0].0.to_string(), second);
+        assert_eq!(after_second[1].0.to_string(), detached);
+        assert_eq!(after_second.len(), expected.len() + 2);
         let disconnected = make("disconnected", None, "2000000000 +0000");
         git(path, &["checkout", "--quiet", "--detach", &disconnected]);
-        let fallback = graph();
-        assert_eq!(&fallback[..expected.len()], expected.as_slice());
-        assert_eq!(fallback.last().unwrap().0.to_string(), disconnected);
+        let disconnected_graph = graph();
+        assert_eq!(disconnected_graph.len(), expected.len() + 1);
+        assert!(
+            disconnected_graph
+                .iter()
+                .any(|row| row.0 == ObjectId::from_hex(disconnected.as_bytes()).unwrap())
+        );
     }
 }

@@ -69,6 +69,14 @@ unchanged unrelated refs/files/stashes, or preserved paused state after failure
 or cancellation. These checks cover integration plumbing; live authentication, model
 availability, provider responses and physical input still require separate use.
 
+`request-branches` and `request-branches-menu` cover the PR/MR branch selectors.
+Captures may omit background text even after a full repaint; this also occurs
+in baseline views. Retain and report that PNG. `-DisableDirectComposition` allows
+a separate diagnostic capture; it can improve the result but does not guarantee
+a complete underlay. This still uses PrintWindow on the helper-owned private
+desktop. Record the renderer choice, inspect every PNG, and do not treat the two
+captures as identical rendering conditions or as proof of physical-display output.
+
 Reuse the existing real action/paint harness for new views. Add a preset and a
 matching disposable fixture to `screenshot-app.ps1`, or call the capture helper
 from a dedicated visual scenario runner:

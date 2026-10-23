@@ -9,6 +9,8 @@ pub(super) struct State {
     pub(super) verified: bool,
     paints: Paints,
     head: Option<gix::ObjectId>,
+    ghost_api: Option<crate::remote::files::fixture::Api>,
+    ghost_started: Option<Instant>,
 }
 impl Desktop {
     fn graph_feature_name(&self) -> Option<&str> {
@@ -17,6 +19,8 @@ impl Desktop {
                 *name,
                 "graph-multiselect"
                     | "graph-selection-boundary"
+                    | "ghost-files-github"
+                    | "ghost-files-gitlab"
                     | "multi-details"
                     | "pending-graph"
                     | "stash-preview"
@@ -24,6 +28,7 @@ impl Desktop {
                     | "stash-pop"
                     | "dense-labels"
                     | "checkout-simple"
+                    | "detached-commit"
                     | "diff-base"
                     | "diff-base-choose"
             )
@@ -95,8 +100,156 @@ impl Desktop {
             });
         });
     }
+    fn ghost_files_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::remote::{
+            Provider,
+            files::fixture::{Api, id, install},
+        };
+        use std::sync::atomic::Ordering;
+        let phase = self.graph_features.phase;
+        if phase == 0 {
+            let app = &self.engine.app;
+            if !app.history.complete
+                || !app.pending.known
+                || app
+                    .details
+                    .as_ref()
+                    .is_none_or(|d| Some(d.id) != app.head_id())
+            {
+                return;
+            }
+            assert!(!app.pending.exists());
+            let root = self.engine.repository_root().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join(".git/git-rustle-graph-fixture"))
+                    .unwrap()
+                    .trim(),
+                "disposable graph feature fixture"
+            );
+            let api = Api::start(if self.scenario.as_deref() == Some("ghost-files-gitlab") {
+                Provider::Gitlab
+            } else {
+                Provider::Github
+            });
+            install(&mut self.engine.app, &api.remote);
+            self.graph_features.head = self.engine.app.head_id();
+            self.graph_features.ghost_api = Some(api);
+            self.graph_features.ghost_started = Some(Instant::now());
+            self.engine.mark("graph feature requested");
+            let index = self.engine.app.history.index_of(&id(1)).unwrap();
+            self.action(Action::Select(index, false), window, cx);
+            let index = self.engine.app.history.index_of(&id(2)).unwrap();
+            self.action(Action::Select(index, true), window, cx);
+            self.graph_features.phase = 1;
+            return;
+        }
+        assert!(
+            self.graph_features.ghost_started.unwrap().elapsed() < Duration::from_secs(15),
+            "Ghost files stalled in phase {phase}"
+        );
+        if phase == 1 {
+            if !self
+                .graph_features
+                .ghost_api
+                .as_ref()
+                .unwrap()
+                .blocked
+                .load(Ordering::Acquire)
+            {
+                return;
+            }
+            self.engine.mark("ghost comparison blocked");
+            let index = self.engine.app.history.index_of(&id(3)).unwrap();
+            self.action(Action::Select(index, false), window, cx);
+        } else {
+            let expected = match phase {
+                2 | 5 => id(3),
+                3 => id(2),
+                4 => id(4),
+                6 => id(3),
+                _ => unreachable!(),
+            };
+            let Some(cs) = self
+                .engine
+                .app
+                .details_changes
+                .as_ref()
+                .filter(|c| c.new == expected && c.loaded)
+            else {
+                return;
+            };
+            let paints = self.graph_features.paints.borrow();
+            let Some(bounds) = paints.get(&(0, 7)) else {
+                return;
+            };
+            assert!(bounds.size.width > px(100.) && bounds.size.height > px(30.));
+            assert!(
+                bounds.left() >= px(0.)
+                    && bounds.top() >= px(0.)
+                    && bounds.right() <= window.viewport_size().width
+                    && bounds.bottom() <= window.viewport_size().height
+            );
+            assert_eq!(cs.error.is_some(), phase == 4);
+            if phase != 4 {
+                assert_eq!(cs.files.len(), 1);
+                assert_eq!(cs.files[0].path, "remote-example.txt");
+            }
+            assert_eq!(
+                self.selected_commits.count(self.engine.app.selected_id()),
+                if phase == 6 { 2 } else { 1 }
+            );
+            assert_eq!(self.engine.app.head_id(), self.graph_features.head);
+            drop(paints);
+            match phase {
+                2 => {
+                    self.engine.mark("ghost single recovered frame");
+                    let index = self.engine.app.history.index_of(&id(2)).unwrap();
+                    self.action(Action::Select(index, false), window, cx);
+                }
+                3 => {
+                    self.graph_features.ghost_api.as_ref().unwrap().unblock();
+                    let index = self.engine.app.history.index_of(&id(4)).unwrap();
+                    self.action(Action::Select(index, false), window, cx);
+                }
+                4 => {
+                    let index = self.engine.app.history.index_of(&id(3)).unwrap();
+                    self.action(Action::Select(index, false), window, cx);
+                }
+                5 => {
+                    let index = self.engine.app.history.index_of(&id(2)).unwrap();
+                    self.action(Action::Select(index, true), window, cx);
+                }
+                6 => {
+                    assert!(
+                        self.graph_features
+                            .ghost_api
+                            .as_ref()
+                            .unwrap()
+                            .requests
+                            .load(Ordering::Acquire)
+                            >= 6
+                    );
+                    self.graph_features.verified = true;
+                    self.engine.mark("graph feature verified frame");
+                    return;
+                }
+                _ => unreachable!(),
+            }
+        }
+        self.graph_features.paints.borrow_mut().clear();
+        self.graph_features.phase += 1;
+    }
+
     fn graph_feature_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.graph_feature_name().unwrap().to_owned();
+        if name == "detached-commit" {
+            self.detached_commit_tick(window, cx);
+            return;
+        }
+        if name.starts_with("ghost-files-") {
+            self.ghost_files_tick(window, cx);
+            return;
+        }
         if self.graph_features.phase == 0 {
             if !self.engine.app.history.complete
                 || self.engine.app.history.len() < 3
@@ -575,6 +728,66 @@ impl Desktop {
         if name != "checkout-simple" {
             assert_eq!(self.engine.app.head_id(), self.graph_features.head);
         }
+        self.graph_features.verified = true;
+        self.engine.mark("graph feature verified frame");
+    }
+
+    fn detached_commit_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app = &self.engine.app;
+        if !app.history.complete || !app.pending.known || app.pending.busy {
+            return;
+        }
+        if self.graph_features.phase == 0 {
+            if !app.pending.selected || !app.details_changes.as_ref().is_some_and(|c| c.loaded) {
+                return;
+            }
+            let root = self.engine.repository_root().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join(".git/git-rustle-graph-fixture"))
+                    .unwrap()
+                    .trim(),
+                "disposable graph feature fixture"
+            );
+            assert!(app.refs.as_ref().unwrap().head_branch.is_none());
+            self.graph_features.head = app.head_id();
+            self.engine.app.pending.description.value =
+                "Detached commit stays above its parent".into();
+            self.engine.app.pending.branch.value.clear();
+            self.engine.mark("graph feature requested");
+            self.action(Action::Commit, window, cx);
+            assert!(self.engine.app.pending.request.is_some() || self.engine.app.pending.busy);
+            self.graph_features.phase = 1;
+            return;
+        }
+        assert!(!app.pending.error, "{}", app.pending.status);
+        let Some(head) = app.head_id() else { return };
+        if Some(head) == self.graph_features.head || app.pending.request.is_some() {
+            return;
+        }
+        let Some(row) = app.history.index_of(&head) else {
+            return;
+        };
+        let parent_row = app
+            .history
+            .index_of(&self.graph_features.head.unwrap())
+            .unwrap();
+        assert!(row < parent_row, "detached commit must precede its parent");
+        assert_eq!(row, 0, "newest detached commit belongs at the top");
+        assert!(app.refs.as_ref().unwrap().head_branch.is_none());
+        if self.graph_features.phase == 1 {
+            self.action(Action::Select(row, false), window, cx);
+            self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            self.graph_features.paints.borrow_mut().clear();
+            self.graph_features.phase = 2;
+            return;
+        }
+        let paints = self.graph_features.paints.borrow();
+        let (Some(sha), Some(subject)) = (paints.get(&(row, 0)), paints.get(&(row, 1))) else {
+            return;
+        };
+        assert!(sha.size.width > px(0.) && subject.size.width > px(0.));
+        assert!(sha.right() <= subject.left() + px(1.));
+        assert!(subject.right() <= window.viewport_size().width);
         self.graph_features.verified = true;
         self.engine.mark("graph feature verified frame");
     }

@@ -1,16 +1,17 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
-    [ValidateSet('graph','branches','settings','diff','stash-panel','graph-selection-boundary','ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error')]
+    [ValidateSet('graph','branches','settings','diff','stash-panel','detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','request-branches','request-branches-menu','graph-request-menu','graph-request-compose','ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error')]
     [string[]]$Scenarios = @('graph','branches','settings','diff','stash-panel'),
     [string]$OutputDirectory = "$PSScriptRoot/../target/bench/screenshots-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))",
     [ValidateRange(10,120)][int]$TimeoutSeconds = 30,
     [ValidateSet('Codex','Claude')][string]$AiProvider = 'Codex',
-    [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900'
+    [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
+    [switch]$DisableDirectComposition
 )
 $ErrorActionPreference = 'Stop'
-if('graph-selection-boundary' -in $Scenarios){
-    if($Scenarios.Count-ne1){throw 'Capture graph-selection-boundary separately from other views'}
-    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios graph-selection-boundary -Screenshots -OutputDirectory $OutputDirectory
+if(@($Scenarios|Where-Object{$_-in@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose')}).Count){
+    if(@($Scenarios|Where-Object{$_-notin@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose')}).Count){throw 'Capture graph harness scenarios separately from other views'}
+    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios $Scenarios -Screenshots -DisableDirectComposition:$DisableDirectComposition -OutputDirectory $OutputDirectory
     return
 }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
@@ -57,6 +58,7 @@ try {
         $env:PATH = "$bin;$env:PATH"
     }
     $env:GIT_CONFIG_NOSYSTEM = '1'
+    if ($DisableDirectComposition) { $env:GPUI_DISABLE_DIRECT_COMPOSITION = '1' }
     $env:GIT_CONFIG_GLOBAL = Join-Path $OutputDirectory 'empty-gitconfig'
     [IO.File]::WriteAllText($env:GIT_CONFIG_GLOBAL,'')
     $env:GIT_TERMINAL_PROMPT = '0'
@@ -81,6 +83,22 @@ try {
         }
         Invoke-FixtureGit $fixture @('branch','feature/visual-review','HEAD~2') | Out-Null
         Invoke-FixtureGit $fixture @('tag','v0.1.0','HEAD~3') | Out-Null
+        if ($scenario -in @('request-branches','request-branches-menu')) {
+            $mainBase = (Invoke-FixtureGit $fixture @('rev-parse','HEAD~5')).Trim()
+            foreach ($branch in @(@('Dev','HEAD~1'),@('FeatureA','HEAD'))) {
+                Invoke-FixtureGit $fixture (@('branch') + $branch) | Out-Null
+            }
+            Invoke-FixtureGit $fixture @('symbolic-ref','HEAD','refs/heads/FeatureA') | Out-Null
+            Invoke-FixtureGit $fixture @('branch','-D','main','feature/visual-review') | Out-Null
+            Invoke-FixtureGit $fixture @('branch','Main',$mainBase) | Out-Null
+            foreach ($branch in @('Main','Dev','FeatureA')) {
+                Invoke-FixtureGit $fixture @('update-ref',"refs/remotes/origin/$branch","refs/heads/$branch") | Out-Null
+            }
+            Invoke-FixtureGit $fixture @('update-ref','refs/remotes/origin/remote-only','refs/heads/Main') | Out-Null
+            Invoke-FixtureGit $fixture @('update-ref','refs/remotes/other/wrong-project','refs/heads/Main') | Out-Null
+            Invoke-FixtureGit $fixture @('symbolic-ref','refs/remotes/origin/HEAD','refs/remotes/origin/Main') | Out-Null
+            [IO.File]::WriteAllText((Join-Path $fixture '.git/git-rustle-request-branches-fixture'),'disposable request branch fixture')
+        }
         foreach ($n in 1..3) {
             [IO.File]::AppendAllText((Join-Path $fixture 'README.md'),"`nSaved draft $n`n")
             Invoke-FixtureGit $fixture @('stash','push','-m',"Visual review draft $n") | Out-Null
@@ -223,6 +241,7 @@ try {
     @{
         schemaVersion = 1; success = ($null -eq $failure); error = $failure
         candidate = $Candidate; sha256 = (Get-FileHash -LiteralPath $Candidate).Hash
+        directCompositionDisabled = [bool]$DisableDirectComposition
         scenarios = @($results.ToArray())
         limitations = 'Inspect PNGs for appearance. Capture sanity checks cannot prove complete rendering or interaction feel. These runs are excluded from performance comparisons.'
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.json') -Encoding utf8

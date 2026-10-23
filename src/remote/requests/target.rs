@@ -153,10 +153,12 @@ fn infer_from_parents(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn repository(extra_branches: usize) -> (tempfile::TempDir, Remote) {
+    pub(in crate::remote::requests) fn repository(
+        extra_branches: usize,
+    ) -> (tempfile::TempDir, Remote) {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             String::from_utf8(crate::git::command::checked(dir.path(), args).unwrap())

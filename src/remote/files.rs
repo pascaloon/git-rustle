@@ -1,5 +1,6 @@
 //! Immutable, on-demand API diffs. No branch fetch or Git ref writes.
 use super::*;
+pub(crate) mod fixture;
 use crate::diff::Side;
 use crate::diff::{ChangeKind, FileChange, FileDiff, Stat, TreeDiff};
 use gix::ObjectId;
@@ -33,6 +34,7 @@ struct Session<'a> {
     http: Http,
     token: Option<String>,
     no_cache: bool,
+    cancelled: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> Session<'a> {
@@ -44,6 +46,7 @@ impl<'a> Session<'a> {
             http: Http::new(),
             token: cached_token(path, &crate::git::git_dir(repo), remote)?,
             no_cache,
+            cancelled: None,
         })
     }
 
@@ -64,7 +67,19 @@ impl<'a> Session<'a> {
         )
     }
 
+    fn check_cancelled(&self) -> Result<(), String> {
+        if self
+            .cancelled
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+        {
+            Err("Remote diff superseded".into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn get(&mut self, url: &str, accept: &str) -> Result<Response, String> {
+        self.check_cancelled()?;
         if let Some(path) = self.location(url, accept)
             && std::fs::metadata(&path).is_ok_and(|m| m.len() <= MAX_CACHE)
             && let Ok(bytes) = std::fs::read(path)
@@ -82,6 +97,7 @@ impl<'a> Session<'a> {
         let mut response =
             self.http
                 .get_url_accept(self.remote, url, None, self.token.as_deref(), accept)?;
+        self.check_cancelled()?;
         if matches!(response.status, 401 | 403 | 404) && self.token.is_none() {
             self.token = helper_token(
                 self.repo.workdir().unwrap_or_else(|| self.repo.git_dir()),
@@ -136,6 +152,99 @@ fn file_path(v: &serde_json::Value, key: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+type GitlabFile = (String, Option<String>, ChangeKind, Option<Stat>, bool);
+fn gitlab_file(v: &serde_json::Value) -> Result<GitlabFile, String> {
+    let path = file_path(v, "new_path")?;
+    let kind = if v["new_file"] == true {
+        ChangeKind::Added
+    } else if v["deleted_file"] == true {
+        ChangeKind::Deleted
+    } else if v["renamed_file"] == true {
+        ChangeKind::Renamed
+    } else {
+        ChangeKind::Modified
+    };
+    let old_path = (kind == ChangeKind::Renamed)
+        .then(|| file_path(v, "old_path"))
+        .transpose()?;
+    let stat = v["diff"]
+        .as_str()
+        .filter(|_| v["too_large"] != true && v["collapsed"] != true)
+        .filter(|d| !d.is_empty())
+        .map(|d| Stat::Lines {
+            added: d
+                .lines()
+                .filter(|l| l.starts_with('+') && !l.starts_with("+++ "))
+                .count() as u32,
+            removed: d
+                .lines()
+                .filter(|l| l.starts_with('-') && !l.starts_with("--- "))
+                .count() as u32,
+        });
+    Ok((
+        path,
+        old_path,
+        kind,
+        stat,
+        v["a_mode"] == "160000" || v["b_mode"] == "160000",
+    ))
+}
+
+/// GitLab's straight comparison is the exact two endpoints, unlike its default
+/// merge-base comparison. Never trust a partial or unspecified completeness flag.
+fn gitlab_compare(
+    client: &mut Session<'_>,
+    old: ObjectId,
+    new: ObjectId,
+) -> Result<Option<TreeDiff>, String> {
+    let root = client
+        .remote
+        .endpoint
+        .strip_suffix("/branches")
+        .ok_or("Invalid API endpoint")?;
+    let response = client.get(
+        &format!("{root}/compare?from={old}&to={new}&straight=true"),
+        "application/json",
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|_| "Invalid comparison API response")?;
+    if value["compare_timeout"] != false {
+        return Ok(None);
+    }
+    let list = value["diffs"]
+        .as_array()
+        .ok_or("Comparison API omitted files")?;
+    let remote = Arc::new(client.remote.clone());
+    let mut files = Vec::with_capacity(list.len());
+    let mut paths = std::collections::HashSet::new();
+    for v in list {
+        let (path, old_path, kind, stat, submodule) = gitlab_file(v)?;
+        if !paths.insert(path.clone()) {
+            return Err("Duplicate path in remote comparison".into());
+        }
+        files.push(FileChange {
+            worktree: false,
+            path,
+            old_path,
+            kind,
+            old: None,
+            new: None,
+            remote: Some(Box::new(RemoteFile {
+                remote: remote.clone(),
+                old_remote: None,
+                old: Some(old),
+                new,
+                stat,
+                no_cache: client.no_cache,
+                submodule,
+                blob: None,
+            })),
+        });
+    }
+    files.sort_by(|a, b| crate::diff::display_order(&a.path, &b.path));
+    Ok(Some(TreeDiff { files }))
+}
+
 pub fn tree(
     repo: &gix::Repository,
     remote: &Remote,
@@ -143,7 +252,19 @@ pub fn tree(
     new: ObjectId,
     no_cache: bool,
 ) -> Result<TreeDiff, String> {
+    tree_cancellable(repo, remote, old, new, no_cache, None)
+}
+
+pub(crate) fn tree_cancellable(
+    repo: &gix::Repository,
+    remote: &Remote,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    no_cache: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<TreeDiff, String> {
     let mut client = Session::new(repo, remote, no_cache)?;
+    client.cancelled = cancelled;
     let root = remote
         .endpoint
         .strip_suffix("/branches")
@@ -199,41 +320,8 @@ pub fn tree(
                     .map(str::to_owned);
                 (path, old_path, kind, stat, false, blob)
             } else {
-                let path = file_path(v, "new_path")?;
-                let kind = if v["new_file"] == true {
-                    ChangeKind::Added
-                } else if v["deleted_file"] == true {
-                    ChangeKind::Deleted
-                } else if v["renamed_file"] == true {
-                    ChangeKind::Renamed
-                } else {
-                    ChangeKind::Modified
-                };
-                let old_path = (kind == ChangeKind::Renamed)
-                    .then(|| file_path(v, "old_path"))
-                    .transpose()?;
-                let stat = v["diff"]
-                    .as_str()
-                    .filter(|_| v["too_large"] != true && v["collapsed"] != true)
-                    .filter(|d| !d.is_empty())
-                    .map(|d| Stat::Lines {
-                        added: d
-                            .lines()
-                            .filter(|l| l.starts_with('+') && !l.starts_with("+++ "))
-                            .count() as u32,
-                        removed: d
-                            .lines()
-                            .filter(|l| l.starts_with('-') && !l.starts_with("--- "))
-                            .count() as u32,
-                    });
-                (
-                    path,
-                    old_path,
-                    kind,
-                    stat,
-                    v["a_mode"] == "160000" || v["b_mode"] == "160000",
-                    None,
-                )
+                let (path, old_path, kind, stat, submodule) = gitlab_file(v)?;
+                (path, old_path, kind, stat, submodule, None)
             };
             files.push(FileChange {
                 worktree: false,
@@ -273,8 +361,32 @@ pub fn compare(
     new: ObjectId,
     no_cache: bool,
 ) -> Result<TreeDiff, String> {
+    compare_cancellable(repo, remote, old_remote, old, new, no_cache, None)
+}
+
+pub(crate) fn compare_cancellable(
+    repo: &gix::Repository,
+    remote: &Remote,
+    old_remote: Option<&Remote>,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    no_cache: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<TreeDiff, String> {
     let mut client = Session::new(repo, remote, no_cache)?;
+    client.cancelled = cancelled;
+    if remote.provider == Provider::Gitlab
+        && old_remote.is_some_and(|source| {
+            source.provider == remote.provider && source.endpoint == remote.endpoint
+        })
+        && let Some(old) = old
+        && crate::git::commit_details(repo, &new).is_err()
+        && let Some(result) = gitlab_compare(&mut client, old, new)?
+    {
+        return Ok(result);
+    }
     let mut old_client = Session::new(repo, old_remote.unwrap_or(remote), no_cache)?;
+    old_client.cancelled = cancelled;
     let mut before = old
         .map(|id| snapshot(&mut old_client, id))
         .transpose()?
@@ -333,6 +445,7 @@ pub fn compare(
 }
 
 fn snapshot(client: &mut Session<'_>, id: ObjectId) -> Result<BTreeMap<String, Side>, String> {
+    client.check_cancelled()?;
     // A local side may contain unpushed commits, unavailable to the provider.
     if crate::git::commit_details(client.repo, &id).is_ok() {
         return crate::diff::tree_diff(client.repo, None, &id)
@@ -622,6 +735,118 @@ mod tests {
             "5000 modified files; local HTTP fixture first tree {network_tree:.3} ms, first file {network_file:.3} ms; one offline warm-up, 15 samples: {}",
             serde_json::to_string(&samples).unwrap()
         );
+    }
+
+    #[test]
+    #[ignore = "one warm-up and 15 cached GitLab ghost comparison measurements"]
+    fn benchmark_gitlab_ghost_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let api = fixture::Api::start(Provider::Gitlab);
+        let old = fixture::id(2);
+        let new = fixture::id(3);
+        for straight in [false, true] {
+            for sample in -1..15 {
+                let start = std::time::Instant::now();
+                let result = compare(
+                    &repo,
+                    &api.remote,
+                    straight.then_some(&api.remote),
+                    Some(old),
+                    new,
+                    false,
+                )
+                .unwrap();
+                let ms = start.elapsed().as_secs_f64() * 1000.;
+                assert_eq!(result.files.len(), 1);
+                assert_eq!(result.files[0].path, "remote-example.txt");
+                println!(
+                    "{}",
+                    json!({"sample":sample,"straight":straight,"comparisonMs":ms})
+                );
+            }
+        }
+        assert_eq!(api.requests.load(std::sync::atomic::Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn gitlab_ghost_pairs_use_straight_comparison_and_exact_raw_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        command::checked(dir.path(), &["init", "-q"]).unwrap();
+        let repo = crate::git::open(dir.path()).unwrap();
+        let old = fixture::id(1);
+        let new = fixture::id(2);
+        let body = json!({"compare_timeout":false,"diffs":[{"new_path":"after.txt","old_path":"before.txt","renamed_file":true,"diff":"@@ -1 +1 @@\n-old\n+new\n"}]});
+        let (url, server) = super::super::tests::server(vec![
+            (200, String::new(), serde_json::to_vec(&body).unwrap()),
+            (200, String::new(), b"old\n".to_vec()),
+            (200, String::new(), b"new\n".to_vec()),
+        ]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://gitlab-fixture.invalid/team/repo",
+            Some("gitlab"),
+        )
+        .unwrap();
+        remote.endpoint = format!("{url}/repository/branches");
+        let result = compare(&repo, &remote, Some(&remote), Some(old), new, false).unwrap();
+        assert_eq!(result.files.len(), 1);
+        let file = &result.files[0];
+        assert_eq!(file.kind, ChangeKind::Renamed);
+        assert_eq!(file.old_path.as_deref(), Some("before.txt"));
+        let diff = crate::diff::file_diff(&repo, file).unwrap();
+        assert_eq!((diff.added, diff.removed), (1, 1));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains(&format!("/compare?from={old}&to={new}&straight=true")));
+        assert!(requests[1].contains(&format!("/files/before.txt/raw?ref={old}")));
+        assert!(requests[2].contains(&format!("/files/after.txt/raw?ref={new}")));
+        assert_eq!(
+            compare(&repo, &remote, Some(&remote), Some(old), new, false)
+                .unwrap()
+                .files,
+            result.files
+        );
+        assert!(repo.find_object(new).is_err());
+    }
+
+    #[test]
+    fn incomplete_gitlab_comparison_falls_back_to_complete_trees() {
+        for flag in [Some(true), None] {
+            let dir = tempfile::tempdir().unwrap();
+            command::checked(dir.path(), &["init", "-q"]).unwrap();
+            let repo = crate::git::open(dir.path()).unwrap();
+            let mut body = json!({"diffs":[]});
+            if let Some(flag) = flag {
+                body["compare_timeout"] = json!(flag);
+            }
+            let entry = |n| json!([{"path":"changed.txt","id":fixture::id(n).to_string(),"mode":"100644","type":"blob"}]);
+            let (url, server) = super::super::tests::server(vec![
+                (200, String::new(), serde_json::to_vec(&body).unwrap()),
+                (200, String::new(), serde_json::to_vec(&entry(8)).unwrap()),
+                (200, String::new(), serde_json::to_vec(&entry(9)).unwrap()),
+            ]);
+            let mut remote = Remote::parse(
+                "origin",
+                "https://gitlab-fixture.invalid/team/repo",
+                Some("gitlab"),
+            )
+            .unwrap();
+            remote.endpoint = format!("{url}/repository/branches");
+            let result = compare(
+                &repo,
+                &remote,
+                Some(&remote),
+                Some(fixture::id(1)),
+                fixture::id(2),
+                true,
+            )
+            .unwrap();
+            assert_eq!(result.files.len(), 1);
+            assert_eq!(result.files[0].path, "changed.txt");
+            assert_eq!(server.join().unwrap().len(), 3);
+        }
     }
 
     #[test]

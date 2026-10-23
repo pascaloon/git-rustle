@@ -102,6 +102,103 @@ impl SelectDelegate for People {
     }
 }
 
+#[derive(Clone)]
+struct BranchOption {
+    name: String,
+    title: SharedString,
+    search: String,
+    // Only the isolated branch scenario enables item paint probes.
+    paint: Option<BranchPaints>,
+}
+impl SelectItem for BranchOption {
+    type Value = String;
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+    fn value(&self) -> &String {
+        &self.name
+    }
+    fn render(&self, _: &mut Window, _: &mut gpui::App) -> impl IntoElement {
+        let name = self.name.clone();
+        let paint = self.paint.clone();
+        div()
+            .relative()
+            .child(self.title.clone())
+            .children(paint.map(|paint| {
+                canvas(
+                    |b, _, _| b,
+                    move |b, _, _, _| {
+                        paint.borrow_mut().insert(name.clone(), b);
+                    },
+                )
+                .absolute()
+                .size_full()
+            }))
+    }
+}
+type BranchPaints = std::rc::Rc<std::cell::RefCell<HashMap<String, Bounds<Pixels>>>>;
+#[derive(Default)]
+struct BranchOptions {
+    items: std::rc::Rc<Vec<BranchOption>>,
+    matches: Vec<usize>,
+}
+impl BranchOptions {
+    fn new(names: &[String]) -> Self {
+        Self {
+            items: std::rc::Rc::new(
+                names
+                    .iter()
+                    .map(|name| BranchOption {
+                        title: name.clone().into(),
+                        search: name.to_lowercase(),
+                        name: name.clone(),
+                        paint: None,
+                    })
+                    .collect(),
+            ),
+            matches: (0..names.len()).collect(),
+        }
+    }
+    fn filter(&mut self, query: &str) {
+        let query = query.to_lowercase();
+        self.matches.clear();
+        self.matches.extend(
+            self.items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| b.search.contains(&query).then_some(i)),
+        );
+    }
+}
+impl SelectDelegate for BranchOptions {
+    type Item = BranchOption;
+    fn items_count(&self, _: usize) -> usize {
+        self.matches.len()
+    }
+    fn item(&self, ix: IndexPath) -> Option<&BranchOption> {
+        self.matches.get(ix.row).map(|i| &self.items[*i])
+    }
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SelectItem<Value = V>,
+        V: PartialEq,
+    {
+        self.matches
+            .iter()
+            .position(|i| self.items[*i].value() == value)
+            .map(|i| IndexPath::default().row(i))
+    }
+    fn perform_search(
+        &mut self,
+        query: &str,
+        _: &mut Window,
+        _: &mut Context<SelectState<Self>>,
+    ) -> Task<()> {
+        self.filter(query);
+        Task::ready(())
+    }
+}
+
 pub(super) struct Composer {
     path: String,
     pub active: bool,
@@ -111,8 +208,19 @@ pub(super) struct Composer {
     remote: Option<Remote>,
     remotes: Vec<Remote>,
     title: Entity<InputState>,
-    source: Entity<InputState>,
-    target: Entity<InputState>,
+    source: Entity<SelectState<BranchOptions>>,
+    target: Entity<SelectState<BranchOptions>>,
+    source_name: String,
+    target_name: String,
+    target_edited: bool,
+    branch_choices: remote::requests::branch_choices::Choices,
+    branch_generation: u64,
+    branches_loading: bool,
+    default_branch: String,
+    branch_test_phase: u8,
+    branch_test_paints: BranchPaints,
+    branch_test_scheduled: bool,
+    branch_test_verified: bool,
     body: Entity<InputState>,
     assignees: Entity<SelectState<People>>,
     reviewers: Entity<SelectState<People>>,
@@ -136,11 +244,17 @@ impl Composer {
         let title =
             cx.new(|cx| InputState::new(window, cx).placeholder("What does this change do?"));
         let source_input = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).placeholder("Source branch (push it first)");
-            s.set_value(source, window, cx);
-            s
+            SelectState::new(
+                BranchOptions::new(std::slice::from_ref(&source)),
+                Some(IndexPath::default().row(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
         });
-        let target = cx.new(|cx| InputState::new(window, cx).placeholder("Target branch"));
+        let target = cx.new(|cx| {
+            SelectState::new(BranchOptions::default(), None, window, cx).searchable(true)
+        });
         let body = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("markdown")
@@ -154,6 +268,27 @@ impl Composer {
         let reviewers =
             cx.new(|cx| SelectState::new(People::default(), None, window, cx).searchable(true));
         let mut subscriptions = Vec::new();
+        subscriptions.push(
+            cx.subscribe_in(&source_input, window, |v, _, event, window, cx| {
+                if let SelectEvent::Confirm(Some(name)) = event {
+                    v.choose_request_source(name.clone(), window, cx);
+                }
+            }),
+        );
+        subscriptions.push(cx.subscribe_in(&target, window, |v, _, event, _, cx| {
+            if let SelectEvent::Confirm(Some(name)) = event
+                && let Some(c) = &mut v.composer
+                && !c.sending
+                && !c.uncertain
+                && c.created.is_none()
+                && !c.branches_loading
+                && c.branch_choices.targets.contains(name)
+            {
+                c.target_name = name.clone();
+                c.target_edited = true;
+                cx.notify();
+            }
+        }));
         for (input, reviewer) in [(&assignees, false), (&reviewers, true)] {
             subscriptions.push(cx.subscribe_in(
                 input,
@@ -192,6 +327,17 @@ impl Composer {
             title,
             source: source_input,
             target,
+            source_name: source,
+            target_name: String::new(),
+            target_edited: false,
+            branch_choices: Default::default(),
+            branch_generation: 0,
+            branches_loading: true,
+            default_branch: String::new(),
+            branch_test_phase: 0,
+            branch_test_paints: Default::default(),
+            branch_test_scheduled: false,
+            branch_test_verified: false,
             body,
             assignees,
             reviewers,
@@ -469,9 +615,18 @@ impl Desktop {
         composer.title.update(cx, |s, cx| {
             s.set_value("Make remote reviews feel native", window, cx)
         });
-        composer
-            .target
-            .update(cx, |s, cx| s.set_value("main", window, cx));
+        composer.target_name = "main".into();
+        composer.branches_loading = false;
+        composer.branch_choices.sources = vec!["feature/review".into(), "main".into()];
+        composer.branch_choices.targets = vec!["main".into()];
+        composer.target.update(cx, |s, cx| {
+            s.set_items(
+                BranchOptions::new(&composer.branch_choices.targets),
+                window,
+                cx,
+            );
+            s.set_selected_value(&composer.target_name, window, cx);
+        });
         composer.body.update(cx, |s, cx| s.set_value("## Summary\nA **Markdown** description with `code`, a [link](https://example.com), and a task list.\n\n## Testing\n- [x] Provider fixtures\n- [ ] Review", window, cx));
         let people = Arc::new(
             (0..10_000)
@@ -539,10 +694,11 @@ impl Desktop {
             .as_ref()
             .map(|c| {
                 format!(
-                    "request_open=true request_members={} request_sending={} request_body_bytes={}",
+                    "request_open=true request_members={} request_sending={} request_body_bytes={} request_source={} request_target={} request_branches={} request_branches_verified={}",
                     c.member_count,
                     c.sending,
-                    c.body.read(cx).value().len()
+                    c.body.read(cx).value().len(),
+                    c.source_name, c.target_name, c.branch_choices.sources.len(), c.branch_test_verified
                 )
             })
             .unwrap_or_else(|| "request_open=false".into())
@@ -555,6 +711,241 @@ impl Desktop {
         {
             self.composer = None;
         }
+    }
+
+    pub(super) fn request_branches_ready(&self) -> bool {
+        self.composer
+            .as_ref()
+            .is_some_and(|c| c.branch_test_verified)
+    }
+
+    pub(super) fn graph_request_source_painted(&self, source: &str, cx: &gpui::App) -> bool {
+        let Some(c) = &self.composer else {
+            return false;
+        };
+        if c.branches_loading || c.source_name != source {
+            return false;
+        }
+        let paints = c.branch_test_paints.borrow();
+        let (Some(source_bounds), Some(target_bounds)) =
+            (paints.get("source"), paints.get("target"))
+        else {
+            return false;
+        };
+        assert!(source_bounds.size.width > px(150.) && target_bounds.size.width > px(150.));
+        assert!(source_bounds.right() < target_bounds.left());
+        assert_eq!(
+            c.source.read(cx).selected_value().map(String::as_str),
+            Some(source)
+        );
+        assert!(!c.sending && c.created.is_none());
+        true
+    }
+
+    fn request_branch_probe(&self, name: &'static str) -> Option<AnyElement> {
+        if !matches!(
+            self.scenario.as_deref(),
+            Some(
+                "request-branches"
+                    | "request-branches-menu"
+                    | "graph-request-menu"
+                    | "graph-request-compose"
+            )
+        ) {
+            return None;
+        }
+        let paints = self.composer.as_ref()?.branch_test_paints.clone();
+        Some(
+            canvas(
+                |b, _, _| b,
+                move |b, _, _, _| {
+                    paints.borrow_mut().insert(name.into(), b);
+                },
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+        )
+    }
+
+    pub(super) fn request_branches_schedule(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(
+            self.scenario.as_deref(),
+            Some("request-branches" | "request-branches-menu")
+        ) {
+            return;
+        }
+        let Some(c) = &mut self.composer else { return };
+        if c.branch_test_scheduled || c.branch_test_verified {
+            return;
+        }
+        c.branch_test_scheduled = true;
+        let weak = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let _ = weak.update(cx, |v, cx| {
+                let c = v.composer.as_mut().unwrap();
+                c.branch_test_scheduled = false;
+                if c.branches_loading || c.loading {
+                    cx.notify();
+                    return;
+                }
+                let paints = c.branch_test_paints.borrow();
+                let (Some(source), Some(target)) = (paints.get("source"), paints.get("target"))
+                else {
+                    cx.notify();
+                    return;
+                };
+                assert!(source.size.width > px(150.) && target.size.width > px(150.));
+                assert!(source.size.height >= px(28.) && target.size.height >= px(28.));
+                assert!(source.right() < target.left());
+                assert!(target.right() <= window.viewport_size().width);
+                drop(paints);
+                assert!(!c.sending && !c.uncertain && c.created.is_none());
+                let emit_source = match c.branch_test_phase {
+                    0 => {
+                        let root = v.engine.repository_root().unwrap();
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                root.join(".git/git-rustle-request-branches-fixture")
+                            )
+                            .unwrap()
+                            .trim(),
+                            "disposable request branch fixture"
+                        );
+                        if c.remote.is_none() {
+                            // Offline provider overlay only; choices still come from real refs.
+                            c.remote = Remote::parse(
+                                "origin",
+                                "https://github.com/example/request-fixture.git",
+                                None,
+                            );
+                            c.error.clear();
+                            v.refresh_request_branches(true, window, cx);
+                            return;
+                        }
+                        assert_eq!(c.source_name, "FeatureA");
+                        assert_eq!(c.target_name, "Dev");
+                        assert_eq!(c.branch_choices.targets[0], "Dev");
+                        assert!(c.branch_choices.sources.contains(&"remote-only".into()));
+                        assert!(!c.branch_choices.sources.contains(&"wrong-project".into()));
+                        v.engine.mark("request source change requested");
+                        Some("Dev")
+                    }
+                    1 => {
+                        assert_eq!(c.source_name, "Dev");
+                        assert_eq!(c.target_name, "Main");
+                        v.engine.mark("request source change verified frame");
+                        Some("FeatureA")
+                    }
+                    2 => {
+                        assert_eq!(c.target_name, "Dev");
+                        let target = c.target.clone();
+                        c.branch_test_phase += 1;
+                        target.update(cx, |_, cx| {
+                            cx.emit(SelectEvent::Confirm(Some("Main".to_string())))
+                        });
+                        cx.notify();
+                        return;
+                    }
+                    3 => {
+                        assert_eq!(c.target_name, "Main");
+                        assert!(c.target_edited);
+                        c.branch_test_phase += 1;
+                        v.refresh_request_branches(false, window, cx);
+                        return;
+                    }
+                    4 => {
+                        assert_eq!(
+                            c.target_name, "Main",
+                            "Refreshing choices preserves a manual target"
+                        );
+                        Some("Dev")
+                    }
+                    5 => {
+                        assert_eq!(c.target_name, "Main");
+                        Some("FeatureA")
+                    }
+                    6 => {
+                        assert_eq!(c.source_name, "FeatureA");
+                        assert_eq!(c.target_name, "Dev");
+                        assert!(!c.target_edited);
+                        assert_eq!(
+                            c.source.read(cx).selected_value().map(String::as_str),
+                            Some("FeatureA")
+                        );
+                        assert_eq!(
+                            c.target.read(cx).selected_value().map(String::as_str),
+                            Some("Dev")
+                        );
+                        if v.scenario.as_deref() == Some("request-branches-menu") {
+                            let mut items = BranchOptions::new(&c.branch_choices.targets);
+                            for item in std::rc::Rc::get_mut(&mut items.items).unwrap() {
+                                item.paint = Some(c.branch_test_paints.clone());
+                            }
+                            c.target.update(cx, |s, cx| {
+                                s.set_items(items, window, cx);
+                                s.set_selected_value(&"Dev".into(), window, cx);
+                                s.focus(window, cx);
+                            });
+                            c.branch_test_phase += 1;
+                            cx.notify();
+                            return;
+                        }
+                        c.branch_test_verified = true;
+                        v.engine.mark("request branches verified frame");
+                        cx.notify();
+                        return;
+                    }
+                    7 => {
+                        // Wait until the enabled, focused selector is in the
+                        // painted action tree before dispatching its real action.
+                        c.branch_test_phase += 1;
+                        window
+                            .dispatch_action(cx.build_action("ui::SelectDown", None).unwrap(), cx);
+                        cx.notify();
+                        return;
+                    }
+                    8 => {
+                        let paints = c.branch_test_paints.borrow();
+                        let (Some(dev), Some(main)) = (paints.get("Dev"), paints.get("Main"))
+                        else {
+                            cx.notify();
+                            return;
+                        };
+                        assert!(
+                            dev.top() < main.top(),
+                            "Closest base must paint first in the dropdown"
+                        );
+                        assert!(dev.size.width > px(10.) && main.size.width > px(10.));
+                        assert!(main.bottom() <= window.viewport_size().height);
+                        drop(paints);
+                        c.branch_test_phase += 1;
+                        window.refresh();
+                        cx.notify();
+                        return;
+                    }
+                    9 => {
+                        c.branch_test_verified = true;
+                        v.engine.mark("request branches verified frame");
+                        cx.notify();
+                        return;
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(name) = emit_source {
+                    let source = c.source.clone();
+                    c.branch_test_phase += 1;
+                    source.update(cx, |_, cx| {
+                        cx.emit(SelectEvent::Confirm(Some(name.to_string())))
+                    });
+                }
+                cx.notify();
+            });
+        });
     }
     pub(super) fn open_request(
         &mut self,
@@ -578,6 +969,100 @@ impl Desktop {
         cx.notify();
     }
 
+    fn choose_request_source(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = &mut self.composer else { return };
+        if c.sending
+            || c.uncertain
+            || c.created.is_some()
+            || c.branches_loading
+            || c.source_name == name
+            || !c.branch_choices.sources.contains(&name)
+        {
+            return;
+        }
+        c.source_name = name;
+        self.refresh_request_branches(true, window, cx);
+    }
+
+    fn refresh_request_branches(
+        &mut self,
+        reset_target: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(c) = &mut self.composer else { return };
+        c.branch_generation += 1;
+        let generation = c.branch_generation;
+        let composer_id = c.generation >> 32;
+        c.branches_loading = true;
+        if reset_target {
+            c.target_edited = false;
+            c.target_name.clear();
+            c.target
+                .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        }
+        let path = c.path.clone();
+        let remote = c.remote.clone();
+        let source = c.source_name.clone();
+        let default = c.default_branch.clone();
+        self.engine.mark("request branches requested");
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    remote::requests::branch_choices::load(
+                        std::path::Path::new(&path),
+                        &source,
+                        remote.as_ref(),
+                        &default,
+                    )
+                })
+                .await;
+            let _ = view.update_in(cx, |v, window, cx| {
+                let Some(c) = &mut v.composer else { return };
+                if c.branch_generation != generation || c.generation >> 32 != composer_id {
+                    return;
+                }
+                c.branches_loading = false;
+                match result {
+                    Ok(choices) => {
+                        if !choices.sources.contains(&c.source_name) {
+                            c.source_name = choices.sources.first().cloned().unwrap_or_default();
+                            c.branch_choices = choices;
+                            if !c.source_name.is_empty() {
+                                v.refresh_request_branches(true, window, cx);
+                                return;
+                            }
+                        } else {
+                            c.branch_choices = choices;
+                        }
+                        if !c.target_edited || !c.branch_choices.targets.contains(&c.target_name) {
+                            c.target_name = c
+                                .branch_choices
+                                .targets
+                                .first()
+                                .cloned()
+                                .unwrap_or_default();
+                        }
+                        c.source.update(cx, |s, cx| {
+                            s.set_items(BranchOptions::new(&c.branch_choices.sources), window, cx);
+                            s.set_selected_value(&c.source_name, window, cx);
+                        });
+                        c.target.update(cx, |s, cx| {
+                            s.set_items(BranchOptions::new(&c.branch_choices.targets), window, cx);
+                            s.set_selected_value(&c.target_name, window, cx);
+                        });
+                    }
+                    Err(error) => c.error = error,
+                }
+                v.engine.mark("request branches ready");
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn load_request(
         &mut self,
         chosen: Option<Remote>,
@@ -585,23 +1070,21 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(c) = &mut self.composer else {
-            return;
-        };
+        let Some(c) = &mut self.composer else { return };
         c.loading = true;
         c.error.clear();
         c.warning.clear();
         c.generation += 1;
         let generation = c.generation;
         let path = c.path.clone();
-        let source = c.source.read(cx).value().trim().to_string();
         let no_cache = self.engine.no_cache();
+        // Local choices must not wait for provider authentication or member I/O.
+        self.refresh_request_branches(false, window, cx);
         cx.spawn_in(window, async move |view, cx| {
-            let result = cx
+            let configured = cx
                 .background_executor()
                 .spawn(async move {
-                    let path = std::path::Path::new(&path);
-                    let remotes = remote::configured(path)?.0;
+                    let remotes = remote::configured(std::path::Path::new(&path))?.0;
                     let remote = chosen
                         .or_else(|| {
                             remotes
@@ -611,51 +1094,72 @@ impl Desktop {
                                 .cloned()
                         })
                         .ok_or("Configure a GitHub or GitLab remote in Settings first.")?;
-                    let metadata = Client::new(path, &remote, no_cache)
-                        .and_then(|mut client| client.metadata(force));
-                    let default = metadata
-                        .as_ref()
-                        .map(|data| data.default_branch.as_str())
-                        .unwrap_or("");
-                    let target = remote::requests::target::infer(path, &source, &remote, default);
-                    Ok::<_, String>((remotes, remote, metadata, source, target))
+                    Ok::<_, String>((path, remotes, remote))
+                })
+                .await;
+            let (path, remotes, remote) = match configured {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = view.update_in(cx, |v, _, cx| {
+                        if let Some(c) = &mut v.composer
+                            && c.generation == generation
+                        {
+                            c.loading = false;
+                            c.error = error;
+                            v.engine.mark("request composer ready");
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+            };
+            let active = view
+                .update_in(cx, |v, window, cx| {
+                    let Some(c) = &mut v.composer else {
+                        return false;
+                    };
+                    if c.generation != generation {
+                        return false;
+                    }
+                    let changed = c.remote.as_ref() != Some(&remote);
+                    c.remotes = remotes;
+                    c.remote = Some(remote.clone());
+                    if changed {
+                        c.default_branch.clear();
+                    }
+                    v.refresh_request_branches(changed, window, cx);
+                    true
+                })
+                .unwrap_or(false);
+            if !active {
+                return;
+            }
+            let metadata = cx
+                .background_executor()
+                .spawn(async move {
+                    Client::new(std::path::Path::new(&path), &remote, no_cache)
+                        .and_then(|mut client| client.metadata(force))
                 })
                 .await;
             let _ = view.update_in(cx, |v, window, cx| {
-                let Some(c) = &mut v.composer else {
-                    return;
-                };
+                let Some(c) = &mut v.composer else { return };
                 if c.generation != generation {
                     return;
                 }
                 c.loading = false;
-                match result {
-                    Ok((remotes, remote, metadata, source, target)) => {
-                        c.remotes = remotes;
-                        c.remote = Some(remote);
-                        // A late suggestion must never replace an edited target,
-                        // or apply ancestry from a source that the user changed.
-                        if c.target.read(cx).value().is_empty()
-                            && c.source.read(cx).value().trim() == source
-                        {
-                            c.target.update(cx, |s, cx| s.set_value(target, window, cx));
-                        }
-                        match metadata {
-                            Ok(data) => {
-                                c.member_count = data.members.len();
-                                c.web_url = data.web_url;
-                                c.warning = data.warning;
-                                let people =
-                                    Arc::new(data.members.into_iter().map(Person::new).collect());
-                                c.assignees.update(cx, |s, cx| {
-                                    s.set_items(People::new(Arc::clone(&people)), window, cx)
-                                });
-                                c.reviewers.update(cx, |s, cx| {
-                                    s.set_items(People::new(people), window, cx)
-                                });
-                            }
-                            Err(error) => c.error = error,
-                        }
+                match metadata {
+                    Ok(data) => {
+                        c.default_branch = data.default_branch;
+                        c.member_count = data.members.len();
+                        c.web_url = data.web_url;
+                        c.warning = data.warning;
+                        let people = Arc::new(data.members.into_iter().map(Person::new).collect());
+                        c.assignees.update(cx, |s, cx| {
+                            s.set_items(People::new(Arc::clone(&people)), window, cx)
+                        });
+                        c.reviewers
+                            .update(cx, |s, cx| s.set_items(People::new(people), window, cx));
+                        v.refresh_request_branches(false, window, cx);
                     }
                     Err(error) => c.error = error,
                 }
@@ -670,15 +1174,15 @@ impl Desktop {
         let Some(c) = &mut self.composer else {
             return;
         };
-        if c.sending || c.loading || c.created.is_some() || c.uncertain {
+        if c.sending || c.loading || c.branches_loading || c.created.is_some() || c.uncertain {
             return;
         }
         let Some(remote) = c.remote.clone() else {
             return;
         };
         let draft = Draft {
-            source: c.source.read(cx).value().trim().into(),
-            target: c.target.read(cx).value().trim().into(),
+            source: c.source_name.clone(),
+            target: c.target_name.clone(),
             title: c.title.read(cx).value().to_string(),
             description: c.body.read(cx).value().to_string(),
             assignees: c.assigned.clone(),
@@ -1110,7 +1614,7 @@ impl Desktop {
                                         }
                                         c.assigned.clear();
                                         c.reviewing.clear();
-                                        c.target.update(cx, |s, cx| s.set_value("", window, cx));
+                                        c.target_name.clear();
                                     }
                                     v.load_request(Some(remote.clone()), false, window, cx);
                                 });
@@ -1180,10 +1684,17 @@ impl Desktop {
                     .on_click(cx.listener(|v, _, _, cx| { v.composer = None; cx.notify(); }))))
             .child(row().child(icon("branch").text_color(rgb(ACCENT))).child(remote_select))
             .child(row().items_start().gap_4()
-                .child(column().flex_1().gap_2().child(caption("Source branch")).child(Input::new(&c.source).disabled(locked)))
+                .child(column().flex_1().min_w_0().gap_2().child(caption("Source branch")).child(div().relative().w_full().child(Select::new(&c.source).w_full().placeholder("Search source branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("source"))))
                 .child(div().pt_6().text_color(rgb(ACCENT)).child("→"))
-                .child(column().flex_1().gap_2().child(caption("Target branch")).child(Input::new(&c.target).disabled(locked))))
-            .child(caption("The source branch must be pushed to the selected project. Your draft stays here when switching tabs."))
+                .child(column().flex_1().min_w_0().gap_2().child(caption("Target branch")).child(div().relative().w_full().child(Select::new(&c.target).w_full().placeholder("Search target branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("target")))))
+            .child(row().justify_between()
+                .child(caption("Closest base first. Changing the source selects the first target."))
+                .child(Button::new("refresh-request-branches").ghost().small().label("Refresh branches")
+                    .disabled(locked || c.branches_loading)
+                    .on_click(cx.listener(|v,_,window,cx|v.refresh_request_branches(false,window,cx)))))
+            .child(caption("Local and fetched branches for this project. Push the source before creating a request."))
+            .when(c.branches_loading, |s| s.child(caption("Finding branch bases…")))
+            .when(c.branch_choices.incomplete, |s| s.child(caption("Some history is unavailable. Fetch more history to improve target ordering.")))
             .child(div().h(px(1.)).bg(rgb(LINE)))
             .child(row().items_start().gap_6().child(editor).child(column().w(px(260.)).flex_shrink_0().gap_5()
                 .child(self.people_field(false, cx)).child(self.people_field(true, cx))
@@ -1218,7 +1729,14 @@ impl Desktop {
                     } else {
                         format!("Create {label}")
                     })
-                    .disabled(locked || c.loading || c.remote.is_none())
+                    .disabled(
+                        locked
+                            || c.loading
+                            || c.branches_loading
+                            || c.remote.is_none()
+                            || c.source_name.is_empty()
+                            || c.target_name.is_empty(),
+                    )
                     .on_click(cx.listener(|v, _, _, cx| v.submit_request(cx))),
             );
         column()
@@ -1294,7 +1812,56 @@ impl Desktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arc, Instant, Member, People, Person};
+    use super::{Arc, BranchOptions, IndexPath, Instant, Member, People, Person, SelectDelegate};
+
+    #[test]
+    fn branch_search_preserves_ranking_and_exact_names_without_cloning_roster() {
+        let names = vec![
+            "Dev".into(),
+            "team/Dev".into(),
+            "Main".into(),
+            "feature/Unicode-é".into(),
+        ];
+        let mut options = BranchOptions::new(&names);
+        let items = options.items.clone();
+        options.filter("dEv");
+        assert_eq!(options.matches, [0, 1]);
+        options.filter("unicode-É");
+        assert_eq!(
+            options.item(IndexPath::default().row(0)).unwrap().name,
+            "feature/Unicode-é"
+        );
+        options.filter("missing");
+        assert_eq!(options.items_count(0), 0);
+        options.filter("");
+        assert_eq!(options.matches, [0, 1, 2, 3]);
+        assert!(std::rc::Rc::ptr_eq(&items, &options.items));
+    }
+
+    #[test]
+    #[ignore = "one warmup plus 15 samples, 10000 branches and 600 queries"]
+    fn benchmark_branch_search() {
+        let names = (0..10_000)
+            .map(|i| format!("feature/branch-{i}"))
+            .collect::<Vec<_>>();
+        let mut options = BranchOptions::new(&names);
+        for sample in -1..15 {
+            let started = Instant::now();
+            for _ in 0..100 {
+                for query in ["f", "fea", "feature/branch-9", "99", "no match", ""] {
+                    options.filter(query);
+                    std::hint::black_box(&options.matches);
+                }
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000. / 600.;
+            if sample >= 0 {
+                println!(
+                    "{}",
+                    serde_json::json!({"sample":sample,"branch_search_ms_per_query":ms})
+                );
+            }
+        }
+    }
     use gix::bstr::ByteSlice;
 
     #[test]

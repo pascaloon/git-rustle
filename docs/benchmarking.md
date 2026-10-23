@@ -96,10 +96,15 @@ the startup cost of expanding an unusually large timestamp frontier.
 The latter two components establish candidate costs; preserved baseline native
 startup and scrolling remain the shared comparisons. The history-cache version
 changes, so distinguish fresh candidate cache creation from warmed reopening.
-Detached HEAD history unreachable from references is appended after reference
-history to avoid a second ancestry pass; reference-reachable checkout preserves
-existing rows even with equal timestamps or clock skew. This is a display-order
-policy, not a new strict topological-order guarantee.
+Detached HEAD history unreachable from references participates in the normal
+date-ordered frontier. Detached checkouts require an ancestry query to distinguish
+new tips from reference-reachable ancestors; attached checkouts retain one pass.
+Reference-reachable checkout preserves existing rows even with equal timestamps
+or clock skew. This is a display-order policy, not a new strict topological-order
+guarantee. `benchmark-graph-features.ps1 -Scenarios detached-commit` commits pending
+content through the real action and verifies the new HEAD row above its parent
+after paint, plus files, index and unchanged branch references. Use
+`screenshot-app.ps1 -Scenarios detached-commit` separately for image review.
 
 
 ## GPUI desktop (current implementation)
@@ -682,6 +687,42 @@ scrolling remains fast; moving to GPU rendering does not imply faster startup.
 ## 1. Preserve a trustworthy baseline
 
 ### Provider composition and photos
+
+Graph-row request commands have two focused native scenarios:
+`graph-request-menu` verifies a directly painted request item on the checked-out
+branch, activates the real menu handler, waits for the composer and its selected
+source to paint, then returns to the menu. `graph-request-compose` retains the
+composer after the same action. Use `benchmark-graph-features.ps1` for timing and
+`screenshot-app.ps1 -Scenarios graph-request-menu,graph-request-compose` separately
+for PNG review. Both use marked disposable repositories and preserve HEAD, refs,
+index, worktree and stashes. Compare the existing `graph-branch-menu` control with
+a preserved executable and run `graph-branch-menu-edge` for shared-tip overflow
+and menu navigation. A single local branch exposes its create action directly;
+several local names at the same tip retain the per-branch submenu. Named HEAD is
+a request source; detached HEAD is not a branch.
+
+For branch selectors, preserve the starting executable, then compare the existing
+`request-compose,request-edit,request-tabs` scenarios and warm/uncached startup.
+The candidate-only `request-branches` and `request-branches-menu` scenarios invoke
+the source/target selection subscriptions, await real reference/ancestry workers,
+verify FeatureA -> Dev and Dev -> Main, preserve a manual target during refresh,
+and verify that changing the source restores automatic selection. They assert
+painted selector bounds; the menu case additionally opens the real selector with
+its registered action and checks that Dev paints above Main.
+
+Use `scripts/screenshot-app.ps1 -Scenarios request-branches,request-branches-menu`
+for separate visual captures (see the screenshot workflow's DirectComposition
+capture limitation and diagnostic switch). It prepares marked local/fetched refs, a remote-only
+branch and an excluded other-remote branch; it verifies unchanged repository
+postconditions after normal close. Reuse the resulting marked fixture with
+`benchmark-desktop.ps1 -Scenarios request-branches,request-branches-menu -Samples 15`
+for timing without capture. These scenarios use an offline provider overlay and
+never submit requests. Run `remote::requests::branch_choices::tests::benchmark_branch_ordering`
+and `desktop::requests::tests::benchmark_branch_search` in an optimized test harness
+after building: one warmup plus fifteen retained samples cover worker ordering at
+1,000 branch names and in-memory filtering at 10,000 branch names. Keep their raw
+output and comparison report under ignored `target/bench/<run>`. Native action/
+paint checks exclude physical typing, pointer behavior and live provider latency.
 
 For empty-description regressions, also run candidate-only
 `benchmark-desktop.ps1 -Scenarios request-open,request-clear` on a disposable local
@@ -1690,3 +1731,41 @@ The runner asserts repository files, index and refs remain intact, and disposes
 its private desktop and fixture process. Generated reports and diagnostics stay
 under ignored `target/bench/<run>` directories. Short runs are iteration checks,
 not the full 15-sample performance acceptance run.
+
+### Ghost comparison loading and recovery
+
+`ghost-files-gitlab` and `ghost-files-github` in
+`benchmark-graph-features.ps1` run a loopback API fixture on a private desktop.
+The real Select handlers choose two unfetched commits, hold their comparison
+response open, and switch to two other individual ghosts. Both file lists must
+finish and paint before the held response is released. The scenario then checks
+an HTTP 503, a successful selection afterward, and a successful two-ghost
+comparison. Loaded/error state, file names, selection count, paint bounds and
+unchanged repository state are asserted. Use `-Samples 15` for timing and capture
+separately with `screenshot-app.ps1 -Scenarios ghost-files-gitlab` (or the GitHub
+variant). Review the resulting PNG; action/paint assertions do not establish
+physical input or display scanout.
+
+The remote diff queue has two bounded workers, removes obsolete queued work and
+cancels superseded pagination between HTTP calls. Existing HTTP deadlines bound
+an already-running call; cancellation does not interrupt a synchronous socket
+read. Live parked Diff tabs retain their requests. GitLab same-project ghost
+pairs use [`straight=true`](https://docs.gitlab.com/api/repositories/#compare-branches-tags-or-commits)
+for exact endpoints only when `compare_timeout` is explicitly false. Incomplete
+or unspecified comparisons fall back to complete snapshot trees; mixed local or
+cross-project pairs retain their existing snapshot behavior.
+
+Run engine regressions `slow_ghost_pair_does_not_block_later_single_selections`
+and `parked_remote_diff_and_new_ghost_details_both_finish`, along with
+`remote::files::tests`. The former covers burst selection and error recovery for
+both providers while preserving refs and absent ghost objects. Retain the
+failing baseline reproduction. Use preserved baseline/candidate test executables
+for `engine::tests::benchmark_remote_diff_refresh` and
+`remote::files::tests::benchmark_remote_pairs`. Candidate-only
+`benchmark_gitlab_ghost_pair` compares the cached snapshot and straight paths on
+the same small fixture; it does not model large repositories or server latency.
+Measure shared startup and normal/searched scrolling with the app baseline.
+If a managed worktree shares the main checkout's Cargo target, pass that checkout
+as `-IdleWorkspaceRoot` to verify an existing waiting `cargo run` launcher against
+its actual app path; compiler/linker processes still reject timing.
+Keep raw output and limitations under the ignored `target/bench/<run>` tree.
