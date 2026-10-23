@@ -801,12 +801,36 @@ fn branches(pages: &[Page]) -> Vec<Branch> {
         .collect()
 }
 
+/// Store a complete advertisement in the existing paged cache format. Synthetic
+/// pages have no API ETags; a later API fallback must verify every page afresh.
+fn branch_pages(branches: &[Branch]) -> Vec<Page> {
+    let mut pages: Vec<_> = branches
+        .chunks(100)
+        .map(|batch| Page {
+            etag: None,
+            branches: batch.to_vec(),
+            more: true,
+        })
+        .collect();
+    if let Some(last) = pages.last_mut() {
+        last.more = false;
+    } else {
+        pages.push(Page {
+            etag: None,
+            branches: Vec::new(),
+            more: false,
+        });
+    }
+    pages
+}
+
 fn load_one(
     path: &Path,
     git_dir: &Path,
     remote: &Remote,
     force: bool,
     no_cache: bool,
+    cancel: &std::sync::atomic::AtomicBool,
     emit: &(impl Fn(Event) + Sync),
 ) {
     let token = match cached_token(path, git_dir, remote) {
@@ -821,7 +845,7 @@ fn load_one(
     } else {
         cache_file(git_dir, remote, token.as_deref())
     };
-    load_cached(path, remote, force, location, token, emit);
+    load_cached(path, remote, force, location, token, cancel, emit);
 }
 
 pub fn test_connection(
@@ -861,6 +885,7 @@ fn load_cached(
     force: bool,
     location: Option<(PathBuf, String)>,
     mut token: Option<String>,
+    cancel: &std::sync::atomic::AtomicBool,
     emit: &(impl Fn(Event) + Sync),
 ) {
     let cached = location.as_ref().and_then(|(p, id)| read_cache(p, id));
@@ -884,17 +909,32 @@ fn load_cached(
         .map(|c| c.pages.as_slice())
         .unwrap_or_default();
     let mut used_helper = false;
-    let result = pages(remote.provider, old, |n, etag| {
-        let response = http.get(remote, n, etag, token.as_deref())?;
-        if matches!(response.status, 401 | 403 | 404) && token.is_none() && !used_helper {
-            used_helper = true;
-            token = helper_token(path, remote);
-            if token.is_some() {
-                return http.get(remote, n, None, token.as_deref());
+    // The branch browser only needs names and tip IDs. Reuse the pooled Git
+    // advertisement instead of transferring full commit payloads one API page
+    // at a time. Keep API pagination/ETags as the compatibility fallback.
+    let advertised = advertisement::read_all(remote, token.as_deref(), cancel)
+        .filter(|branches| branches.len() <= MAX_PAGES * 100);
+    let result = if let Some(branches) = advertised {
+        Ok(branch_pages(&branches))
+    } else {
+        pages(remote.provider, old, |n, etag| {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("Branch listing cancelled".into());
             }
-        }
-        Ok(response)
-    });
+            let response = http.get(remote, n, etag, token.as_deref())?;
+            if matches!(response.status, 401 | 403 | 404) && token.is_none() && !used_helper {
+                used_helper = true;
+                token = helper_token(path, remote);
+                if token.is_some() {
+                    return http.get(remote, n, None, token.as_deref());
+                }
+            }
+            Ok(response)
+        })
+    };
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     match result {
         Ok(pages) => {
             emit(Event::Branches(Update {
@@ -1289,7 +1329,7 @@ pub fn discover_scoped(
                                     )));
                                 }
                             } else {
-                                load_one(path, git_dir, remote, force, no_cache, &emit);
+                                load_one(path, git_dir, remote, force, no_cache, cancel, &emit);
                             }
                         }
                     });
@@ -1651,6 +1691,90 @@ mod tests {
     }
 
     #[test]
+    fn full_advertisement_refresh_replaces_complete_cache_and_keeps_it_on_failure() {
+        let packet = |s: &str| format!("{:04x}{s}", s.len() + 4);
+        let advertised = |count: usize| {
+            let mut body = packet("# service=git-upload-pack\n") + "0000";
+            body += &packet(&format!("{} HEAD\0multi_ack\n", "a".repeat(40)));
+            for n in 0..count {
+                body += &packet(&format!("{} refs/heads/server-{n:03}\n", "a".repeat(40)));
+            }
+            body += "0000";
+            body.into_bytes()
+        };
+        let header = "Content-Type: application/x-git-upload-pack-advertisement\r\n".to_string();
+        let (url, server) = server(vec![
+            (200, header.clone(), advertised(201)),
+            (200, header.clone(), advertised(1)),
+            (200, header, b"truncated".to_vec()),
+            (503, String::new(), Vec::new()),
+        ]);
+        let mut remote = Remote::parse(
+            "origin",
+            "https://example.invalid/team/repo",
+            Some("github"),
+        )
+        .unwrap();
+        remote.url = format!("{url}/repo");
+        remote.endpoint = format!("{url}/branches");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("branches.json");
+        let location = Some((file.clone(), "advertisement-test".into()));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let events = std::sync::Mutex::new(Vec::new());
+        let emit = |event| events.lock().unwrap().push(event);
+        load_cached(
+            dir.path(),
+            &remote,
+            false,
+            location.clone(),
+            None,
+            &cancel,
+            &emit,
+        );
+        let cache = read_cache(&file, "advertisement-test").unwrap();
+        assert_eq!(branches(&cache.pages).len(), 201);
+        assert!(cache.pages.iter().all(|p| p.etag.is_none()));
+        // Fresh cache makes no network request. Forced refresh establishes deletions.
+        load_cached(
+            dir.path(),
+            &remote,
+            false,
+            location.clone(),
+            None,
+            &cancel,
+            &emit,
+        );
+        load_cached(
+            dir.path(),
+            &remote,
+            true,
+            location.clone(),
+            None,
+            &cancel,
+            &emit,
+        );
+        let cache = read_cache(&file, "advertisement-test").unwrap();
+        assert_eq!(branches(&cache.pages).len(), 1);
+        let before = std::fs::read(&file).unwrap();
+        load_cached(dir.path(), &remote, true, location, None, &cancel, &emit);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(Event::Status(_))
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[..3]
+                .iter()
+                .all(|r| r.contains("/repo/info/refs?service=git-upload-pack"))
+        );
+        assert!(requests[3].contains("/branches?per_page=100&page=1"));
+        assert!(!requests[3].to_lowercase().contains("if-none-match"));
+    }
+
+    #[test]
     fn http_cache_ttl_etag_and_failed_refresh_keep_complete_results() {
         let first = response(&["main"], false);
         let (url, server) = server(vec![
@@ -1670,13 +1794,29 @@ mod tests {
         let location = Some((file.clone(), "test-id".into()));
         let events = std::sync::Mutex::new(Vec::new());
         let emit = |event| events.lock().unwrap().push(event);
-        load_cached(dir.path(), &remote, false, location.clone(), None, &emit);
+        load_cached(
+            dir.path(),
+            &remote,
+            false,
+            location.clone(),
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            &emit,
+        );
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(Event::Branches(Update { cached: false, .. }))
         ));
         // This invocation must use the fresh cache and issue no HTTP request.
-        load_cached(dir.path(), &remote, false, location.clone(), None, &emit);
+        load_cached(
+            dir.path(),
+            &remote,
+            false,
+            location.clone(),
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            &emit,
+        );
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(Event::Branches(Update {
@@ -1686,9 +1826,25 @@ mod tests {
                 ..
             }))
         ));
-        load_cached(dir.path(), &remote, true, location.clone(), None, &emit);
+        load_cached(
+            dir.path(),
+            &remote,
+            true,
+            location.clone(),
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            &emit,
+        );
         let before = std::fs::read(&file).unwrap();
-        load_cached(dir.path(), &remote, true, location, None, &emit);
+        load_cached(
+            dir.path(),
+            &remote,
+            true,
+            location,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            &emit,
+        );
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(Event::Status(_))
@@ -2028,7 +2184,15 @@ mod tests {
         remote.endpoint = format!("{url}/branches");
         let events = std::sync::Mutex::new(Vec::new());
         let emit = |event| events.lock().unwrap().push(event);
-        load_one(dir.path(), &git_dir, &remote, false, false, &emit);
+        load_one(
+            dir.path(),
+            &git_dir,
+            &remote,
+            false,
+            false,
+            &std::sync::atomic::AtomicBool::new(false),
+            &emit,
+        );
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains("Bearer fixture-cache-token"));
@@ -2047,7 +2211,15 @@ mod tests {
             .lock()
             .unwrap()
             .remove(&(dir.path().to_path_buf(), remote.endpoint.clone()));
-        load_one(dir.path(), &git_dir, &remote, false, false, &emit);
+        load_one(
+            dir.path(),
+            &git_dir,
+            &remote,
+            false,
+            false,
+            &std::sync::atomic::AtomicBool::new(false),
+            &emit,
+        );
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(Event::Branches(Update { cached: true, .. }))

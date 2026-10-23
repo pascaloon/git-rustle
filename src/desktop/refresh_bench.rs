@@ -9,6 +9,7 @@ struct Paint {
     settled: bool,
     local: bool,
     tips: bool,
+    last_commit: Option<i64>,
 }
 type Paints = Rc<RefCell<HashMap<gix::ObjectId, Paint>>>;
 
@@ -42,6 +43,15 @@ impl Desktop {
         let tips = local
             && !self.engine.app.branches.loading
             && self.engine.app.branches.want_refresh.is_none();
+        let last_commit = self
+            .engine
+            .app
+            .branches
+            .entries
+            .iter()
+            .find(|e| e.target.sha == id)
+            .and_then(|e| e.activity.as_ref())
+            .map(|a| a.commit_time);
         Some(
             canvas(
                 |bounds, _, _| bounds,
@@ -53,6 +63,7 @@ impl Desktop {
                             settled,
                             local,
                             tips,
+                            last_commit,
                         },
                     );
                 },
@@ -93,7 +104,9 @@ impl Desktop {
             self.refresh_bench.expected = Some(oid("GIT_RUSTLE_REFRESH_EXPECTED"));
         }
         let case = std::env::var("GIT_RUSTLE_REFRESH_CASE").unwrap_or_default();
-        if case == "after-branches" && !self.refresh_bench.branches_visited {
+        if matches!(case.as_str(), "after-branches" | "branches")
+            && !self.refresh_bench.branches_visited
+        {
             if self.engine.refresh_in_progress()
                 || self.provider.pending
                 || !self
@@ -105,7 +118,13 @@ impl Desktop {
                 return;
             }
             self.refresh_bench.branches_visited = true;
+            self.engine.mark("branches native open requested");
             self.action(Action::Tab(Tab::Branches), window, cx);
+            if case == "branches" {
+                self.refresh_bench.paints.borrow_mut().clear();
+                self.engine.app.branches.query = "z-ghost".into();
+                self.engine.app.branches.filter();
+            }
             return;
         }
         if case == "after-branches" && self.engine.app.branches.open {
@@ -131,13 +150,21 @@ impl Desktop {
                 "fixture advanced before Refresh"
             );
             let initial = self.refresh_bench.paints.borrow()[&old];
-            let viewport = self.graph_scroll.0.borrow().base_handle.bounds();
+            let viewport = if case == "branches" {
+                self.branches_scroll.0.borrow().base_handle.bounds()
+            } else {
+                self.graph_scroll.0.borrow().base_handle.bounds()
+            };
             assert!(initial.bounds.size.width > px(0.) && initial.bounds.size.height > px(0.));
             assert!(
                 initial.bounds.bottom() > viewport.top()
                     && initial.bounds.top() < viewport.bottom(),
                 "initial server tip must be painted before Refresh"
             );
+            if case == "branches" {
+                assert!(self.engine.app.branches.remotes.values().any(|u| !u.scoped));
+                self.engine.mark("branches native open frame");
+            }
             self.engine.mark("refresh native startup ghost frame");
             let control =
                 std::env::var("GIT_RUSTLE_REFRESH_CONTROL").expect("refresh fixture control URL");
@@ -204,18 +231,72 @@ impl Desktop {
             }) = painted
             {
                 assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
-                let viewport = self.graph_scroll.0.borrow().base_handle.bounds();
+                let viewport = if case == "branches" {
+                    self.branches_scroll.0.borrow().base_handle.bounds()
+                } else {
+                    self.graph_scroll.0.borrow().base_handle.bounds()
+                };
                 assert!(
                     bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom(),
                     "updated ghost must be painted inside the viewport"
                 );
-                assert!(self.engine.app.ghosts.contains_key(&expected));
+                if case != "branches" {
+                    assert!(self.engine.app.ghosts.contains_key(&expected));
+                }
                 if self.refresh_bench.phase == 2 {
                     self.engine.mark("refresh native first ghost frame");
                     self.refresh_bench.phase = 3;
                     cx.notify();
                 }
                 if settled && !self.engine.refresh_in_progress() && !self.provider.pending {
+                    if case == "branches" {
+                        let tip = self
+                            .engine
+                            .app
+                            .branches
+                            .entries
+                            .iter()
+                            .find(|e| e.target.sha == expected)
+                            .expect("refreshed browser tip");
+                        if tip.activity.is_none() || painted.unwrap().last_commit.is_none() {
+                            return;
+                        }
+                        assert!(
+                            tip.activity.as_ref().unwrap().commit_time > 0,
+                            "last commit time retained"
+                        );
+                        if std::env::var("GIT_RUSTLE_REFRESH_BROWSER").as_deref() == Ok("1") {
+                            let update = self
+                                .engine
+                                .app
+                                .branches
+                                .remotes
+                                .values()
+                                .find(|u| !u.scoped)
+                                .expect("complete browser listing");
+                            assert!(
+                                update
+                                    .branches
+                                    .iter()
+                                    .any(|b| b.name == "server-only-00000" && b.sha == expected),
+                                "server-only tip updated"
+                            );
+                            assert!(
+                                !update
+                                    .branches
+                                    .iter()
+                                    .any(|b| b.name == "server-only-00001"),
+                                "deleted server-only branch removed"
+                            );
+                            assert!(
+                                update
+                                    .branches
+                                    .iter()
+                                    .any(|b| b.name == "server-only-added"),
+                                "new server-only branch discovered"
+                            );
+                        }
+                    }
                     if expected == old {
                         let (history, labels, selected) = self.refresh_bench.retained.unwrap();
                         assert_eq!(self.engine.app.history.commits.as_ptr() as usize, history);

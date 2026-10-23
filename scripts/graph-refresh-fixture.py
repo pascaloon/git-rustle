@@ -27,6 +27,7 @@ parser.add_argument('--git-cli-only', action='store_true')
 parser.add_argument('--tracking-only-ghost', action='store_true')
 parser.add_argument('--malformed-advertisement', action='store_true')
 parser.add_argument('--unicode-tag-advertisement', action='store_true')
+parser.add_argument('--advance-browser-heads', action='store_true')
 args = parser.parse_args()
 owned = Path(args.directory).resolve()
 owned.mkdir(parents=True, exist_ok=False)
@@ -62,6 +63,20 @@ old, new = 'a'*40, ('a' if args.unchanged else 'c')*40
 local_names = ['z-ghost'] + [f'branch-{i:03}' for i in range(args.branches-1)]
 lock = threading.Lock()
 state = {'advanced': False, 'active': 0, 'peakRequests': 0, 'requests': [], 'forbidden': [], 'pipelineRequests': 0, 'projectRequests': 0, 'pullRequests': 0}
+def browser_names(advanced):
+    names = [f'server-only-{i:05}' for i in range(args.server_only)]
+    if advanced and args.advance_browser_heads:
+        names = [name for name in names if name != 'server-only-00001']
+        names.append('server-only-added')
+    return names
+
+def branch_sha(name, advanced):
+    if name == 'z-ghost':
+        return new if advanced else old
+    if advanced and args.advance_browser_heads and name == 'server-only-00000':
+        return new
+    return base
+
 def commit(sha, parent):
     return {'sha': sha, 'parents': [{'sha': parent}], 'commit': {
         'author': {'name': 'Fixture', 'email': 'fixture@example.invalid', 'date': '2026-01-01T00:00:00Z'},
@@ -117,9 +132,9 @@ class Handler(BaseHTTPRequestHandler):
                     body = value.encode()
                     return f'{len(body)+4:04x}'.encode()+body
                 body = pkt('# service=git-upload-pack\n')+b'0000'
-                names = local_names + [f'server-only-{i:05}' for i in range(args.server_only)]
+                names = local_names + browser_names(advanced)
                 for index, name in enumerate(names):
-                    sha = (new if advanced else old) if name == 'z-ghost' else base
+                    sha = branch_sha(name, advanced)
                     capabilities = '\x00multi_ack' if index == 0 else ''
                     body += pkt(f'{sha} refs/heads/{name}{capabilities}\n')
                     if index == 0 and args.malformed_advertisement and self.headers.get('User-Agent', '').startswith('git-rustle/'):
@@ -137,14 +152,14 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path.startswith(root+'/branches/'):
                 name = unquote(parsed.path[len(root+'/branches/'):])
                 time.sleep(args.delay_ms/1000)
-                self.response(200, {'name': name, 'commit': {'sha': (new if advanced else old) if name == 'z-ghost' else base}})
+                self.response(200, {'name': name, 'commit': {'sha': branch_sha(name, advanced)}})
             elif parsed.path == root+'/branches':
                 time.sleep(args.delay_ms/1000)
                 page = int(parse_qs(parsed.query).get('page', ['1'])[0])
-                unrelated = [f'server-only-{i:05}' for i in range(args.server_only)]
+                unrelated = browser_names(advanced)
                 names = unrelated + local_names if args.unrelated_first else local_names + unrelated
                 batch = names[(page-1)*100:page*100]
-                self.response(200, [{'name':name,'commit':{'sha':(new if advanced else old) if name=='z-ghost' else base}} for name in batch])
+                self.response(200, [{'name':name,'commit':{'sha':branch_sha(name, advanced)}} for name in batch])
             elif parsed.path == root+'/commits':
                 sha = parse_qs(parsed.query).get('sha', [''])[0]
                 self.response(200, [commit(new, old), commit(old, base)] if sha == new and new != old else [commit(old, base)])

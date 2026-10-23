@@ -1,9 +1,10 @@
 param(
     [string]$Candidate="$PSScriptRoot/../target/release/git-rustle.exe",
-    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
+    [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [switch]$DisableDirectComposition,
+    [string]$IdleWorkspaceRoot="$PSScriptRoot/..",
     [Parameter(Mandatory)][string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
@@ -55,10 +56,10 @@ try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0';$env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
     $env:GIT_AUTHOR_DATE='2026-01-01T12:00:00+0000';$env:GIT_COMMITTER_DATE=$env:GIT_AUTHOR_DATE
     foreach($scenario in $Scenarios){
-        if($scenario-notin@('graph-multiselect','graph-selection-boundary','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
+        if($scenario-notin@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','diff-base','diff-base-choose','graph-polish','graph-commit-menu','graph-request-menu','graph-request-compose','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review')){throw "Unknown graph feature $scenario"}
         $samplesForScenario=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
         foreach($sample in $samplesForScenario){
-            if(!$Screenshots){Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
+            if(!$Screenshots){Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path $IdleWorkspaceRoot).Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json')}
             $directory=Join-Path $OutputDirectory "$scenario-$sample";New-Item -ItemType Directory -Path $directory|Out-Null
             $fixture=Join-Path $directory 'repository';New-Item -ItemType Directory -Path $fixture|Out-Null
             $env:LOCALAPPDATA=Join-Path $directory 'app-data';$env:APPDATA=$env:LOCALAPPDATA;New-Item -ItemType Directory -Path $env:LOCALAPPDATA|Out-Null

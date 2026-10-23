@@ -91,6 +91,11 @@ impl Desktop {
                         };
                         let entry = &b.entries[b.visible[i]];
                         branch_row(b.selected == i)
+                            .children(
+                                gix::ObjectId::from_hex(entry.target.sha.as_bytes())
+                                    .ok()
+                                    .and_then(|id| v.refresh_bench_probe(id)),
+                            )
                             .relative()
                             .children(
                                 (entry.target.name == "fixes/task-123")

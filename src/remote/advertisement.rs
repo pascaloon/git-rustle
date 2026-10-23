@@ -97,6 +97,25 @@ pub(super) fn read(
     names: &HashSet<String>,
     cancel: &AtomicBool,
 ) -> Option<Vec<Branch>> {
+    read_scope(remote, token, Some(names), cancel)
+}
+
+/// Complete branch-browser listing. A final flush is required before publishing
+/// any heads, so a failed/truncated advertisement cannot establish deletions.
+pub(super) fn read_all(
+    remote: &Remote,
+    token: Option<&str>,
+    cancel: &AtomicBool,
+) -> Option<Vec<Branch>> {
+    read_scope(remote, token, None, cancel)
+}
+
+fn read_scope(
+    remote: &Remote,
+    token: Option<&str>,
+    names: Option<&HashSet<String>>,
+    cancel: &AtomicBool,
+) -> Option<Vec<Branch>> {
     let url = endpoint(remote)?;
     let mut identity = std::collections::hash_map::DefaultHasher::new();
     token.hash(&mut identity);
@@ -125,7 +144,7 @@ fn request(
     url: &str,
     provider: Provider,
     token: Option<&str>,
-    names: &HashSet<String>,
+    names: Option<&HashSet<String>>,
     cancel: &AtomicBool,
 ) -> Option<Vec<Branch>> {
     let mut request = HTTP
@@ -165,7 +184,7 @@ fn request(
         .limit(16 * 1024 * 1024)
         .read_to_vec()
         .ok()?;
-    let branches = parse(&body, names).ok()?;
+    let branches = parse_scope(&body, names).ok()?;
     Some(branches)
 }
 
@@ -185,7 +204,12 @@ fn packet<'a>(bytes: &mut &'a [u8]) -> Result<Option<&'a [u8]>, ()> {
     Ok(Some(value))
 }
 
-fn parse(mut bytes: &[u8], names: &HashSet<String>) -> Result<Vec<Branch>, ()> {
+#[cfg(test)]
+fn parse(bytes: &[u8], names: &HashSet<String>) -> Result<Vec<Branch>, ()> {
+    parse_scope(bytes, Some(names))
+}
+
+fn parse_scope(mut bytes: &[u8], names: Option<&HashSet<String>>) -> Result<Vec<Branch>, ()> {
     let service = packet(&mut bytes)?.ok_or(())?;
     if service.strip_suffix(b"\n").unwrap_or(service) != b"# service=git-upload-pack"
         || packet(&mut bytes)?.is_some()
@@ -226,7 +250,7 @@ fn parse(mut bytes: &[u8], names: &HashSet<String>) -> Result<Vec<Branch>, ()> {
                 if name.is_empty() {
                     return Err(());
                 }
-                if names.contains(name) {
+                if names.is_none_or(|names| names.contains(name)) {
                     found.insert(name.to_owned(), sha.to_owned());
                 }
             }
@@ -263,6 +287,26 @@ mod tests {
             .into_iter()
             .collect()
     }
+    #[test]
+    fn complete_listing_includes_untracked_heads_and_requires_final_flush() {
+        let sha = "a".repeat(40);
+        let body = response(&[
+            format!("{sha} HEAD\0multi_ack\n"),
+            format!("{sha} refs/heads/topic/slash\n"),
+            format!("{sha} refs/heads/server-only\n"),
+            format!("{sha} refs/tags/release\n"),
+        ]);
+        let all = parse_scope(&body, None).unwrap();
+        assert_eq!(
+            all.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["server-only", "topic/slash"]
+        );
+        assert_eq!(parse(&body, &names()).unwrap().len(), 1);
+        assert!(parse_scope(&body[..body.len() - 4], None).is_err());
+        let empty = response(&[format!("{} capabilities^{{}}\0multi_ack\n", "0".repeat(40))]);
+        assert!(parse_scope(&empty, None).unwrap().is_empty());
+    }
+
     #[test]
     fn parses_heads_ignores_tags_and_requires_a_complete_response() {
         let a = "a".repeat(40);

@@ -224,6 +224,37 @@ fn checkout_inner(path: &Path, target: &Target, fetch_and_ff: bool) -> Result<St
                 "Fetched and checked out {local} (fast-forward only)"
             ));
         }
+        // A remote branch can be selected from a commit that differs from its
+        // local tracking branch (for example, when the local branch is ahead
+        // of origin). Switching to `local` would report success while leaving
+        // HEAD at a different commit than the user selected. Preserve the
+        // local branch and inspect the exact selected remote tip detached.
+        let selected = gix::ObjectId::from_hex(target.sha.as_bytes())
+            .map_err(|_| "Invalid remote commit ID".to_string())?
+            .to_string();
+        let local_tip = output(
+            path,
+            &["rev-parse", "--verify", &format!("refs/heads/{local}")],
+        )?;
+        if local_tip != selected {
+            let object = command::run(
+                path,
+                &["cat-file", "-e", &format!("{selected}^{{commit}}")],
+                None,
+                Duration::from_secs(10),
+            )?;
+            if !object.status.success() {
+                return Err(format!(
+                    "Selected {remote}/{} tip is unavailable locally; refresh or fetch it before checking out",
+                    target.name
+                ));
+            }
+            output(path, &["switch", "--detach", "--no-guess", "--", &selected])?;
+            return Ok(format!(
+                "Checked out {remote}/{} (detached HEAD)",
+                target.name
+            ));
+        }
         output(path, &["switch", "--no-guess", "--", local])?;
         return Ok(format!(
             "Checked out {local} (existing local tracking branch; no pull)"
@@ -498,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn fetches_only_selected_branch_and_preserves_existing_tracking_tip() {
+    fn remote_checkout_targets_selected_tip_without_moving_tracking_branch() {
         let f = Fixture::new();
         assert!(
             !command::run(
@@ -524,11 +555,17 @@ mod tests {
         assert!(!exists(&f.repo, "refs/remotes/origin/unselected").unwrap());
         assert!(!exists(&f.repo, "refs/tags/unselected-tag").unwrap());
         checkout(&f.repo, &f.local("main")).unwrap();
-        // Existing branch must remain usable offline and must never be reset to a supplied API tip.
+        // A remote tip that differs from its tracking branch must be checked
+        // out exactly, without moving or switching the local tracking branch.
         let mut target = f.remote();
         target.sha = f.main.clone();
         checkout(&f.repo, &target).unwrap();
-        assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), f.topic);
+        assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), f.main);
+        assert_eq!(output(&f.repo, &["branch", "--show-current"]).unwrap(), "");
+        assert_eq!(
+            output(&f.repo, &["rev-parse", "refs/heads/topic/nested"]).unwrap(),
+            f.topic
+        );
     }
 
     #[test]
@@ -683,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_existing_branch_checkout_stays_offline_even_with_missing_advertised_tip() {
+    fn remote_checkout_refuses_missing_selected_tip_instead_of_switching_to_wrong_local_tip() {
         let f = Fixture::new();
         checkout(&f.repo, &f.remote()).unwrap();
         let missing_tip = f.advance("not fetched\n");
@@ -696,7 +733,8 @@ mod tests {
         let mut target = f.remote();
         target.url = Some(missing.to_string_lossy().into_owned());
         target.sha = missing_tip;
-        execute(&f.repo, &crate::checkout::Request::Branch(target)).unwrap();
+        let error = execute(&f.repo, &crate::checkout::Request::Branch(target)).unwrap_err();
+        assert!(error.contains("unavailable locally"), "{error}");
         assert_eq!(output(&f.repo, &["rev-parse", "HEAD"]).unwrap(), f.topic);
     }
 

@@ -9,7 +9,7 @@ param(
     [switch]$EnableCache,
     [switch]$BaselineSmart,
     [switch]$CandidateOnly,
-    [ValidateSet('changed','unchanged','full','after-branches')][string]$RefreshCase = 'changed',
+    [ValidateSet('changed','unchanged','full','after-branches','branches')][string]$RefreshCase = 'changed',
     [ValidateRange(0,10000)][int]$ServerOnlyBranches = 1000,
     [ValidateRange(2,10000)][int]$Branches = 12,
     [ValidateRange(0,10000)][int]$Tags = 0,
@@ -19,17 +19,27 @@ param(
     [switch]$TrackingOnlyGhost,
     [switch]$MalformedAdvertisement,
     [switch]$UnicodeTagAdvertisement,
+    [switch]$AdvanceBrowserHeads,
     [ValidateRange(0,1000)][int]$DelayMs = 60
 )
 $ErrorActionPreference = 'Stop'
+if ($AdvanceBrowserHeads -and (!$CandidateOnly -or $RefreshCase -ne 'branches' -or $ServerOnlyBranches -lt 2)) { throw 'AdvanceBrowserHeads requires candidate-only Branches with at least two server-only branches.' }
 if ($MalformedAdvertisement -and (!$CandidateOnly -or $ApiOnly -or $GitCliOnly -or $Branches -lt 64)) {
     throw 'MalformedAdvertisement requires CandidateOnly, at least 64 branches, and no transport rejection flags.'
 }
-if ($RefreshCase -ne 'changed' -and !$CandidateOnly) { throw 'New scenarios require -CandidateOnly; the preserved baseline supports changed only.' }
+if ($RefreshCase -notin @('changed','branches') -and !$CandidateOnly) { throw 'New scenarios require -CandidateOnly; the preserved baseline supports changed only.' }
 if (!$IsWindows) { throw 'This runner requires the Windows private-desktop native helper.' }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
 . "$PSScriptRoot/benchmark-processes.ps1"
 $workspace = (Resolve-Path -LiteralPath "$PSScriptRoot/..").Path
+# A managed worktree can share its build directory with the primary checkout.
+# Validate waiting cargo run launchers against that repository's primary target.
+$timingWorkspace = $workspace
+$commonGit = & git -C $workspace rev-parse --path-format=absolute --git-common-dir
+if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve benchmark repository identity' }
+if ([IO.Path]::GetFileName(([string]$commonGit).TrimEnd('/','\')) -ceq '.git') {
+    $timingWorkspace = Split-Path -Parent ([string]$commonGit)
+}
 $Baseline = (Resolve-Path -LiteralPath $Baseline).Path
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
 $Python = (Resolve-Path -LiteralPath $Python).Path
@@ -41,7 +51,7 @@ $names = @(@(Get-ChildItem Env: | Where-Object { $_.Name -match '^(GIT_|GIT_RUST
     'LOCALAPPDATA','APPDATA','XDG_CONFIG_HOME','XDG_CACHE_HOME','PYTHONUNBUFFERED','GH_TOKEN','GITHUB_TOKEN','GITLAB_TOKEN',
     'GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE',
     'GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_REFRESH_CONTROL',
-    'GIT_RUSTLE_REFRESH_OLD','GIT_RUSTLE_REFRESH_EXPECTED','GIT_RUSTLE_REFRESH_CASE'
+    'GIT_RUSTLE_REFRESH_OLD','GIT_RUSTLE_REFRESH_EXPECTED','GIT_RUSTLE_REFRESH_CASE','GIT_RUSTLE_REFRESH_BROWSER'
 ) | Select-Object -Unique)
 $saved = @{}
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
@@ -92,7 +102,7 @@ try {
         # Alternate order within each pair, with one fresh warm-up per executable.
         $order = if ($CandidateOnly) { @('candidate') } elseif (($sample + 1) % 2 -eq 0) { @('baseline','candidate') } else { @('candidate','baseline') }
         foreach ($label in $order) {
-            Assert-BenchmarkIdle -WorkspaceRoot $workspace -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
+            Assert-BenchmarkIdle -WorkspaceRoot $timingWorkspace -AuditPath (Join-Path $OutputDirectory 'background-processes.json')
             $suffix = if ($Capture) { 'capture' } elseif ($sample -lt 0) { 'warmup' } else { 'sample-'+$sample.ToString('00') }
             $directory = Join-Path $OutputDirectory "$label-$suffix"
             New-Item -ItemType Directory -Path $directory | Out-Null
@@ -110,6 +120,7 @@ try {
                 if ($GitCliOnly) { $fixtureArguments += '--git-cli-only' }
                 if ($TrackingOnlyGhost) { $fixtureArguments += '--tracking-only-ghost' }
                 if ($MalformedAdvertisement) { $fixtureArguments += '--malformed-advertisement' }
+                if ($AdvanceBrowserHeads) { $fixtureArguments += '--advance-browser-heads' }
                 if ($UnicodeTagAdvertisement) { $fixtureArguments += '--unicode-tag-advertisement' }
                 $server = Start-Process -FilePath $Python -WindowStyle Hidden -PassThru `
                     -ArgumentList $fixtureArguments `
@@ -138,6 +149,7 @@ try {
                 $initialStats | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $directory 'stats-before.json')
                 $env:GIT_RUSTLE_SCENARIO = 'refresh-native'
                 $env:GIT_RUSTLE_REFRESH_CASE = $RefreshCase
+                $env:GIT_RUSTLE_REFRESH_BROWSER = if ($AdvanceBrowserHeads) { '1' } else { '0' }
                 $env:GIT_RUSTLE_AUTOQUIT = if ($Capture) { '600000' } else { '100' }
                 $env:GIT_RUSTLE_DUMP = Join-Path $directory 'state.txt'
                 $env:GIT_RUSTLE_REFRESH_CONTROL = $control+'/advance'
@@ -203,7 +215,7 @@ try {
                     if ($ApiOnly -and $UnrelatedFirst -and $Branches -eq 64 -and $ServerOnlyBranches -ge 1000 -and ($listRefresh -ne 4 -or $individualRefresh -ne 64)) { throw "Unrelated branch tail did not use the bounded fallback: $directory" }
                     if ($listRefresh -gt [Math]::Ceiling(($Branches+$ServerOnlyBranches)/100)+4) { throw "Large graph repeated its listing: $directory" }
                 }
-                if ($label -eq 'candidate' -and $RefreshCase -eq 'full' -and ($tagRefresh -lt 1 -or $listRefresh -lt 1)) { throw "Force refresh omitted tags or complete branch list" }
+                if ($label -eq 'candidate' -and $RefreshCase -eq 'full' -and ($tagRefresh -lt 1 -or ($listRefresh -lt 1 -and $advertisementRefresh -lt 1))) { throw "Force refresh omitted tags or complete branch list" }
                 $localFrame = $null; $tipsFrame = $null
                 if ($label -eq 'candidate' -or $BaselineSmart) {
                     $localFrame = Refresh-Interval $text 'refresh native local frame'
@@ -217,7 +229,7 @@ try {
                 $remoteCacheCount = @($cacheFiles | Where-Object { $_.path -match '^remotes[\\/].+\.heads\.json$' }).Count
                 [pscustomobject]@{mode=$cacheMode;enabled=[bool]$EnableCache;root=$cacheRoot;freshDirectoryAtLaunch=$true;remoteCacheFiles=$remoteCacheCount;files=$cacheFiles} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $directory 'cache-evidence.json')
                 if ($EnableCache -and $remoteCacheCount -lt 1) { throw "Cache-enabled refresh did not persist an isolated remote-head cache: $directory" }
-                $results.Add([pscustomobject]@{label=$label;sample=$sample;warmup=($sample-lt0);capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;remoteCacheFiles=$remoteCacheCount;performanceSample=(!$Capture-and$sample-ge0);refreshCase=$RefreshCase;localFrameMs=$localFrame;tipsFrameMs=$tipsFrame;refreshTagRequests=$tagRefresh;refreshListRequests=$listRefresh;refreshAdvertisementRequests=$advertisementRefresh;refreshHttpAdvertisementRequests=$httpAdvertisementRefresh;firstGhostMs=$(if($Capture){$null}else{$firstGhost});settledMs=$(if($Capture){$null}else{$settled});peakRequests=$stats.peakRequests;requestCount=@($stats.requests).Count;forbiddenCount=@($stats.forbidden).Count;projectRequests=[int]$stats.projectRequests;pullRequests=[int]$stats.pullRequests;pipelineRequests=[int]$stats.pipelineRequests;refreshProjectRequests=$projectRefresh;refreshPullRequests=$pullRefresh;refreshPipelineRequests=$pipelineRefresh;startupGraphMs=([double]([regex]::Match($text,'([0-9.]+) ms\s+first frame').Groups[1].Value));startupReadyMs=([double]([regex]::Match($text,'([0-9.]+) ms\s+refresh native requested').Groups[1].Value));providerFairnessVerified=$true;refsUnchanged=[bool]$stats.refsUnchanged;fetchHeadAbsent=[bool]$stats.fetchHeadAbsent;directory=$directory})
+                $results.Add([pscustomobject]@{label=$label;sample=$sample;warmup=($sample-lt0);capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;remoteCacheFiles=$remoteCacheCount;performanceSample=(!$Capture-and$sample-ge0);refreshCase=$RefreshCase;localFrameMs=$localFrame;tipsFrameMs=$tipsFrame;refreshTagRequests=$tagRefresh;refreshListRequests=$listRefresh;refreshAdvertisementRequests=$advertisementRefresh;refreshHttpAdvertisementRequests=$httpAdvertisementRefresh;firstGhostMs=$(if($Capture){$null}else{$firstGhost});settledMs=$(if($Capture){$null}else{$settled});peakRequests=$stats.peakRequests;requestCount=@($stats.requests).Count;forbiddenCount=@($stats.forbidden).Count;projectRequests=[int]$stats.projectRequests;pullRequests=[int]$stats.pullRequests;pipelineRequests=[int]$stats.pipelineRequests;refreshProjectRequests=$projectRefresh;refreshPullRequests=$pullRefresh;refreshPipelineRequests=$pipelineRefresh;startupGraphMs=([double]([regex]::Match($text,'([0-9.]+) ms\s+first frame').Groups[1].Value));branchesOpenMs=$(if($RefreshCase -eq 'branches'){ [double]([regex]::Match($text,'([0-9.]+) ms\s+branches native open frame').Groups[1].Value) - [double]([regex]::Match($text,'([0-9.]+) ms\s+branches native open requested').Groups[1].Value) }else{$null});startupReadyMs=([double]([regex]::Match($text,'([0-9.]+) ms\s+refresh native requested').Groups[1].Value));providerFairnessVerified=$true;refsUnchanged=[bool]$stats.refsUnchanged;fetchHeadAbsent=[bool]$stats.fetchHeadAbsent;directory=$directory})
                 $results.ToArray() | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'samples.json')
             } finally {
                 try {
@@ -250,16 +262,16 @@ try {
 finally {
     foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
     $report = [Collections.Generic.List[string]]::new()
-    $report.Add('# Native graph refresh')
+    $report.Add($(if ($RefreshCase -eq 'branches') { '# Native Branches refresh' } else { '# Native graph refresh' }))
     $report.Add('')
     $report.Add('Fresh fixture, isolated app data and hidden localhost server for every launch. Executable order alternates. Raw evidence is retained beside this report.')
     $report.Add('')
-    $report.Add('Case: '+$RefreshCase+'. Cache mode: '+$cacheMode+'. Enabled mode starts with an empty isolated application cache for each launch, then measures Refresh after initial load has populated the cache. This does not measure warmed application reopening. cache-evidence.json retains persisted cache hashes. New cases use -CandidateOnly; changed compares the supplied baseline; -BaselineSmart selects the v0.1.15 Smart baseline.')
+    $report.Add('Case: '+$RefreshCase+'. Cache mode: '+$cacheMode+'. Enabled mode starts with an empty isolated application cache for each launch, then measures Refresh after initial load has populated the cache. This does not measure warmed application reopening. cache-evidence.json retains persisted cache hashes. New cases use -CandidateOnly, except branches can compare a baseline with the same harness; -BaselineSmart selects the v0.1.15 Smart baseline.')
     $report.Add('')
     if ($Capture) {
         $report.Add('Capture-only run: screenshot durations and trace intervals are excluded from performance samples. Review the actual PNGs separately.')
     } else {
-        $report.Add('| Executable | Samples | First ghost median (ms) | First ghost p95 (ms) | Settled median (ms) | Settled p95 (ms) |')
+        $report.Add('| Executable | Samples | First tip median (ms) | First tip p95 (ms) | Settled median (ms) | Settled p95 (ms) |')
         $report.Add('| --- | ---: | ---: | ---: | ---: | ---: |')
         foreach ($label in @('baseline','candidate')) {
             $rows = @($results | Where-Object { $_.label -eq $label -and $_.performanceSample })
@@ -279,8 +291,9 @@ finally {
         if ($Samples -lt 15) { $report.Add(''); $report.Add('Smoke run only; fewer than 15 measured samples per executable. Do not treat this as a performance conclusion.') }
     }
     $report.Add('')
+    if ($RefreshCase -eq 'branches') { $report.Add('Branches opening is recorded separately as branchesOpenMs in samples.json. The candidate checks all branches, including server-only additions/deletions; the older Smart baseline checked only graph heads. Last commit time must be present in a painted row. Activity scoring remains enabled.'); $report.Add('') }
     $report.Add('Smart refresh requests no broad provider metadata or tags. Graph scopes of four or more heads use native HTTP ref discovery. Large scopes fall back to Git advertisements then bounded API branch pages. Results are filtered to requested identities. Full Refresh also requests tags and provider metadata. Git refs, objects, index, worktree and stashes remain unchanged. Raw counts and paint intervals are retained. Private-desktop paints exclude physical input, interactive composition, scanout and live-network latency.')
     if ($failure) { $report.Add(''); $report.Add('Run failed: '+$failure) }
     $report.ToArray() | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.md')
-    [pscustomobject]@{startedUtc=$startedUtc;finishedUtc=[DateTime]::UtcNow.ToString('o');success=($null-eq$failure);baselineSmart=[bool]$BaselineSmart;failure=$failure;baseline=$Baseline;baselineSha256=(Get-FileHash -LiteralPath $Baseline).Hash;refreshCase=$RefreshCase;candidateOnly=[bool]$CandidateOnly;serverOnlyBranches=$ServerOnlyBranches;providerFairness='Original v0.1.14 baseline refreshes metadata. Smart candidate does not; Full candidate must refresh metadata, tags and complete branches. Pipelines remain forbidden.';candidate=$Candidate;candidateSha256=(Get-FileHash -LiteralPath $Candidate).Hash;python=$Python;fixtureScript=$fixtureScript;fixtureSha256=(Get-FileHash -LiteralPath $fixtureScript).Hash;runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;nativeHelperSha256=(Get-FileHash -LiteralPath "$PSScriptRoot/benchmark-native-process.ps1").Hash;samplesPerExecutable=$(if($Capture){0}else{$Samples});warmupsPerExecutable=$(if($Capture){0}else{1});capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;cachePolicy='Fresh isolated disk cache for each launch; enable via -EnableCache; default retains --no-cache. Initial load followed by forced Refresh in the same process.';branches=$Branches;tags=$Tags;unrelatedFirst=[bool]$UnrelatedFirst;apiOnly=[bool]$ApiOnly;gitCliOnly=[bool]$GitCliOnly;trackingOnlyGhost=[bool]$TrackingOnlyGhost;malformedAdvertisement=[bool]$MalformedAdvertisement;unicodeTagAdvertisement=[bool]$UnicodeTagAdvertisement;delayMs=$DelayMs;limitations='Fresh loopback synthetic provider, fresh repository and isolated app configuration for every launch. Alternating executable order; first new ghost and settled refresh end at native GPUI paint marks. Baseline must include the same refresh-native harness backport. Capture runs are separate and their durations are not performance samples. Private-desktop paint/capture excludes physical input, interactive desktop composition, display scanout and real network latency. Existing verified user application may remain running under the shared idle policy.'} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
+    [pscustomobject]@{startedUtc=$startedUtc;finishedUtc=[DateTime]::UtcNow.ToString('o');success=($null-eq$failure);baselineSmart=[bool]$BaselineSmart;failure=$failure;baseline=$Baseline;baselineSha256=(Get-FileHash -LiteralPath $Baseline).Hash;refreshCase=$RefreshCase;candidateOnly=[bool]$CandidateOnly;serverOnlyBranches=$ServerOnlyBranches;providerFairness='Original v0.1.14 baseline refreshes metadata. Smart candidate does not; Full candidate must refresh metadata, tags and complete branches. Pipelines remain forbidden.';candidate=$Candidate;candidateSha256=(Get-FileHash -LiteralPath $Candidate).Hash;python=$Python;fixtureScript=$fixtureScript;fixtureSha256=(Get-FileHash -LiteralPath $fixtureScript).Hash;runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;nativeHelperSha256=(Get-FileHash -LiteralPath "$PSScriptRoot/benchmark-native-process.ps1").Hash;samplesPerExecutable=$(if($Capture){0}else{$Samples});warmupsPerExecutable=$(if($Capture){0}else{1});capture=[bool]$Capture;cacheMode=$cacheMode;cacheEnabled=[bool]$EnableCache;cachePolicy='Fresh isolated disk cache for each launch; enable via -EnableCache; default retains --no-cache. Initial load followed by forced Refresh in the same process.';branches=$Branches;tags=$Tags;unrelatedFirst=[bool]$UnrelatedFirst;apiOnly=[bool]$ApiOnly;gitCliOnly=[bool]$GitCliOnly;trackingOnlyGhost=[bool]$TrackingOnlyGhost;malformedAdvertisement=[bool]$MalformedAdvertisement;unicodeTagAdvertisement=[bool]$UnicodeTagAdvertisement;advanceBrowserHeads=[bool]$AdvanceBrowserHeads;delayMs=$DelayMs;limitations='Fresh loopback synthetic provider, fresh repository and isolated app configuration for every launch. Alternating executable order; first new ghost and settled refresh end at native GPUI paint marks. Baseline must include the same refresh-native harness backport. Capture runs are separate and their durations are not performance samples. Private-desktop paint/capture excludes physical input, interactive desktop composition, display scanout and real network latency. Existing verified user application may remain running under the shared idle policy.'} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'provenance.json')
 }
