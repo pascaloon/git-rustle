@@ -7,8 +7,12 @@ pub(super) fn branch_row(selected: bool) -> Div {
         .w_full()
         .h(px(40.))
         .px_4()
-        .bg(rgb(if selected { SELECTED } else { BG }))
-        .hover(|s| s.bg(rgb(HOVER)))
+        .bg(rgb(if selected {
+            palette().selected
+        } else {
+            palette().bg
+        }))
+        .hover(|s| s.bg(rgb(palette().hover)))
 }
 
 type Paints = std::rc::Rc<std::cell::RefCell<[Option<(u64, Bounds<Pixels>)>; 16]>>;
@@ -62,9 +66,9 @@ impl Desktop {
                                         .pl(px(16. + *depth as f32 * 18.))
                                         .pr_4()
                                         .gap_2()
-                                        .bg(rgb(BG))
+                                        .bg(rgb(palette().bg))
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .hover(|s| s.bg(rgb(palette().hover)))
                                         .child(icon(
                                             if b.collapsed.contains(&path) && b.query.is_empty() {
                                                 "right"
@@ -72,7 +76,7 @@ impl Desktop {
                                                 "down"
                                             },
                                         ))
-                                        .child(icon("folder").text_color(rgb(ACCENT)))
+                                        .child(icon("folder").text_color(rgb(palette().accent)))
                                         .child(name.clone())
                                         .child(caption(count.to_string()))
                                         .on_click(cx.listener(move |v, _, _, cx| {
@@ -116,7 +120,11 @@ impl Desktop {
                             .h(px(40.))
                             .px_4()
                             .pl(px(16. + depth as f32 * 18.))
-                            .bg(rgb(if b.selected == i { SELECTED } else { BG }))
+                            .bg(rgb(if b.selected == i {
+                                palette().selected
+                            } else {
+                                palette().bg
+                            }))
                             .cursor_pointer()
                             .child(
                                 icon(if entry.current {
@@ -130,11 +138,11 @@ impl Desktop {
                                 })
                                 .text_color(rgb(
                                     if entry.current {
-                                        ACCENT
+                                        palette().accent
                                     } else if entry.target.remote.is_none() {
-                                        MUTED
+                                        palette().muted
                                     } else {
-                                        REMOTE_TEXT
+                                        palette().remote_text
                                     },
                                 )),
                             )
@@ -152,14 +160,14 @@ impl Desktop {
                                     } else {
                                         "cloud"
                                     })
-                                    .text_color(rgb(REMOTE_TEXT)),
+                                    .text_color(rgb(palette().remote_text)),
                                 )
                                 .child(
                                     div()
                                         .max_w(px(200.))
                                         .overflow_hidden()
                                         .whitespace_nowrap()
-                                        .text_color(rgb(REMOTE_TEXT))
+                                        .text_color(rgb(palette().remote_text))
                                         .child(entry.paired_remotes[0].label()),
                                 )
                             })
@@ -186,7 +194,7 @@ impl Desktop {
                                     .flex_shrink_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette().muted))
                                     .child(
                                         v.branch_matches.styled(
                                             entry
@@ -201,7 +209,7 @@ impl Desktop {
                                 div()
                                     .w(px(190.))
                                     .flex_shrink_0()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette().muted))
                                     .text_size(px(12.))
                                     .child(
                                         entry
@@ -263,12 +271,12 @@ impl Desktop {
                     .flex_shrink_0()
                     .px_3()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .child(
                         row()
                             .gap_0()
                             .border_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(palette().line))
                             .rounded_md()
                             .child(
                                 Button::new("branch-view-list")
@@ -316,7 +324,7 @@ impl Desktop {
                     .flex_shrink_0()
                     .px_4()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .child(div().w(px(18.)).flex_shrink_0())
                     .child(div().flex_1().child(self.branch_sort_button(
                         "sort-branch-name",

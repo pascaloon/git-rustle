@@ -217,7 +217,7 @@ impl Desktop {
                         column()
                             .flex_shrink_0()
                             .border_b_1()
-                            .border_color(rgb(INSPECTOR_LINE))
+                            .border_color(rgb(palette().inspector_line))
                             .child(
                                 row()
                                     .id(("commit-accordion", index))
@@ -226,7 +226,7 @@ impl Desktop {
                                     .px_4()
                                     .min_w_0()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .hover(|s| s.bg(rgb(palette().hover)))
                                     .child(
                                         icon(if expanded { "down" } else { "next" }).size(px(14.)),
                                     )
@@ -235,7 +235,7 @@ impl Desktop {
                                             .flex_1()
                                             .min_w_0()
                                             .text_ellipsis()
-                                            .text_color(rgb(INSPECTOR_MUTED))
+                                            .text_color(rgb(palette().inspector_muted))
                                             .child(header.subject.clone()),
                                     )
                                     .child(requests::avatar(
@@ -247,7 +247,7 @@ impl Desktop {
                                         div()
                                             .font_family("Cascadia Mono")
                                             .text_size(px(11.))
-                                            .text_color(rgb(INSPECTOR_MUTED))
+                                            .text_color(rgb(palette().inspector_muted))
                                             .flex_shrink_0()
                                             .child(id.to_hex_with_len(8).to_string()),
                                     )
@@ -261,10 +261,10 @@ impl Desktop {
                                             .px_2()
                                             .h(px(30.))
                                             .rounded_md()
-                                            .bg(rgb(CONTROL))
-                                            .text_color(rgb(TEXT))
+                                            .bg(rgb(palette().control))
+                                            .text_color(rgb(palette().text))
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                                            .hover(|s| s.bg(rgb(palette().selected_hover)))
                                             .child(icon("copy"))
                                             .on_click(cx.listener(move |_, _, _, cx| {
                                                 cx.write_to_clipboard(ClipboardItem::new_string(

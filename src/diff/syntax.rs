@@ -726,7 +726,10 @@ mod tests {
             let name = language(path).unwrap();
             assert!(configuration(name).is_some(), "{name}");
         }
-        assert_eq!(NAMES.len(), crate::desktop_theme::SYNTAX_COLORS.len());
+        assert_eq!(
+            NAMES.len(),
+            crate::desktop_theme::palette().syntax_colors.len()
+        );
     }
 
     #[test]

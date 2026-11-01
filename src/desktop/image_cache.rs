@@ -104,9 +104,9 @@ impl Desktop {
             .mt_4()
             .pt_4()
             .border_t_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .gap_2()
-            .child(div().text_color(rgb(TEXT)).child("Images cache"))
+            .child(div().text_color(rgb(palette().text)).child("Images cache"))
             .child(caption(
                 "Downloaded author and project images · shared by all repositories",
             ))
@@ -128,7 +128,11 @@ impl Desktop {
             .when(!state.message.is_empty(), |s| {
                 s.child(
                     div()
-                        .text_color(rgb(if state.error { REMOVED } else { MUTED }))
+                        .text_color(rgb(if state.error {
+                            palette().removed
+                        } else {
+                            palette().muted
+                        }))
                         .child(state.message.clone()),
                 )
             })

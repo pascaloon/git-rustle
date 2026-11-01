@@ -1,24 +1,30 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
-    [ValidateSet('graph','branches','settings','diff','stash-panel','remote-checkout','detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','request-branches','request-branches-menu','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-branch-menu-edge','graph-polish','graph-polish-detached','ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error')]
+    [ValidateSet('graph','branches','settings','settings-project','settings-gitlab','settings-github','theme-toggle','commit-details','commit-diff','landing','pending','pending-diff','operations','history','rebase-plan','tag-dialog','checkout-dialog','graph-menu','branches-hierarchy','cleanup-review','external-tools','ref-storage','search','diff','stash-panel','remote-checkout','detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','request-branches','request-branches-menu','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-branch-menu-edge','graph-polish','graph-polish-detached','ai-settings','ai-commit','ai-summary','ai-rebase','ai-rebase-cancel','ai-rebase-error','ai-merge','ai-merge-cancel','ai-merge-error','ai-conflict','ai-conflict-rebase','ai-conflict-pull','ai-stale','ai-cancel','ai-error')]
     [string[]]$Scenarios = @('graph','branches','settings','diff','stash-panel'),
     [string]$OutputDirectory = "$PSScriptRoot/../target/bench/screenshots-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))-$([Guid]::NewGuid().ToString('N').Substring(0,8))",
     [ValidateRange(10,120)][int]$TimeoutSeconds = 30,
     [ValidateSet('Codex','Claude')][string]$AiProvider = 'Codex',
     [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
     [switch]$LegacyClaude,
+    [switch]$LightTheme,
     [switch]$DisableDirectComposition
 )
 $ErrorActionPreference = 'Stop'
 if ($LegacyClaude -and $AiProvider -ne 'Claude') { throw 'LegacyClaude requires the Claude fixture provider' }
+if(@($Scenarios|Where-Object{$_-in@('branches-hierarchy','cleanup-review')}).Count){
+    if(@($Scenarios|Where-Object{$_-notin@('branches-hierarchy','cleanup-review')}).Count){throw 'Capture branch cleanup views separately'}
+    & "$PSScriptRoot/benchmark-branch-cleanup.ps1" -Candidate $Candidate -Scenarios $Scenarios -Stages Screenshots -LightTheme:$LightTheme -MinimumWindow:($WindowSize -eq '900x600') -OutputDirectory $OutputDirectory
+    return
+}
 if($Scenarios -contains 'remote-checkout'){
     if($Scenarios.Count-ne1){throw 'Capture remote checkout separately'}
-    & "$PSScriptRoot/benchmark-remote-checkout.ps1" -Candidate $Candidate -Screenshots -OutputDirectory $OutputDirectory
+    & "$PSScriptRoot/benchmark-remote-checkout.ps1" -Candidate $Candidate -Screenshots -LightTheme:$LightTheme -WindowSize $WindowSize -OutputDirectory $OutputDirectory
     return
 }
 if(@($Scenarios|Where-Object{$_-in@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-branch-menu-edge','graph-polish','graph-polish-detached')}).Count){
     if(@($Scenarios|Where-Object{$_-notin@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-branch-menu-edge','graph-polish','graph-polish-detached')}).Count){throw 'Capture graph harness scenarios separately from other views'}
-    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios $Scenarios -Screenshots -DisableDirectComposition:$DisableDirectComposition -WindowSize $WindowSize -OutputDirectory $OutputDirectory
+    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios $Scenarios -Screenshots -LightTheme:$LightTheme -DisableDirectComposition:$DisableDirectComposition -WindowSize $WindowSize -OutputDirectory $OutputDirectory
     return
 }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
@@ -112,6 +118,13 @@ try {
         }
         [IO.File]::AppendAllText((Join-Path $fixture 'README.md'),"`nPending documentation update`n")
         [IO.File]::WriteAllText((Join-Path $fixture 'notes.txt'),"Untracked fixture notes`n")
+        if ($scenario -in @('tag-dialog','graph-menu')) {
+            # The existing tag scenario selects row 1 as a non-HEAD commit;
+            # omit the pending row so that its target remains that older commit.
+            # The legacy graph-menu scenario also needs a selected local commit.
+            Invoke-FixtureGit $fixture @('restore','README.md') | Out-Null
+            Remove-Item -LiteralPath (Join-Path $fixture 'notes.txt')
+        }
         if ($scenario -like 'ai-*') {
             [IO.File]::WriteAllText((Join-Path $fixture '.git/git-rustle-ai-fixture'),'disposable AI fixture')
             $settingsDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
@@ -153,6 +166,16 @@ try {
             }
         }
         $before = Get-FixtureFingerprint $fixture
+        $settingsDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
+        New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+        @{ light_theme = [bool]($LightTheme -and $scenario -ne 'theme-toggle') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir 'appearance.json')
+        if ($scenario -eq 'landing') {
+            # Git walks parent directories; an empty folder under target is still
+            # inside this checkout. Use a clearly owned, unrelated temporary root.
+            $launchFixture = Join-Path ([IO.Path]::GetTempPath()) ('git-rustle-theme-landing-' + [Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $launchFixture | Out-Null
+            [IO.File]::WriteAllText((Join-Path $launchFixture '.git-rustle-landing-fixture'),'disposable appearance landing fixture')
+        } else { $launchFixture = $fixture }
         $before | Set-Content -LiteralPath (Join-Path $directory 'fixture-before.json')
         $env:GIT_RUSTLE_TIMING = '1'; $env:GIT_RUSTLE_TRACE = '1'
         # The capture worker requests normal application close after the screenshot.
@@ -164,9 +187,9 @@ try {
         $process = $null
         $result = [ordered]@{ scenario = $scenario; outputDirectory = $directory; capture = $null; exitCode = $null; cleanupVerified = $false; fixtureUnchanged = $false }
         try {
-            $process = Start-BenchmarkNativeProcess -FilePath $Candidate -ArgumentList @(('"' + $fixture + '"'),'--no-cache') -RedirectStandardError $log
+            $process = Start-BenchmarkNativeProcess -FilePath $Candidate -ArgumentList @(('"' + $launchFixture + '"'),'--no-cache') -RedirectStandardError $log
             $deadline = [Diagnostics.Stopwatch]::StartNew()
-            $readyPattern = if ($scenario -eq 'graph') { '\bfirst frame \(' } else { '\bdesktop scenario frame\b' }
+            $readyPattern = if ($scenario -eq 'graph') { '\bfirst frame \(' } elseif ($scenario -eq 'landing') { '\blanding frame\b' } else { '\bdesktop scenario frame\b' }
             do {
                 if ($process.WaitForExit(0)) { throw "Application exited before screenshot readiness; see $log" }
                 $text = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw } else { '' }
@@ -248,6 +271,14 @@ try {
                 $result.cleanupVerified = $process.WaitForExit(0)
             }
             $results.Add([pscustomobject]$result)
+            if ($scenario -eq 'landing' -and $launchFixture) {
+                $expectedParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\','/')
+                $ownedPath = [IO.Path]::GetFullPath($launchFixture)
+                $marker = Join-Path $ownedPath '.git-rustle-landing-fixture'
+                if ([IO.Path]::GetDirectoryName($ownedPath) -cne $expectedParent -or [IO.Path]::GetFileName($ownedPath) -notmatch '^git-rustle-theme-landing-[0-9a-f]{32}$' -or [IO.File]::ReadAllText($marker) -cne 'disposable appearance landing fixture') { throw 'Landing fixture ownership changed; retaining directory' }
+                Remove-Item -LiteralPath $marker
+                Remove-Item -LiteralPath $ownedPath
+            }
         }
         Write-Output "Captured $scenario -> $directory/screenshot.png"
     }
@@ -264,6 +295,7 @@ try {
         candidate = $Candidate; sha256 = (Get-FileHash -LiteralPath $Candidate).Hash
         directCompositionDisabled = [bool]$DisableDirectComposition
         legacyClaudeFixture = [bool]$LegacyClaude
+        lightTheme = [bool]$LightTheme
         scenarios = @($results.ToArray())
         limitations = 'Inspect PNGs for appearance. Capture sanity checks cannot prove complete rendering or interaction feel. These runs are excluded from performance comparisons.'
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.json') -Encoding utf8

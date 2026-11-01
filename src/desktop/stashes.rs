@@ -449,7 +449,7 @@ impl Desktop {
             .h_full()
             .min_h_0()
             .border_l_1()
-            .border_color(rgb(INSPECTOR_LINE))
+            .border_color(rgb(palette().inspector_line))
             .children(self.graph_feature_probe(0, 9));
         let Some(stash) = stash else {
             return panel
@@ -467,130 +467,129 @@ impl Desktop {
             .and_then(|result| result.as_ref().ok())
             .map(|preview| preview.details.author_name.as_str())
             .unwrap_or("?");
-        panel = panel
-            .child(
-                row()
-                    .h(px(44.))
-                    .flex_shrink_0()
-                    .px_4()
-                    .border_b_1()
-                    .border_color(rgb(INSPECTOR_LINE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(caption("STASH DETAILS").text_color(rgb(INSPECTOR_MUTED))),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .children(self.graph_feature_probe(0, 10))
-                            .child(requests::avatar(
-                                oid.as_ref().and_then(|id| self.avatars.image(id)),
-                                author,
-                                28.,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .font_family("Cascadia Mono")
-                            .text_size(px(11.))
-                            .text_color(rgb(INSPECTOR_MUTED))
-                            .child(stash.oid.chars().take(8).collect::<String>()),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .children(self.graph_feature_probe(0, 11))
-                            .child(
-                                Button::new("stash-copy-sha")
-                                    .small()
-                                    .ghost()
-                                    .icon(gpui_component::Icon::default().path("rustle/copy"))
-                                    .tooltip("Copy stash SHA")
-                                    .on_click(cx.listener(move |v, _, w, cx| {
-                                        v.stash_action(Action::CopySha(copy.clone()), w, cx)
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                row()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .child(
-                        Button::new("selected-stash-apply")
-                            .small()
-                            .ghost()
-                            .label("Apply…")
-                            .disabled(!enabled)
-                            .tooltip("Apply changes and keep this stash")
-                            .on_click(cx.listener(move |v, _, w, cx| {
-                                v.stash_action(Action::Apply(apply.clone()), w, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("selected-stash-pop")
-                            .small()
-                            .ghost()
-                            .label("Pop…")
-                            .disabled(!enabled)
-                            .tooltip("Remove the stash only after changes apply successfully")
-                            .on_click(cx.listener(move |v, _, w, cx| {
-                                v.stash_action(Action::Pop(pop.clone()), w, cx)
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("selected-stash-delete")
-                            .small()
-                            .ghost()
-                            .icon(gpui_component::Icon::default().path("rustle/trash"))
-                            .disabled(!enabled)
-                            .tooltip(if armed {
-                                "Confirm deleting this stash"
-                            } else {
-                                "Delete stash — two clicks"
-                            })
-                            .when(armed, |s| s.text_color(rgb(ACCENT)))
-                            .on_click(cx.listener(move |v, _, w, cx| {
-                                v.stash_action(Action::Delete(delete.clone()), w, cx)
-                            })),
-                    ),
-            )
-            .when(armed, |s| {
-                s.child(
-                    caption("Click trash again to delete this stash")
+        panel =
+            panel
+                .child(
+                    row()
+                        .h(px(44.))
+                        .flex_shrink_0()
                         .px_4()
-                        .pb_2(),
+                        .border_b_1()
+                        .border_color(rgb(palette().inspector_line))
+                        .child(div().flex_1().child(
+                            caption("STASH DETAILS").text_color(rgb(palette().inspector_muted)),
+                        ))
+                        .child(
+                            div()
+                                .relative()
+                                .children(self.graph_feature_probe(0, 10))
+                                .child(requests::avatar(
+                                    oid.as_ref().and_then(|id| self.avatars.image(id)),
+                                    author,
+                                    28.,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .font_family("Cascadia Mono")
+                                .text_size(px(11.))
+                                .text_color(rgb(palette().inspector_muted))
+                                .child(stash.oid.chars().take(8).collect::<String>()),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .children(self.graph_feature_probe(0, 11))
+                                .child(
+                                    Button::new("stash-copy-sha")
+                                        .small()
+                                        .ghost()
+                                        .icon(gpui_component::Icon::default().path("rustle/copy"))
+                                        .tooltip("Copy stash SHA")
+                                        .on_click(cx.listener(move |v, _, w, cx| {
+                                            v.stash_action(Action::CopySha(copy.clone()), w, cx)
+                                        })),
+                                ),
+                        ),
                 )
-            })
-            .child(caption(stash.selector.clone()).px_4().pb_2())
-            .child(
-                div()
-                    .h(px(240.))
-                    .flex_shrink_0()
-                    .min_h_0()
-                    .px_4()
-                    .py_3()
-                    .when_some(self.stashes.detail_text.as_ref(), |s, text| {
-                        s.child(text.clone())
-                    })
-                    .when(self.stashes.detail_text.is_none(), |s| {
-                        s.child(caption("Loading stash details…"))
-                    }),
-            )
-            .child(
-                row()
-                    .px_4()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_b_1()
-                    .border_color(rgb(INSPECTOR_LINE))
-                    .child(caption("FILES")),
-            );
+                .child(
+                    row()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("selected-stash-apply")
+                                .small()
+                                .ghost()
+                                .label("Apply…")
+                                .disabled(!enabled)
+                                .tooltip("Apply changes and keep this stash")
+                                .on_click(cx.listener(move |v, _, w, cx| {
+                                    v.stash_action(Action::Apply(apply.clone()), w, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("selected-stash-pop")
+                                .small()
+                                .ghost()
+                                .label("Pop…")
+                                .disabled(!enabled)
+                                .tooltip("Remove the stash only after changes apply successfully")
+                                .on_click(cx.listener(move |v, _, w, cx| {
+                                    v.stash_action(Action::Pop(pop.clone()), w, cx)
+                                })),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("selected-stash-delete")
+                                .small()
+                                .ghost()
+                                .icon(gpui_component::Icon::default().path("rustle/trash"))
+                                .disabled(!enabled)
+                                .tooltip(if armed {
+                                    "Confirm deleting this stash"
+                                } else {
+                                    "Delete stash — two clicks"
+                                })
+                                .when(armed, |s| s.text_color(rgb(palette().accent)))
+                                .on_click(cx.listener(move |v, _, w, cx| {
+                                    v.stash_action(Action::Delete(delete.clone()), w, cx)
+                                })),
+                        ),
+                )
+                .when(armed, |s| {
+                    s.child(
+                        caption("Click trash again to delete this stash")
+                            .px_4()
+                            .pb_2(),
+                    )
+                })
+                .child(caption(stash.selector.clone()).px_4().pb_2())
+                .child(
+                    div()
+                        .h(px(240.))
+                        .flex_shrink_0()
+                        .min_h_0()
+                        .px_4()
+                        .py_3()
+                        .when_some(self.stashes.detail_text.as_ref(), |s, text| {
+                            s.child(text.clone())
+                        })
+                        .when(self.stashes.detail_text.is_none(), |s| {
+                            s.child(caption("Loading stash details…"))
+                        }),
+                )
+                .child(
+                    row()
+                        .px_4()
+                        .py_2()
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_b_1()
+                        .border_color(rgb(palette().inspector_line))
+                        .child(caption("FILES")),
+                );
         match preview {
             Some(Ok(preview)) if !preview.changes.files.is_empty() => {
                 let oid = stash.oid.clone();
@@ -618,7 +617,7 @@ impl Desktop {
                                     .px_3()
                                     .gap_2()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .hover(|s| s.bg(rgb(palette().hover)))
                                     .children(v.graph_feature_probe(0, 8))
                                     .child(caption(change.kind.letter().to_string()))
                                     .child(
@@ -683,13 +682,17 @@ impl Desktop {
                             .children(v.todo_stash_probe(row_index, 0))
                             .children(v.todo_stash_probe(row_index, 1))
                             .children(v.todo_stash_probe(row_index, 2))
-                            .bg(rgb(if selected { SELECTED } else { BG }))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .child(icon("stash").text_color(rgb(if selected {
-                                ACCENT
+                            .bg(rgb(if selected {
+                                palette().selected
                             } else {
-                                MUTED
+                                palette().bg
+                            }))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(palette().hover)))
+                            .child(icon("stash").text_color(rgb(if selected {
+                                palette().accent
+                            } else {
+                                palette().muted
                             })))
                             .child(
                                 div()
@@ -720,7 +723,7 @@ impl Desktop {
                 .w_full()
                 .h_full()
                 .flex_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(palette().line))
                 .child(
                     row()
                         .h(px(44.))

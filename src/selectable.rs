@@ -174,9 +174,9 @@ pub fn line(
                                 point(left + line.x_for_index(end), bounds.bottom()),
                             ),
                             rgba(if id.2 {
-                                crate::desktop_theme::ADDED_HIGHLIGHT
+                                crate::desktop_theme::palette().added_highlight
                             } else {
-                                crate::desktop_theme::REMOVED_HIGHLIGHT
+                                crate::desktop_theme::palette().removed_highlight
                             }),
                         ));
                     }
@@ -204,7 +204,7 @@ pub fn line(
                                     bounds.bottom(),
                                 ),
                             ),
-                            rgba(crate::desktop_theme::SELECTION),
+                            rgba(crate::desktop_theme::palette().selection),
                         ));
                     }
                     let origin = point(left, bounds.top() + px(3.));
@@ -247,7 +247,8 @@ fn paint_syntax(
                 } else {
                     let color = glyph_style(spans, glyph.index)
                         .map(|style| {
-                            rgb(crate::desktop_theme::SYNTAX_COLORS[style as usize]).into()
+                            rgb(crate::desktop_theme::palette().syntax_colors[style as usize])
+                                .into()
                         })
                         .unwrap_or(default_color);
                     let _ = window.paint_glyph(at, run.font_id, glyph.id, line.font_size, color);

@@ -379,11 +379,11 @@ impl Desktop {
                             .px_2()
                             .overflow_hidden()
                             .bg(rgb(if view.current == Some(file) {
-                                SELECTED
+                                palette().selected
                             } else {
-                                BG
+                                palette().bg
                             }))
-                            .hover(|s| s.bg(rgb(HOVER)))
+                            .hover(|s| s.bg(rgb(palette().hover)))
                             .cursor_pointer()
                             .min_w_0()
                             .truncate()
@@ -494,7 +494,7 @@ impl Desktop {
                 .w_full()
                 .p_2()
                 .flex_shrink_0()
-                .bg(rgb(PANEL))
+                .bg(rgb(palette().panel))
                 .child(caption(format!(
                     "{} line {line}{}",
                     if hit.right { "After" } else { "Before" },

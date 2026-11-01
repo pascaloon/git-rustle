@@ -193,16 +193,20 @@ impl Desktop {
         assert_eq!(
             rendered.border,
             if focused {
-                ACCENT
+                palette().accent
             } else if active {
-                FILTER_ACTIVE_BORDER
+                palette().filter_active_border
             } else {
-                LINE
+                palette().line
             }
         );
         assert_eq!(
             rendered.background,
-            if active { FILTER_ACTIVE_BG } else { BG }
+            if active {
+                palette().filter_active_bg
+            } else {
+                palette().bg
+            }
         );
         if matches!(phase, 4 | 5) {
             let browser = &self.engine.app.branches;

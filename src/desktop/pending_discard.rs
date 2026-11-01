@@ -104,7 +104,11 @@ impl Desktop {
                 } else {
                     format!("Discard selected ({count})")
                 })
-                .text_color(rgb(if armed { ACCENT } else { MUTED }))
+                .text_color(rgb(if armed {
+                    palette().accent
+                } else {
+                    palette().muted
+                }))
                 .disabled(!enabled)
                 .when_some(self.discard_batch_probe(armed), |s, probe| s.child(probe))
                 .tooltip(if armed {
@@ -218,14 +222,18 @@ impl Desktop {
             "Discard file"
         };
         let color = if !valid {
-            MUTED
+            palette().muted
         } else if menu.armed {
-            REMOVED
+            palette().removed
         } else {
-            TEXT
+            palette().text
         };
         let paint = self.discard_scenario.paint.clone();
-        let phase = if menu.armed && color == REMOVED { 2 } else { 1 };
+        let phase = if menu.armed && color == palette().removed {
+            2
+        } else {
+            1
+        };
         Some(
             deferred(
                 column()
@@ -245,9 +253,9 @@ impl Desktop {
                     )
                     .w(px(340.))
                     .p_1()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(palette().panel))
                     .border_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .rounded_md()
                     .shadow_lg()
                     .occlude()
@@ -277,7 +285,7 @@ impl Desktop {
                             )
                             .when(valid, |s| {
                                 s.cursor_pointer()
-                                    .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                                    .hover(|s| s.bg(rgb(palette().selected_hover)))
                                     .on_click(cx.listener(|v, _, window, cx| {
                                         v.confirm_discard_file(window, cx);
                                     }))

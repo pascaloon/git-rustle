@@ -516,8 +516,8 @@ impl Desktop {
                     .rounded_sm()
                     .flex_shrink_0()
                     .text_size(px(12.))
-                    .text_color(rgb(ACCENT_HOVER))
-                    .bg(rgb(REMOTE_BG))
+                    .text_color(rgb(palette().accent_hover))
+                    .bg(rgb(palette().remote_bg))
                     .child(label)
                     .tooltip(move |w, cx| {
                         gpui_component::tooltip::Tooltip::new(title.clone()).build(w, cx)
@@ -665,9 +665,9 @@ impl Desktop {
                 .overflow_y_scroll()
                 .p_1()
                 .rounded_md()
-                .bg(rgb(PANEL))
+                .bg(rgb(palette().panel))
                 .border_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(palette().line))
                 .shadow_lg()
                 .occlude()
                 .on_mouse_down_out(cx.listener(|v, _, _, cx| {
@@ -681,10 +681,14 @@ impl Desktop {
                             .h(px(36.))
                             .px_2()
                             .rounded_sm()
-                            .text_color(rgb(if enabled { TEXT } else { MUTED }))
+                            .text_color(rgb(if enabled {
+                                palette().text
+                            } else {
+                                palette().muted
+                            }))
                             .when(enabled, |row| {
                                 row.cursor_pointer()
-                                    .hover(|style| style.bg(rgb(SELECTED_HOVER)))
+                                    .hover(|style| style.bg(rgb(palette().selected_hover)))
                             })
                             .child(icon("diff"))
                             .child(label)
@@ -703,7 +707,7 @@ impl Desktop {
                             .px_2()
                             .rounded_sm()
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                            .hover(|s| s.bg(rgb(palette().selected_hover)))
                             .child(icon(icon_name))
                             .child(label)
                             .on_click(

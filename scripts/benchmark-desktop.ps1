@@ -9,6 +9,7 @@ param(
     [switch]$RequireSelectedPath,
     [ValidateRange(0,200000)][int]$ExpectedSyntaxSpans = 0,
     [switch]$RejectCompetingBuilds,
+    [switch]$LightTheme,
     [int]$Samples = 15,
     [string[]]$Scenarios = @('scroll','branches','diff','search','settings'),
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\desktop"
@@ -86,6 +87,12 @@ function New-DisposableFixture([string]$Scenario,[string]$Label,[int]$Sample) {
     } finally { foreach($name in $dates.Keys){ if($null-eq$dates[$name]){Remove-Item -LiteralPath ('Env:'+$name) -ErrorAction SilentlyContinue}else{[Environment]::SetEnvironmentVariable($name,$dates[$name],'Process')} } }
 }
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
+    if ($LightTheme -or $scenario -eq 'theme-toggle') {
+        $env:LOCALAPPDATA = Join-Path $OutputDirectory "$label-$scenario-$sample-appdata"
+        $appearanceDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
+        New-Item -ItemType Directory -Path $appearanceDir -Force | Out-Null
+        @{light_theme=[bool]($LightTheme -and $scenario -ne 'theme-toggle')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
+    }
     if ($ToolsDiscoveryFixtureRoot) {
         $root = (Resolve-Path -LiteralPath $ToolsDiscoveryFixtureRoot).Path
         $marker = '.git-rustle-tools-list-fixture'
@@ -286,6 +293,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
         'diff' { 'file diff (' }
         'search' { 'search ready' }
         'settings' { 'settings completed' }
+        'theme-toggle' { 'desktop scenario frame' }
         'pending' { 'pending status ready' }
         'pending-diff' { 'file diff (' }
     }
@@ -309,6 +317,7 @@ function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
             "search requested ($($Matches[1]))"
         }
         'settings' { 'settings requested' }
+        'theme-toggle' { 'settings requested' }
         'pending' { 'pending status requested' }
         'pending-diff' { 'file diff requested' }
         'compare' { 'file diff requested' }

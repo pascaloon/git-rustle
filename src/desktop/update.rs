@@ -224,7 +224,7 @@ impl Desktop {
         };
         column()
             .gap_2()
-            .child(div().text_color(rgb(TEXT)).child("Updates"))
+            .child(div().text_color(rgb(palette().text)).child("Updates"))
             .child(
                 row()
                     .child(caption(format!("Git Rustle {}", update::VERSION)))
@@ -242,7 +242,11 @@ impl Desktop {
             )
             .child(
                 div()
-                    .text_color(rgb(if error { REMOVED } else { MUTED }))
+                    .text_color(rgb(if error {
+                        palette().removed
+                    } else {
+                        palette().muted
+                    }))
                     .child(message),
             )
     }
@@ -388,7 +392,7 @@ impl Desktop {
             .child(caption("Your repository and commit draft will reopen. Other unsaved forms close on restart."))
             .when(busy, |s| s.child(caption("Waiting for the active operation to finish…")))
             .when(self.updates.fixture, |s| s.child(caption("Preview only — installation is disabled.")))
-            .when(!self.updates.error.is_empty(), |s| s.child(div().text_color(rgb(REMOVED)).child(self.updates.error.clone())))
+            .when(!self.updates.error.is_empty(), |s| s.child(div().text_color(rgb(palette().removed)).child(self.updates.error.clone())))
             .child(dialog_actions()
                 .child(Button::new("update-later").label("Later").disabled(installing)
                     .on_click(cx.listener(|v, _, _, cx| { v.updates.open = false; cx.notify(); })))

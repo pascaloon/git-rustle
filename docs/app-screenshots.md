@@ -1,5 +1,46 @@
 # Isolated application screenshots
 
+## Appearance coverage
+
+`Settings → General → Light theme` switches the entire native UI immediately and
+saves the preference globally in `git-rustle/appearance.json` under LOCALAPPDATA.
+Dark remains the default for existing installations. Appearance writes run on the
+background executor; a failed save restores the preceding theme and shows an
+error beside the switch.
+
+Run the complete light-theme view matrix at normal and minimum window sizes:
+
+```powershell
+.\scripts\validate-light-theme.ps1 -Candidate .\target\release\git-rustle.exe `
+  -OutputDirectory .\target\bench\light-theme-visuals
+```
+
+The matrix includes the welcome screen, graph and commit inspector, pending and
+syntax diffs, flat/hierarchical branches, stashes, cleanup, every Settings page,
+external-tool configuration, request composer/selectors, rebase plan, branch/tag/
+checkout dialogs, graph menus, and AI settings/draft/summary/conflict/error views.
+Each group uses the existing action/paint harness and preserves its disposable
+fixture. `coverage.json` retains failures while allowing independent views to
+continue. Inspect every generated PNG; a successful scenario is not visual review.
+Scrollable views may show only the current viewport. Remote/provider fixtures are
+local and do not establish live service behavior.
+
+For a focused capture, add `-LightTheme` to `screenshot-app.ps1`. The
+`theme-toggle` scenario always starts dark and invokes the real switch action
+three times (light, dark, light), awaiting persistence and native paint and
+asserting the Appearance card's bounds. It finishes in light mode. Captures use
+isolated application data and never alter the user's saved appearance. The
+welcome fixture uses an owned temporary directory outside this checkout because
+Git discovers repositories in parent directories, then removes that directory.
+
+Keep capture runs separate from `benchmark-desktop.ps1 -Scenarios theme-toggle
+-Samples 15` timing runs. The trace records three action-to-paint-and-persistence
+durations per launch. Shared startup, normal/searched scrolling, diff scrolling
+and General tab frames should also be compared against a preserved baseline.
+`benchmark.ps1 -LightTheme` requires `-IsolatedCacheRoot`; it keeps the baseline
+dark and seeds the candidate's light preference. Desktop, graph, remote-checkout
+and branch-cleanup runners also accept `-LightTheme` for their isolated fixtures.
+
 Agents should inspect actual screenshots when changing visual UI. The runner
 captures Git Rustle's client area on a private, non-current Windows desktop. It
 does not switch desktops, activate windows, move the pointer, send keyboard input,

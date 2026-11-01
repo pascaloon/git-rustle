@@ -358,7 +358,11 @@ impl Desktop {
     pub(super) fn tools_notice(&self) -> Option<AnyElement> {
         (!self.tools.message.is_empty()).then(|| {
             div()
-                .text_color(rgb(if self.tools.error { REMOVED } else { MUTED }))
+                .text_color(rgb(if self.tools.error {
+                    palette().removed
+                } else {
+                    palette().muted
+                }))
                 .child(self.tools.message.clone())
                 .into_any_element()
         })
@@ -912,7 +916,7 @@ impl Desktop {
             .mt_4()
             .pt_4()
             .border_t_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .gap_2()
             .child(
                 row()

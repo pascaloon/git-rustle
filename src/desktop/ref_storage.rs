@@ -145,7 +145,7 @@ impl Desktop {
     pub(super) fn ref_storage_controls(&self, cx: &Context<Self>) -> Div {
         let ready = self.ref_storage.info.as_ref();
         let already_enabled = self.engine.reference_storage_reftable();
-        column().mt_4().pt_3().gap_2().border_t_1().border_color(rgb(LINE))
+        column().mt_4().pt_3().gap_2().border_t_1().border_color(rgb(palette().line))
             .child("Branch name compatibility")
             .child(caption("Case-sensitive storage allows names such as Feature and feature to coexist safely on Windows."))
             .when(ready.is_none() && already_enabled, |panel| panel.child(caption("Case-sensitive references enabled.")))
@@ -166,7 +166,7 @@ impl Desktop {
                     .when(!info.can_migrate && !info.reftable, |panel| panel.child(caption("Update Git for Windows to enable conversion.")))
             })
             .when(!self.ref_storage.message.is_empty(), |panel| panel.child(
-                div().text_color(rgb(if self.ref_storage.failed { REMOVED } else { MUTED })).child(self.ref_storage.message.clone()),
+                div().text_color(rgb(if self.ref_storage.failed { palette().removed } else { palette().muted })).child(self.ref_storage.message.clone()),
             ))
     }
 
@@ -176,7 +176,7 @@ impl Desktop {
                 .relative().children(self.todo_probe(8))
                 .child("This converts this repository's references to Git's reftable format. Commits, staging and working files are preserved.")
                 .child(caption("Other Git applications must support reftable. Enabling it starts a new Undo/Redo history."))
-                .when(self.ref_storage.failed, |body| body.child(div().text_color(rgb(REMOVED)).child(self.ref_storage.message.clone())))
+                .when(self.ref_storage.failed, |body| body.child(div().text_color(rgb(palette().removed)).child(self.ref_storage.message.clone())))
                 .child(dialog_actions()
                     .child(Button::new("cancel-ref-conversion").label("Cancel").disabled(self.ref_storage.busy)
                         .on_click(cx.listener(|v, _, window, cx| v.action(super::Action::RefStorage(Action::Cancel), window, cx))))

@@ -836,6 +836,12 @@ impl Desktop {
             self.todo_advance(2);
             return;
         }
+        // Appearance adds a card above tools. At the minimum window size the
+        // collapsed tools row may need scrolling before Configure can paint.
+        if phase == 2 && !self.todo_painted(3, window) {
+            self.todo_scroll_tools(phase, window, cx);
+            return;
+        }
         if phase == 2 && self.todo_painted(3, window) {
             if !self.tools_scenario_loaded()
                 || !self.tools_scenario_scan_complete()

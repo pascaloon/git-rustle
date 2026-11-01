@@ -14,9 +14,13 @@ impl Desktop {
             .px_2()
             .pr(px(if compact { 12. } else { 24. }))
             .gap_2()
-            .bg(rgb(if selected { SELECTED } else { BG }))
+            .bg(rgb(if selected {
+                palette().selected
+            } else {
+                palette().bg
+            }))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(HOVER)))
+            .hover(|s| s.bg(rgb(palette().hover)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -41,7 +45,7 @@ impl Desktop {
                         .flex_shrink_0()
                         .font_family("Cascadia Mono")
                         .text_size(px(12.))
-                        .text_color(rgb(ACCENT))
+                        .text_color(rgb(palette().accent))
                         .child(id.to_hex_with_len(8).to_string()),
                 )
                 .child(
@@ -53,7 +57,7 @@ impl Desktop {
                         .child(
                             row()
                                 .text_size(px(11.))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette().muted))
                                 .child(requests::avatar(self.avatars.image(&id), author, 18.))
                                 .child(div().flex_1().text_ellipsis().child(author.to_owned()))
                                 .child(crate::ui::time::format_relative(
@@ -84,12 +88,16 @@ impl Desktop {
                 .children(self.graph_feature_probe(row_index, 0))
                 .font_family("Cascadia Mono")
                 .flex_shrink_0()
-                .text_color(rgb(if ghost { MUTED } else { ACCENT }))
+                .text_color(rgb(if ghost {
+                    palette().muted
+                } else {
+                    palette().accent
+                }))
                 .child(
                     div()
                         .when(on_path, |s| {
-                            s.bg(rgb(0x674125))
-                                .text_color(rgb(ACCENT_HOVER))
+                            s.bg(rgb(palette().path_bg))
+                                .text_color(rgb(palette().accent_hover))
                                 .rounded_sm()
                         })
                         .child(self.matches.styled(id.to_hex_with_len(8).to_string())),
@@ -117,13 +125,17 @@ impl Desktop {
                     .px_2()
                     .rounded_full()
                     .flex_shrink_0()
-                    .bg(rgb(ACCENT))
-                    .text_color(rgb(BG))
+                    .bg(rgb(palette().accent))
+                    .text_color(rgb(palette().on_accent))
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .children(self.filter_head_probe())
                     .children(self.graph_polish_checkout_probe("HEAD", true))
-                    .child(icon("head").size(px(14.)).text_color(rgb(BG)))
+                    .child(
+                        icon("head")
+                            .size(px(14.))
+                            .text_color(rgb(palette().on_accent)),
+                    )
                     .child("HEAD")
                     .tooltip(|window, cx| {
                         gpui_component::tooltip::Tooltip::new("Detached HEAD · current checkout")
@@ -151,11 +163,11 @@ impl Desktop {
                         .and_then(|refs| refs.head_branch.as_deref())
                         == Some(label.name.as_str());
                 let color = if current {
-                    BG
+                    palette().bg
                 } else if remote {
-                    REMOTE_TEXT
+                    palette().remote_text
                 } else {
-                    SEARCH_TEXT
+                    palette().search_text
                 };
                 badges = badges
                     .child(
@@ -172,20 +184,28 @@ impl Desktop {
                             .rounded_sm()
                             .px_1()
                             .flex_shrink_0()
-                            .bg(rgb(if remote { REMOTE_BG } else { SELECTED }))
+                            .bg(rgb(if remote {
+                                palette().remote_bg
+                            } else {
+                                palette().selected
+                            }))
                             .text_color(rgb(color))
                             .when(current, |badge| {
                                 badge
                                     .h(px(22.))
                                     .px_2()
                                     .rounded_full()
-                                    .bg(rgb(ACCENT))
+                                    .bg(rgb(palette().accent))
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .children(self.filter_head_probe())
                                     .children(self.graph_polish_checkout_probe(&label.name, false))
                                     .children(self.graph_context_branch_probe(&label.name))
-                                    .child(icon("head").size(px(14.)).text_color(rgb(BG)))
+                                    .child(
+                                        icon("head")
+                                            .size(px(14.))
+                                            .text_color(rgb(palette().on_accent)),
+                                    )
                             })
                             .max_w(px(170.))
                             .overflow_hidden()
@@ -225,7 +245,11 @@ impl Desktop {
                 .text_ellipsis()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_color(rgb(if ghost { MUTED } else { TEXT }))
+                .text_color(rgb(if ghost {
+                    palette().muted
+                } else {
+                    palette().text
+                }))
                 .child(self.matches.styled(subject.to_owned())),
         );
         r = r
@@ -238,7 +262,7 @@ impl Desktop {
                     .flex_shrink_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette().muted))
                     .child(requests::avatar(
                         self.avatars
                             .image(&id)
@@ -264,7 +288,7 @@ impl Desktop {
                     .whitespace_nowrap()
                     .text_right()
                     .text_size(px(12.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette().muted))
                     .child(crate::ui::time::format_relative(
                         commit_time,
                         crate::ui::time::now_unix(),

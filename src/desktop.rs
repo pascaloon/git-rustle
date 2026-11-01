@@ -19,6 +19,7 @@ use gpui_component::{
 };
 use std::time::{Duration, Instant};
 mod ai;
+mod appearance;
 mod base_diff;
 mod branch_views;
 mod cleanup;
@@ -52,6 +53,7 @@ mod toolbar_bench;
 mod update;
 
 pub fn run(mut engine: Engine) {
+    let appearance = crate::appearance::Preferences::load().unwrap_or_default();
     engine.mark("GPUI initialization requested");
     // Drive local startup while DirectX/DirectWrite initialize on the main thread.
     // No network work or status polling starts until the first native frame.
@@ -75,17 +77,15 @@ pub fn run(mut engine: Engine) {
         gpui_component::init(cx);
         crate::desktop_text::init(cx);
         engine.mark("GPUI components ready");
-        crate::desktop_theme::apply(cx);
+        crate::desktop_theme::apply(appearance.light_theme, cx);
+        engine.mark(if appearance.light_theme {
+            "appearance light"
+        } else {
+            "appearance dark"
+        });
         // Opt-in native layout coverage; ordinary launches retain their size.
-        let minimum_cleanup_bench = std::env::var("GIT_RUSTLE_BENCH_WINDOW")
-            .is_ok_and(|value| value == "900x600")
-            && std::env::var("GIT_RUSTLE_SCENARIO").is_ok_and(|scenario| {
-                scenario.starts_with("cleanup-")
-                    || scenario.starts_with("ai-")
-                    || scenario.starts_with("graph-reset")
-                    || scenario.starts_with("graph-delete")
-                    || scenario == "branches-hierarchy"
-            });
+        let minimum_cleanup_bench =
+            std::env::var("GIT_RUSTLE_BENCH_WINDOW").is_ok_and(|value| value == "900x600");
         let initial_size = if minimum_cleanup_bench {
             size(px(900.), px(600.))
         } else {
@@ -107,7 +107,8 @@ pub fn run(mut engine: Engine) {
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
                     weak.update(cx, |v, cx| {
-                        if v.updates.installing
+                        if v.appearance.busy
+                            || v.updates.installing
                             || v.composer.as_ref().is_some_and(|c| c.busy())
                             || v.engine.operation_busy
                             || v.engine.repository_edit_busy
@@ -205,9 +206,11 @@ enum Action {
     ForgetToken,
     ClearImages,
     CheckUpdates,
+    LightTheme(bool),
 }
 
 struct Desktop {
+    appearance: appearance::State,
     ai: ai::State,
     updates: update::Updates,
     composer: Option<requests::Composer>,
@@ -303,7 +306,7 @@ fn row() -> Div {
 }
 fn caption(s: impl Into<SharedString>) -> Div {
     div()
-        .text_color(rgb(MUTED))
+        .text_color(rgb(palette().muted))
         .text_size(px(12.))
         .child(s.into())
 }
@@ -331,10 +334,10 @@ fn dialog_overlay(body: Div) -> Div {
                 .max_w_full()
                 .max_h_full()
                 .p_6()
-                .bg(rgb(PANEL))
+                .bg(rgb(palette().panel))
                 .rounded_lg()
                 .border_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(palette().line))
                 .shadow_lg(),
         )
 }
@@ -380,13 +383,17 @@ impl RenderOnce for ToolbarFilter {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focused = self.state.read(cx).focus_handle(cx).is_focused(window);
         let border = if focused {
-            ACCENT
+            palette().accent
         } else if self.active {
-            FILTER_ACTIVE_BORDER
+            palette().filter_active_border
         } else {
-            LINE
+            palette().line
         };
-        let background = if self.active { FILTER_ACTIVE_BG } else { BG };
+        let background = if self.active {
+            palette().filter_active_bg
+        } else {
+            palette().bg
+        };
         if let Some(observer) = self.observer {
             observer.record(self.active, focused, border, background);
         }
@@ -413,7 +420,7 @@ fn toolbar_filter(
         .py_0()
         .cleanable(true)
         .when(input.read(cx).value().is_empty(), |s| {
-            s.prefix(icon("search").text_color(rgb(MUTED)))
+            s.prefix(icon("search").text_color(rgb(palette().muted)))
         });
     ToolbarFilter {
         input: element,
@@ -432,7 +439,7 @@ fn tab_bar() -> Stateful<Div> {
         .gap_0()
         .px_3()
         .border_b_1()
-        .border_color(rgb(LINE))
+        .border_color(rgb(palette().line))
 }
 
 fn tab_item(id: impl Into<ElementId>, active: bool, enabled: bool) -> Stateful<Div> {
@@ -442,10 +449,24 @@ fn tab_item(id: impl Into<ElementId>, active: bool, enabled: bool) -> Stateful<D
         .flex_shrink_0()
         .px_4()
         .border_b_2()
-        .border_color(rgb(if active { ACCENT } else { BG }))
-        .bg(rgb(if active { PANEL } else { BG }))
-        .text_color(rgb(if enabled { TEXT } else { MUTED }))
-        .when(enabled, |s| s.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
+        .border_color(rgb(if active {
+            palette().accent
+        } else {
+            palette().bg
+        }))
+        .bg(rgb(if active {
+            palette().panel
+        } else {
+            palette().bg
+        }))
+        .text_color(rgb(if enabled {
+            palette().text
+        } else {
+            palette().muted
+        }))
+        .when(enabled, |s| {
+            s.cursor_pointer().hover(|s| s.bg(rgb(palette().hover)))
+        })
 }
 
 impl Desktop {
@@ -833,9 +854,9 @@ impl Desktop {
                         .children(self.graph_context_probe(1))
                         .w(px(320.))
                         .p_1()
-                        .bg(rgb(PANEL))
+                        .bg(rgb(palette().panel))
                         .border_1()
-                        .border_color(rgb(LINE))
+                        .border_color(rgb(palette().line))
                         .rounded_md()
                         .shadow_lg()
                         .occlude()
@@ -863,9 +884,9 @@ impl Desktop {
                                         .rounded_sm()
                                         .cursor_pointer()
                                         .bg(rgb(if group == Some(name) {
-                                            SELECTED_HOVER
+                                            palette().selected_hover
                                         } else {
-                                            PANEL
+                                            palette().panel
                                         }))
                                         .child(icon(if name == "Commit" {
                                             "graph"
@@ -902,9 +923,9 @@ impl Desktop {
                                 |menu| menu.track_scroll(&self.graph_context.submenu_scroll),
                             )
                             .p_1()
-                            .bg(rgb(PANEL))
+                            .bg(rgb(palette().panel))
                             .border_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(palette().line))
                             .rounded_md()
                             .shadow_lg()
                             .occlude()
@@ -937,12 +958,20 @@ impl Desktop {
             .flex_shrink_0()
             .px_2()
             .rounded_sm()
-            .text_color(rgb(if enabled { TEXT } else { MUTED }))
-            .child(icon(name).text_color(rgb(if enabled { TEXT } else { MUTED })))
+            .text_color(rgb(if enabled {
+                palette().text
+            } else {
+                palette().muted
+            }))
+            .child(icon(name).text_color(rgb(if enabled {
+                palette().text
+            } else {
+                palette().muted
+            })))
             .child(div().flex_1().min_w_0().truncate().child(label))
             .when(enabled, |s| {
                 s.cursor_pointer()
-                    .hover(|s| s.bg(rgb(SELECTED_HOVER)))
+                    .hover(|s| s.bg(rgb(palette().selected_hover)))
                     .on_click(cx.listener(move |v, _, w, cx| {
                         cx.stop_propagation();
                         v.graph_menu_activate(action.clone(), w, cx);
@@ -1253,6 +1282,12 @@ impl Desktop {
                                     cx.notify();
                                 }
                                 Some("pending-diff") => v.action(Action::Diff, window, cx),
+                                Some("commit-details" | "commit-diff") => {
+                                    v.action(Action::Select(1, false), window, cx);
+                                    if v.scenario.as_deref() == Some("commit-diff") {
+                                        v.action(Action::Diff, window, cx);
+                                    }
+                                }
                                 Some("branches") => v.action(Action::Branches, window, cx),
                                 Some(
                                     "diff" | "diff-scroll" | "diff-pan" | "wrap-scroll" | "tabs",
@@ -1264,8 +1299,8 @@ impl Desktop {
                                     v.search
                                         .update(cx, |s, cx| s.set_value("m: merge", window, cx));
                                 }
-                                Some("settings" | "settings-tabs" | "settings-cache" | "settings-cache-clear") => {
-                                    v.action(Action::Settings, window, cx)
+                                Some("settings" | "settings-project" | "settings-gitlab" | "settings-github" | "theme-toggle" | "settings-tabs" | "settings-cache" | "settings-cache-clear") => {
+                                    v.action(Action::Settings, window, cx);
                                 }
                                 Some("compare") => {
                                     v.action(Action::Select(0, false), window, cx);
@@ -1307,6 +1342,7 @@ impl Desktop {
                         }
                         v.improvement_scenario_tick(window, cx);
                         v.general_scenario_tick(window, cx);
+                        v.appearance_scenario_tick(window, cx);
                         v.tools_tick(window, cx);
                         v.ai_scenario_tick(window, cx);
                         if v.scenario_started && v.scenario.as_deref() == Some("settings-cache-clear")
@@ -1398,6 +1434,7 @@ impl Desktop {
         let select_focus = cx.focus_handle();
         select_focus.focus(window);
         Self {
+            appearance: Default::default(),
             ai,
             updates: Default::default(),
             composer: None,
@@ -1739,6 +1776,10 @@ impl Desktop {
             return;
         }
         if self.updates.open {
+            return;
+        }
+        if let Action::LightTheme(light) = action {
+            self.set_light_theme(light, window, cx);
             return;
         }
         if self.ref_storage.confirming && !matches!(action, Action::RefStorage(_)) {
@@ -2108,6 +2149,7 @@ impl Desktop {
             Action::SaveSettings => app.settings.save_page(),
             Action::ClearImages => {}
             Action::CheckUpdates => {}
+            Action::LightTheme(_) => unreachable!(),
             Action::ForgetToken => {
                 if !app.settings.busy
                     && let Some(index) = app.settings.provider_index()
@@ -2200,10 +2242,13 @@ impl Desktop {
             .gap_3()
             .rounded_md()
             .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(CONTROL))
+            .border_color(rgb(palette().line))
+            .bg(rgb(palette().control))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(HOVER)).border_color(rgb(ACCENT)))
+            .hover(|s| {
+                s.bg(rgb(palette().hover))
+                    .border_color(rgb(palette().accent))
+            })
             .tooltip(move |w, cx| {
                 gpui_component::tooltip::Tooltip::new(full_target.clone()).build(w, cx)
             })
@@ -2213,11 +2258,15 @@ impl Desktop {
                     .flex_shrink_0()
                     .justify_center()
                     .rounded_md()
-                    .bg(rgb(if branch { SELECTED } else { PANEL }))
-                    .child(icon(symbol).size(px(20.)).text_color(rgb(if branch {
-                        ACCENT
+                    .bg(rgb(if branch {
+                        palette().selected
                     } else {
-                        MUTED
+                        palette().panel
+                    }))
+                    .child(icon(symbol).size(px(20.)).text_color(rgb(if branch {
+                        palette().accent
+                    } else {
+                        palette().muted
                     }))),
             )
             .child(
@@ -2228,7 +2277,11 @@ impl Desktop {
                         div()
                             .text_size(px(10.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if branch { ACCENT } else { MUTED }))
+                            .text_color(rgb(if branch {
+                                palette().accent
+                            } else {
+                                palette().muted
+                            }))
                             .child(action),
                     )
                     .child(
@@ -2240,7 +2293,7 @@ impl Desktop {
                     )
                     .child(caption(description)),
             )
-            .child(icon("next").text_color(rgb(MUTED)))
+            .child(icon("next").text_color(rgb(palette().muted)))
             .on_click(
                 cx.listener(move |v, _, window, cx| v.action(Action::Confirm(index), window, cx)),
             )
@@ -2340,24 +2393,29 @@ impl Desktop {
             .h(px(30.))
             .rounded_md()
             .bg(rgb(if save && enabled {
-                ACCENT
+                palette().accent
             } else if active {
-                SELECTED
+                palette().selected
             } else {
-                CONTROL
+                palette().control
             }))
             .text_color(rgb(if save && enabled {
-                BG
+                palette().bg
             } else if active {
-                ACCENT
+                palette().accent
             } else if enabled {
-                TEXT
+                palette().text
             } else {
-                MUTED
+                palette().muted
             }))
             .when(enabled, |s| {
-                s.cursor_pointer()
-                    .hover(move |s| s.bg(rgb(if save { ACCENT_HOVER } else { SELECTED_HOVER })))
+                s.cursor_pointer().hover(move |s| {
+                    s.bg(rgb(if save {
+                        palette().accent_hover
+                    } else {
+                        palette().selected_hover
+                    }))
+                })
             })
             .when_some(icon_name, |s, n| s.child(icon(n)))
             .when_some(icon_name, |s, n| {
@@ -2404,7 +2462,7 @@ impl Desktop {
             .flex_shrink_0()
             .px_3()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .child(self.button("head", "", Action::Head, cx))
             .child(self.button("refresh", "", Action::Refresh, cx))
             .child(self.button(
@@ -2645,11 +2703,15 @@ impl Desktop {
                                 .relative()
                                 .children(v.todo_probe(1))
                                 .children(v.graph_feature_probe(0, 6))
-                                .bg(rgb(if selected { 0x4a2b15 } else { 0x241508 }))
+                                .bg(rgb(if selected {
+                                    palette().pending_selected
+                                } else {
+                                    palette().pending_bg
+                                }))
                                 .border_l_2()
-                                .border_color(rgb(ACCENT))
+                                .border_color(rgb(palette().accent))
                                 .pl(px(6.))
-                                .text_color(rgb(ACCENT_HOVER))
+                                .text_color(rgb(palette().accent_hover))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(pending_graph_canvas(
                                     graph_width,
@@ -2692,8 +2754,8 @@ impl Desktop {
                             .left(px(self.graph_width + 8.))
                             .w(px(5.))
                             .cursor_col_resize()
-                            .bg(rgb(LINE))
-                            .hover(|s| s.bg(rgb(ACCENT)))
+                            .bg(rgb(palette().line))
+                            .hover(|s| s.bg(rgb(palette().accent)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|v, _, _, cx| {
@@ -2734,7 +2796,7 @@ impl Desktop {
                 "f: " => "File",
                 _ => selected.1,
             })
-            .child(div().text_color(rgb(MUTED)).child("▾"))
+            .child(div().text_color(rgb(palette().muted)).child("▾"))
             .tooltip("Search field")
             .dropdown_menu(move |mut menu, _, _| {
                 for (prefix, title) in choices {
@@ -2771,11 +2833,11 @@ impl Desktop {
                             div()
                                 .pr_1()
                                 .border_r_1()
-                                .border_color(rgb(LINE))
+                                .border_color(rgb(palette().line))
                                 .child(selector),
                         )
                         .when(query.is_empty(), |s| {
-                            s.child(icon("search").text_color(rgb(MUTED)))
+                            s.child(icon("search").text_color(rgb(palette().muted)))
                         }),
                 ),
             )
@@ -2842,9 +2904,9 @@ impl Desktop {
                             .pr_3()
                             .h(px(30.))
                             .pl(px(8. + visible.depth as f32 * 14.))
-                            .bg(rgb(if selected { SELECTED } else { BG }))
+                            .bg(rgb(if selected { palette().selected } else { palette().bg }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(CONTROL)));
+                            .hover(|s| s.bg(rgb(palette().control)));
                         if let Some(check) = cs.check_state(node) {
                             r = r.child(v.file_checkbox(node, check, cx));
                         }
@@ -2890,7 +2952,7 @@ impl Desktop {
                 row()
                     .p_2()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .child(div().flex_1().child(caption("FILES")))
                     .children(self.discard_selected_button(cx))
                     .child(self.button("expand", "", Action::Expand(true), cx))
@@ -2941,7 +3003,7 @@ impl Desktop {
                         |_, _, _| (),
                         move |bounds, _, window, _| {
                             let opacity = if disabled { 0.5 } else { 1. };
-                            let color: Hsla = rgb(ACCENT).into();
+                            let color: Hsla = rgb(palette().accent).into();
                             if disabled {
                                 window.paint_quad(quad(
                                     Bounds::new(
@@ -2949,9 +3011,9 @@ impl Desktop {
                                         size(px(14.), px(14.)),
                                     ),
                                     px(3.),
-                                    rgb(BG),
+                                    rgb(palette().bg),
                                     px(0.),
-                                    rgb(BG),
+                                    rgb(palette().bg),
                                     BorderStyle::Solid,
                                 ));
                             }
@@ -2971,7 +3033,7 @@ impl Desktop {
                                     bounds.origin + point(px(4.), px(7.)),
                                     size(px(8.), px(2.)),
                                 ),
-                                rgb(BG),
+                                rgb(palette().bg),
                             ));
                         },
                     )
@@ -2989,9 +3051,9 @@ impl Desktop {
             .w(px(self.pane_width))
             .flex_shrink_0()
             .h_full()
-            .bg(rgb(BG))
+            .bg(rgb(palette().bg))
             .border_l_1()
-            .border_color(rgb(INSPECTOR_LINE))
+            .border_color(rgb(palette().inspector_line))
             .relative()
             .children(workflow.then(|| self.conflicts_probe(7)).flatten());
         if !workflow && app.pending.selected {
@@ -3038,61 +3100,63 @@ impl Desktop {
         } else if !workflow && self.selected_commits.count(app.selected_id()) > 1 {
             panel = panel.child(self.multi_details_panel(cx));
         } else {
-            panel =
-                panel.child(
-                    column()
-                        .h(relative(0.55))
-                        .min_h(px(240.))
-                        .flex_shrink_0()
-                        .child(
-                            row()
-                                .h(px(44.))
-                                .flex_shrink_0()
-                                .px_4()
-                                .border_b_1()
-                                .border_color(rgb(INSPECTOR_LINE))
-                                .child(div().flex_1().child(
-                                    caption("COMMIT DETAILS").text_color(rgb(INSPECTOR_MUTED)),
+            panel = panel.child(
+                column()
+                    .h(relative(0.55))
+                    .min_h(px(240.))
+                    .flex_shrink_0()
+                    .child(
+                        row()
+                            .h(px(44.))
+                            .flex_shrink_0()
+                            .px_4()
+                            .border_b_1()
+                            .border_color(rgb(palette().inspector_line))
+                            .child(
+                                div().flex_1().child(
+                                    caption("COMMIT DETAILS")
+                                        .text_color(rgb(palette().inspector_muted)),
+                                ),
+                            )
+                            .when_some(self.detail_id, |s, id| {
+                                s.child(requests::avatar(
+                                    self.avatars.image(&id),
+                                    app.details
+                                        .as_ref()
+                                        .map(|d| d.author_name.as_str())
+                                        .unwrap_or("?"),
+                                    28.,
                                 ))
-                                .when_some(self.detail_id, |s, id| {
-                                    s.child(requests::avatar(
-                                        self.avatars.image(&id),
-                                        app.details
-                                            .as_ref()
-                                            .map(|d| d.author_name.as_str())
-                                            .unwrap_or("?"),
-                                        28.,
-                                    ))
-                                    .child(
-                                        div()
-                                            .font_family("Cascadia Mono")
-                                            .text_size(px(11.))
-                                            .text_color(rgb(INSPECTOR_MUTED))
-                                            .child(id.to_hex_with_len(8).to_string()),
-                                    )
-                                })
-                                .when(self.detail_id.is_some(), |s| {
-                                    s.child(self.button("copy-sha1", "", Action::CopySha1, cx))
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .px_4()
-                                .py_3()
-                                .when(self.detail_id.is_none(), |s| {
-                                    s.child(caption(if app.details_id().is_some() {
-                                        "Loading commit details…"
-                                    } else {
-                                        "Select a commit to inspect its details"
-                                    }))
-                                })
-                                .when(self.detail_id.is_some(), |s| {
-                                    s.child(self.detail_text.clone())
-                                }),
-                        ),
-                );
+                                .child(
+                                    div()
+                                        .font_family("Cascadia Mono")
+                                        .text_size(px(11.))
+                                        .text_color(rgb(palette().inspector_muted))
+                                        .child(id.to_hex_with_len(8).to_string()),
+                                )
+                            })
+                            .when(self.detail_id.is_some(), |s| {
+                                s.child(self.button("copy-sha1", "", Action::CopySha1, cx))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .px_4()
+                            .py_3()
+                            .when(self.detail_id.is_none(), |s| {
+                                s.child(caption(if app.details_id().is_some() {
+                                    "Loading commit details…"
+                                } else {
+                                    "Select a commit to inspect its details"
+                                }))
+                            })
+                            .when(self.detail_id.is_some(), |s| {
+                                s.child(self.detail_text.clone())
+                            }),
+                    ),
+            );
         }
         if !workflow && !app.pending.selected && self.selected_commits.count(app.selected_id()) > 2
         {
@@ -3249,7 +3313,7 @@ impl Desktop {
                     .w(px(5.))
                     .h_full()
                     .cursor_col_resize()
-                    .bg(rgb(LINE))
+                    .bg(rgb(palette().line))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|v, _, _, _| v.resizing_diff = true),
@@ -3260,7 +3324,7 @@ impl Desktop {
                     .flex_1()
                     .h_full()
                     .border_l_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .child(
                         row()
                             .p_2()
@@ -3376,6 +3440,7 @@ impl Desktop {
         } else if settings.page == crate::settings::GENERAL_PAGE {
             form = form
                 .child(caption("General settings · shared by all repositories"))
+                .child(self.appearance_controls(cx))
                 .child(
                     row()
                         .relative()
@@ -3384,7 +3449,7 @@ impl Desktop {
                             Button::new("project-website")
                                 .ghost()
                                 .icon(gpui_component::Icon::default().path("rustle/external-link"))
-                                .text_color(rgb(ACCENT))
+                                .text_color(rgb(palette().accent))
                                 .tooltip("Open the project website in your browser")
                                 .label("Website")
                                 .on_click(|_, _, cx| {
@@ -3395,7 +3460,7 @@ impl Desktop {
                             Button::new("project-releases")
                                 .ghost()
                                 .icon(gpui_component::Icon::default().path("rustle/external-link"))
-                                .text_color(rgb(ACCENT))
+                                .text_color(rgb(palette().accent))
                                 .tooltip("Open release notes in your browser")
                                 .label("Release notes")
                                 .on_click(|_, _, cx| {
@@ -3435,7 +3500,7 @@ impl Desktop {
                 .child(caption("Repository path"))
                 .child(
                     div()
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(palette().text))
                         .child(self.engine.repository_path()),
                 )
                 .child(caption("Remote"))
@@ -3449,14 +3514,14 @@ impl Desktop {
                                 .py_2()
                                 .rounded_md()
                                 .bg(rgb(if settings.project_selected == i {
-                                    SELECTED
+                                    palette().selected
                                 } else {
-                                    CONTROL
+                                    palette().control
                                 }))
                                 .text_color(rgb(if settings.project_selected == i {
-                                    ACCENT
+                                    palette().accent
                                 } else {
-                                    TEXT
+                                    palette().text
                                 }))
                                 .child(d.name.clone())
                                 .when(!settings.busy, |s| {
@@ -3470,7 +3535,7 @@ impl Desktop {
                 );
             if let Some(d) = settings.projects.get(settings.project_selected) {
                 form = form
-                    .child(div().text_color(rgb(TEXT)).child(d.url.clone()))
+                    .child(div().text_color(rgb(palette().text)).child(d.url.clone()))
                     .child(caption("Provider"))
                     .child(
                         row()
@@ -3569,7 +3634,11 @@ impl Desktop {
                 |s| {
                     s.child(
                         div()
-                            .text_color(rgb(if settings.error { REMOVED } else { MUTED }))
+                            .text_color(rgb(if settings.error {
+                                palette().removed
+                            } else {
+                                palette().muted
+                            }))
                             .child(settings.status.clone()),
                     )
                 },
@@ -3577,6 +3646,9 @@ impl Desktop {
             .into_any_element()
     }
     fn scenario_ready(&self) -> bool {
+        if self.scenario.as_deref() == Some("theme-toggle") {
+            return self.appearance_scenario_ready();
+        }
         if let Some(ready) = self.ai_scenario_ready() {
             return ready;
         }
@@ -3707,12 +3779,27 @@ impl Desktop {
                 | "update-available",
             ) => self.scroll_step > 121,
             Some("branches") => app.branches.open && !app.branches.activity_cache.is_empty(),
-            Some("diff" | "pending-diff" | "compare" | "remote-diff" | "remote-pair") => {
+            Some(
+                "diff" | "pending-diff" | "commit-diff" | "compare" | "remote-diff" | "remote-pair",
+            ) => {
                 matches!(&app.mode,Mode::Diff(v) if v.diff.as_ref().is_some_and(|d| d.syntax.is_some()))
             }
             Some("search") => app.search.result.as_ref().is_some_and(|r| r.done),
-            Some("settings") => app.settings.open && !app.settings.busy,
+            Some("settings" | "settings-project" | "settings-gitlab" | "settings-github") => {
+                app.settings.open
+                    && !app.settings.busy
+                    && self.appearance_settings_page() == Some(app.settings.page)
+                    && !self.image_cache.busy
+            }
             Some("pending") => app.pending.known && app.pending.selected,
+            Some("commit-details") => {
+                !app.pending.selected
+                    && app.details.is_some()
+                    && app
+                        .details_changes
+                        .as_ref()
+                        .is_some_and(|changes| changes.loaded)
+            }
             _ => true,
         }
     }
@@ -3839,8 +3926,8 @@ impl Render for Desktop {
                                 .w(px(5.))
                                 .h_full()
                                 .cursor_col_resize()
-                                .bg(rgb(BG))
-                                .hover(|s| s.bg(rgb(CONTROL)))
+                                .bg(rgb(palette().bg))
+                                .hover(|s| s.bg(rgb(palette().control)))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|v, _, _, _| v.resizing = true),
@@ -3853,6 +3940,7 @@ impl Render for Desktop {
         self.toolbar_scenario_schedule(window, cx);
         self.filter_scenario_schedule(window, cx);
         self.general_scenario_schedule(window, cx);
+        self.appearance_scenario_schedule(window, cx);
         self.todo_scenario_schedule(window, cx);
         self.ghost_checkout_schedule(window, cx);
         self.conflicts_schedule(window, cx);
@@ -4200,8 +4288,8 @@ impl Render for Desktop {
                     v.resizing_diff = false;
                 }),
             )
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(palette().bg))
+            .text_color(rgb(palette().text))
             .font_family("Segoe UI")
             .text_size(px(14.))
             .child(
@@ -4210,7 +4298,7 @@ impl Render for Desktop {
                     .flex_shrink_0()
                     .px_4()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .children(self.provider_icon())
                     .child(
                         column()
@@ -4244,8 +4332,16 @@ fn diff_stats(added: u32, removed: u32) -> Div {
     row()
         .flex_shrink_0()
         .text_size(px(12.))
-        .child(div().text_color(rgb(ADDED)).child(format!("+{added}")))
-        .child(div().text_color(rgb(REMOVED)).child(format!("−{removed}")))
+        .child(
+            div()
+                .text_color(rgb(palette().added))
+                .child(format!("+{added}")),
+        )
+        .child(
+            div()
+                .text_color(rgb(palette().removed))
+                .child(format!("−{removed}")),
+        )
 }
 
 fn diff_line(
@@ -4292,15 +4388,19 @@ fn diff_line(
         .font_family("Cascadia Mono")
         .text_size(px(12.))
         .bg(rgb(if changed {
-            if added { ADDED_BG } else { REMOVED_BG }
+            if added {
+                palette().added_bg
+            } else {
+                palette().removed_bg
+            }
         } else {
-            BG
+            palette().bg
         }))
         .child(
             div()
                 .w(px(48.))
                 .flex_shrink_0()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette().muted))
                 .child(
                     line.filter(|_| offset == 0)
                         .map(|l| format!("{:>5}", l.no))
@@ -4364,7 +4464,7 @@ fn paint_graph_node_outline(center: Point<Pixels>, window: &mut Window) {
         radius,
         rgba(0),
         px(2.),
-        rgb(0x996039),
+        rgb(palette().pending_line),
         BorderStyle::Solid,
     ));
 }
@@ -4414,7 +4514,7 @@ fn pending_incoming(
 }
 
 fn graph_color(cell: GraphCell, flag: u8) -> Hsla {
-    let color: Hsla = rgb(COLORS[cell.color() as usize % COLORS.len()]).into();
+    let color: Hsla = rgb(palette().colors[cell.color() as usize % palette().colors.len()]).into();
     if flag & 1 != 0 {
         color.opacity(0.42)
     } else {
@@ -4482,7 +4582,7 @@ fn pending_graph_canvas(
                         continue;
                     }
                     let color = if outline {
-                        rgb(0x996039).into()
+                        rgb(palette().pending_line).into()
                     } else {
                         graph_color(*cell, flags.get(i).copied().unwrap_or(0))
                     };
@@ -4547,7 +4647,7 @@ fn pending_graph_canvas(
                 let color = cells
                     .get(lane)
                     .map(|cell| graph_color(*cell, flags.get(lane).copied().unwrap_or(0)))
-                    .unwrap_or_else(|| rgb(COLORS[0]).into());
+                    .unwrap_or_else(|| rgb(palette().colors[0]).into());
                 paint_graph_node(center, color, true, window);
                 if let Some(trace) = &trace {
                     trace.node();
@@ -4582,13 +4682,13 @@ fn graph_canvas(
                     let highlighted = hover & crate::graph::hover::GLYPH != 0;
                     let base = graph_color(*c, flags.get(i).copied().unwrap_or(0));
                     let color = if outline && highlighted {
-                        rgb(0x996039).into()
+                        rgb(palette().pending_line).into()
                     } else {
                         base
                     };
                     let connector = hover & crate::graph::hover::CONNECTOR != 0;
                     let connector_color = if outline && connector {
-                        rgb(0x996039).into()
+                        rgb(palette().pending_line).into()
                     } else {
                         base
                     };

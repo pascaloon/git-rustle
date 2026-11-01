@@ -21,10 +21,10 @@ enum Level {
 impl Level {
     fn color(self) -> u32 {
         match self {
-            Self::Info => MUTED,
-            Self::Done => ADDED,
-            Self::Working | Self::Warning => ACCENT,
-            Self::Error => REMOVED,
+            Self::Info => palette().muted,
+            Self::Done => palette().added,
+            Self::Working | Self::Warning => palette().accent,
+            Self::Error => palette().removed,
         }
     }
     fn label(self) -> &'static str {
@@ -257,8 +257,8 @@ impl Desktop {
             .px_3()
             .gap_3()
             .border_t_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(PANEL))
+            .border_color(rgb(palette().line))
+            .bg(rgb(palette().panel))
             .text_size(px(12.))
             .children(self.update_button(cx))
             .child(
@@ -272,7 +272,7 @@ impl Desktop {
                         s.child(
                             gpui_component::spinner::Spinner::new()
                                 .xsmall()
-                                .color(rgb(ACCENT).into()),
+                                .color(rgb(palette().accent).into()),
                         )
                     })
                     .when(!working, |s| {
@@ -296,9 +296,9 @@ impl Desktop {
                     .min_w_0()
                     .text_ellipsis()
                     .text_color(rgb(if level == Level::Error {
-                        REMOVED
+                        palette().removed
                     } else {
-                        MUTED
+                        palette().muted
                     }))
                     .child(text.to_string()),
             )
@@ -316,7 +316,7 @@ impl Desktop {
                         cx.notify();
                     })),
             )
-            .child(div().w(px(1.)).h(px(12.)).bg(rgb(LINE)))
+            .child(div().w(px(1.)).h(px(12.)).bg(rgb(palette().line)))
             .child(
                 Button::new("operation-history")
                     .xsmall()
@@ -349,9 +349,9 @@ impl Desktop {
                     .overflow_y_scroll()
                     .p_4()
                     .gap_3()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(palette().panel))
                     .border_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .rounded_md()
                     .shadow_lg()
                     .occlude()

@@ -362,7 +362,7 @@ impl Desktop {
             .min_w_0()
             .h_full()
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .rounded_md()
             .overflow_hidden()
             .children(self.conflicts_probe(side))
@@ -372,19 +372,19 @@ impl Desktop {
                     .py_2()
                     .gap_1()
                     .flex_shrink_0()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(palette().panel))
                     .child(
                         row()
                             .gap_2()
                             .child(
                                 icon(if side == 0 { "pull" } else { "branch" })
-                                    .text_color(rgb(ACCENT)),
+                                    .text_color(rgb(palette().accent)),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(ACCENT))
+                                    .text_color(rgb(palette().accent))
                                     .child(title),
                             )
                             .child(div().flex_1())
@@ -445,7 +445,7 @@ impl Desktop {
             .h_full()
             .flex_shrink_0()
             .border_r_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .children(self.conflicts_probe(2))
             .child(
                 div()
@@ -454,7 +454,7 @@ impl Desktop {
                     .py_2()
                     .flex_shrink_0()
                     .text_size(px(11.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette().muted))
                     .child("CONFLICTING FILES"),
             )
             .child(
@@ -477,16 +477,24 @@ impl Desktop {
                                         .px_3()
                                         .gap_2()
                                         .border_l_2()
-                                        .border_color(rgb(if selected { ACCENT } else { BG }))
-                                        .bg(rgb(if selected { SELECTED } else { BG }))
+                                        .border_color(rgb(if selected {
+                                            palette().accent
+                                        } else {
+                                            palette().bg
+                                        }))
+                                        .bg(rgb(if selected {
+                                            palette().selected
+                                        } else {
+                                            palette().bg
+                                        }))
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .hover(|s| s.bg(rgb(palette().hover)))
                                         .child(
                                             icon(if file.unmerged { "attention" } else { "check" })
                                                 .text_color(rgb(if file.unmerged {
-                                                    ACCENT
+                                                    palette().accent
                                                 } else {
-                                                    ADDED
+                                                    palette().added
                                                 })),
                                         )
                                         .child(
@@ -636,7 +644,7 @@ impl Desktop {
             );
         if state.stale {
             editor = editor.child(row().flex_wrap().gap_2().flex_shrink_0()
-                .child(caption("File changed on disk. Your draft is preserved; saving will check the original file.").text_color(rgb(ACCENT)))
+                .child(caption("File changed on disk. Your draft is preserved; saving will check the original file.").text_color(rgb(palette().accent)))
                 .child(Button::new("conflict-reload-draft").small().label("Discard draft & reload").disabled(disabled)
                     .on_click(cx.listener(|v, _, w, cx| v.operation_action(operations::Action::ReloadConflict, w, cx)))));
         }
@@ -711,19 +719,19 @@ impl Desktop {
         }
         let left = column().flex_1().min_w_0().h_full().min_h_0()
             .child(column().p_4().gap_1().flex_shrink_0()
-                .child(row().gap_2().child(icon("attention").text_color(rgb(ACCENT)))
+                .child(row().gap_2().child(icon("attention").text_color(rgb(palette().accent)))
                     .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(format!("Resolve {} conflicts", conflict.kind.to_lowercase()))))
                 .child(caption(format!("{} unresolved · changes refresh automatically", conflict.files.len())))
                 .when(conflict.commits_truncated, |p| p.child(caption("Commit lists are limited; select a commit to inspect its full details.")))
-                .when_some(conflict.metadata_error.clone(), |p, error| p.child(caption(error).text_color(rgb(REMOVED)))))
-            .when_some(self.engine.conflict_refresh_error.clone(), |p, error| p.child(caption(format!("Automatic refresh paused: {error}")).px_4().text_color(rgb(REMOVED))))
-            .when(self.engine.operation_error, |p| p.child(caption(self.engine.operation_status.clone()).px_4().text_color(rgb(REMOVED))))
+                .when_some(conflict.metadata_error.clone(), |p, error| p.child(caption(error).text_color(rgb(palette().removed)))))
+            .when_some(self.engine.conflict_refresh_error.clone(), |p, error| p.child(caption(format!("Automatic refresh paused: {error}")).px_4().text_color(rgb(palette().removed))))
+            .when(self.engine.operation_error, |p| p.child(caption(self.engine.operation_status.clone()).px_4().text_color(rgb(palette().removed))))
             .child(row().h(relative(0.34)).min_h(px(155.)).max_h(px(270.)).flex_shrink_0().px_4().gap_3()
                 .child(self.conflict_commit_column(0, cx)).child(self.conflict_commit_column(1, cx)))
-            .child(row().flex_1().min_h_0().mt_3().border_t_1().border_color(rgb(LINE))
+            .child(row().flex_1().min_h_0().mt_3().border_t_1().border_color(rgb(palette().line))
                 .child(self.conflict_files(cx)).child(self.conflict_editor(cx)))
             .children(self.tools_notice())
-            .child(row().relative().h(px(64.)).w_full().flex_shrink_0().px_4().gap_2().bg(rgb(PANEL)).border_t_1().border_color(rgb(LINE))
+            .child(row().relative().h(px(64.)).w_full().flex_shrink_0().px_4().gap_2().bg(rgb(palette().panel)).border_t_1().border_color(rgb(palette().line))
                 .children(self.conflicts_probe(4))
                 .when(matches!(conflict.kind.as_str(), "Rebase" | "Cherry-pick" | "Revert"), |r| r.child(
                     Button::new("conflict-skip").small().ghost().label("Skip commit…").disabled(self.engine.operation_busy || self.external_merge_busy())

@@ -851,13 +851,13 @@ impl Desktop {
         .track_scroll(self.operations.plan_scroll.clone());
         column().flex_1().size_full().p_6().gap_4().overflow_hidden()
             .child(column().flex_shrink_0().gap_2()
-                .child(row().gap_3().child(icon("graph").text_color(rgb(ACCENT)))
+                .child(row().gap_3().child(icon("graph").text_color(rgb(palette().accent)))
                     .child(div().text_size(px(22.)).child("Interactive rebase"))
                     .child(div().flex_1())
                     .child(caption(plan.map(|p| format!("{}  /  onto {}", p.branch, &p.base[..12.min(p.base.len())])).unwrap_or_default()).truncate()))
                 .child(caption("Shape your history. Choose an action for each commit and use the arrows to change replay order.")))
-            .child(column().flex_1().border_1().border_color(rgb(LINE)).rounded_lg().overflow_hidden()
-                .child(row().flex_shrink_0().h(px(38.)).px_4().bg(rgb(CONTROL))
+            .child(column().flex_1().border_1().border_color(rgb(palette().line)).rounded_lg().overflow_hidden()
+                .child(row().flex_shrink_0().h(px(38.)).px_4().bg(rgb(palette().control))
                     .child(caption("REPLAY ORDER · OLDEST FIRST"))
                     .child(div().flex_1())
                     .child(caption(format!("{count} commits"))))
@@ -866,7 +866,7 @@ impl Desktop {
             .child(column().flex_shrink_0().gap_3()
                 .child(row().child(div().text_size(px(13.)).child(self.operations.draft.summary.clone()))
                     .child(div().flex_1())
-                    .when(!valid, |r| r.child(div().text_size(px(12.)).text_color(rgb(REMOVED)).child(format!("Fix {} plan issue(s) before continuing", self.operations.draft.errors)))))
+                    .when(!valid, |r| r.child(div().text_size(px(12.)).text_color(rgb(palette().removed)).child(format!("Fix {} plan issue(s) before continuing", self.operations.draft.errors)))))
                 .child(row()
                     .child(Button::new("reset-rebase").small().ghost().label("Reset plan").disabled(!enabled)
                         .on_click(cx.listener(|v, _, window, cx| v.operation_action(Action::ResetPlan, window, cx))))
@@ -882,11 +882,11 @@ impl Desktop {
         let controls = &self.operations.controls[&key];
         let enabled = !self.engine.operation_busy && !self.operations.rebase_submitted;
         let color = if entry.error.is_some() || entry.action == CommitAction::Drop {
-            REMOVED
+            palette().removed
         } else if entry.action == CommitAction::Pick {
-            MUTED
+            palette().muted
         } else {
-            ACCENT
+            palette().accent
         };
         let detail = if let Some(error) = entry.error {
             error.to_string()
@@ -916,7 +916,7 @@ impl Desktop {
                     div()
                         .font_family("Cascadia Mono")
                         .text_size(px(12.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette().muted))
                         .child(entry.id[..8.min(entry.id.len())].to_string()),
                 )
                 .child(
@@ -924,9 +924,9 @@ impl Desktop {
                         .flex_1()
                         .truncate()
                         .text_color(rgb(if entry.action == CommitAction::Drop {
-                            MUTED
+                            palette().muted
                         } else {
-                            TEXT
+                            palette().text
                         }))
                         .when(entry.action == CommitAction::Drop, |s| s.line_through())
                         .child(entry.subject.clone()),
@@ -945,15 +945,15 @@ impl Desktop {
                         ),
                     )
                     .when(entry.error.is_some(), |r| {
-                        r.child(div().text_color(rgb(REMOVED)).child("Required"))
+                        r.child(div().text_color(rgb(palette().removed)).child("Required"))
                     }),
             );
         } else {
             body = body.child(caption(detail).truncate().text_color(rgb(
                 if entry.error.is_some() {
-                    REMOVED
+                    palette().removed
                 } else {
-                    MUTED
+                    palette().muted
                 },
             )));
         }
@@ -965,11 +965,11 @@ impl Desktop {
             .px_4()
             .gap_4()
             .border_b_1()
-            .border_color(rgb(INSPECTOR_LINE))
+            .border_color(rgb(palette().inspector_line))
             .bg(rgb(if entry.error.is_some() {
-                REMOVED_BG
+                palette().removed_bg
             } else {
-                PANEL
+                palette().panel
             }))
             .child(
                 div()
@@ -985,7 +985,7 @@ impl Desktop {
                     .w(px(24.))
                     .flex_shrink_0()
                     .text_size(px(12.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette().muted))
                     .child(format!("{:02}", i + 1)),
             )
             .child(
@@ -1152,9 +1152,11 @@ impl Desktop {
                     body = body.child(caption("Checking the remote branch… You can close this dialog while the check runs."));
                 } else if let Some(push) = &op.push {
                     let (color, label) = match push.risk {
-                        PushRisk::Trivial => (ADDED, "Ready for a normal push"),
-                        PushRisk::Rewrite => (0xe5a04b, "History rewrite · lease protected"),
-                        PushRisk::Blocked => (REMOVED, "Remote changed · push blocked"),
+                        PushRisk::Trivial => (palette().added, "Ready for a normal push"),
+                        PushRisk::Rewrite => {
+                            (palette().warning, "History rewrite · lease protected")
+                        }
+                        PushRisk::Blocked => (palette().removed, "Remote changed · push blocked"),
                     };
                     body = body
                         .child(
@@ -1171,15 +1173,23 @@ impl Desktop {
                                 )
                                 .child(div().text_color(rgb(color)).child(label)),
                         )
-                        .child(column().p_3().gap_2().bg(rgb(CONTROL)).rounded_md().child(
-                            format!("{}  →  {}/{}", push.local_branch, push.remote, push.branch),
-                        ));
+                        .child(
+                            column()
+                                .p_3()
+                                .gap_2()
+                                .bg(rgb(palette().control))
+                                .rounded_md()
+                                .child(format!(
+                                    "{}  →  {}/{}",
+                                    push.local_branch, push.remote, push.branch
+                                )),
+                        );
                     if push.risk != PushRisk::Trivial {
                         body = body.child(push.explanation.clone());
                     }
                     body = body.child(caption("clears undo history"));
                 } else {
-                    body = body.child(row().child(icon("shield-alert").size(px(32.)).text_color(rgb(REMOVED))).child("Could not verify this push"))
+                    body = body.child(row().child(icon("shield-alert").size(px(32.)).text_color(rgb(palette().removed))).child("Could not verify this push"))
                         .child(self.engine.operation_status.clone()).child(caption("No push was sent. Check your remote and authentication, then try again."));
                 }
             } else {
@@ -1245,8 +1255,8 @@ impl Desktop {
                             .p_3()
                             .gap_2()
                             .rounded_md()
-                            .bg(rgb(CONTROL))
-                            .child(caption("SELECTED TARGET"))
+                            .bg(rgb(palette().control))
+                            .child(caption("palette().selected TARGET"))
                             .child(op.label.clone())
                             .child(caption("CURRENT BRANCH"))
                             .child(op.current_branch.clone()),
@@ -1254,7 +1264,11 @@ impl Desktop {
                 }
             }
             if let Some(error) = &op.dialog_error {
-                body = body.child(div().text_color(rgb(REMOVED)).child(error.clone()));
+                body = body.child(
+                    div()
+                        .text_color(rgb(palette().removed))
+                        .child(error.clone()),
+                );
             }
             let enabled = !self.engine.operation_busy
                 && !self.engine.app.pending.busy
@@ -1279,8 +1293,16 @@ impl Desktop {
                             .px_4()
                             .py_2()
                             .rounded_md()
-                            .bg(rgb(if enabled { ACCENT } else { CONTROL }))
-                            .text_color(rgb(if enabled { BG } else { MUTED }))
+                            .bg(rgb(if enabled {
+                                palette().accent
+                            } else {
+                                palette().control
+                            }))
+                            .text_color(rgb(if enabled {
+                                palette().bg
+                            } else {
+                                palette().muted
+                            }))
                             .child(submit)
                             .when(enabled, |s| {
                                 s.cursor_pointer()
@@ -1313,9 +1335,9 @@ impl Desktop {
                             .p_6()
                             .gap_4()
                             .rounded_lg()
-                            .bg(rgb(PANEL))
+                            .bg(rgb(palette().panel))
                             .border_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(palette().line))
                             .child(div().text_size(px(20.)).child("Review Git operation"))
                             .child(
                                 div()

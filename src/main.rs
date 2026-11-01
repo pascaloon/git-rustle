@@ -22,6 +22,7 @@ mod settings;
 mod term;
 mod ui;
 
+mod appearance;
 mod desktop;
 mod desktop_details;
 mod desktop_icons;

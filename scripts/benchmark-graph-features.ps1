@@ -3,6 +3,7 @@ param(
     [string[]]$Scenarios=@('graph-multiselect','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','multi-details','pending-graph','stash-preview','stash-file','stash-pop','dense-labels','checkout-simple','detached-commit','diff-base','diff-base-choose','graph-polish','graph-polish-detached','graph-commit-menu','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-commit-menu-edge','graph-branch-menu-edge','cherry-pick-one','cherry-pick-many','cherry-pick-review'),
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
+    [switch]$LightTheme,
     [switch]$DisableDirectComposition,
     [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
     [string]$IdleWorkspaceRoot="$PSScriptRoot/..",
@@ -67,6 +68,8 @@ try{
             $directory=Join-Path $OutputDirectory "$scenario-$sample";New-Item -ItemType Directory -Path $directory|Out-Null
             $fixture=Join-Path $directory 'repository';New-Item -ItemType Directory -Path $fixture|Out-Null
             $env:LOCALAPPDATA=Join-Path $directory 'app-data';$env:APPDATA=$env:LOCALAPPDATA;New-Item -ItemType Directory -Path $env:LOCALAPPDATA|Out-Null
+            $appearanceDir=Join-Path $env:LOCALAPPDATA 'git-rustle';New-Item -ItemType Directory -Path $appearanceDir -Force|Out-Null
+            @{light_theme=[bool]$LightTheme}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
             Graph-Git $fixture @('init','-b','main')|Out-Null
             foreach($config in @(@('user.name','Graph Fixture'),@('user.email','graph@example.test'),@('commit.gpgSign','false'),@('core.hooksPath','disabled-fixture-hooks'),@('core.autocrlf','false'))){Graph-Git $fixture @('config',$config[0],$config[1])|Out-Null}
             if($scenario-eq'graph-selection-boundary'){New-SelectionBoundaryFixture $fixture}else{

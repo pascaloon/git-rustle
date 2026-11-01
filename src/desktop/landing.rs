@@ -97,8 +97,8 @@ impl Desktop {
         column()
             .size_full()
             .items_center()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(palette().bg))
+            .text_color(rgb(palette().text))
             .text_size(px(14.))
             .p_6()
             .child(
@@ -132,7 +132,7 @@ impl Desktop {
                         ),
                     )
                     .when_some(error, |s, error| {
-                        s.child(div().text_color(rgb(REMOVED)).child(error))
+                        s.child(div().text_color(rgb(palette().removed)).child(error))
                     })
                     .when(!self.notice.is_empty(), |s| {
                         s.child(caption(self.notice.clone()))
@@ -144,7 +144,7 @@ impl Desktop {
                     .when(!self.engine.recents_error.is_empty(), |s| {
                         s.child(
                             div()
-                                .text_color(rgb(REMOVED))
+                                .text_color(rgb(palette().removed))
                                 .child(self.engine.recents_error.clone()),
                         )
                     })
@@ -177,8 +177,8 @@ impl Desktop {
                                             .px_3()
                                             .rounded_md()
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(HOVER)))
-                                            .child(icon("folder").text_color(rgb(ACCENT)))
+                                            .hover(|s| s.bg(rgb(palette().hover)))
+                                            .child(icon("folder").text_color(rgb(palette().accent)))
                                             .child(
                                                 column()
                                                     .flex_1()

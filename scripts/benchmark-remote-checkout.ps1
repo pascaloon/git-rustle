@@ -3,6 +3,8 @@ param(
     [string]$Baseline,
     [int]$Samples=15,
     [switch]$Screenshots,
+    [switch]$LightTheme,
+    [ValidateSet('1440x900','900x600')][string]$WindowSize='1440x900',
     [switch]$Functional,
     [Parameter(Mandatory)][string]$OutputDirectory
 )
@@ -14,7 +16,7 @@ if($Baseline){$Baseline=(Resolve-Path $Baseline).Path}
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 if(Test-Path $OutputDirectory){throw 'Use a fresh output directory'}
 New-Item -ItemType Directory $OutputDirectory|Out-Null
-$names=@('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_GHOST_CHECKOUT_SOURCE','GIT_RUSTLE_GHOST_CHECKOUT_BRANCH','GIT_RUSTLE_GHOST_CHECKOUT_SHA')
+$names=@('LOCALAPPDATA','APPDATA','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_TERMINAL_PROMPT','GIT_RUSTLE_TIMING','GIT_RUSTLE_TRACE','GIT_RUSTLE_AUTOQUIT','GIT_RUSTLE_SCENARIO','GIT_RUSTLE_DUMP','GIT_RUSTLE_GHOST_CHECKOUT_SOURCE','GIT_RUSTLE_GHOST_CHECKOUT_BRANCH','GIT_RUSTLE_GHOST_CHECKOUT_SHA','GIT_RUSTLE_BENCH_WINDOW')
 $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $results=[Collections.Generic.List[object]]::new()
 function FixtureGit([string]$Root,[string[]]$Arguments){
@@ -30,6 +32,7 @@ function ReadLiveLog([string]$Path){
 try{
     $env:GIT_CONFIG_GLOBAL='NUL';$env:GIT_CONFIG_NOSYSTEM='1';$env:GIT_TERMINAL_PROMPT='0'
     $env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_TRACE='1'
+    $env:GIT_RUSTLE_BENCH_WINDOW=$WindowSize
     $cases=if($Screenshots){@('menu')}else{@('existing','new','detached')}
     foreach($case in $cases){
         $iterations=if($Screenshots){@(0)}else{@(-1..($Samples-1))}
@@ -66,6 +69,8 @@ try{
                 [IO.File]::WriteAllText((Join-Path $repo '.git/git-rustle-ghost-checkout-fixture'),'disposable ghost checkout fixture')
                 $env:LOCALAPPDATA=Join-Path $dir 'appdata';$env:APPDATA=Join-Path $dir 'roaming'
                 New-Item -ItemType Directory $env:LOCALAPPDATA,$env:APPDATA|Out-Null
+                $appearanceDir=Join-Path $env:LOCALAPPDATA 'git-rustle';New-Item -ItemType Directory -Path $appearanceDir -Force|Out-Null
+                @{light_theme=[bool]$LightTheme}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
                 $env:GIT_RUSTLE_GHOST_CHECKOUT_SOURCE=$source;$env:GIT_RUSTLE_GHOST_CHECKOUT_BRANCH='topic';$env:GIT_RUSTLE_GHOST_CHECKOUT_SHA=$tip
                 $env:GIT_RUSTLE_SCENARIO="ghost-checkout-$case";$env:GIT_RUSTLE_AUTOQUIT=if($Screenshots){'600000'}else{'100'}
                 $env:GIT_RUSTLE_DUMP=Join-Path $dir 'state.txt'

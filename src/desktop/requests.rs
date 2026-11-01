@@ -575,7 +575,7 @@ pub(super) fn avatar(image: Option<&Arc<Image>>, name: &str, size: f32) -> Div {
         .flex_shrink_0()
         .rounded_full()
         .overflow_hidden()
-        .bg(rgb(CONTROL));
+        .bg(rgb(palette().control));
     if let Some(image) = image {
         frame.child(
             img(image.clone())
@@ -588,7 +588,7 @@ pub(super) fn avatar(image: Option<&Arc<Image>>, name: &str, size: f32) -> Div {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgb(ACCENT_HOVER))
+            .text_color(rgb(palette().accent_hover))
             .text_size(px(size * 0.43))
             .child(
                 name.chars()
@@ -1535,7 +1535,7 @@ impl Desktop {
             .children(people.iter().enumerate().map(|(i, p)| {
                 row()
                     .rounded_md()
-                    .bg(rgb(CONTROL))
+                    .bg(rgb(palette().control))
                     .px_2()
                     .py_1()
                     .child(avatar(None, &p.name, 24.))
@@ -1663,8 +1663,8 @@ impl Desktop {
                     .p_4()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(PANEL))
+                    .border_color(rgb(palette().line))
+                    .bg(rgb(palette().panel))
                     .child(
                         TextView::markdown("request-markdown", c.body.read(cx).value(), window, cx)
                             .w_full()
@@ -1682,10 +1682,10 @@ impl Desktop {
                     .child(caption("Share your changes and bring your team into the review.")))
                 .child(Button::new("close-request").ghost().label("Close tab").disabled(c.sending)
                     .on_click(cx.listener(|v, _, _, cx| { v.composer = None; cx.notify(); }))))
-            .child(row().child(icon("branch").text_color(rgb(ACCENT))).child(remote_select))
+            .child(row().child(icon("branch").text_color(rgb(palette().accent))).child(remote_select))
             .child(row().items_start().gap_4()
                 .child(column().flex_1().min_w_0().gap_2().child(caption("Source branch")).child(div().relative().w_full().child(Select::new(&c.source).w_full().placeholder("Search source branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("source"))))
-                .child(div().pt_6().text_color(rgb(ACCENT)).child("→"))
+                .child(div().pt_6().text_color(rgb(palette().accent)).child("→"))
                 .child(column().flex_1().min_w_0().gap_2().child(caption("Target branch")).child(div().relative().w_full().child(Select::new(&c.target).w_full().placeholder("Search target branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("target")))))
             .child(row().justify_between()
                 .child(caption("Closest base first. Changing the source selects the first target."))
@@ -1695,7 +1695,7 @@ impl Desktop {
             .child(caption("Local and fetched branches for this project. Push the source before creating a request."))
             .when(c.branches_loading, |s| s.child(caption("Finding branch bases…")))
             .when(c.branch_choices.incomplete, |s| s.child(caption("Some history is unavailable. Fetch more history to improve target ordering.")))
-            .child(div().h(px(1.)).bg(rgb(LINE)))
+            .child(div().h(px(1.)).bg(rgb(palette().line)))
             .child(row().items_start().gap_6().child(editor).child(column().w(px(260.)).flex_shrink_0().gap_5()
                 .child(self.people_field(false, cx)).child(self.people_field(true, cx))
                 .child(caption("Suggestions include project members. Search by name or @username. Up to 10 per field."))))
@@ -1756,15 +1756,15 @@ impl Desktop {
                     .px_6()
                     .items_center()
                     .border_t_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(PANEL))
+                    .border_color(rgb(palette().line))
+                    .bg(rgb(palette().panel))
                     .when(!c.error.is_empty(), |s| {
                         s.child(
                             div()
                                 .w_full()
                                 .max_w(px(1080.))
                                 .pt_3()
-                                .text_color(rgb(REMOVED))
+                                .text_color(rgb(palette().removed))
                                 .child(c.error.clone()),
                         )
                     })
@@ -1791,7 +1791,7 @@ impl Desktop {
                                 .child(
                                     div()
                                         .flex_1()
-                                        .text_color(rgb(ADDED))
+                                        .text_color(rgb(palette().added))
                                         .child(format!("Created {label} #{}", created.number)),
                                 )
                                 .child(

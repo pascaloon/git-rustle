@@ -22,9 +22,9 @@ impl Desktop {
             .w(px(440.))
             .p_4()
             .gap_3()
-            .bg(rgb(PANEL))
+            .bg(rgb(palette().panel))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .rounded_lg()
             .shadow_lg()
             .occlude()
@@ -32,7 +32,7 @@ impl Desktop {
             .child(
                 row()
                     .gap_3()
-                    .child(icon("history").text_color(rgb(ACCENT)))
+                    .child(icon("history").text_color(rgb(palette().accent)))
                     .child(div().flex_1().text_size(px(16.)).child("Undo history"))
                     .child(caption(format!(
                         "{count} {}",
@@ -101,7 +101,7 @@ impl Desktop {
                     .gap_2()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(CONTROL))
+                    .bg(rgb(palette().control))
                     .child(
                         div()
                             .text_size(px(14.))
@@ -139,7 +139,11 @@ impl Desktop {
                     .items_center()
                     .justify_center()
                     .gap_2()
-                    .child(icon("history").size(px(24.)).text_color(rgb(MUTED)))
+                    .child(
+                        icon("history")
+                            .size(px(24.))
+                            .text_color(rgb(palette().muted)),
+                    )
                     .child(div().text_size(px(14.)).child("No undo history"))
                     .child(caption("New actions will appear here.")),
             );
@@ -198,8 +202,14 @@ impl Desktop {
             .pr(px(28.))
             .gap_3()
             .rounded_md()
-            .bg(rgb(if current { SELECTED } else { PANEL }))
-            .when(enabled, |r| r.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
+            .bg(rgb(if current {
+                palette().selected
+            } else {
+                palette().panel
+            }))
+            .when(enabled, |r| {
+                r.cursor_pointer().hover(|s| s.bg(rgb(palette().hover)))
+            })
             .child(
                 div()
                     .w(px(14.))
@@ -217,7 +227,7 @@ impl Desktop {
                                 .left(px(6.))
                                 .w(px(1.))
                                 .h(px(16.))
-                                .bg(rgb(LINE)),
+                                .bg(rgb(palette().line)),
                         )
                     })
                     .when(position > 0, |r| {
@@ -228,14 +238,18 @@ impl Desktop {
                                 .left(px(6.))
                                 .w(px(1.))
                                 .h(px(16.))
-                                .bg(rgb(LINE)),
+                                .bg(rgb(palette().line)),
                         )
                     })
                     .child(
                         div()
                             .size(px(if current { 8. } else { 6. }))
                             .rounded_full()
-                            .bg(rgb(if current { ACCENT } else { MUTED })),
+                            .bg(rgb(if current {
+                                palette().accent
+                            } else {
+                                palette().muted
+                            })),
                     ),
             )
             .child(
@@ -243,14 +257,18 @@ impl Desktop {
                     .flex_1()
                     .truncate()
                     .text_size(px(13.))
-                    .text_color(rgb(if future { MUTED } else { TEXT }))
+                    .text_color(rgb(if future {
+                        palette().muted
+                    } else {
+                        palette().text
+                    }))
                     .child(label.to_string()),
             )
             .when(current, |r| {
                 r.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(ACCENT))
+                        .text_color(rgb(palette().accent))
                         .child("Current"),
                 )
             })

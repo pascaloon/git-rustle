@@ -740,7 +740,7 @@ impl Desktop {
             .on_click(cx.listener(|v, _, w, cx| v.ai_action(Action::Save, w, cx)));
         let mut form = column().w_full().gap_3()
             .child(row().gap_3().child(caption("Global AI settings · shared by all repositories").flex_1()).child(save))
-            .child(div().text_size(px(12.)).text_color(rgb(if self.ai.error { REMOVED } else { MUTED })).child(self.ai.status.clone()))
+            .child(div().text_size(px(12.)).text_color(rgb(if self.ai.error { palette().removed } else { palette().muted })).child(self.ai.status.clone()))
             .child(caption("Provider"))
             .child(row().gap_2().children([Provider::Codex, Provider::Claude].into_iter().enumerate().map(|(i, provider)| {
                 Button::new(("ai-provider", i)).small().label(provider.label()).selected(self.ai.provider == provider).disabled(disabled)
@@ -758,7 +758,7 @@ impl Desktop {
                     .w_full()
                     .flex_shrink_0()
                     .border_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette().line))
                     .rounded_md()
                     .overflow_hidden()
                     .child(
@@ -767,10 +767,10 @@ impl Desktop {
                             .w_full()
                             .p_3()
                             .cursor_pointer()
-                            .bg(rgb(CONTROL))
+                            .bg(rgb(palette().control))
                             .gap_2()
                             .child(icon(if expanded { "down" } else { "right" }))
-                            .child(icon("sparkles").text_color(rgb(ACCENT)))
+                            .child(icon("sparkles").text_color(rgb(palette().accent)))
                             .child(task.label())
                             .on_click(cx.listener(move |v, _, w, cx| {
                                 v.ai_action(Action::Toggle(i), w, cx)
@@ -812,13 +812,13 @@ impl Desktop {
                         .p_5()
                         .gap_3()
                         .rounded_lg()
-                        .bg(rgb(PANEL))
+                        .bg(rgb(palette().panel))
                         .border_1()
-                        .border_color(rgb(LINE))
+                        .border_color(rgb(palette().line))
                         .child(
                             row()
                                 .gap_2()
-                                .child(icon("sparkles").text_color(rgb(ACCENT)))
+                                .child(icon("sparkles").text_color(rgb(palette().accent)))
                                 .child(self.ai.result_title.clone())
                                 .child(div().flex_1())
                                 .child(

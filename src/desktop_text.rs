@@ -80,8 +80,8 @@ impl Matches {
 }
 fn search_style() -> HighlightStyle {
     HighlightStyle {
-        color: Some(rgb(desktop_theme::SEARCH_TEXT).into()),
-        background_color: Some(rgba(desktop_theme::SEARCH_BG).into()),
+        color: Some(rgb(desktop_theme::palette().search_text).into()),
+        background_color: Some(rgba(desktop_theme::palette().search_bg).into()),
         ..Default::default()
     }
 }
@@ -206,7 +206,7 @@ impl TextBlock {
             (
                 r,
                 HighlightStyle {
-                    background_color: Some(rgba(desktop_theme::SELECTION).into()),
+                    background_color: Some(rgba(desktop_theme::palette().selection).into()),
                     ..Default::default()
                 },
             )
@@ -233,11 +233,11 @@ impl TextBlock {
                 .mt_2()
                 .pt_2()
                 .border_t_1()
-                .border_color(rgb(desktop_theme::INSPECTOR_LINE))
+                .border_color(rgb(desktop_theme::palette().inspector_line))
                 .text_size(px(10.))
                 .line_height(px(18.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(desktop_theme::INSPECTOR_MUTED)),
+                .text_color(rgb(desktop_theme::palette().inspector_muted)),
             TextRole::Value => content
                 .text_size(px(13.))
                 .line_height(px(21.))
@@ -245,7 +245,7 @@ impl TextBlock {
             TextRole::Muted => content
                 .text_size(px(12.))
                 .line_height(px(19.))
-                .text_color(rgb(desktop_theme::INSPECTOR_MUTED)),
+                .text_color(rgb(desktop_theme::palette().inspector_muted)),
         };
         content
             .on_mouse_down(

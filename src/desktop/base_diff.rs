@@ -233,13 +233,13 @@ impl Desktop {
                             .px_3()
                             .gap_2()
                             .bg(rgb(if v.base_diff.choice == Some(index) {
-                                SELECTED
+                                palette().selected
                             } else {
-                                BG
+                                palette().bg
                             }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .child(icon("branch").text_color(rgb(MUTED)))
+                            .hover(|s| s.bg(rgb(palette().hover)))
+                            .child(icon("branch").text_color(rgb(palette().muted)))
                             .child(
                                 div()
                                     .flex_1()

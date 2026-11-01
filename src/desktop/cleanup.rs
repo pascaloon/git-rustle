@@ -254,22 +254,22 @@ impl Desktop {
             Section::FetchedOnly => (
                 "Fetched only",
                 "Fetched references without a local branch",
-                0x38975c,
+                palette().success,
             ),
             Section::Matching => (
                 "Matching copies",
                 "Local branches whose latest commit matches the server",
-                0x90a83d,
+                palette().caution,
             ),
             Section::OldLocal => (
                 "Old local branches",
                 "Last commit at least 1 year ago · may contain unique work",
-                0xcf4949,
+                palette().danger,
             ),
             Section::MissingServer => (
                 "Missing on server",
                 "Server branch no longer exists · this fetched reference may be the last copy",
-                0xcf4949,
+                palette().danger,
             ),
         };
         let list = uniform_list(
@@ -337,14 +337,14 @@ impl Desktop {
                                                         .absolute()
                                                         .inset_0()
                                                         .rounded_sm()
-                                                        .bg(rgb(ACCENT))
-                                                        .text_color(rgb(BG))
+                                                        .bg(rgb(palette().accent))
+                                                        .text_color(rgb(palette().on_accent))
                                                         .text_center()
                                                         .child("−"),
                                                 )
                                             }),
                                     )
-                                    .child(icon("folder").text_color(rgb(MUTED)))
+                                    .child(icon("folder").text_color(rgb(palette().muted)))
                                     .child(div().flex_1().min_w_0().truncate().child(label))
                                     .child(caption(format!("{checked}/{total}")).flex_shrink_0())
                                     .into_any_element()
@@ -382,7 +382,7 @@ impl Desktop {
                                         } else {
                                             "branch"
                                         })
-                                        .text_color(rgb(MUTED)),
+                                        .text_color(rgb(palette().muted)),
                                     )
                                     .child(div().flex_1().min_w_0().truncate().child(label))
                                     .when(entry.protected, |r| r.child(caption("Protected")))
@@ -391,7 +391,7 @@ impl Desktop {
                                             .w(px(125.))
                                             .flex_shrink_0()
                                             .truncate()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(palette().muted))
                                             .child(entry.author.clone()),
                                     )
                                     .child(div().w(px(90.)).flex_shrink_0().text_right().child(
@@ -424,7 +424,7 @@ impl Desktop {
             .flex_shrink_0()
             .min_h_0()
             .border_t_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette().line))
             .child(
                 row()
                     .h(px(28.))
@@ -523,12 +523,12 @@ impl Desktop {
             .child(self.cleanup_section(Section::OldLocal, cx))
             .child(self.cleanup_section(Section::MissingServer, cx))
             .when(self.cleanup.collapsed_sections.len() == 4, |s| s.child(div().flex_1().min_h_0()))
-            .child(row().relative().children(self.branch_cleanup_probe(15)).h(px(30.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(LINE))
+            .child(row().relative().children(self.branch_cleanup_probe(15)).h(px(30.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(palette().line))
                 .child(Checkbox::new("cleanup-remove-tags").checked(self.cleanup.remove_tags)
                     .label("Remove local tags unique to selected branches")
                     .disabled(busy)
                     .on_click(cx.listener(|v, checked: &bool, w, cx| v.cleanup_action(Action::RemoveTags(*checked), w, cx)))))
-            .child(row().relative().children(self.branch_cleanup_probe(9)).h(px(40.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(LINE))
+            .child(row().relative().children(self.branch_cleanup_probe(9)).h(px(40.)).flex_shrink_0().px_4().gap_2().border_t_1().border_color(rgb(palette().line))
                 .child(div().flex_1())
                 .child(Button::new("cleanup-review").small().primary().label(format!("Review selected ({})…", self.cleanup.selected.len())).disabled(busy || self.cleanup.selected.is_empty())
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Review, w, cx)))))

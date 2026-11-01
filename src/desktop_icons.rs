@@ -52,7 +52,7 @@ impl AssetSource for Assets {
             "refresh" => "<path d='M20 8a8 8 0 1 0 0 8M20 3v5h-5'/>",
             "spinner" => "<path d='M12 3a9 9 0 1 1-9 9'/>",
             "settings" => {
-                "<path d='m10 3 4 0 1 3 3 1 3 3-2 3 0 3-3 3-3-1-3 1-3-3 0-3-2-3 3-3 3-1z'/><circle cx='12' cy='12' r='3'/>"
+                "<path d='M10.186 4.723L10.436 2.123L13.564 2.123L13.814 4.723L15.863 5.571L17.878 3.91L20.09 6.122L18.429 8.137L19.277 10.186L21.877 10.436L21.877 13.564L19.277 13.814L18.429 15.863L20.09 17.878L17.878 20.09L15.863 18.429L13.814 19.277L13.564 21.877L10.436 21.877L10.186 19.277L8.137 18.429L6.122 20.09L3.91 17.878L5.571 15.863L4.723 13.814L2.123 13.564L2.123 10.436L4.723 10.186L5.571 8.137L3.91 6.122L6.122 3.91L8.137 5.571Z'/><circle cx='12' cy='12' r='3'/>"
             }
             "back" => "<path d='m15 5-7 7 7 7'/>",
             "next" | "right" => "<path d='m9 5 7 7-7 7'/>",
@@ -94,5 +94,5 @@ pub fn icon(name: &str) -> gpui::Svg {
         .path(format!("rustle/{name}"))
         .size(px(16.))
         .flex_shrink_0()
-        .text_color(rgb(crate::desktop_theme::TEXT))
+        .text_color(rgb(crate::desktop_theme::palette().text))
 }

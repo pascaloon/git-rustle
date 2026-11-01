@@ -8,6 +8,7 @@ param(
     [ValidateSet('branches-hierarchy','cleanup-review','cleanup-delete')][string[]]$Scenarios=@('branches-hierarchy','cleanup-review','cleanup-delete'),
     [switch]$ReviewDialogCapture,
     [switch]$MinimumWindow,
+    [switch]$LightTheme,
     [switch]$CollapsedCapture,
     [ValidateSet('All','Cleanup')][string]$ComponentSet='All',
     [ValidateSet('Native','Components','Screenshots')][string[]]$Stages=@('Native','Components')
@@ -104,6 +105,7 @@ function Native([string]$Scenario,[int]$Sample,[string]$Directory,[bool]$Capture
     $working=Fixture (Join-Path $launch 'fixture');$before=Fingerprint $working
     $env:LOCALAPPDATA=Join-Path $launch 'app-data';$env:APPDATA=Join-Path $launch 'roaming';New-Item -ItemType Directory -Path $env:LOCALAPPDATA,$env:APPDATA|Out-Null
     New-Item -ItemType Directory -Path (Join-Path $env:LOCALAPPDATA 'git-rustle')|Out-Null
+    @{light_theme=[bool]$LightTheme}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'git-rustle/appearance.json')
     [IO.File]::WriteAllText((Join-Path $env:LOCALAPPDATA 'git-rustle/tools.json'),'{"scanned":true,"tools":[]}')
     if($Capture -and $MinimumWindow){$env:GIT_RUSTLE_BENCH_WINDOW='900x600'}else{Remove-Item Env:GIT_RUSTLE_BENCH_WINDOW -ErrorAction SilentlyContinue}
     $env:GIT_RUSTLE_TIMING='1';$env:GIT_RUSTLE_SCENARIO=$Scenario;$env:GIT_RUSTLE_AUTOQUIT=if($Capture){'60000'}else{'100'}
