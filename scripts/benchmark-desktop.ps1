@@ -10,11 +10,14 @@ param(
     [ValidateRange(0,200000)][int]$ExpectedSyntaxSpans = 0,
     [switch]$RejectCompetingBuilds,
     [switch]$LightTheme,
+    [ValidateSet('black','dark','light')][string]$Theme = 'black',
     [int]$Samples = 15,
     [string[]]$Scenarios = @('scroll','branches','diff','search','settings'),
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\desktop"
 )
 $ErrorActionPreference = 'Stop'
+if ($LightTheme) { $Theme = 'light' }
+$themeRequested = $PSBoundParameters.ContainsKey('Theme') -or $LightTheme
 . "$PSScriptRoot/benchmark-processes.ps1"
 . "$PSScriptRoot/benchmark-native-process.ps1"
 $Repository = (Resolve-Path -LiteralPath $Repository).Path
@@ -87,11 +90,12 @@ function New-DisposableFixture([string]$Scenario,[string]$Label,[int]$Sample) {
     } finally { foreach($name in $dates.Keys){ if($null-eq$dates[$name]){Remove-Item -LiteralPath ('Env:'+$name) -ErrorAction SilentlyContinue}else{[Environment]::SetEnvironmentVariable($name,$dates[$name],'Process')} } }
 }
 function Run-One([string]$scenario,[int]$sample,[string]$label,[string]$exe) {
-    if ($LightTheme -or $scenario -eq 'theme-toggle') {
+    if ($themeRequested -or $scenario -eq 'theme-toggle') {
         $env:LOCALAPPDATA = Join-Path $OutputDirectory "$label-$scenario-$sample-appdata"
         $appearanceDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
         New-Item -ItemType Directory -Path $appearanceDir -Force | Out-Null
-        @{light_theme=[bool]($LightTheme -and $scenario -ne 'theme-toggle')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
+        @{theme=$(if ($scenario -eq 'theme-toggle') { 'black' } else { $Theme });light_theme=($Theme -eq 'light' -and $scenario -ne 'theme-toggle')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
+        if ($scenario -eq 'theme-toggle') { [IO.File]::WriteAllText((Join-Path $appearanceDir 'appearance.fixture'),'disposable appearance scenario') }
     }
     if ($ToolsDiscoveryFixtureRoot) {
         $root = (Resolve-Path -LiteralPath $ToolsDiscoveryFixtureRoot).Path

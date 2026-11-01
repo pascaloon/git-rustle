@@ -748,7 +748,7 @@ impl Desktop {
             })))
             .child(caption("Install your CLI and sign in in a terminal. Git Rustle uses its existing authentication."))
             .child(caption("Model name"))
-            .child(div().relative().children(self.ai_probe(0)).child(Input::new(&self.ai.model).disabled(disabled)))
+            .child(div().relative().children(self.ai_probe(0)).child(themed_input(&self.ai.model).disabled(disabled)))
             .child(caption("Markdown prompts · additional context is supplied automatically"));
         for task in Task::ALL {
             let i = task.index();
@@ -779,7 +779,7 @@ impl Desktop {
                     .when(expanded, |s| {
                         s.child(
                             div().p_3().child(
-                                Input::new(&self.ai.prompts[i])
+                                themed_input(&self.ai.prompts[i])
                                     .h(px(180.))
                                     .disabled(disabled),
                             ),

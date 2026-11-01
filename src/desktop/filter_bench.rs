@@ -205,7 +205,7 @@ impl Desktop {
             if active {
                 palette().filter_active_bg
             } else {
-                palette().bg
+                palette().input_bg
             }
         );
         if matches!(phase, 4 | 5) {

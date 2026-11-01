@@ -4,11 +4,13 @@ param(
     [int]$Samples=15,
     [switch]$Screenshots,
     [switch]$LightTheme,
+    [ValidateSet('black','dark','light')][string]$Theme = 'black',
     [ValidateSet('1440x900','900x600')][string]$WindowSize='1440x900',
     [switch]$Functional,
     [Parameter(Mandatory)][string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
+if ($LightTheme) { $Theme = 'light' }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
 . "$PSScriptRoot/benchmark-processes.ps1"
 $Candidate=(Resolve-Path $Candidate).Path
@@ -70,7 +72,7 @@ try{
                 $env:LOCALAPPDATA=Join-Path $dir 'appdata';$env:APPDATA=Join-Path $dir 'roaming'
                 New-Item -ItemType Directory $env:LOCALAPPDATA,$env:APPDATA|Out-Null
                 $appearanceDir=Join-Path $env:LOCALAPPDATA 'git-rustle';New-Item -ItemType Directory -Path $appearanceDir -Force|Out-Null
-                @{light_theme=[bool]$LightTheme}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
+                @{theme=$Theme;light_theme=($Theme -eq 'light')}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
                 $env:GIT_RUSTLE_GHOST_CHECKOUT_SOURCE=$source;$env:GIT_RUSTLE_GHOST_CHECKOUT_BRANCH='topic';$env:GIT_RUSTLE_GHOST_CHECKOUT_SHA=$tip
                 $env:GIT_RUSTLE_SCENARIO="ghost-checkout-$case";$env:GIT_RUSTLE_AUTOQUIT=if($Screenshots){'600000'}else{'100'}
                 $env:GIT_RUSTLE_DUMP=Join-Path $dir 'state.txt'

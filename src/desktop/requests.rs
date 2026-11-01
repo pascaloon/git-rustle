@@ -6,7 +6,7 @@ use crate::remote::{
 };
 use gpui_component::{
     IndexPath,
-    select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
+    select::{SelectDelegate, SelectEvent, SelectItem, SelectState},
     text::TextView,
 };
 use std::{
@@ -1526,7 +1526,7 @@ impl Desktop {
             .gap_2()
             .child(caption(if reviewer { "Reviewers" } else { "Assignees" }))
             .child(
-                Select::new(if reviewer { &c.reviewers } else { &c.assignees })
+                themed_select(if reviewer { &c.reviewers } else { &c.assignees })
                     .placeholder("Add project member…")
                     .search_placeholder("Search name or username…")
                     .disabled(locked || c.loading || people.len() >= 10)
@@ -1627,7 +1627,7 @@ impl Desktop {
             .flex_1()
             .gap_3()
             .child(caption("Title"))
-            .child(Input::new(&c.title).disabled(locked))
+            .child(themed_input(&c.title).disabled(locked))
             .child(
                 row().justify_between().child(caption("Description")).child(
                     row()
@@ -1674,7 +1674,7 @@ impl Desktop {
                     ),
             )
         } else {
-            editor.child(Input::new(&c.body).h(px(300.)).disabled(locked))
+            editor.child(themed_input(&c.body).h(px(300.)).disabled(locked))
         };
         let form = column().gap_5().w_full().max_w(px(1080.))
             .child(row().justify_between()
@@ -1684,9 +1684,9 @@ impl Desktop {
                     .on_click(cx.listener(|v, _, _, cx| { v.composer = None; cx.notify(); }))))
             .child(row().child(icon("branch").text_color(rgb(palette().accent))).child(remote_select))
             .child(row().items_start().gap_4()
-                .child(column().flex_1().min_w_0().gap_2().child(caption("Source branch")).child(div().relative().w_full().child(Select::new(&c.source).w_full().placeholder("Search source branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("source"))))
+                .child(column().flex_1().min_w_0().gap_2().child(caption("Source branch")).child(div().relative().w_full().child(themed_select(&c.source).w_full().placeholder("Search source branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("source"))))
                 .child(div().pt_6().text_color(rgb(palette().accent)).child("→"))
-                .child(column().flex_1().min_w_0().gap_2().child(caption("Target branch")).child(div().relative().w_full().child(Select::new(&c.target).w_full().placeholder("Search target branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("target")))))
+                .child(column().flex_1().min_w_0().gap_2().child(caption("Target branch")).child(div().relative().w_full().child(themed_select(&c.target).w_full().placeholder("Search target branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("target")))))
             .child(row().justify_between()
                 .child(caption("Closest base first. Changing the source selects the first target."))
                 .child(Button::new("refresh-request-branches").ghost().small().label("Refresh branches")

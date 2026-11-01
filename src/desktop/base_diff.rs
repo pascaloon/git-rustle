@@ -273,7 +273,9 @@ impl Desktop {
                             div()
                                 .relative()
                                 .children(self.graph_feature_probe(0, 14))
-                                .child(Input::new(self.base_diff.input.as_ref().unwrap()).small()),
+                                .child(
+                                    themed_input(self.base_diff.input.as_ref().unwrap()).small(),
+                                ),
                         )
                         .child(caption(format!(
                             "{} matching branches",

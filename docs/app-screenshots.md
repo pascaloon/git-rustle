@@ -2,17 +2,24 @@
 
 ## Appearance coverage
 
-`Settings → General → Light theme` switches the entire native UI immediately and
-saves the preference globally in `git-rustle/appearance.json` under LOCALAPPDATA.
-Dark remains the default for existing installations. Appearance writes run on the
-background executor; a failed save restores the preceding theme and shows an
-error beside the switch.
+`Settings → General → Appearance` offers **Black**, **Dark** and **Light** in a
+segmented control. Black is the default and retains the original pure-black
+palette; Dark uses charcoal surfaces inspired by VS Code, orange accents and
+darker inset input fields.
+Switching updates the entire native UI immediately and saves the preference
+globally in `git-rustle/appearance.json` under LOCALAPPDATA. Existing `light_theme`
+preferences migrate to Black or Light without changing the saved choice.
+Appearance writes run on the background executor; a failed save restores the
+preceding theme and shows an
+error below the segments.
 
-Run the complete light-theme view matrix at normal and minimum window sizes:
+Run the complete view matrix at normal and minimum window sizes for each palette
+(the existing runner name is retained for compatibility):
 
 ```powershell
 .\scripts\validate-light-theme.ps1 -Candidate .\target\release\git-rustle.exe `
-  -OutputDirectory .\target\bench\light-theme-visuals
+  -Theme dark -OutputDirectory .\target\bench\dark-theme-visuals
+# Repeat with -Theme black and -Theme light in separate output directories.
 ```
 
 The matrix includes the welcome screen, graph and commit inspector, pending and
@@ -25,21 +32,28 @@ continue. Inspect every generated PNG; a successful scenario is not visual revie
 Scrollable views may show only the current viewport. Remote/provider fixtures are
 local and do not establish live service behavior.
 
-For a focused capture, add `-LightTheme` to `screenshot-app.ps1`. The
-`theme-toggle` scenario always starts dark and invokes the real switch action
-three times (light, dark, light), awaiting persistence and native paint and
-asserting the Appearance card's bounds. It finishes in light mode. Captures use
+For a focused capture, add `-Theme black`, `-Theme dark` or `-Theme light` to
+`screenshot-app.ps1`; the old `-LightTheme` flag remains an alias for Light. The
+`theme-toggle` scenario always starts Black and invokes the real segment actions
+through all six directed theme transitions, awaiting persistence and native paint.
+It asserts palette/component mode, the selected segment and non-overlapping
+segment bounds inside the Appearance card. It then injects a failed save in
+marked disposable settings, checks rollback and error state, removes the failure
+and retries successfully. It finishes in Dark. Captures use
 isolated application data and never alter the user's saved appearance. The
 welcome fixture uses an owned temporary directory outside this checkout because
 Git discovers repositories in parent directories, then removes that directory.
 
 Keep capture runs separate from `benchmark-desktop.ps1 -Scenarios theme-toggle
--Samples 15` timing runs. The trace records three action-to-paint-and-persistence
-durations per launch. Shared startup, normal/searched scrolling, diff scrolling
+-Samples 15` timing runs. The trace records action-to-paint-and-persistence
+durations for the six successful transitions per launch; failure/retry checks are
+excluded from those durations. Shared startup, normal/searched scrolling, diff scrolling
 and General tab frames should also be compared against a preserved baseline.
-`benchmark.ps1 -LightTheme` requires `-IsolatedCacheRoot`; it keeps the baseline
-dark and seeds the candidate's light preference. Desktop, graph, remote-checkout
-and branch-cleanup runners also accept `-LightTheme` for their isolated fixtures.
+`benchmark.ps1 -Theme <choice>` requires `-IsolatedCacheRoot` for non-default
+themes. It seeds both binaries with the requested theme and a legacy Light flag;
+the previous two-theme baseline uses Black when comparing the new Dark palette.
+Desktop, graph, remote-checkout and branch-cleanup runners also accept `-Theme`
+for their isolated fixtures. Screenshots must remain separate from timing runs.
 
 Agents should inspect actual screenshots when changing visual UI. The runner
 captures Git Rustle's client area on a private, non-current Windows desktop. It

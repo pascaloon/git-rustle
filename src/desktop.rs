@@ -77,12 +77,11 @@ pub fn run(mut engine: Engine) {
         gpui_component::init(cx);
         crate::desktop_text::init(cx);
         engine.mark("GPUI components ready");
-        crate::desktop_theme::apply(appearance.light_theme, cx);
-        engine.mark(if appearance.light_theme {
-            "appearance light"
-        } else {
-            "appearance dark"
-        });
+        crate::desktop_theme::apply(appearance.theme, cx);
+        engine.mark(format!(
+            "appearance {}",
+            appearance.theme.label().to_lowercase()
+        ));
         // Opt-in native layout coverage; ordinary launches retain their size.
         let minimum_cleanup_bench =
             std::env::var("GIT_RUSTLE_BENCH_WINDOW").is_ok_and(|value| value == "900x600");
@@ -206,7 +205,7 @@ enum Action {
     ForgetToken,
     ClearImages,
     CheckUpdates,
-    LightTheme(bool),
+    AppearanceTheme(crate::appearance::ThemeChoice),
 }
 
 struct Desktop {
@@ -311,6 +310,21 @@ fn caption(s: impl Into<SharedString>) -> Div {
         .child(s.into())
 }
 
+// Inputs use an inset surface in Dark; retain component defaults in other themes.
+fn themed_input(state: &Entity<InputState>) -> Input {
+    Input::new(state).when(palette().input_bg != palette().bg, |input| {
+        input.bg(rgb(palette().input_bg))
+    })
+}
+
+fn themed_select<D: gpui_component::select::SelectDelegate + 'static>(
+    state: &Entity<gpui_component::select::SelectState<D>>,
+) -> gpui_component::select::Select<D> {
+    gpui_component::select::Select::new(state).when(palette().input_bg != palette().bg, |select| {
+        select.bg(rgb(palette().input_bg))
+    })
+}
+
 // Checkout and Git operation dialogs share one shell and action alignment.
 fn dialog_body(title: &'static str) -> Div {
     column()
@@ -392,7 +406,7 @@ impl RenderOnce for ToolbarFilter {
         let background = if self.active {
             palette().filter_active_bg
         } else {
-            palette().bg
+            palette().input_bg
         };
         if let Some(observer) = self.observer {
             observer.record(self.active, focused, border, background);
@@ -414,7 +428,7 @@ fn toolbar_filter(
     observer: Option<filter_bench::Observer>,
     cx: &App,
 ) -> ToolbarFilter {
-    let element = Input::new(input)
+    let element = themed_input(input)
         .small()
         .min_h(px(30.))
         .py_0()
@@ -1778,8 +1792,8 @@ impl Desktop {
         if self.updates.open {
             return;
         }
-        if let Action::LightTheme(light) = action {
-            self.set_light_theme(light, window, cx);
+        if let Action::AppearanceTheme(theme) = action {
+            self.set_appearance_theme(theme, window, cx);
             return;
         }
         if self.ref_storage.confirming && !matches!(action, Action::RefStorage(_)) {
@@ -2149,7 +2163,7 @@ impl Desktop {
             Action::SaveSettings => app.settings.save_page(),
             Action::ClearImages => {}
             Action::CheckUpdates => {}
-            Action::LightTheme(_) => unreachable!(),
+            Action::AppearanceTheme(_) => unreachable!(),
             Action::ForgetToken => {
                 if !app.settings.busy
                     && let Some(index) = app.settings.provider_index()
@@ -3072,11 +3086,11 @@ impl Desktop {
                             )),
                     )
                     .child(
-                        Input::new(&self.description)
+                        themed_input(&self.description)
                             .disabled(app.pending.busy)
                             .h(px(150.)),
                     )
-                    .child(Input::new(&self.new_branch).disabled(app.pending.busy))
+                    .child(themed_input(&self.new_branch).disabled(app.pending.busy))
                     .child(
                         row()
                             .child(self.button("commit", "Commit", Action::Commit, cx))
@@ -3559,7 +3573,7 @@ impl Desktop {
                             )),
                     )
                     .child(caption("Project path · group/project or owner/repository"))
-                    .child(Input::new(&self.project).disabled(settings.busy));
+                    .child(themed_input(&self.project).disabled(settings.busy));
             } else if !settings.busy {
                 form = form.child(caption(
                     "No remotes configured. Add one with git remote add, then reopen the app.",
@@ -3569,9 +3583,9 @@ impl Desktop {
             let draft = &settings.providers[index];
             form = form.child(caption("Global settings · shared by all your projects"))
                 .child(caption("Custom server or API URL"))
-                .child(Input::new(&self.api).disabled(settings.busy))
+                .child(themed_input(&self.api).disabled(settings.busy))
                 .child(caption("Access token · stored in Windows Credential Manager"))
-                .child(Input::new(&self.token).disabled(settings.busy))
+                .child(themed_input(&self.token).disabled(settings.busy))
                 .child(caption(if draft.forget { "The saved token will be removed when you save." }
                     else if draft.has_token { "A custom token is saved. Leave it masked to keep it, or replace it." }
                     else { "No custom token saved. Environment tokens and Git credentials can still be used." }))

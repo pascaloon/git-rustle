@@ -656,7 +656,7 @@ impl Desktop {
                         .flex_1()
                         .min_h(px(110.))
                         .children(self.conflicts_probe(3))
-                        .child(Input::new(&state.editor).size_full().disabled(disabled)),
+                        .child(themed_input(&state.editor).size_full().disabled(disabled)),
                 )
                 .child(
                     row()

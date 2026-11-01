@@ -8,23 +8,25 @@ param(
     [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
     [switch]$LegacyClaude,
     [switch]$LightTheme,
+    [ValidateSet('black','dark','light')][string]$Theme = 'black',
     [switch]$DisableDirectComposition
 )
 $ErrorActionPreference = 'Stop'
+if ($LightTheme) { $Theme = 'light' }
 if ($LegacyClaude -and $AiProvider -ne 'Claude') { throw 'LegacyClaude requires the Claude fixture provider' }
 if(@($Scenarios|Where-Object{$_-in@('branches-hierarchy','cleanup-review')}).Count){
     if(@($Scenarios|Where-Object{$_-notin@('branches-hierarchy','cleanup-review')}).Count){throw 'Capture branch cleanup views separately'}
-    & "$PSScriptRoot/benchmark-branch-cleanup.ps1" -Candidate $Candidate -Scenarios $Scenarios -Stages Screenshots -LightTheme:$LightTheme -MinimumWindow:($WindowSize -eq '900x600') -OutputDirectory $OutputDirectory
+    & "$PSScriptRoot/benchmark-branch-cleanup.ps1" -Candidate $Candidate -Scenarios $Scenarios -Stages Screenshots -Theme $Theme -MinimumWindow:($WindowSize -eq '900x600') -OutputDirectory $OutputDirectory
     return
 }
 if($Scenarios -contains 'remote-checkout'){
     if($Scenarios.Count-ne1){throw 'Capture remote checkout separately'}
-    & "$PSScriptRoot/benchmark-remote-checkout.ps1" -Candidate $Candidate -Screenshots -LightTheme:$LightTheme -WindowSize $WindowSize -OutputDirectory $OutputDirectory
+    & "$PSScriptRoot/benchmark-remote-checkout.ps1" -Candidate $Candidate -Screenshots -Theme $Theme -WindowSize $WindowSize -OutputDirectory $OutputDirectory
     return
 }
 if(@($Scenarios|Where-Object{$_-in@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-branch-menu-edge','graph-polish','graph-polish-detached')}).Count){
     if(@($Scenarios|Where-Object{$_-notin@('detached-commit','graph-selection-boundary','ghost-files-github','ghost-files-gitlab','graph-request-menu','graph-request-compose','graph-new-branch','graph-new-branch-review','graph-reset','graph-reset-review','graph-delete','graph-delete-review','graph-branch-menu','graph-branch-menu-edge','graph-polish','graph-polish-detached')}).Count){throw 'Capture graph harness scenarios separately from other views'}
-    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios $Scenarios -Screenshots -LightTheme:$LightTheme -DisableDirectComposition:$DisableDirectComposition -WindowSize $WindowSize -OutputDirectory $OutputDirectory
+    & "$PSScriptRoot/benchmark-graph-features.ps1" -Candidate $Candidate -Scenarios $Scenarios -Screenshots -Theme $Theme -DisableDirectComposition:$DisableDirectComposition -WindowSize $WindowSize -OutputDirectory $OutputDirectory
     return
 }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
@@ -168,7 +170,8 @@ try {
         $before = Get-FixtureFingerprint $fixture
         $settingsDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
         New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
-        @{ light_theme = [bool]($LightTheme -and $scenario -ne 'theme-toggle') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir 'appearance.json')
+        @{ theme = $(if ($scenario -eq 'theme-toggle') { 'black' } else { $Theme }) } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir 'appearance.json')
+        if ($scenario -eq 'theme-toggle') { [IO.File]::WriteAllText((Join-Path $settingsDir 'appearance.fixture'),'disposable appearance scenario') }
         if ($scenario -eq 'landing') {
             # Git walks parent directories; an empty folder under target is still
             # inside this checkout. Use a clearly owned, unrelated temporary root.
@@ -295,7 +298,7 @@ try {
         candidate = $Candidate; sha256 = (Get-FileHash -LiteralPath $Candidate).Hash
         directCompositionDisabled = [bool]$DisableDirectComposition
         legacyClaudeFixture = [bool]$LegacyClaude
-        lightTheme = [bool]$LightTheme
+        theme = $Theme
         scenarios = @($results.ToArray())
         limitations = 'Inspect PNGs for appearance. Capture sanity checks cannot prove complete rendering or interaction feel. These runs are excluded from performance comparisons.'
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.json') -Encoding utf8

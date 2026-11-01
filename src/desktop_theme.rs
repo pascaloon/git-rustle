@@ -1,5 +1,6 @@
 //! Semantic palettes shared by custom elements and GPUI components.
 //! Palette lookup stays on the rendering thread; it never locks or does I/O.
+use crate::appearance::ThemeChoice;
 use gpui::{App, rgb, rgba};
 use gpui_component::{Theme, ThemeMode};
 use std::cell::Cell;
@@ -7,6 +8,7 @@ use std::cell::Cell;
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub bg: u32,
+    pub input_bg: u32,
     pub panel: u32,
     pub control: u32,
     pub hover: u32,
@@ -47,9 +49,10 @@ pub struct Palette {
     pub primary_active: u32,
 }
 
-pub const DARK: Palette = {
+pub const BLACK: Palette = {
     Palette {
         bg: 0x000000,
+        input_bg: 0x000000,
         panel: 0x0c0c0c,
         control: 0x191919,
         hover: 0x24201d,
@@ -98,9 +101,61 @@ pub const DARK: Palette = {
     }
 };
 
+// Charcoal surfaces and Dark+ syntax colors, with Rustle's orange accents.
+pub const DARK: Palette = Palette {
+    bg: 0x1e1e1e,
+    input_bg: 0x121212,
+    panel: 0x252526,
+    control: 0x333333,
+    hover: 0x2d2926,
+    line: 0x454545,
+    text: 0xd4d4d4,
+    muted: 0xaaaaaa,
+    inspector_line: 0x3c3c3c,
+    inspector_muted: 0xaaaaaa,
+    accent: 0xff914d,
+    accent_hover: 0xffad75,
+    selected: 0x3b2a20,
+    selected_hover: 0x4a3325,
+    selection: 0xff914d55,
+    search_text: 0xffcc80,
+    search_bg: 0xea9f3544,
+    filter_active_border: 0xbb7545,
+    filter_active_bg: 0x241b16,
+    remote_text: 0x9cdcfe,
+    remote_bg: 0x203b50,
+    added: 0xb5cea8,
+    removed: 0xf0a5a5,
+    added_bg: 0x203024,
+    removed_bg: 0x372326,
+    added_highlight: 0x89d18533,
+    removed_highlight: 0xf4877133,
+    syntax_colors: [
+        0x91ad80, 0xce9178, 0xc586c0, 0xdcdcaa, 0x4ec9b0, 0xb5cea8, 0x9cdcfe, 0x9cdcfe, 0xd4d4d4,
+        0xd4d4d4, 0x9cdcfe, 0x75b4e8, 0x9cdcfe, 0xdcdcaa, 0x75b4e8, 0xd4d4d4, 0x75b4e8, 0x75beff,
+        0xce9178,
+    ],
+    colors: [
+        0xff914d, 0x4ec9b0, 0xc586c0, 0xb5cea8, 0xf0a5a5, 0xdcdcaa, 0x9cdcfe, 0x89d185, 0xd7a6dc,
+        0xd4d4d4,
+    ],
+    on_accent: 0x24160e,
+    path_bg: 0x69462f,
+    pending_line: 0xa86a40,
+    scroll_thumb: 0x686868,
+    pending_bg: 0x2d241f,
+    pending_selected: 0x493123,
+    warning: 0xe5c07b,
+    success: 0x89d185,
+    caution: 0xdcdcaa,
+    danger: 0xf48771,
+    primary_active: 0xe57838,
+};
+
 pub const LIGHT: Palette = {
     Palette {
         bg: 0xfaf9f6,
+        input_bg: 0xfaf9f6,
         panel: 0xf2f0eb,
         control: 0xeae7e1,
         hover: 0xeee9e1,
@@ -149,22 +204,26 @@ pub const LIGHT: Palette = {
     }
 };
 
-thread_local! { static LIGHT_MODE: Cell<bool> = const { Cell::new(false) }; }
+thread_local! { static THEME: Cell<ThemeChoice> = const { Cell::new(ThemeChoice::Black) }; }
 
 #[inline]
-pub fn is_light() -> bool {
-    LIGHT_MODE.get()
+pub fn current_theme() -> ThemeChoice {
+    THEME.get()
 }
 
 #[inline]
 pub fn palette() -> &'static Palette {
-    if is_light() { &LIGHT } else { &DARK }
+    match current_theme() {
+        ThemeChoice::Black => &BLACK,
+        ThemeChoice::Dark => &DARK,
+        ThemeChoice::Light => &LIGHT,
+    }
 }
 
-pub fn apply(light: bool, cx: &mut App) {
-    LIGHT_MODE.set(light);
+pub fn apply(choice: ThemeChoice, cx: &mut App) {
+    THEME.set(choice);
     Theme::change(
-        if light {
+        if choice == ThemeChoice::Light {
             ThemeMode::Light
         } else {
             ThemeMode::Dark
@@ -209,6 +268,13 @@ pub fn apply(light: bool, cx: &mut App) {
     theme.link_active = rgb(p.accent).into();
     theme.switch = rgb(p.line).into();
     theme.switch_thumb = rgb(0xffffff).into();
+    // Code-editor inputs have their own surface, separate from normal inputs.
+    let editor = &mut std::sync::Arc::make_mut(&mut theme.highlight_theme).style;
+    editor.editor_background = Some(rgb(p.input_bg).into());
+    editor.editor_foreground = Some(rgb(p.text).into());
+    editor.editor_active_line = Some(rgb(p.hover).into());
+    editor.editor_line_number = Some(rgb(p.muted).into());
+    editor.editor_active_line_number = Some(rgb(p.accent).into());
     cx.refresh_windows();
 }
 
@@ -235,9 +301,18 @@ mod tests {
 
     #[test]
     fn light_text_and_statuses_remain_readable_on_their_surfaces() {
-        let p = LIGHT;
+        assert_readable(LIGHT);
+    }
+
+    #[test]
+    fn dark_text_and_syntax_remain_readable_on_their_surfaces() {
+        assert_readable(DARK);
+    }
+
+    fn assert_readable(p: Palette) {
         for background in [
             p.bg,
+            p.input_bg,
             p.panel,
             p.control,
             p.hover,

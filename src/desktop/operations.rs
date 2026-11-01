@@ -3,7 +3,7 @@ use super::rebase::{CommitAction, Draft};
 use super::*;
 use crate::git::operations::{PushPreview, PushRisk, Request, ResetMode, Resolution};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
+use gpui_component::select::{SelectEvent, SelectItem, SelectState};
 use std::collections::HashMap;
 mod history;
 
@@ -938,7 +938,7 @@ impl Desktop {
                     .child(caption("Message"))
                     .child(
                         div().flex_1().min_w_0().child(
-                            Input::new(controls.message.as_ref().unwrap())
+                            themed_input(controls.message.as_ref().unwrap())
                                 .small()
                                 .disabled(!enabled)
                                 .w_full(),
@@ -990,7 +990,7 @@ impl Desktop {
             )
             .child(
                 div().w(px(126.)).flex_shrink_0().child(
-                    Select::new(&controls.select)
+                    themed_select(&controls.select)
                         .small()
                         .w_full()
                         .menu_width(px(420.))
@@ -1241,11 +1241,11 @@ impl Desktop {
                     }
                 }
                 if matches!(dialog, Dialog::Create | Dialog::CreateTag | Dialog::Rename) {
-                    body = body.child(Input::new(&op.name));
+                    body = body.child(themed_input(&op.name));
                 }
                 if dialog == Dialog::CreateTag {
                     body = body.child(caption("Annotation (optional)")).child(
-                        Input::new(op.annotation.as_ref().expect("tag dialog annotation"))
+                        themed_input(op.annotation.as_ref().expect("tag dialog annotation"))
                             .h(px(100.)),
                     );
                 }

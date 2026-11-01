@@ -4,6 +4,7 @@ param(
     [string]$Candidate = "$PSScriptRoot\..\target\release\git-rustle.exe",
     [switch]$RejectCompetingBuilds,
     [switch]$LightTheme,
+    [ValidateSet('black','dark','light')][string]$Theme = 'black',
     [int]$Samples = 15,
     [switch]$NativeCandidate,
     [switch]$NativeBaseline,
@@ -12,7 +13,8 @@ param(
     [string]$OutputDirectory = "$PSScriptRoot\..\target\bench\comparison"
 )
 $ErrorActionPreference = 'Stop'
-if ($LightTheme -and !$IsolatedCacheRoot) { throw 'LightTheme requires an isolated application-data root' }
+if ($LightTheme) { $Theme = 'light' }
+if ($Theme -ne 'black' -and !$IsolatedCacheRoot) { throw 'Theme requires an isolated application-data root' }
 . "$PSScriptRoot/benchmark-processes.ps1"
 . "$PSScriptRoot/benchmark-native-process.ps1"
 $Repository = (Resolve-Path -LiteralPath $Repository).Path
@@ -29,10 +31,11 @@ function Run-One([string]$exe, [string]$label, [string]$mode, [int]$sample) {
         $env:LOCALAPPDATA = Join-Path $IsolatedCacheRoot $label
         New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
     }
-    if ($LightTheme -and $IsolatedCacheRoot) {
+    if ($IsolatedCacheRoot) {
         $appearanceDir = Join-Path $env:LOCALAPPDATA 'git-rustle'
         New-Item -ItemType Directory -Path $appearanceDir -Force | Out-Null
-        @{light_theme=($label -eq 'candidate')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
+        # Legacy light_theme also seeds the preserved two-theme baseline.
+        @{theme=$Theme;light_theme=($Theme -eq 'light')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
     }
     if ($RejectCompetingBuilds) { Assert-BenchmarkIdle -WorkspaceRoot (Resolve-Path "$PSScriptRoot/..").Path -AuditPath (Join-Path $OutputDirectory 'background-processes.json') }
     $log = Join-Path $OutputDirectory "$label-$mode-$sample.txt"

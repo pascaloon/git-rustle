@@ -1008,7 +1008,7 @@ impl Desktop {
                                 .flex_shrink_0()
                                 .children(self.todo_probe(9 + i))
                                 .child(
-                                    Input::new(&inputs[i])
+                                    themed_input(&inputs[i])
                                         .w_full()
                                         .h(height)
                                         .flex_shrink_0()

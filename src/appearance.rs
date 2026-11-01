@@ -3,9 +3,51 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeChoice {
+    #[default]
+    Black,
+    Dark,
+    Light,
+}
+
+impl ThemeChoice {
+    pub const ALL: [Self; 3] = [Self::Black, Self::Dark, Self::Light];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Black => "Black",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredPreferences")]
 pub struct Preferences {
-    pub light_theme: bool,
+    pub theme: ThemeChoice,
+}
+
+// Read the previous two-theme format without changing a user's saved choice.
+// An explicit theme takes precedence; future writes use only the new format.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredPreferences {
+    theme: Option<ThemeChoice>,
+    light_theme: bool,
+}
+
+impl From<StoredPreferences> for Preferences {
+    fn from(stored: StoredPreferences) -> Self {
+        Self {
+            theme: stored.theme.unwrap_or(if stored.light_theme {
+                ThemeChoice::Light
+            } else {
+                ThemeChoice::Black
+            }),
+        }
+    }
 }
 
 pub fn settings_file() -> Result<PathBuf, String> {
@@ -48,26 +90,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_and_persistent_light_dark_round_trip() {
+    fn defaults_and_all_themes_persist_across_reloads() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings/appearance.json");
         assert_eq!(
-            Preferences::load_file(&path).unwrap(),
-            Preferences::default()
+            Preferences::load_file(&path).unwrap().theme,
+            ThemeChoice::Black
         );
-        for light_theme in [true, false, true] {
-            let preference = Preferences { light_theme };
+        for theme in ThemeChoice::ALL {
+            let preference = Preferences { theme };
             preference.save_file(&path).unwrap();
             assert_eq!(Preferences::load_file(&path).unwrap(), preference);
             assert!(!path.with_extension("json.tmp").exists());
+            let json = std::fs::read_to_string(&path).unwrap();
+            assert!(!json.contains("light_theme"));
         }
-        std::fs::write(&path, "{}").unwrap();
+        for json in ["{}", r#"{"light_theme":false}"#] {
+            std::fs::write(&path, json).unwrap();
+            assert_eq!(
+                Preferences::load_file(&path).unwrap().theme,
+                ThemeChoice::Black
+            );
+        }
+        for json in ["broken", r#"{"theme":"unknown"}"#] {
+            std::fs::write(&path, json).unwrap();
+            assert!(Preferences::load_file(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn migrates_legacy_light_and_honors_explicit_theme() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        std::fs::write(&path, r#"{"light_theme":true}"#).unwrap();
+        let preferences = Preferences::load_file(&path).unwrap();
+        assert_eq!(preferences.theme, ThemeChoice::Light);
+        preferences.save_file(&path).unwrap();
+        assert_eq!(Preferences::load_file(&path).unwrap(), preferences);
+        std::fs::write(&path, r#"{"theme":"dark","light_theme":true}"#).unwrap();
         assert_eq!(
-            Preferences::load_file(&path).unwrap(),
-            Preferences::default()
+            Preferences::load_file(&path).unwrap().theme,
+            ThemeChoice::Dark
         );
-        std::fs::write(&path, "broken").unwrap();
-        assert!(Preferences::load_file(&path).is_err());
     }
 
     #[test]
@@ -76,7 +140,13 @@ mod tests {
         let path = directory.path().join("appearance.json");
         Preferences::default().save_file(&path).unwrap();
         std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
-        assert!(Preferences { light_theme: true }.save_file(&path).is_err());
+        assert!(
+            Preferences {
+                theme: ThemeChoice::Dark
+            }
+            .save_file(&path)
+            .is_err()
+        );
         assert_eq!(
             Preferences::load_file(&path).unwrap(),
             Preferences::default()

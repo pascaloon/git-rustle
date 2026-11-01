@@ -2,6 +2,7 @@
 param(
     [string]$Candidate = "$PSScriptRoot/../target/release/git-rustle.exe",
     [Parameter(Mandatory)][string]$OutputDirectory,
+    [ValidateSet('black','dark','light')][string]$Theme = 'light',
     [ValidateSet('1440x900','900x600')][string[]]$WindowSizes = @('1440x900','900x600'),
     [string[]]$Scenarios = @(
         'landing','graph','commit-details','commit-diff','pending','branches','settings','settings-project',
@@ -24,11 +25,11 @@ foreach ($size in $WindowSizes) {
         $directory = Join-Path $OutputDirectory "$size-$scenario"
         $failure = $null
         try {
-            & "$PSScriptRoot/screenshot-app.ps1" -Candidate $Candidate -LightTheme -Scenarios @($scenario) -WindowSize $size -OutputDirectory $directory
+            & "$PSScriptRoot/screenshot-app.ps1" -Candidate $Candidate -Theme $Theme -Scenarios @($scenario) -WindowSize $size -OutputDirectory $directory
             $logs = @(Get-ChildItem -LiteralPath $directory -Recurse -Filter app.log)
             if (!$logs.Count) { throw 'Missing native application log' }
             foreach ($log in $logs) {
-                if ([IO.File]::ReadAllText($log.FullName) -notmatch '\bappearance light\b') { throw "Saved light preference was not loaded: $($log.FullName)" }
+                if ([IO.File]::ReadAllText($log.FullName) -notmatch "\bappearance $Theme\b") { throw "Saved $Theme preference was not loaded: $($log.FullName)" }
             }
             $dimensions = $size.Split('x')
             $captures = @(Get-ChildItem -LiteralPath $directory -Recurse -Filter screenshot.json)

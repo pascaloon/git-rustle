@@ -4,12 +4,14 @@ param(
     [ValidateRange(1,100)][int]$Samples=15,
     [switch]$Screenshots,
     [switch]$LightTheme,
+    [ValidateSet('black','dark','light')][string]$Theme = 'black',
     [switch]$DisableDirectComposition,
     [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
     [string]$IdleWorkspaceRoot="$PSScriptRoot/..",
     [Parameter(Mandatory)][string]$OutputDirectory
 )
 $ErrorActionPreference='Stop'
+if ($LightTheme) { $Theme = 'light' }
 . "$PSScriptRoot/benchmark-screenshot.ps1"
 . "$PSScriptRoot/benchmark-processes.ps1"
 $Candidate=(Resolve-Path -LiteralPath $Candidate).Path
@@ -69,7 +71,7 @@ try{
             $fixture=Join-Path $directory 'repository';New-Item -ItemType Directory -Path $fixture|Out-Null
             $env:LOCALAPPDATA=Join-Path $directory 'app-data';$env:APPDATA=$env:LOCALAPPDATA;New-Item -ItemType Directory -Path $env:LOCALAPPDATA|Out-Null
             $appearanceDir=Join-Path $env:LOCALAPPDATA 'git-rustle';New-Item -ItemType Directory -Path $appearanceDir -Force|Out-Null
-            @{light_theme=[bool]$LightTheme}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
+            @{theme=$Theme;light_theme=($Theme -eq 'light')}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $appearanceDir 'appearance.json')
             Graph-Git $fixture @('init','-b','main')|Out-Null
             foreach($config in @(@('user.name','Graph Fixture'),@('user.email','graph@example.test'),@('commit.gpgSign','false'),@('core.hooksPath','disabled-fixture-hooks'),@('core.autocrlf','false'))){Graph-Git $fixture @('config',$config[0],$config[1])|Out-Null}
             if($scenario-eq'graph-selection-boundary'){New-SelectionBoundaryFixture $fixture}else{

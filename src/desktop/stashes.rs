@@ -768,7 +768,8 @@ impl Desktop {
                             .p_3()
                             .gap_2()
                             .child(
-                                Input::new(self.stashes.name.as_ref().unwrap()).disabled(!enabled),
+                                themed_input(self.stashes.name.as_ref().unwrap())
+                                    .disabled(!enabled),
                             )
                             .child(caption("Includes staged, unstaged and untracked files."))
                             .child(
