@@ -406,8 +406,8 @@ subsequent releases can be installed from inside the app.
 
 ## License
 
-Git Rustle is licensed under the GNU General Public License version 3 only
-(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
+Git Rustle is licensed under the MIT License. See [LICENSE](LICENSE) for the full
+terms.
 
 This program is distributed without any warranty, including the implied
 warranties of merchantability or fitness for a particular purpose, to the extent
