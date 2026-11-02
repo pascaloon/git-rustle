@@ -1,5 +1,40 @@
 # Isolated application screenshots
 
+Run `screenshot-app.ps1` from the repository root with PowerShell 7, Git, and
+a built Windows executable. It captures only Git Rustle’s window on a private,
+non-current desktop. Run captures separately from performance measurements.
+
+```powershell
+.\scripts\screenshot-app.ps1
+# Or select views and an alternate build:
+.\scripts\screenshot-app.ps1 -Candidate .\target\release\git-rustle.exe `
+  -Scenarios @('graph','settings','stash-panel') `
+  -OutputDirectory .\target\bench\my-visual-review
+```
+
+Choose a new output directory. The default run covers the graph, branches,
+settings, a diff, and a populated stash list. For each view, the runner creates
+a disposable repository, isolates app data and Git configuration, waits for
+the expected paint, and captures the window. It then checks the fixture’s
+files, HEAD, refs, status, and stashes.
+
+| Artifact | Purpose |
+| --- | --- |
+| `<scenario>/screenshot.png` | Full client pixels at the window's physical resolution |
+| `<scenario>/screenshot.json` | Dimensions, DPI, app identity, desktop identity, hash, capture duration and pixel sanity results |
+| `<scenario>/readiness.json` | Actual application paint mark observed before capture; not a model snapshot |
+| `<scenario>/app.log` | Application trace and errors |
+| `<scenario>/fixture-before.json`, `fixture-after.json` | Repository postconditions |
+| `<scenario>/capture-*.json` and logs | Worker request and diagnostics, retained on failure |
+| `report.json` | Overall success/failure, per-view results, application binary hash and limitations |
+
+Open the PNGs with a local image-reading tool. Check the intended state, complete
+right/bottom edges, readable text, spacing, truncation, contrast, control grouping
+and consistency with adjacent views. Record the findings with the change. A PNG
+passing the pixel checks is not automatically an acceptable UI. Images from
+different runs may differ due to paths, dates, asynchronous activity or fonts;
+do not use byte equality as a general visual regression oracle.
+
 ## Appearance coverage
 
 `Settings → General → Appearance` offers **Black**, **Dark** and **Light** in a
@@ -54,48 +89,6 @@ themes. It seeds both binaries with the requested theme and a legacy Light flag;
 the previous two-theme baseline uses Black when comparing the new Dark palette.
 Desktop, graph, remote-checkout and branch-cleanup runners also accept `-Theme`
 for their isolated fixtures. Screenshots must remain separate from timing runs.
-
-Agents should inspect actual screenshots when changing visual UI. The runner
-captures Git Rustle's client area on a private, non-current Windows desktop. It
-does not switch desktops, activate windows, move the pointer, send keyboard input,
-or capture the user's screen. It needs Windows, PowerShell 7, Git and a built
-Git Rustle executable; no extra screenshot package or product build flag is needed.
-
-From the repository root:
-
-```powershell
-.\scripts\screenshot-app.ps1
-# Or select views and an alternate build:
-.\scripts\screenshot-app.ps1 -Candidate .\target\release\git-rustle.exe `
-  -Scenarios @('graph','settings','stash-panel') `
-  -OutputDirectory .\target\bench\my-visual-review
-```
-
-The output directory must be new. Defaults cover graph, branches, settings, diff,
-and the populated Stashes tab. Each view gets a fresh disposable Git fixture,
-isolated application data and Git configuration, and a separate native app
-process. Fixtures contain six commits, two branches, a tag, three stashes and
-pending files. There are no remotes, hooks or signing prompts. The runner waits
-for the application's first-frame or scenario-paint trace, then captures the
-window and requests normal application close. It checks that files, HEAD, refs,
-status and stashes are unchanged. The resulting files are:
-
-| Artifact | Purpose |
-| --- | --- |
-| `<scenario>/screenshot.png` | Full client pixels at the window's physical resolution |
-| `<scenario>/screenshot.json` | Dimensions, DPI, app identity, desktop identity, hash, capture duration and pixel sanity results |
-| `<scenario>/readiness.json` | Actual application paint mark observed before capture; not a model snapshot |
-| `<scenario>/app.log` | Application trace and errors |
-| `<scenario>/fixture-before.json`, `fixture-after.json` | Repository postconditions |
-| `<scenario>/capture-*.json` and logs | Worker request and diagnostics, retained on failure |
-| `report.json` | Overall success/failure, per-view results, application binary hash and limitations |
-
-Open the PNGs with a local image-reading tool. Check the intended state, complete
-right/bottom edges, readable text, spacing, truncation, contrast, control grouping
-and consistency with adjacent views. Record the findings with the change. A PNG
-passing the pixel checks is not automatically an acceptable UI. Images from
-different runs may differ due to paths, dates, asynchronous activity or fonts;
-do not use byte equality as a general visual regression oracle.
 
 ## Additional scenarios
 

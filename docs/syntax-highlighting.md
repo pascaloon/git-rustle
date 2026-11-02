@@ -52,7 +52,8 @@ All of this work runs away from the diff worker and UI thread.
 
 Follow [benchmarking.md](benchmarking.md), preserving an executable before edits
 and completing release tests, Clippy and builds before any measurements.
-Use an unlocked, visible desktop and run suites sequentially.
+Run native suites sequentially on the private desktop. For visual review, use
+the [isolated screenshot workflow](app-screenshots.md) in a separate run.
 
 Create fresh fixtures inside the ignored run directory:
 
