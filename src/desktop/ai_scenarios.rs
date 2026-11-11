@@ -1,7 +1,7 @@
 //! Real handlers and paint assertions; only runs on marked disposable fixtures.
 use super::*;
 use std::{cell::RefCell, rc::Rc};
-type Paints = Rc<RefCell<[Option<(u8, Bounds<Pixels>)>; 6]>>;
+type Paints = Rc<RefCell<[Option<(u8, Bounds<Pixels>)>; 11]>>;
 #[derive(Default)]
 pub(super) struct State {
     phase: u8,
@@ -236,6 +236,51 @@ impl Desktop {
                     "ai-settings" => {
                         assert!(!self.ai.error, "{}", self.ai.status);
                         assert!(self.ai.settings.as_ref().unwrap().prompts[2].contains("behavior"));
+                        if !self.ai_painted(0, window) || !self.ai_painted(6, window) {
+                            return;
+                        }
+                        let paints = self.ai.scenario.paints.borrow();
+                        // At minimum height later prompts scroll below the viewport.
+                        let visible_separators = if window.viewport_size().height >= px(800.) {
+                            4
+                        } else {
+                            1
+                        };
+                        for slot in 7..7 + visible_separators {
+                            let Some((phase, separator)) = paints[slot] else {
+                                return;
+                            };
+                            if phase != self.ai.scenario.phase {
+                                return;
+                            }
+                            let physical_height =
+                                f32::from(separator.size.height) * window.scale_factor();
+                            assert!(
+                                (0.99..=2.01).contains(&physical_height),
+                                "Prompt dividers occupy one or two physical pixels after DPI rounding"
+                            );
+                            assert!(
+                                separator.size.width > px(600.),
+                                "Prompt dividers span the card"
+                            );
+                            assert!(
+                                separator.bottom() < paints[6].unwrap().1.top(),
+                                "Visible prompt dividers stay above Save"
+                            );
+                        }
+                        let model = paints[0].unwrap().1;
+                        let footer = paints[6].unwrap().1;
+                        assert!(
+                            model.bottom() < footer.top(),
+                            "AI fields stay above the persistent save bar"
+                        );
+                        assert!(
+                            footer.size.height >= px(24.)
+                                && footer.bottom()
+                                    <= window.viewport_size().height
+                                        - px(super::super::status::HEIGHT),
+                            "AI Save action remains visible"
+                        );
                         0
                     }
                     "ai-summary" => {

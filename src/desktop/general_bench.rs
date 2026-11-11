@@ -111,7 +111,8 @@ pub(super) struct State {
     check_ms: Vec<f64>,
     clear_frame_ms: Option<f64>,
     verified: bool,
-    bounds: Rc<RefCell<[Option<Bounds<Pixels>>; 2]>>,
+    bounds: Rc<RefCell<[Option<Bounds<Pixels>>; 4]>>,
+    layout_pages: Rc<RefCell<std::collections::BTreeSet<usize>>>,
 }
 
 impl Desktop {
@@ -186,11 +187,33 @@ impl Desktop {
             return None;
         }
         let bounds = self.general_bench.bounds.clone();
+        let pages = self.general_bench.layout_pages.clone();
+        let page = self.engine.app.settings.page;
         Some(
             canvas(
                 move |bounds, _, _| bounds,
                 move |value, _, _, _| {
-                    bounds.borrow_mut()[slot] = Some(value);
+                    let mut painted = bounds.borrow_mut();
+                    painted[slot] = Some(value);
+                    if slot == 3
+                        && let Some(header) = painted[2]
+                    {
+                        assert_eq!(
+                            value.left(),
+                            header.left(),
+                            "Settings content aligns with navigation"
+                        );
+                        assert_eq!(
+                            value.size.width, header.size.width,
+                            "Settings pages share one content width"
+                        );
+                        assert!(
+                            value.top() >= header.bottom(),
+                            "Settings content stays below navigation"
+                        );
+                        assert!(value.size.width >= px(600.) && value.size.width <= px(880.));
+                        pages.borrow_mut().insert(page);
+                    }
                 },
             )
             .absolute()
@@ -345,7 +368,10 @@ impl Desktop {
         let updates = bounds[0].expect("Updates card rendered in General");
         let cache = bounds[1].expect("Images cache card rendered in General");
         assert!(updates.size.height > px(0.) && cache.size.height > px(0.));
-        assert!(cache.top() >= updates.bottom());
+        assert!(
+            updates.top() >= cache.bottom(),
+            "Maintenance precedes About"
+        );
         if self.scenario.as_deref() == Some("general-settings") {
             let fixture = self.general_bench.fixture.as_ref().unwrap();
             assert_eq!(fixture.requests.load(Ordering::Acquire), 3);
@@ -356,6 +382,11 @@ impl Desktop {
             assert!(!self.updates.open && !self.updates.installing);
         } else {
             assert_eq!(self.frame_samples.len(), 121);
+            assert_eq!(
+                self.general_bench.layout_pages.borrow().len(),
+                4,
+                "Every settings tab was painted on the shared grid"
+            );
         }
         self.general_bench.verified = true;
     }

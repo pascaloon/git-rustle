@@ -99,22 +99,25 @@ impl Desktop {
                 }
                 .into()
             });
-        settings_card()
-            .child(section_heading("image", "Image cache").child(help_icon("image-cache-help", "Downloaded author and project images, shared by all repositories. Clearing the cache downloads them again as needed.")))
+        column()
+            .w_full()
+            .gap_1()
+            .py_1()
             .child(
                 row()
-                    .child(caption(size))
-                    .child(div().flex_1())
-                    .child(self.button(
-                        "clear-images-cache",
-                        if state.busy {
-                            "Please wait…"
-                        } else {
-                            "Clear images cache"
-                        },
-                        Action::ClearImages,
-                        cx,
-                    )),
+                    .child(
+                        column()
+                            .flex_1()
+                            .gap_1()
+                            .child("Image cache")
+                            .child(caption(size)),
+                    )
+                    .child(Button::new("clear-images-cache").small().w(px(164.))
+                        .icon(gpui_component::Icon::default().path("rustle/trash"))
+                        .label(if state.busy { "Please wait…" } else { "Clear cache" })
+                        .tooltip("Remove downloaded author and project images. They download again as needed.")
+                        .disabled(state.busy || !state.stats.is_some_and(|stats| stats.images > 0 || stats.bytes > 0))
+                        .on_click(cx.listener(|v, _, w, cx| v.action(Action::ClearImages, w, cx)))),
             )
             .when(!state.message.is_empty(), |s| {
                 s.child(

@@ -18,6 +18,11 @@ a disposable repository, isolates app data and Git configuration, waits for
 the expected paint, and captures the window. It then checks the fixture’s
 files, HEAD, refs, status, and stashes.
 
+For populated Project settings, pass `-Scenarios settings-project -ProjectRemotes`.
+This creates two local bare remotes inside the owned fixture directory; it does
+not contact a hosting service. Without the flag, Project covers the empty-remote
+state. Capture both at normal and minimum window sizes when changing the form.
+
 | Artifact | Purpose |
 | --- | --- |
 | `<scenario>/screenshot.png` | Full client pixels at the window's physical resolution |

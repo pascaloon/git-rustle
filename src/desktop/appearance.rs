@@ -87,27 +87,11 @@ impl Desktop {
             .relative()
             .w_full()
             .flex_shrink_0()
-            .gap_3()
-            .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(palette().line))
-            .bg(rgb(palette().panel))
+            .gap_1()
+            .py_1()
             .child(
-                column()
-                    .gap_1()
-                    .child(section_heading("settings", "Appearance")),
-            )
-            .child(
-                row()
-                    .w(px(324.))
-                    .gap_1()
-                    .p_1()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(palette().line))
-                    .bg(rgb(palette().bg))
-                    .children(
+                row().w_full().child(div().flex_1().child("Theme")).child(
+                    settings_view::segments().children(
                         ThemeChoice::ALL
                             .into_iter()
                             .enumerate()
@@ -119,25 +103,27 @@ impl Desktop {
                                     .flex_1()
                                     .min_w_0()
                                     .child(
-                                        Button::new(("appearance-theme", index))
-                                            .label(choice.label())
-                                            .ghost()
-                                            .selected(active)
-                                            .w_full()
-                                            .h(px(32.))
-                                            .disabled(self.appearance.busy)
-                                            .tooltip(match choice {
-                                                ThemeChoice::Black => "Pure black · Default",
-                                                ThemeChoice::Dark => "Charcoal · VS Code inspired",
-                                                ThemeChoice::Light => "Warm paper",
-                                            })
-                                            .on_click(cx.listener(move |v, _, window, cx| {
+                                        settings_view::segment(
+                                            ("appearance-theme", index),
+                                            choice.label(),
+                                            active,
+                                            self.appearance.busy,
+                                        )
+                                        .w_full()
+                                        .tooltip(match choice {
+                                            ThemeChoice::Black => "Pure black · Default",
+                                            ThemeChoice::Dark => "Charcoal · VS Code inspired",
+                                            ThemeChoice::Light => "Warm paper",
+                                        })
+                                        .on_click(
+                                            cx.listener(move |v, _, window, cx| {
                                                 v.action(
                                                     Action::AppearanceTheme(choice),
                                                     window,
                                                     cx,
                                                 );
-                                            })),
+                                            }),
+                                        ),
                                     )
                                     .when(scenario, |s| {
                                         s.child(
@@ -157,6 +143,7 @@ impl Desktop {
                                     })
                             }),
                     ),
+                ),
             )
             .when(!self.appearance.error.is_empty(), |s| {
                 s.child(
@@ -237,7 +224,11 @@ impl Desktop {
                     Some(rgb(palette().input_bg).into())
                 );
                 let bounds = v.appearance.bounds.get().expect("Appearance card painted");
-                assert!(bounds.size.width >= px(400.) && bounds.size.height >= px(60.));
+                assert!(bounds.size.width >= px(400.));
+                assert!(
+                    bounds.size.height >= px(40.) && bounds.size.height <= px(100.),
+                    "Theme remains a compact row, including save errors"
+                );
                 assert!(bounds.left() >= px(0.) && bounds.right() <= window.viewport_size().width);
                 assert!(bounds.top() >= px(0.) && bounds.bottom() <= window.viewport_size().height);
                 for (index, paint) in painted.into_iter().enumerate() {

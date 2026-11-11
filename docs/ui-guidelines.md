@@ -13,6 +13,11 @@
   copy inside working views. Never hide a destructive consequence in a tooltip.
 - Use consistent cards for Settings sections, a single accent treatment for the
   primary action, and spacing or separators for secondary action groups.
+  Align Settings navigation, groups, and save controls on the same centered
+  880-pixel content grid. Use compact rows with 148-pixel field labels and a fixed
+  save bar outside the scrolling form. Put each icon-led section title inside its
+  card in a tinted header with a separator. Theme and provider choices share the
+  same segmented control. Accordion separators are explicit non-shrinking lines.
 - Preserve disabled and selected states. Color supplements shape, labels, and
   grouping; it must not be the only indication of meaning.
 - Check the minimum supported window size as well as the normal size. Keep

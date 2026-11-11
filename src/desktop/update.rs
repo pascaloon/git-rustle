@@ -199,10 +199,7 @@ impl Desktop {
 
     pub(super) fn update_controls(&self, cx: &Context<Self>) -> Div {
         let (message, error) = if self.updates.installed {
-            (
-                "The update is installed. Use “Restart to update” below to finish.".into(),
-                false,
-            )
+            ("Update installed · restart required".into(), false)
         } else {
             match &self.updates.check_state {
                 CheckState::Idle => (String::new(), false),
@@ -214,25 +211,35 @@ impl Desktop {
                 }
             }
         };
-        settings_card()
-            .child(section_heading("refresh", "Updates").child(help_icon(
-                "updates-help",
-                "Check for the latest stable Windows release.",
-            )))
+        column()
+            .w_full()
+            .gap_1()
+            .py_1()
             .child(
                 row()
-                    .child(caption(format!("Git Rustle {}", update::VERSION)))
-                    .child(div().flex_1())
-                    .child(self.button(
-                        "check-updates",
-                        if self.updates.checking {
-                            "Checking…"
-                        } else {
-                            "Check for updates"
-                        },
-                        Action::CheckUpdates,
-                        cx,
-                    )),
+                    .child(
+                        column()
+                            .flex_1()
+                            .gap_1()
+                            .child("Version")
+                            .child(caption(update::VERSION)),
+                    )
+                    .child(
+                        Button::new("check-updates")
+                            .small()
+                            .w(px(164.))
+                            .icon(gpui_component::Icon::default().path("rustle/refresh"))
+                            .label(if self.updates.checking {
+                                "Checking…"
+                            } else {
+                                "Check for updates"
+                            })
+                            .tooltip("Check for the latest stable Windows release")
+                            .disabled(!self.update_check_enabled())
+                            .on_click(
+                                cx.listener(|v, _, w, cx| v.action(Action::CheckUpdates, w, cx)),
+                            ),
+                    ),
             )
             .when(!message.is_empty(), |s| {
                 s.child(

@@ -143,30 +143,39 @@ impl Desktop {
     }
 
     pub(super) fn ref_storage_controls(&self, cx: &Context<Self>) -> Div {
-        let ready = self.ref_storage.info.as_ref();
-        let already_enabled = self.engine.reference_storage_reftable();
-        settings_card()
-            .child(section_heading("branch", "Branch names").child(help_icon("branch-names-help", "Case-sensitive storage allows names such as Feature and feature to coexist safely on Windows.")))
-            .when(ready.is_none() && already_enabled, |panel| panel.child(caption("Case-sensitive references enabled.")))
-            .when(ready.is_none() && !already_enabled, |panel| panel.child(
-                Button::new("check-case-sensitive-branches").small().label("Enable case-sensitive branch names…")
-                    .disabled(self.ref_storage.loading || self.engine.repository_edit_busy || self.engine.operation_busy || self.engine.operations.conflict.is_some())
-                    .on_click(cx.listener(|v, _, window, cx| v.action(super::Action::RefStorage(Action::Review), window, cx))),
-            ))
-            .when(self.ref_storage.loading, |panel| panel.child(caption("Checking Git support…")))
-            .when_some(ready, |panel, info| {
-                panel.child(caption(format!("{} · {}", info.git_version,
-                    if info.reftable { "case-sensitive references enabled" } else { "standard reference files" })))
-                    .when(!info.reftable, |panel| panel.child(
-                        Button::new("enable-case-sensitive-branches").small().label("Enable case-sensitive branch names…")
-                            .disabled(!info.can_migrate || self.engine.repository_edit_busy || self.engine.operation_busy || self.engine.app.settings.busy || self.engine.operations.conflict.is_some())
-                            .on_click(cx.listener(|v, _, window, cx| v.action(super::Action::RefStorage(Action::Review), window, cx))),
-                    ))
-                    .when(!info.can_migrate && !info.reftable, |panel| panel.child(caption("Update Git for Windows to enable conversion.")))
-            })
-            .when(!self.ref_storage.message.is_empty(), |panel| panel.child(
-                div().text_color(rgb(if self.ref_storage.failed { palette().removed } else { palette().muted })).child(self.ref_storage.message.clone()),
-            ))
+        let info = self.ref_storage.info.as_ref();
+        let enabled = self.engine.reference_storage_reftable() || info.is_some_and(|i| i.reftable);
+        let locked = self.ref_storage.loading
+            || self.engine.repository_edit_busy
+            || self.engine.operation_busy
+            || self.engine.app.settings.busy
+            || self.engine.operations.conflict.is_some()
+            || info.is_some_and(|i| !i.can_migrate);
+        let status = if self.ref_storage.loading {
+            "Checking Git support…".to_owned()
+        } else {
+            let storage = if enabled {
+                "Enabled"
+            } else {
+                "Standard reference files"
+            };
+            info.map_or_else(
+                || storage.to_owned(),
+                |i| format!("{storage} · {}", i.git_version),
+            )
+        };
+        column().w_full().gap_2().py_1()
+            .child(row().child(column().flex_1().gap_1()
+                .child("Case-sensitive branch names")
+                .child(caption(status)))
+                .when(!enabled, |r| r.child(Button::new("enable-case-sensitive-branches").small().w(px(164.)).label("Enable…")
+                    .tooltip("Allow names such as Feature and feature to coexist on Windows. Review repository conversion before enabling.")
+                    .disabled(locked)
+                    .on_click(cx.listener(|v, _, w, cx| v.action(super::Action::RefStorage(Action::Review), w, cx))))))
+            .when(info.is_some_and(|i| !i.can_migrate && !i.reftable), |s| s.child(caption("Update Git for Windows to enable conversion.")))
+            .when(!self.ref_storage.message.is_empty(), |s| s.child(div()
+                .text_color(rgb(if self.ref_storage.failed { palette().removed } else { palette().muted }))
+                .child(self.ref_storage.message.clone())))
     }
 
     pub(super) fn ref_storage_confirmation(&self, cx: &Context<Self>) -> Option<AnyElement> {

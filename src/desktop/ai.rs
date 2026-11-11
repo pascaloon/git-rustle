@@ -728,68 +728,103 @@ impl Desktop {
         }
         .into();
     }
+    pub(super) fn ai_settings_footer(&self, cx: &Context<Self>) -> Div {
+        row()
+            .relative()
+            .children(self.ai_probe(6))
+            .w_full()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(if self.ai.error {
+                        palette().removed
+                    } else {
+                        palette().muted
+                    }))
+                    .child(self.ai.status.clone()),
+            )
+            .child(
+                Button::new("save-ai-settings")
+                    .small()
+                    .primary()
+                    .label(if self.ai.saving {
+                        "Saving…"
+                    } else {
+                        "Save changes"
+                    })
+                    .disabled(self.ai.loading || self.ai.saving || self.ai.busy)
+                    .on_click(cx.listener(|v, _, w, cx| v.ai_action(Action::Save, w, cx))),
+            )
+    }
     pub(super) fn ai_settings(&self, cx: &Context<Self>) -> AnyElement {
         let disabled = self.ai.loading || self.ai.saving;
-        let save = Button::new("save-ai-settings")
-            .small()
-            .primary()
-            .icon(gpui_component::Icon::default().path("rustle/sparkles"))
-            .label(if self.ai.saving {
-                "Saving…"
-            } else {
-                "Save AI settings"
-            })
-            .disabled(disabled || self.ai.busy)
-            .on_click(cx.listener(|v, _, w, cx| v.ai_action(Action::Save, w, cx)));
-        let mut form = column().w_full().gap_3()
-            .child(row().gap_3().child(field_label("ai-scope", "Global", "AI settings apply to every repository.").flex_1()).child(save))
-            .child(div().text_size(px(12.)).text_color(rgb(if self.ai.error { palette().removed } else { palette().muted })).child(self.ai.status.clone()))
-            .child(field_label("ai-provider-help", "Provider", "Install your CLI and sign in in a terminal. Git Rustle uses its existing authentication."))
-            .child(row().gap_2().children([Provider::Codex, Provider::Claude].into_iter().enumerate().map(|(i, provider)| {
-                Button::new(("ai-provider", i)).small().label(provider.label()).selected(self.ai.provider == provider).disabled(disabled)
-                    .on_click(cx.listener(move |v, _, w, cx| v.ai_action(Action::Provider(provider), w, cx)))
-            })))
-            .child(caption("Model name"))
-            .child(div().relative().children(self.ai_probe(0)).child(themed_input(&self.ai.model).disabled(disabled)))
-            .child(section_heading("sparkles", "Prompts").child(help_icon("ai-prompts-help", "Markdown supported. Relevant repository context is supplied automatically.")));
+        let connection = settings_view::group("terminal", "Connection", settings_body()
+            .child(settings_view::field("ai-provider-help", "Provider", "Install the CLI and sign in from a terminal. Git Rustle uses its existing authentication.",
+                settings_view::segments().children([Provider::Codex, Provider::Claude].into_iter().enumerate().map(|(i, provider)| {
+                    settings_view::segment(("ai-provider", i), provider.label(), self.ai.provider == provider, disabled)
+                        .on_click(cx.listener(move |v, _, w, cx| v.ai_action(Action::Provider(provider), w, cx)))
+                }))))
+            .child(settings_view::field("ai-model-help", "Model", "Leave empty to use the selected CLI's default model.",
+                div().relative().children(self.ai_probe(0)).child(themed_input(&self.ai.model).disabled(disabled)))));
+        let mut prompts = column().w_full();
         for task in Task::ALL {
             let i = task.index();
             let expanded = self.ai.expanded[i];
-            form = form.child(
+            if i > 0 {
+                prompts = prompts.child(
+                    settings_view::divider()
+                        .relative()
+                        .children(self.ai_probe(6 + i)),
+                );
+            }
+            prompts = prompts.child(
                 column()
                     .w_full()
                     .flex_shrink_0()
-                    .border_1()
-                    .border_color(rgb(palette().line))
-                    .rounded_md()
                     .overflow_hidden()
                     .child(
                         row()
                             .id(("ai-prompt-toggle", i))
                             .w_full()
-                            .p_3()
+                            .px_3().py_2()
                             .cursor_pointer()
-                            .bg(rgb(palette().control))
+                            .bg(rgb(palette().panel))
                             .gap_2()
                             .child(icon(if expanded { "down" } else { "right" }))
-                            .child(icon("sparkles").text_color(rgb(palette().accent)))
                             .child(task.label())
+                            .tooltip(|w, cx| gpui_component::tooltip::Tooltip::new("Customize the prompt. Relevant repository context is supplied automatically; Markdown is supported.").build(w, cx))
                             .on_click(cx.listener(move |v, _, w, cx| {
                                 v.ai_action(Action::Toggle(i), w, cx)
                             })),
                     )
                     .when(expanded, |s| {
-                        s.child(
+                        s.child(settings_view::divider()).child(
                             div().p_3().child(
                                 themed_input(&self.ai.prompts[i])
-                                    .h(px(180.))
+                                    .h(px(140.))
                                     .disabled(disabled),
                             ),
                         )
                     }),
             );
         }
-        form.into_any_element()
+        column()
+            .w_full()
+            .gap_4()
+            .child(connection)
+            .child(settings_view::group(
+                "sparkles",
+                "Prompts",
+                settings_body()
+                    .p_0()
+                    .gap_0()
+                    .overflow_hidden()
+                    .child(prompts),
+            ))
+            .into_any_element()
     }
     pub(super) fn ai_overlay(&self, cx: &Context<Self>) -> Option<AnyElement> {
         if !self.ai.show_result {

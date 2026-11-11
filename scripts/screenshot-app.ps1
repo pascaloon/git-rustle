@@ -7,6 +7,7 @@ param(
     [ValidateSet('Codex','Claude')][string]$AiProvider = 'Codex',
     [ValidateSet('1440x900','900x600')][string]$WindowSize = '1440x900',
     [switch]$LegacyClaude,
+    [switch]$ProjectRemotes,
     [switch]$LightTheme,
     [ValidateSet('black','dark','light')][string]$Theme = 'black',
     [switch]$DisableDirectComposition
@@ -98,6 +99,14 @@ try {
         }
         Invoke-FixtureGit $fixture @('branch','feature/visual-review','HEAD~2') | Out-Null
         Invoke-FixtureGit $fixture @('tag','v0.1.0','HEAD~3') | Out-Null
+        if ($ProjectRemotes -and $scenario -eq 'settings-project') {
+            # Exercise the populated Project form without live provider traffic.
+            foreach ($name in @('origin','upstream')) {
+                $remote = Join-Path $directory "$name.git"
+                Invoke-FixtureGit $fixture @('init','--bare',$remote) | Out-Null
+                Invoke-FixtureGit $fixture @('remote','add',$name,$remote) | Out-Null
+            }
+        }
         if ($scenario -in @('request-branches','request-branches-menu')) {
             $mainBase = (Invoke-FixtureGit $fixture @('rev-parse','HEAD~5')).Trim()
             foreach ($branch in @(@('Dev','HEAD~1'),@('FeatureA','HEAD'))) {
