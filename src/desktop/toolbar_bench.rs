@@ -5,7 +5,7 @@ type PaintedBounds = (usize, Size<Pixels>, Bounds<Pixels>);
 
 #[derive(Default)]
 struct Probe {
-    bounds: [Option<PaintedBounds>; 2],
+    bounds: [Option<PaintedBounds>; 5],
 }
 
 #[derive(serde::Serialize)]
@@ -15,6 +15,7 @@ struct Observation {
     viewport: [f32; 2],
     search: [f32; 4],
     count: [f32; 4],
+    action_groups: [[f32; 4]; 3],
 }
 
 #[derive(Default)]
@@ -142,7 +143,7 @@ impl Desktop {
         self.toolbar_bench.epoch += 1;
         self.toolbar_bench.phase_frames = 0;
         self.toolbar_bench.last_frame = None;
-        self.toolbar_bench.probe.borrow_mut().bounds = [None, None];
+        self.toolbar_bench.probe.borrow_mut().bounds = [None; 5];
         self.toolbar_bench.awaiting = matches!(stage, 1 | 4 | 5);
         if stage == 0 {
             self.toolbar_bench.resize_barrier = true;
@@ -276,7 +277,7 @@ impl Desktop {
             // Once resize has arrived, require one freshly painted probe epoch.
             self.toolbar_bench.resize_barrier = false;
             self.toolbar_bench.epoch += 1;
-            self.toolbar_bench.probe.borrow_mut().bounds = [None, None];
+            self.toolbar_bench.probe.borrow_mut().bounds = [None; 5];
             self.toolbar_bench.last_frame = None;
             cx.notify();
             return;
@@ -298,6 +299,28 @@ impl Desktop {
             cx.notify();
             return;
         }
+        let mut groups = Vec::with_capacity(3);
+        for painted in &bounds[2..] {
+            let Some((epoch, viewport, bounds)) = painted else {
+                cx.notify();
+                return;
+            };
+            if *epoch != self.toolbar_bench.epoch || *viewport != window.viewport_size() {
+                cx.notify();
+                return;
+            }
+            assert!(bounds.size.height >= px(30.) && bounds.size.width >= px(30.));
+            assert!(bounds.left() >= px(0.) && bounds.right() <= search.left());
+            groups.push(*bounds);
+        }
+        assert!(
+            groups[0].right() + px(12.) <= groups[1].left(),
+            "Navigation and sync actions need visible separation"
+        );
+        assert!(
+            groups[1].right() + px(12.) <= groups[2].left(),
+            "Sync and branch actions need visible separation"
+        );
         self.toolbar_bench.resize_started = None;
         let app = &self.engine.app;
         if stage == 0 {
@@ -370,6 +393,11 @@ impl Desktop {
                 ],
                 search: geometry(search),
                 count: geometry(count),
+                action_groups: [
+                    geometry(groups[0]),
+                    geometry(groups[1]),
+                    geometry(groups[2]),
+                ],
             });
         }
         if self.toolbar_bench.phase_frames == 5 {

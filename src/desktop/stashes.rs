@@ -453,7 +453,7 @@ impl Desktop {
             .children(self.graph_feature_probe(0, 9));
         let Some(stash) = stash else {
             return panel
-                .child(caption("Select a stash to inspect its details").p_4())
+                .child(caption("No stash selected").p_4())
                 .into_any_element();
         };
         let apply = stash.clone();
@@ -729,14 +729,14 @@ impl Desktop {
                         .h(px(44.))
                         .px_3()
                         .gap_2()
-                        .child("Stashes")
+                        .child(section_heading("stash", "Stashes"))
                         .child(caption(self.stashes.entries.len().to_string()))
                         .child(div().flex_1())
                         .child(
                             Button::new("new-stash")
                                 .xsmall()
                                 .ghost()
-                                .label("New stash")
+                                .icon(gpui_component::Icon::default().path("rustle/plus")).tooltip("New stash")
                                 .disabled(!can_create)
                                 .on_click(
                                     cx.listener(|v, _, w, cx| {
@@ -748,7 +748,7 @@ impl Desktop {
                             Button::new("close-stashes")
                                 .xsmall()
                                 .ghost()
-                                .label("×")
+                                .icon(gpui_component::Icon::default().path("rustle/close"))
                                 .tooltip("Close stashes")
                                 .on_click(
                                     cx.listener(|v, _, w, cx| {
@@ -756,11 +756,6 @@ impl Desktop {
                                     }),
                                 ),
                         ),
-                )
-                .child(
-                    caption("Saved changes · Apply keeps the stash · Pop removes it after success")
-                        .px_3()
-                        .pb_2(),
                 )
                 .when(self.stashes.composing, |s| {
                     s.child(
@@ -771,14 +766,13 @@ impl Desktop {
                                 themed_input(self.stashes.name.as_ref().unwrap())
                                     .disabled(!enabled),
                             )
-                            .child(caption("Includes staged, unstaged and untracked files."))
                             .child(
                                 row()
                                     .gap_2()
                                     .child(
                                         Button::new("save-stash")
                                             .small()
-                                            .label("Stash changes")
+                                            .label("Stash changes").tooltip("Save staged, unstaged and untracked files in a stash")
                                             .disabled(!can_create)
                                             .on_click(cx.listener(|v, _, w, cx| {
                                                 v.stash_action(Action::Save, w, cx)

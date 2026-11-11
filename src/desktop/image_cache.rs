@@ -99,17 +99,8 @@ impl Desktop {
                 }
                 .into()
             });
-        column()
-            .max_w(px(700.))
-            .mt_4()
-            .pt_4()
-            .border_t_1()
-            .border_color(rgb(palette().line))
-            .gap_2()
-            .child(div().text_color(rgb(palette().text)).child("Images cache"))
-            .child(caption(
-                "Downloaded author and project images · shared by all repositories",
-            ))
+        settings_card()
+            .child(section_heading("image", "Image cache").child(help_icon("image-cache-help", "Downloaded author and project images, shared by all repositories. Clearing the cache downloads them again as needed.")))
             .child(
                 row()
                     .child(caption(size))

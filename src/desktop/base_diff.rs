@@ -263,11 +263,8 @@ impl Desktop {
                 dialog_body("Diff against branch base")
                     .relative()
                     .children(self.graph_feature_probe(0, 15))
-                    .child(caption(if self.base_diff.busy {
-                        "Finding the common ancestor…"
-                    } else {
-                        "Choose the branch this work started from."
-                    }))
+                    .child(field_label("base-branch-help", "Base branch", "Choose the branch this work started from. The diff begins at the common ancestor."))
+                    .when(self.base_diff.busy, |s| s.child(caption("Finding the common ancestor…")))
                     .when(!self.base_diff.busy, |s| {
                         s.child(
                             div()

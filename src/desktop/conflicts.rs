@@ -619,13 +619,8 @@ impl Desktop {
                             .text_ellipsis()
                             .child(path.clone()),
                     )
-                    .child(caption(if file.is_some_and(|f| f.unmerged && !f.exists) {
-                        "Deleted in the working tree. Choose a version or mark the deletion resolved."
-                    } else if unmerged {
-                        "Choose a whole version or edit the result below."
-                    } else {
-                        "Resolved and staged. The editor buffer below is retained and has not been saved again."
-                    })),
+                    .when(file.is_some_and(|f| f.unmerged && !f.exists), |s| s.child(caption("Deleted in working tree")))
+                    .when(!unmerged, |s| s.child(caption("Resolved and staged · editor buffer retained"))),
             )
             .child(
                 row()
@@ -640,7 +635,8 @@ impl Desktop {
                     ))
                     .child(side_button("conflict-use-local", "Use local…", local, cx))
                     .child(self.tools_merge_button(path, cx))
-                    .child(self.ai_button("ai-resolve-conflict", "Resolve with AI", crate::ai::Task::Conflict, cx)),
+                    .child(self.ai_button("ai-resolve-conflict", "Resolve with AI", crate::ai::Task::Conflict, cx))
+                    .child(help_icon("conflict-editor-help", "Choose a whole version or edit the result. Marking a file resolved stages the version on disk. Saving writes and stages the editor buffer.")),
             );
         if state.stale {
             editor = editor.child(row().flex_wrap().gap_2().flex_shrink_0()
@@ -695,9 +691,31 @@ impl Desktop {
                         ),
                 );
         } else if unmerged {
-            editor = editor.child(caption(if self.engine.operation_busy { "Loading file…" } else { "Binary, large, or non-text file. Choose an entire version or edit it in your application." }))
-                .child(Button::new("mark-binary-resolution").small().label("Mark file resolved").disabled(disabled)
-                    .on_click({ let path = path.clone(); cx.listener(move |v, _, w, cx| v.operation_action(operations::Action::Run(Request::Resolve { path: path.clone(), choice: Resolution::Mark }), w, cx)) }));
+            editor = editor
+                .child(caption(if self.engine.operation_busy {
+                    "Loading file…"
+                } else {
+                    "Binary, large, or non-text file"
+                }))
+                .child(
+                    Button::new("mark-binary-resolution")
+                        .small()
+                        .label("Mark file resolved")
+                        .disabled(disabled)
+                        .on_click({
+                            let path = path.clone();
+                            cx.listener(move |v, _, w, cx| {
+                                v.operation_action(
+                                    operations::Action::Run(Request::Resolve {
+                                        path: path.clone(),
+                                        choice: Resolution::Mark,
+                                    }),
+                                    w,
+                                    cx,
+                                )
+                            })
+                        }),
+                );
         }
         editor.into_any_element()
     }
@@ -721,7 +739,7 @@ impl Desktop {
             .child(column().p_4().gap_1().flex_shrink_0()
                 .child(row().gap_2().child(icon("attention").text_color(rgb(palette().accent)))
                     .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(format!("Resolve {} conflicts", conflict.kind.to_lowercase()))))
-                .child(caption(format!("{} unresolved · changes refresh automatically", conflict.files.len())))
+                .child(caption(format!("{} unresolved", conflict.files.len())))
                 .when(conflict.commits_truncated, |p| p.child(caption("Commit lists are limited; select a commit to inspect its full details.")))
                 .when_some(conflict.metadata_error.clone(), |p, error| p.child(caption(error).text_color(rgb(palette().removed)))))
             .when_some(self.engine.conflict_refresh_error.clone(), |p, error| p.child(caption(format!("Automatic refresh paused: {error}")).px_4().text_color(rgb(palette().removed))))

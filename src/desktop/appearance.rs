@@ -96,8 +96,7 @@ impl Desktop {
             .child(
                 column()
                     .gap_1()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Appearance"))
-                    .child(caption("Choose your theme. Saved for every repository.")),
+                    .child(section_heading("settings", "Appearance")),
             )
             .child(
                 row()

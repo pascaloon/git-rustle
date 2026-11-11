@@ -95,11 +95,14 @@ impl SelectItem for CommitAction {
         self
     }
     fn render(&self, _: &mut Window, _: &mut gpui::App) -> impl IntoElement {
-        column()
+        let description = self.description();
+        row()
+            .id(SharedString::from(format!("rebase-action-{}", self.name())))
             .py_1()
-            .gap_1()
+            .gap_2()
             .child(self.name())
-            .child(caption(self.description()))
+            .child(icon("info").text_color(rgb(palette().muted)))
+            .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(description).build(w, cx))
     }
 }
 impl Panel {
@@ -761,8 +764,14 @@ impl Desktop {
                     .child(div().text_size(px(22.)).child("Interactive rebase")),
             );
             if self.engine.operations.interactive_rebase {
-                content = content.child(caption("Rebase is in progress. Resolve or amend the current commit, then continue."))
-                        .child(self.op_button("rebase-progress", "Open rebase progress", Action::ShowConflicts, cx));
+                content = content
+                    .child(caption("Rebase paused"))
+                    .child(self.op_button(
+                        "rebase-progress",
+                        "Open rebase progress",
+                        Action::ShowConflicts,
+                        cx,
+                    ));
             } else {
                 unreachable!("draft rebase uses its own virtualized layout");
             }
@@ -853,9 +862,10 @@ impl Desktop {
             .child(column().flex_shrink_0().gap_2()
                 .child(row().gap_3().child(icon("graph").text_color(rgb(palette().accent)))
                     .child(div().text_size(px(22.)).child("Interactive rebase"))
+                    .child(help_icon("rebase-help", "Choose an action for each commit and use the arrows to change replay order. History changes only after review and confirmation."))
                     .child(div().flex_1())
                     .child(caption(plan.map(|p| format!("{}  /  onto {}", p.branch, &p.base[..12.min(p.base.len())])).unwrap_or_default()).truncate()))
-                .child(caption("Shape your history. Choose an action for each commit and use the arrows to change replay order.")))
+                )
             .child(column().flex_1().border_1().border_color(rgb(palette().line)).rounded_lg().overflow_hidden()
                 .child(row().flex_shrink_0().h(px(38.)).px_4().bg(rgb(palette().control))
                     .child(caption("REPLAY ORDER · OLDEST FIRST"))
@@ -870,7 +880,7 @@ impl Desktop {
                 .child(row()
                     .child(Button::new("reset-rebase").small().ghost().label("Reset plan").disabled(!enabled)
                         .on_click(cx.listener(|v, _, window, cx| v.operation_action(Action::ResetPlan, window, cx))))
-                    .child(caption("History changes only after review and confirmation.").flex_1())
+                    .child(div().flex_1())
                     .child(self.op_button("close-plan", "Discard plan", Action::ClosePlan, cx))
                     .child(Button::new("start-plan").small().primary().label("Review rebase…").disabled(!enabled || !valid)
                         .on_click(cx.listener(|v, _, window, cx| v.operation_action(Action::StartPlan, window, cx))))))
@@ -948,7 +958,7 @@ impl Desktop {
                         r.child(div().text_color(rgb(palette().removed)).child("Required"))
                     }),
             );
-        } else {
+        } else if entry.error.is_some() || entry.action.combines() {
             body = body.child(caption(detail).truncate().text_color(rgb(
                 if entry.error.is_some() {
                     palette().removed
@@ -989,13 +999,21 @@ impl Desktop {
                     .child(format!("{:02}", i + 1)),
             )
             .child(
-                div().w(px(126.)).flex_shrink_0().child(
-                    themed_select(&controls.select)
-                        .small()
-                        .w_full()
-                        .menu_width(px(420.))
-                        .disabled(!enabled),
-                ),
+                div()
+                    .id(("rebase-action", key))
+                    .w(px(126.))
+                    .flex_shrink_0()
+                    .tooltip({
+                        let description = entry.action.description();
+                        move |w, cx| gpui_component::tooltip::Tooltip::new(description).build(w, cx)
+                    })
+                    .child(
+                        themed_select(&controls.select)
+                            .small()
+                            .w_full()
+                            .menu_width(px(420.))
+                            .disabled(!enabled),
+                    ),
             )
             .child(body)
             .child(
@@ -1006,7 +1024,7 @@ impl Desktop {
                         Button::new(("rebase-up", key))
                             .small()
                             .ghost()
-                            .label("↑")
+                            .icon(gpui_component::Icon::default().path("rustle/arrow-up"))
                             .tooltip("Move earlier in replay order")
                             .disabled(!enabled || i == 0)
                             .on_click(cx.listener(move |v, _, window, cx| {
@@ -1017,7 +1035,7 @@ impl Desktop {
                         Button::new(("rebase-down", key))
                             .small()
                             .ghost()
-                            .label("↓")
+                            .icon(gpui_component::Icon::default().path("rustle/arrow-down"))
                             .tooltip("Move later in replay order")
                             .disabled(!enabled || i + 1 == self.operations.draft.entries.len())
                             .on_click(cx.listener(move |v, _, window, cx| {
@@ -1144,12 +1162,20 @@ impl Desktop {
                     },
                 ),
             };
-            let mut body = dialog_body(title)
+            let mut body = column()
+                .gap_4()
+                .child(
+                    row()
+                        .child(div().flex_1().text_size(px(22.)).child(title))
+                        .when(!detail.is_empty(), |r| {
+                            r.child(help_icon("operation-help", detail))
+                        }),
+                )
                 .relative()
                 .children(self.graph_context_probe(9));
             if dialog == Dialog::Push {
                 if op.push_pending {
-                    body = body.child(caption("Checking the remote branch… You can close this dialog while the check runs."));
+                    body = body.child(caption("Checking remote branch…"));
                 } else if let Some(push) = &op.push {
                     let (color, label) = match push.risk {
                         PushRisk::Trivial => (palette().added, "Ready for a normal push"),
@@ -1193,16 +1219,40 @@ impl Desktop {
                         .child(self.engine.operation_status.clone()).child(caption("No push was sent. Check your remote and authentication, then try again."));
                 }
             } else {
-                body = body.child(detail);
-                if dialog == Dialog::Delete {
+                if !matches!(dialog, Dialog::Merge | Dialog::Rebase | Dialog::Plan) {
                     body = body.child(
-                        Checkbox::new("delete-unmerged")
-                            .checked(op.force_delete)
-                            .label("Delete even if the branch has unmerged commits")
-                            .on_click(cx.listener(|v, checked: &bool, w, cx| {
-                                v.operation_action(Action::ForceDelete(*checked), w, cx)
-                            })),
+                        row()
+                            .child(icon(if dialog == Dialog::CreateTag {
+                                "tag"
+                            } else {
+                                "branch"
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(
+                                if dialog == Dialog::Reset {
+                                    format!("{} → {}", op.current_branch, op.label)
+                                } else {
+                                    op.label.clone()
+                                },
+                            )),
                     );
+                }
+                if dialog == Dialog::Rebase {
+                    body = body.child(
+                        caption("Rewrites commit IDs; a force push may be required.")
+                            .text_color(rgb(palette().accent)),
+                    );
+                }
+                if dialog == Dialog::Delete {
+                    body = body
+                        .child(caption("Deletes the local branch. Remote branch retained."))
+                        .child(
+                            Checkbox::new("delete-unmerged")
+                                .checked(op.force_delete)
+                                .label("Delete even if the branch has unmerged commits")
+                                .on_click(cx.listener(|v, checked: &bool, w, cx| {
+                                    v.operation_action(Action::ForceDelete(*checked), w, cx)
+                                })),
+                        );
                 }
                 if dialog == Dialog::Reset {
                     for (mode, title, description) in [
@@ -1256,7 +1306,7 @@ impl Desktop {
                             .gap_2()
                             .rounded_md()
                             .bg(rgb(palette().control))
-                            .child(caption("palette().selected TARGET"))
+                            .child(caption("TARGET"))
                             .child(op.label.clone())
                             .child(caption("CURRENT BRANCH"))
                             .child(op.current_branch.clone()),

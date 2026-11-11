@@ -310,6 +310,50 @@ fn caption(s: impl Into<SharedString>) -> Div {
         .child(s.into())
 }
 
+// Guidance belongs beside its control, on demand; labels and live state stay visible.
+fn field_label(id: &'static str, label: &'static str, help: &'static str) -> Div {
+    row()
+        .gap_1()
+        .child(caption(label))
+        .child(help_icon(id, help))
+}
+
+fn help_icon(id: &'static str, help: impl Into<SharedString>) -> impl IntoElement {
+    Button::new(id)
+        .xsmall()
+        .ghost()
+        .icon(gpui_component::Icon::default().path("rustle/info"))
+        .tooltip(help)
+}
+
+fn section_heading(symbol: &'static str, title: &'static str) -> Div {
+    row()
+        .gap_2()
+        .child(icon(symbol).text_color(rgb(palette().muted)))
+        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+}
+
+fn toolbar_separator() -> Div {
+    div()
+        .w(px(1.))
+        .h(px(20.))
+        .mx_1()
+        .flex_shrink_0()
+        .bg(rgb(palette().line))
+}
+
+fn settings_card() -> Div {
+    column()
+        .w_full()
+        .flex_shrink_0()
+        .gap_3()
+        .p_4()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(palette().line))
+        .bg(rgb(palette().panel))
+}
+
 // Inputs use an inset surface in Dark; retain component defaults in other themes.
 fn themed_input(state: &Entity<InputState>) -> Input {
     Input::new(state).when(palette().input_bg != palette().bg, |input| {
@@ -2264,7 +2308,8 @@ impl Desktop {
                     .border_color(rgb(palette().accent))
             })
             .tooltip(move |w, cx| {
-                gpui_component::tooltip::Tooltip::new(full_target.clone()).build(w, cx)
+                gpui_component::tooltip::Tooltip::new(format!("{full_target}\n{description}"))
+                    .build(w, cx)
             })
             .child(
                 row()
@@ -2304,8 +2349,7 @@ impl Desktop {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_ellipsis()
                             .child(target),
-                    )
-                    .child(caption(description)),
+                    ),
             )
             .child(icon("next").text_color(rgb(palette().muted)))
             .on_click(
@@ -2325,7 +2369,7 @@ impl Desktop {
             Action::Operation(ref a) => match a.as_ref() {
                 operations::Action::Pull => Some("pull"),
                 operations::Action::Open(operations::Dialog::Push, ..) => Some("push"),
-                operations::Action::Open(operations::Dialog::Create, ..) => Some("branch"),
+                operations::Action::Open(operations::Dialog::Create, ..) => Some("branch-add"),
                 _ => None,
             },
             Action::Settings => Some("settings"),
@@ -2337,6 +2381,8 @@ impl Desktop {
             Action::Diff => Some("diff"),
             Action::Checkout => Some("checkout"),
             Action::CopySha1 => Some("copy"),
+            Action::CheckAll(true) => Some("check-all"),
+            Action::CheckAll(false) => Some("uncheck-all"),
             Action::Expand(true) => Some("expand"),
             Action::Expand(false) => Some("collapse"),
 
@@ -2395,7 +2441,7 @@ impl Desktop {
             Action::Wrap => self.word_wrap,
             _ => false,
         };
-        let save = matches!(action, Action::SaveSettings);
+        let save = matches!(action, Action::SaveSettings | Action::Commit);
         div()
             .id(id)
             .flex()
@@ -2451,6 +2497,9 @@ impl Desktop {
                         "checkout" => "Checkout",
                         "copy" => "Copy SHA1",
                         "branch" => "Branches",
+                        "branch-add" => "Create and check out a new branch",
+                        "check-all" => "Select all files for commit",
+                        "uncheck-all" => "Deselect all files",
                         _ => "Next file",
                     })
                     .build(w, cx)
@@ -2477,25 +2526,44 @@ impl Desktop {
             .px_3()
             .border_b_1()
             .border_color(rgb(palette().line))
-            .child(self.button("head", "", Action::Head, cx))
-            .child(self.button("refresh", "", Action::Refresh, cx))
-            .child(self.button(
-                "pull",
-                "Pull",
-                Action::Operation(Box::new(operations::Action::Pull)),
-                cx,
-            ))
-            .child(self.button(
-                "push",
-                "Push",
-                Action::Operation(Box::new(operations::Action::Open(
-                    operations::Dialog::Push,
-                    String::new(),
-                    String::new(),
-                ))),
-                cx,
-            ))
-            .child(self.button("create-branch", "New branch", self.new_branch_action(), cx))
+            .child(
+                row()
+                    .relative()
+                    .gap_1()
+                    .children(self.toolbar_bounds_probe(2))
+                    .child(self.button("head", "", Action::Head, cx))
+                    .child(self.button("refresh", "", Action::Refresh, cx)),
+            )
+            .child(toolbar_separator())
+            .child(
+                row()
+                    .relative()
+                    .gap_1()
+                    .children(self.toolbar_bounds_probe(3))
+                    .child(self.button(
+                        "pull",
+                        "",
+                        Action::Operation(Box::new(operations::Action::Pull)),
+                        cx,
+                    ))
+                    .child(self.button(
+                        "push",
+                        "",
+                        Action::Operation(Box::new(operations::Action::Open(
+                            operations::Dialog::Push,
+                            String::new(),
+                            String::new(),
+                        ))),
+                        cx,
+                    )),
+            )
+            .child(toolbar_separator())
+            .child(
+                row()
+                    .relative()
+                    .children(self.toolbar_bounds_probe(4))
+                    .child(self.button("create-branch", "", self.new_branch_action(), cx)),
+            )
             .when(
                 self.selected_commits
                     .ids(self.engine.app.selected_id())
@@ -3094,18 +3162,10 @@ impl Desktop {
                     .child(
                         row()
                             .child(self.button("commit", "Commit", Action::Commit, cx))
-                            .child(self.button(
-                                "check-all",
-                                "Check all",
-                                Action::CheckAll(true),
-                                cx,
-                            ))
-                            .child(self.button(
-                                "uncheck-all",
-                                "Uncheck all",
-                                Action::CheckAll(false),
-                                cx,
-                            )),
+                            .child(div().flex_1())
+                            .child(toolbar_separator())
+                            .child(self.button("check-all", "", Action::CheckAll(true), cx))
+                            .child(self.button("uncheck-all", "", Action::CheckAll(false), cx)),
                     )
                     .when(!app.pending.status.is_empty(), |s| {
                         s.child(caption(app.pending.status.clone()))
@@ -3163,7 +3223,7 @@ impl Desktop {
                                 s.child(caption(if app.details_id().is_some() {
                                     "Loading commit details…"
                                 } else {
-                                    "Select a commit to inspect its details"
+                                    "No commit selected"
                                 }))
                             })
                             .when(self.detail_id.is_some(), |s| {
@@ -3453,7 +3513,11 @@ impl Desktop {
             form = form.child(self.ai_settings(cx));
         } else if settings.page == crate::settings::GENERAL_PAGE {
             form = form
-                .child(caption("General settings · shared by all repositories"))
+                .child(field_label(
+                    "general-scope",
+                    "Global",
+                    "These preferences apply to every repository.",
+                ))
                 .child(self.appearance_controls(cx))
                 .child(
                     row()
@@ -3504,7 +3568,7 @@ impl Desktop {
                 );
         } else if settings.page == 0 {
             form = form
-                .child(caption("Settings for this project"))
+                .child(section_heading("folder", "Repository"))
                 .child(
                     div()
                         .relative()
@@ -3572,24 +3636,26 @@ impl Desktop {
                                 cx,
                             )),
                     )
-                    .child(caption("Project path · group/project or owner/repository"))
+                    .child(field_label(
+                        "project-path-help",
+                        "Project path",
+                        "Use group/project for GitLab or owner/repository for GitHub.",
+                    ))
                     .child(themed_input(&self.project).disabled(settings.busy));
             } else if !settings.busy {
-                form = form.child(caption(
-                    "No remotes configured. Add one with git remote add, then reopen the app.",
-                ));
+                form = form.child(caption("No remotes configured"));
             }
         } else if let Some(index) = settings.provider_index() {
             let draft = &settings.providers[index];
-            form = form.child(caption("Global settings · shared by all your projects"))
+            form = form.child(field_label("provider-scope", "Global", "Provider credentials apply to every repository."))
                 .child(caption("Custom server or API URL"))
                 .child(themed_input(&self.api).disabled(settings.busy))
-                .child(caption("Access token · stored in Windows Credential Manager"))
+                .child(field_label("token-help", "Access token", "Stored in Windows Credential Manager. Leave a saved token masked to keep it, or enter a replacement. Environment tokens and Git credentials are also supported."))
                 .child(themed_input(&self.token).disabled(settings.busy))
-                .child(caption(if draft.forget { "The saved token will be removed when you save." }
-                    else if draft.has_token { "A custom token is saved. Leave it masked to keep it, or replace it." }
-                    else { "No custom token saved. Environment tokens and Git credentials can still be used." }))
-                .child(self.button("forget", if draft.forget { "✓ Forget saved token" } else { "Forget saved token" }, Action::ForgetToken, cx));
+                .child(caption(if draft.forget { "Token removal pending" }
+                    else if draft.has_token { "Token saved" }
+                    else { "No custom token" }))
+                .when(draft.has_token, |s| s.child(self.button("forget", if draft.forget { "Keep saved token" } else { "Remove saved token" }, Action::ForgetToken, cx)));
         }
         column()
             .id("settings-page")
@@ -3972,7 +4038,6 @@ impl Render for Desktop {
                 dialog_body("Confirm checkout")
                     .relative()
                     .children(self.ghost_checkout_modal_probe())
-                    .child(caption("Choose how to open this revision."))
                     .child(
                         column()
                             .id("checkout-options")

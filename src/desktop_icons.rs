@@ -17,6 +17,17 @@ impl AssetSource for Assets {
             _ => path.strip_prefix("rustle/").unwrap_or(""),
         };
         let body = match name {
+            "info" => "<circle cx='12' cy='12' r='9'/><path d='M12 11v6m0-10h.01'/>",
+            "image" => {
+                "<rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8' cy='8' r='2'/><path d='m3 18 5-5 4 4 4-7 5 8'/>"
+            }
+            "plus" => "<path d='M12 4v16M4 12h16'/>",
+            "arrow-up" => "<path d='M12 20V4m-7 7 7-7 7 7'/>",
+            "arrow-down" => "<path d='M12 4v16m-7-7 7 7 7-7'/>",
+            "check-all" => {
+                "<path d='m3 6 2 2 3-4m3 2h10M3 12l2 2 3-4m3 2h10M3 18l2 2 3-4m3 2h10'/>"
+            }
+            "uncheck-all" => "<path d='M3 6h4m4 0h10M3 12h4m4 0h10M3 18h4m4 0h10'/>",
             "sparkles" => {
                 "<path d='m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4ZM20 2v4m-2-2h4M4 18v4m-2-2h4'/>"
             }
@@ -61,6 +72,9 @@ impl AssetSource for Assets {
             "diff" => "<path d='M4 3h16v18H4zM12 3v18M6 8h4m-2-2v4m6 4h4'/>",
             "branch" => {
                 "<circle cx='6' cy='5' r='2'/><circle cx='18' cy='5' r='2'/><circle cx='6' cy='19' r='2'/><path d='M6 7v10m12-10v3c0 4-12 0-12 6'/>"
+            }
+            "branch-add" => {
+                "<circle cx='6' cy='5' r='2'/><circle cx='6' cy='19' r='2'/><path d='M6 7v10m0-3c0-4 12 0 12-5m0-7v6m-3-3h6'/>"
             }
             "computer" => {
                 "<rect x='3' y='4' width='18' height='13' rx='1.5'/><path d='M8 21h8m-4-4v4'/>"

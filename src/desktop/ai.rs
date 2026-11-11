@@ -214,7 +214,10 @@ impl Desktop {
                     .small()
                     .ghost()
                     .icon(gpui_component::Icon::default().path("rustle/sparkles"))
-                    .label(label)
+                    .tooltip(label)
+                    .when(!matches!(task, Task::Commit | Task::Summary), |b| {
+                        b.label(label)
+                    })
                     .disabled(!self.ai_available())
                     .on_click(cx.listener(move |v, _, window, cx| {
                         v.ai_action(Action::Run(task), window, cx)
@@ -739,17 +742,16 @@ impl Desktop {
             .disabled(disabled || self.ai.busy)
             .on_click(cx.listener(|v, _, w, cx| v.ai_action(Action::Save, w, cx)));
         let mut form = column().w_full().gap_3()
-            .child(row().gap_3().child(caption("Global AI settings · shared by all repositories").flex_1()).child(save))
+            .child(row().gap_3().child(field_label("ai-scope", "Global", "AI settings apply to every repository.").flex_1()).child(save))
             .child(div().text_size(px(12.)).text_color(rgb(if self.ai.error { palette().removed } else { palette().muted })).child(self.ai.status.clone()))
-            .child(caption("Provider"))
+            .child(field_label("ai-provider-help", "Provider", "Install your CLI and sign in in a terminal. Git Rustle uses its existing authentication."))
             .child(row().gap_2().children([Provider::Codex, Provider::Claude].into_iter().enumerate().map(|(i, provider)| {
                 Button::new(("ai-provider", i)).small().label(provider.label()).selected(self.ai.provider == provider).disabled(disabled)
                     .on_click(cx.listener(move |v, _, w, cx| v.ai_action(Action::Provider(provider), w, cx)))
             })))
-            .child(caption("Install your CLI and sign in in a terminal. Git Rustle uses its existing authentication."))
             .child(caption("Model name"))
             .child(div().relative().children(self.ai_probe(0)).child(themed_input(&self.ai.model).disabled(disabled)))
-            .child(caption("Markdown prompts · additional context is supplied automatically"));
+            .child(section_heading("sparkles", "Prompts").child(help_icon("ai-prompts-help", "Markdown supported. Relevant repository context is supplied automatically.")));
         for task in Task::ALL {
             let i = task.index();
             let expanded = self.ai.expanded[i];

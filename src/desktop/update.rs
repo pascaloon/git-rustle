@@ -205,26 +205,20 @@ impl Desktop {
             )
         } else {
             match &self.updates.check_state {
-                CheckState::Idle => (
-                    "Check for the latest stable Windows release.".to_string(),
-                    false,
-                ),
+                CheckState::Idle => (String::new(), false),
                 CheckState::Checking => ("Checking for updates…".into(), false),
                 CheckState::Current => ("You're up to date.".into(), false),
-                CheckState::Available(version) => (
-                    format!(
-                        "Version {version} is available. Use the update button below to review it."
-                    ),
-                    false,
-                ),
+                CheckState::Available(version) => (format!("Version {version} available"), false),
                 CheckState::Failed(error) => {
                     (format!("Could not check for updates: {error}"), true)
                 }
             }
         };
-        column()
-            .gap_2()
-            .child(div().text_color(rgb(palette().text)).child("Updates"))
+        settings_card()
+            .child(section_heading("refresh", "Updates").child(help_icon(
+                "updates-help",
+                "Check for the latest stable Windows release.",
+            )))
             .child(
                 row()
                     .child(caption(format!("Git Rustle {}", update::VERSION)))
@@ -240,15 +234,17 @@ impl Desktop {
                         cx,
                     )),
             )
-            .child(
-                div()
-                    .text_color(rgb(if error {
-                        palette().removed
-                    } else {
-                        palette().muted
-                    }))
-                    .child(message),
-            )
+            .when(!message.is_empty(), |s| {
+                s.child(
+                    div()
+                        .text_color(rgb(if error {
+                            palette().removed
+                        } else {
+                            palette().muted
+                        }))
+                        .child(message),
+                )
+            })
     }
 
     pub(super) fn update_check_summary(&self) -> String {

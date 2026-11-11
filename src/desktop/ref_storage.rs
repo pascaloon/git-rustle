@@ -145,9 +145,8 @@ impl Desktop {
     pub(super) fn ref_storage_controls(&self, cx: &Context<Self>) -> Div {
         let ready = self.ref_storage.info.as_ref();
         let already_enabled = self.engine.reference_storage_reftable();
-        column().mt_4().pt_3().gap_2().border_t_1().border_color(rgb(palette().line))
-            .child("Branch name compatibility")
-            .child(caption("Case-sensitive storage allows names such as Feature and feature to coexist safely on Windows."))
+        settings_card()
+            .child(section_heading("branch", "Branch names").child(help_icon("branch-names-help", "Case-sensitive storage allows names such as Feature and feature to coexist safely on Windows.")))
             .when(ready.is_none() && already_enabled, |panel| panel.child(caption("Case-sensitive references enabled.")))
             .when(ready.is_none() && !already_enabled, |panel| panel.child(
                 Button::new("check-case-sensitive-branches").small().label("Enable case-sensitive branch names…")

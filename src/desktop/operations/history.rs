@@ -144,8 +144,7 @@ impl Desktop {
                             .size(px(24.))
                             .text_color(rgb(palette().muted)),
                     )
-                    .child(div().text_size(px(14.)).child("No undo history"))
-                    .child(caption("New actions will appear here.")),
+                    .child(div().text_size(px(14.)).child("No undo history")),
             );
         } else {
             let height = (count + 1).min(6) as f32 * 44.;
@@ -167,7 +166,10 @@ impl Desktop {
                             .scrollbar_show(ScrollbarShow::Always),
                     ),
                 )
-                .child(caption("Double-click to restore").text_size(px(11.)));
+                .child(help_icon(
+                    "history-help",
+                    "Double-click an entry to restore that point in undo history.",
+                ));
         }
         if !view.boundary.is_empty() {
             let detail = view.boundary.clone();

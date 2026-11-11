@@ -160,7 +160,7 @@ impl Settings {
                     .min(self.projects.len().saturating_sub(1));
                 self.providers = loaded.providers;
                 self.finish(Outcome::Loaded(Ok(loaded.configs)));
-                self.status = "Project settings apply here. GitLab and GitHub settings apply to all projects.".into();
+                self.status.clear();
             }
             Outcome::SavedPage(Ok(message)) => {
                 if let Some(index) = self.provider_index() {

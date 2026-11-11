@@ -150,7 +150,7 @@ impl Desktop {
                     })
                     .when(
                         !self.engine.recents_loading && self.engine.recents.is_empty(),
-                        |s| s.child(caption("Open a repository to get started.")),
+                        |s| s.child(caption("No recent repositories")),
                     )
                     .child(
                         column()
@@ -195,7 +195,10 @@ impl Desktop {
                                     .child(
                                         Button::new(("recent-forget", i))
                                             .ghost()
-                                            .label("×")
+                                            .icon(
+                                                gpui_component::Icon::default()
+                                                    .path("rustle/close"),
+                                            )
                                             .tooltip("Forget repository")
                                             .disabled(loading || self.engine.recents_loading)
                                             .on_click(cx.listener(move |v, _, _, cx| {

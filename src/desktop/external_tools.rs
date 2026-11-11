@@ -909,38 +909,29 @@ impl Desktop {
     }
     pub(super) fn tools_controls(&self, cx: &mut Context<Self>) -> Div {
         let locked = self.tools.busy || self.tools.loading;
-        let mut panel = column()
-            .w(px(700.))
-            .max_w_full()
-            .flex_shrink_0()
-            .mt_4()
-            .pt_4()
-            .border_t_1()
-            .border_color(rgb(palette().line))
-            .gap_2()
-            .child(
-                row()
-                    .w_full()
-                    .flex_shrink_0()
-                    .child("External comparison tools")
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("configure-tools")
-                            .label(if self.tools.open {
-                                "Hide configuration"
-                            } else {
-                                "Configure tools…"
-                            })
-                            .disabled(self.tools.busy)
-                            .on_click(
-                                cx.listener(|v, _, w, cx| v.tools_action(Action::Toggle, w, cx)),
-                            ),
-                    ),
-            );
+        let mut panel = settings_card().child(
+            row()
+                .w_full()
+                .flex_shrink_0()
+                .child(section_heading("tool", "External tools").child(help_icon(
+                    "tools-help",
+                    "Saved tools appear in Diff and Merge. Changes take effect after Save.",
+                )))
+                .child(div().flex_1())
+                .child(
+                    Button::new("configure-tools")
+                        .label(if self.tools.open {
+                            "Hide configuration"
+                        } else {
+                            "Configure tools…"
+                        })
+                        .disabled(self.tools.busy)
+                        .on_click(cx.listener(|v, _, w, cx| v.tools_action(Action::Toggle, w, cx))),
+                ),
+        );
         if !self.tools.open {
             return panel.children(self.tools_notice());
         }
-        panel = panel.child(caption("Saved tools appear as icon buttons in Diff and Merge. Hover an icon for its name; use the arrow to configure tools. Changes take effect after Save.").w_full().flex_shrink_0());
         for (i, entry) in self.tools.draft.tools.iter().enumerate() {
             let id = entry.id.clone();
             panel = panel.child(
@@ -966,13 +957,15 @@ impl Desktop {
                 .flex_shrink_0()
                 .child(
                     Button::new("add-tool")
-                        .label("Add tool")
+                        .icon(gpui_component::Icon::default().path("rustle/plus"))
+                        .tooltip("Add tool")
                         .disabled(locked || !self.tools.loaded)
                         .on_click(cx.listener(|v, _, w, cx| v.tools_action(Action::Add, w, cx))),
                 )
                 .child(
                     Button::new("remove-tool")
-                        .label("Remove selected")
+                        .icon(gpui_component::Icon::default().path("rustle/trash"))
+                        .tooltip("Remove selected tool")
                         .disabled(locked || self.tools.selected.is_none())
                         .on_click(cx.listener(|v, _, w, cx| v.tools_action(Action::Remove, w, cx))),
                 ),
@@ -981,14 +974,14 @@ impl Desktop {
             panel = panel.child(caption(if self.tools.loading {
                 "Loading tools…"
             } else {
-                "No saved tools. Add a tool to configure an application."
+                "No saved tools"
             }));
         } else if let Some(inputs) = &self.tools.inputs {
             for (i, title) in [
                 "Name",
                 "Application (.exe)",
-                "Diff arguments (blank disables Diff)",
-                "Merge arguments (blank disables Merge)",
+                "Diff arguments",
+                "Merge arguments",
             ]
             .into_iter()
             .enumerate()
@@ -999,7 +992,7 @@ impl Desktop {
                         .w_full()
                         .flex_shrink_0()
                         .gap_1()
-                        .child(title)
+                        .child(row().child(caption(title)).when(i >= 2, |r| r.child(help_icon(if i == 2 { "diff-arguments-help" } else { "merge-arguments-help" }, "One argument per line; paths with spaces stay together. Diff: {left}, {right}. Merge: {left}, {base}, {right}, {output}. Include the application wait option. Leave blank to disable this action."))))
                         .child(
                             div()
                                 .relative()
@@ -1017,11 +1010,11 @@ impl Desktop {
                         ),
                 );
             }
-            panel = panel.child(caption("One argument per line; paths with spaces stay together. Diff: {left}, {right}. Merge: {left}, {base}, {right}, {output}. Include the application's wait option.").w_full().flex_shrink_0());
         }
         panel
             .child(
                 Button::new("save-tools")
+                    .primary()
                     .label("Save tools")
                     .disabled(locked || !self.tools.loaded)
                     .on_click(cx.listener(|v, _, w, cx| v.tools_action(Action::Save, w, cx))),

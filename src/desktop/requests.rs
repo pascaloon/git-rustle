@@ -1524,7 +1524,15 @@ impl Desktop {
         let locked = c.sending || c.created.is_some() || c.uncertain;
         column()
             .gap_2()
-            .child(caption(if reviewer { "Reviewers" } else { "Assignees" }))
+            .child(field_label(
+                if reviewer {
+                    "reviewers-help"
+                } else {
+                    "assignees-help"
+                },
+                if reviewer { "Reviewers" } else { "Assignees" },
+                "Search project members by name or @username. Up to 10 per field.",
+            ))
             .child(
                 themed_select(if reviewer { &c.reviewers } else { &c.assignees })
                     .placeholder("Add project member…")
@@ -1551,7 +1559,7 @@ impl Desktop {
                         ))
                         .ghost()
                         .xsmall()
-                        .label("×")
+                        .icon(gpui_component::Icon::default().path("rustle/close"))
                         .tooltip("Remove member")
                         .disabled(locked)
                         .on_click(cx.listener(move |v, _, _, cx| {
@@ -1629,10 +1637,15 @@ impl Desktop {
             .child(caption("Title"))
             .child(themed_input(&c.title).disabled(locked))
             .child(
-                row().justify_between().child(caption("Description")).child(
-                    row()
-                        .gap_1()
-                        .children([(false, "Write"), (true, "Preview")].into_iter().map(
+                row()
+                    .justify_between()
+                    .child(field_label(
+                        "request-markdown-help",
+                        "Description",
+                        "Markdown supports headings, lists, links, code blocks and task lists.",
+                    ))
+                    .child(row().gap_1().children(
+                        [(false, "Write"), (true, "Preview")].into_iter().map(
                             |(preview, title)| {
                                 Button::new(if preview {
                                     "request-preview"
@@ -1652,8 +1665,8 @@ impl Desktop {
                                     },
                                 ))
                             },
-                        )),
-                ),
+                        ),
+                    )),
             );
         editor = if c.preview {
             editor.child(
@@ -1678,31 +1691,24 @@ impl Desktop {
         };
         let form = column().gap_5().w_full().max_w(px(1080.))
             .child(row().justify_between()
-                .child(column().gap_1().child(div().text_size(px(26.)).child(format!("New {label}")))
-                    .child(caption("Share your changes and bring your team into the review.")))
-                .child(Button::new("close-request").ghost().label("Close tab").disabled(c.sending)
+                .child(row().child(icon("branch").text_color(rgb(palette().accent))).child(div().text_size(px(26.)).child(format!("New {label}"))))
+                .child(Button::new("close-request").ghost().icon(gpui_component::Icon::default().path("rustle/close")).tooltip("Close request tab").disabled(c.sending)
                     .on_click(cx.listener(|v, _, _, cx| { v.composer = None; cx.notify(); }))))
-            .child(row().child(icon("branch").text_color(rgb(palette().accent))).child(remote_select))
+            .child(row().child(icon("cloud").text_color(rgb(palette().muted))).child(remote_select).child(div().flex_1()).child(Button::new("refresh-request-branches").ghost().small().icon(gpui_component::Icon::default().path("rustle/refresh")).tooltip("Refresh local and fetched branches").disabled(locked || c.branches_loading).on_click(cx.listener(|v,_,window,cx|v.refresh_request_branches(false,window,cx)))))
             .child(row().items_start().gap_4()
-                .child(column().flex_1().min_w_0().gap_2().child(caption("Source branch")).child(div().relative().w_full().child(themed_select(&c.source).w_full().placeholder("Search source branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("source"))))
+                .child(column().flex_1().min_w_0().gap_2().child(field_label("source-branch-help", "Source branch", "Local and fetched branches for this project. Push the source before creating a request.")).child(div().relative().w_full().child(themed_select(&c.source).w_full().placeholder("Search source branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("source"))))
                 .child(div().pt_6().text_color(rgb(palette().accent)).child("→"))
-                .child(column().flex_1().min_w_0().gap_2().child(caption("Target branch")).child(div().relative().w_full().child(themed_select(&c.target).w_full().placeholder("Search target branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("target")))))
-            .child(row().justify_between()
-                .child(caption("Closest base first. Changing the source selects the first target."))
-                .child(Button::new("refresh-request-branches").ghost().small().label("Refresh branches")
-                    .disabled(locked || c.branches_loading)
-                    .on_click(cx.listener(|v,_,window,cx|v.refresh_request_branches(false,window,cx)))))
-            .child(caption("Local and fetched branches for this project. Push the source before creating a request."))
+                .child(column().flex_1().min_w_0().gap_2().child(field_label("target-branch-help", "Target branch", "Closest base first. Changing the source selects the first target.")).child(div().relative().w_full().child(themed_select(&c.target).w_full().placeholder("Search target branches…").disabled(locked || c.branches_loading)).children(self.request_branch_probe("target")))))
+
             .when(c.branches_loading, |s| s.child(caption("Finding branch bases…")))
-            .when(c.branch_choices.incomplete, |s| s.child(caption("Some history is unavailable. Fetch more history to improve target ordering.")))
+            .when(c.branch_choices.incomplete, |s| s.child(caption("Incomplete branch history")))
             .child(div().h(px(1.)).bg(rgb(palette().line)))
             .child(row().items_start().gap_6().child(editor).child(column().w(px(260.)).flex_shrink_0().gap_5()
                 .child(self.people_field(false, cx)).child(self.people_field(true, cx))
-                .child(caption("Suggestions include project members. Search by name or @username. Up to 10 per field."))))
-            .child(caption("Markdown supported · headings, lists, links, code blocks and task lists"))
-            .when(c.loading, |s| s.child(caption("Loading project and member suggestions… You can start writing.")))
-            .when(!c.loading && !locked, |s| s.child(Button::new("retry-members").ghost().small().label("Refresh project members")
-                .on_click(cx.listener(|v, _, window, cx| { let remote = v.composer.as_ref().and_then(|c| c.remote.clone()); v.load_request(remote, true, window, cx); }))))
+                .when(!c.loading && !locked, |s| s.child(row().justify_end().child(Button::new("retry-members").ghost().small().icon(gpui_component::Icon::default().path("rustle/refresh")).tooltip("Refresh project members")
+                    .on_click(cx.listener(|v, _, window, cx| { let remote = v.composer.as_ref().and_then(|c| c.remote.clone()); v.load_request(remote, true, window, cx); })))))))
+            .when(c.loading, |s| s.child(caption("Loading project members…")))
+
             ;
         let actions = row()
             .w_full()

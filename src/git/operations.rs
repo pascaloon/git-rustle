@@ -1664,7 +1664,7 @@ fn execute_inner(
         }
         Request::Plan(base) => {
             *loaded_plan = Some(plan(&context.root, base)?);
-            return Ok("Plan loaded. Reorder lines and choose actions, then start rebase.".into());
+            return Ok("Rebase plan loaded.".into());
         }
         Request::MoveTo(cursor) => {
             if journal.pending.is_some() || context.conflict()?.is_some() {

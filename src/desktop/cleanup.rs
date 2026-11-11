@@ -451,11 +451,14 @@ impl Desktop {
                                 "rustle/down"
                             }))
                             .label(title)
-                            .tooltip(if collapsed {
-                                "Expand section"
-                            } else {
-                                "Collapse section"
-                            })
+                            .tooltip(format!(
+                                "{} · {detail}",
+                                if collapsed {
+                                    "Expand section"
+                                } else {
+                                    "Collapse section"
+                                }
+                            ))
                             .on_click(cx.listener(move |v, _, w, cx| {
                                 v.cleanup_action(Action::ToggleSection(section), w, cx)
                             })),
@@ -466,7 +469,8 @@ impl Desktop {
                         Button::new(SharedString::from(format!("cleanup-select-all-{slot}")))
                             .small()
                             .ghost()
-                            .label("Select all")
+                            .icon(gpui_component::Icon::default().path("rustle/check-all"))
+                            .tooltip("Select all eligible branches in this group")
                             .disabled(busy)
                             .on_click(cx.listener(move |v, _, w, cx| {
                                 v.cleanup_action(Action::SelectSection(section, true), w, cx)
@@ -476,7 +480,8 @@ impl Desktop {
                         Button::new(SharedString::from(format!("cleanup-unselect-all-{slot}")))
                             .small()
                             .ghost()
-                            .label("Unselect all")
+                            .icon(gpui_component::Icon::default().path("rustle/uncheck-all"))
+                            .tooltip("Deselect all branches in this group")
                             .disabled(busy)
                             .on_click(cx.listener(move |v, _, w, cx| {
                                 v.cleanup_action(Action::SelectSection(section, false), w, cx)
@@ -485,15 +490,6 @@ impl Desktop {
             )
             .when(!collapsed, |s| {
                 s.child(
-                    caption(detail)
-                        .h(px(16.))
-                        .line_height(px(16.))
-                        .flex_shrink_0()
-                        .px_4()
-                        .whitespace_nowrap()
-                        .truncate(),
-                )
-                .child(
                     self.scroll_region(3 + slot, list, Scrollbar::vertical(scroll), cx)
                         .children(self.branch_cleanup_probe(11 + slot)),
                 )
@@ -505,13 +501,13 @@ impl Desktop {
             self.cleanup.loading || self.engine.operation_busy || self.engine.repository_edit_busy;
         let analysis = self.cleanup.analysis.as_ref();
         column().relative().children(self.branch_cleanup_probe(3)).flex_1().min_h_0()
-            .child(row().h(px(32.)).flex_shrink_0().px_4().gap_3().child(icon("broom")).child("Cleanup").child(div().flex_1())
+            .child(row().h(px(32.)).flex_shrink_0().px_4().gap_3().child(icon("broom")).child("Cleanup").child(help_icon("cleanup-help", "Only local references are removed; server branches stay intact. Fetched-only references are preselected. Checked-out branches are excluded.")).child(div().flex_1())
                 .child(Button::new("cleanup-analyze").small().ghost().icon(gpui_component::Icon::default().path("rustle/refresh")).tooltip("Refresh cleanup analysis").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Analyze, w, cx))))
                 .child(Button::new("cleanup-optimize").small().ghost().label("Optimize storage…").disabled(busy)
                     .on_click(cx.listener(|v, _, w, cx| v.cleanup_action(Action::Optimize, w, cx)))))
             .child(column().px_4().pb_1().gap_1()
-                .child(caption(analysis.map(|a|format!("{} candidates · {} checked-out branches excluded · {} KiB · fetched only preselected · server branches stay intact",a.candidates.len(),a.excluded_worktrees,a.storage_kib)).unwrap_or_else(||"Local references only · fetched only preselected · server branches stay intact".into())).h(px(16.)).line_height(px(16.)).flex_shrink_0().whitespace_nowrap().truncate())
+                .child(caption(analysis.map(|a|format!("{} candidates · {} protected · {} KiB",a.candidates.len(),a.excluded_worktrees,a.storage_kib)).unwrap_or_else(||"Local references".into())).h(px(16.)).line_height(px(16.)).flex_shrink_0().whitespace_nowrap().truncate())
                 .when(analysis.is_some_and(|a| !a.warnings.is_empty()), |s| s
                     .child(caption(format!("{} analysis warning(s)", analysis.unwrap().warnings.len())))
                     .child(column().id("cleanup-warnings").max_h(px(96.)).overflow_y_scroll()
